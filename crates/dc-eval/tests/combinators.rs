@@ -123,9 +123,13 @@ proptest! {
         let lhs = format!("(lam (lam (foldr {F} 0 (foldr cons $0 $1))))");
         let rhs = format!("(lam (lam (foldr {F} (foldr {F} 0 $0) $1)))");
         let inputs = [list(&xs), list(&ys)];
-        let (lv, _) = outcome_value(run_on(&lhs, &inputs));
-        let (rv, _) = outcome_value(run_on(&rhs, &inputs));
+        let (n, m) = (xs.len() as u64, ys.len() as u64);
+        let (lv, ls) = outcome_value(run_on(&lhs, &inputs));
+        let (rv, rs) = outcome_value(run_on(&rhs, &inputs));
         prop_assert_eq!(lv, rv);
+        // As for foldl: rhs β 2 + 5 (n + m); lhs adds the append, 2 per element of xs.
+        prop_assert_eq!(rs, 2 + 5 * (n + m));
+        prop_assert_eq!(ls, rs + 2 * n);
     }
 
     #[test]
@@ -139,8 +143,29 @@ proptest! {
     #[test]
     fn foldr_matches_a_host_fold(xs in prop::collection::vec(-50i64..50, 0..60)) {
         let expected = xs.iter().rev().fold(0i64, |acc, &x| acc - 2 * x);
-        let (v, _) = outcome_value(run_on(&format!("(lam (foldr {F} 0 $0))"), &[list(&xs)]));
+        let (v, s) = outcome_value(run_on(&format!("(lam (foldr {F} 0 $0))"), &[list(&xs)]));
         prop_assert_eq!(v, int(expected));
+        // β 1 + 5 per element, as for foldl.
+        prop_assert_eq!(s, 1 + 5 * xs.len() as u64);
+    }
+
+    #[test]
+    fn foldl_is_foldr_of_the_flipped_function_over_the_reverse(
+        xs in prop::collection::vec(-50i64..50, 0..40),
+    ) {
+        let n = xs.len() as u64;
+        // reverse xs = foldl (λacc. λx. x :: acc) nil xs; flip F = λx. λacc. F acc x.
+        let lhs = format!("(lam (foldl {F} 7 $0))");
+        let rhs = format!(
+            "(lam (foldr (lam (lam ({F} $0 $1))) 7 (foldl (lam (lam (cons $0 $1))) nil $0)))"
+        );
+        let (lv, ls) = outcome_value(run_on(&lhs, &[list(&xs)]));
+        let (rv, rs) = outcome_value(run_on(&rhs, &[list(&xs)]));
+        prop_assert_eq!(lv, rv);
+        prop_assert_eq!(ls, 1 + 5 * n);
+        // β 1 + nil 1 + reverse 4 per element (iteration, β 2, cons) + the flipped
+        // fold 7 per element (iteration, β 2 into flip, β 2 into F, mul, sub).
+        prop_assert_eq!(rs, 2 + 4 * n + 7 * n);
     }
 
     #[test]

@@ -135,6 +135,7 @@ name = "dc-eval"
 version = "0.1.0"
 dependencies = [
  "dc-core",
+ "dc-stitch",
  "imbl",
  "proptest",
  "rustc-hash",
