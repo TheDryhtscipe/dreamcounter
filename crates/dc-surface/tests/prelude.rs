@@ -30,7 +30,7 @@ use std::sync::OnceLock;
 
 use dc_core::types::infer;
 use dc_core::types::LibEnv;
-use dc_core::{Arena, LibId, Scheme, Term, TermId};
+use dc_core::{expand, sexpr, Arena, ExpandError, LibDef, LibId, Scheme, Term, TermId};
 use dc_eval::{apply, ErrorKind, Outcome, Value};
 use dc_stitch::LibNames;
 use dc_surface::prelude::{Prelude, PreludeError, PreludeMode, PRELUDE_LIB_BASE};
@@ -874,4 +874,60 @@ proptest! {
             ints(&merged)
         );
     }
+}
+
+/// A learned abstraction whose body uses the prelude, `lib_0 = λx. map (fun y -> y + x)`,
+/// and the program `lib_0 10`, both compiled in `arena`.
+fn learned_over_prelude(arena: &mut Arena) -> (LibDef, TermId) {
+    let top = prelude().top_level(PreludeMode::On);
+    let lib = top
+        .close_expression(arena, "lib_0", "fun x -> map (fun y -> y + x)")
+        .unwrap_or_else(|e| panic!("{e}"));
+    let program = sexpr::parse(arena, "(lib_0 10)").unwrap_or_else(|e| panic!("{e}"));
+    (
+        LibDef {
+            arity: 1,
+            term: lib,
+        },
+        program,
+    )
+}
+
+#[test]
+fn learned_abstractions_expand_after_the_prelude() {
+    // Prelude-first order (see the prelude module docs): expand prelude references in
+    // the program and in each learned body, then the learned abstractions. The result
+    // must match the hand-inlined program in value and steps (spec §7, invariant 2).
+    let p = prelude();
+    let mut arena = Arena::new();
+    let (lib, program) = learned_over_prelude(&mut arena);
+    let lib = LibDef {
+        arity: lib.arity,
+        term: p.expand(&mut arena, lib.term),
+    };
+    let program = p.expand(&mut arena, program);
+    let expanded = expand(&mut arena, &[lib], program).unwrap_or_else(|e| panic!("{e}"));
+    let refactored = apply(&arena, expanded, &[ints(&[1, 2, 3])], FUEL);
+
+    let inlined = run_with(
+        &p.top_level(PreludeMode::On),
+        "map (fun y -> y + 10)",
+        &[ints(&[1, 2, 3])],
+    );
+    assert_eq!(refactored.to_string(), inlined.to_string());
+    assert!(matches!(refactored, Outcome::Value(ref v, _) if *v == ints(&[11, 12, 13])));
+}
+
+#[test]
+fn learned_expander_rejects_unexpanded_prelude_references() {
+    // The learned-abstraction expander defines only learned ids, so a prelude reference
+    // it meets is an unknown library: callers must expand the prelude first.
+    let mut arena = Arena::new();
+    let (lib, program) = learned_over_prelude(&mut arena);
+    let map = prelude().get("map").expect("prelude defines map").lib();
+    assert!(map.0 >= PRELUDE_LIB_BASE);
+    assert_eq!(
+        expand(&mut arena, &[lib], program),
+        Err(ExpandError::UnknownLib(map))
+    );
 }
