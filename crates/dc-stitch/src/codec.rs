@@ -515,6 +515,22 @@ mod tests {
     }
 
     #[test]
+    fn tree_primitives_encode_as_their_names() {
+        check_encoding("(node leaf 1 leaf)", "(node leaf int_1 leaf)");
+        check_encoding(
+            "(lam (tree_case $0 (lam 0) (lam (lam (lam $1)))))",
+            "(lam (tree_case $0 (lam int_0) (lam (lam (lam $1)))))",
+        );
+        check_encoding(
+            "(lam (tree_fold leaf (lam (lam (lam (node $2 $1 $0)))) $0))",
+            "(lam (tree_fold leaf (lam (lam (lam (node $2 $1 $0)))) $0))",
+        );
+        // Partial applications stay partial.
+        check_encoding("(node leaf)", "(node leaf)");
+        check_encoding("tree_fold", "tree_fold");
+    }
+
+    #[test]
     fn let_binder_is_a_real_lambda_to_stitch() {
         // The body of a let sees the bound value at $0, so Stitch must see a binder:
         // the closed term `let 1 in $0` must not print with a free `$0` at top level.

@@ -4,7 +4,7 @@ title: dc language specification (draft v0)
 type: reference
 scope: internal
 created_at: '2026-10-27T17:11:12.135054Z'
-updated_at: '2026-10-27T18:07:45.032272Z'
+updated_at: '2026-10-27T22:24:39.932620Z'
 ---
 
 Status: phase 1 draft, 2026-10-27. Nothing here is implemented yet. Items marked
@@ -74,7 +74,9 @@ e ::= x_i                    -- de Bruijn index
 - Every evaluation returns exactly one of:
   - `Value(v, steps)`
   - `Error(kind, steps)`: division by zero, overflow, array index out of bounds,
-    fuel exhausted inside `bfix` or `memorec` (§6), equality on functions.
+    fuel exhausted inside `bfix` or `memorec` (§6), equality on functions, an
+    invalid `memorec` key, or a `memorec` `self` called in a later evaluation
+    (`MemoSelfEscaped`, §6).
   - `Timeout(steps)`: fuel exhausted.
 - **Fuel** is a global step budget per evaluation. It is a safety net: every
   combinator except `unfold` terminates without it.
@@ -90,26 +92,49 @@ taken inside function arguments are added on top.
 | `+ - * div mod` | `Int -> Int -> Int` | 1 (error on overflow / zero divisor) |
 | `= < <=` | `Int -> Int -> Bool` | 1 |
 | `not` | `Bool -> Bool` | 1 |
-| `==` | `a -> a -> Bool` (structural) | number of value nodes compared; error on closures |
+| `==` | `a -> a -> Bool` (structural) | number of value-node pairs compared (§7); error on closures |
 | `pair` | `a -> b -> (a, b)` | 1 |
-| `fst`, `snd` | | 1 |
-| `none`, `some` | | 1 |
+| `fst`, `snd` | `(a, b) -> a`, `(a, b) -> b` | 1 |
+| `none`, `some` | `Option a`, `a -> Option a` | 1 |
 | `option_case` | `Option a -> (Unit -> b) -> (a -> b) -> b` | 1 + calls |
-| `nil`, `cons` | | 1 |
+| `nil`, `cons` | `List a`, `a -> List a -> List a` | 1 |
 | `list_case` | `List a -> (Unit -> b) -> (a -> List a -> b) -> b` | 1 + calls |
 | `length` | `List a -> Int` | 1 (lists cache their length) |
-| `array_tabulate` | `Int -> (Int -> a) -> Array a` | n + calls |
+| `array_tabulate` | `Int -> (Int -> a) -> Array a` | max(n, 0) + calls |
 | `array_get` | `Array a -> Int -> a` | 1 |
 | `array_set` | `Array a -> Int -> a -> Array a` | 1 + ⌈log₂(n+1)⌉ |
-| `array_size` | | 1 |
-| `array_of_list`, `array_to_list` | | n + 1 |
+| `array_size` | `Array a -> Int` | 1 |
+| `array_of_list`, `array_to_list` | `List a -> Array a`, `Array a -> List a` | n + 1 |
 | `leaf` | `Tree a` | 1 |
 | `node` | `Tree a -> a -> Tree a -> Tree a` | 1 |
 | `tree_case` | `Tree a -> (Unit -> b) -> (Tree a -> a -> Tree a -> b) -> b` | 1 + calls |
-| `tree_fold` | `b -> (b -> a -> b -> b) -> Tree a -> b` | 1 per node + calls |
+| `tree_fold` | `b -> (b -> a -> b -> b) -> Tree a -> b` | 1 per internal node + calls; 0 per `leaf` |
 
 Notes:
 
+- **Types.** The Type column is the scheme that `dc_core::types::prim_scheme` gives
+  each primitive, up to renaming of type variables.
+- **Operator names.** The Primitive column uses surface operators where they exist.
+  The canonical core names (used in core syntax and in Stitch serialisation) are:
+
+  | Surface | Core |
+  |---|---|
+  | `+`, `-`, `*`, `/`, `mod` | `add`, `sub`, `mul`, `div`, `mod` |
+  | `=` (on `Int`) | `int_eq` |
+  | `<`, `<=` | `lt`, `le` |
+  | `==` (structural) | `eq` |
+  | `::` | `cons` |
+  | `&&`, `\|\|` | the special forms `and`, `or` (§3), not primitives |
+
+  `a > b` desugars to `lt b a` and `a >= b` to `le b a`. When `a` is not a variable
+  or literal, a `let` binds `a` first, so `a` is still evaluated before `b`. The
+  operator sections `( > )`, `( >= )`, `( && )` and `( || )` are rejected.
+- **`div` and `mod` overflow.** `div i64::MIN -1` and `mod i64::MIN -1` both raise
+  `Overflow`. For `mod` the mathematical result, 0, is representable, but the
+  evaluator uses checked remainder, which fails on these operands.
+- **`tree_fold` charges internal nodes only.** A `leaf` makes no call of `f`, so it
+  costs 0, and `tree_fold z f leaf` costs only the evaluation of its arguments.
+  `eq` still counts each `leaf` as a node (§7).
 - `option_case`/`list_case`/`tree_case` take the empty-case branch as a thunk, so under strict
   evaluation it runs only when taken. Calling the thunk costs one β step (§7), so the
   laziness is charged for. The surface `match` produces this form (§10).
@@ -159,8 +184,10 @@ because "generate until" is a recognisable shape the compressor should see.
 bfix : Int -> ((a -> b) -> a -> b) -> a -> b
 ```
 
-`bfix n F x` evaluates `F self x`, where `self` is `bfix (n-1) F`. If `self` is
-called when the fuel `n` is 0, evaluation stops with `FuelExhausted`. The fuel
+`bfix n F x` evaluates `F self x`, where `self` is `bfix (n-1) F`. Any `bfix`
+call with fuel `n ≤ 0` raises `FuelExhausted`, and this includes the first call
+`bfix n F x` itself. So `bfix 0 F x` fails after 0 steps, and `bfix n` allows at
+most `n` nested calls. The fuel
 bounds the depth of the recursion: each call passes one less fuel to its own
 recursive calls, and sibling calls each receive the same amount (decision D9).
 
@@ -174,7 +201,9 @@ recursive calls, and sibling calls each receive the same amount (decision D9).
   expressions are visible syntax that the compressor can share across programs.
 - Depth fuel bounds depth, not total work: a tree recursion of depth n can make up
   to 2ⁿ calls. The global fuel (§4) bounds total work.
-- Cost: 1 per recursive call + calls inside `F`. The fuel check is free.
+- Cost: 1 per call + calls inside `F`. The first call `bfix n F x` is charged 1
+  like every recursive call. The fuel check is free: a call that raises
+  `FuelExhausted` is not charged.
 - Mutual recursion needs an encoding: a tag in the argument. If this becomes common
   in practice, it will be written up and raised with the project lead rather than
   added to the language quietly.
@@ -182,7 +211,7 @@ recursive calls, and sibling calls each receive the same amount (decision D9).
 ### `memorec`: memoised bounded recursion
 
 ```
-memorec : Int -> ((k -> v) -> k -> v) -> k -> v
+memorec : Key k => Int -> ((k -> v) -> k -> v) -> k -> v
 ```
 
 `memorec n F x` is open recursion like `bfix`, plus a memo table keyed on the
@@ -192,13 +221,37 @@ argument.
   depth. Exceeding it raises `FuelExhausted`. A per-depth bound would make a cached
   result depend on how much fuel was left when it was first computed, so the same
   call could succeed or fail depending on evaluation history. Evaluation is strict
-  and left to right, so the miss count is deterministic.
+  and left to right, so the miss count is deterministic. With `n ≤ 0` the first
+  call is a miss with no misses left, so it raises `FuelExhausted` after 0 steps.
 - Key types restricted to `Int`, `Bool`, `Unit` and tuples of those, so hashing is
   O(1) in practice. Subset DP uses an `Int` bitmask. Memoised recursion over a
   lattice is `memorec` over keys that encode the lattice elements.
-- The table is created at the outermost `memorec` call and dropped when it returns.
-  Nothing is shared between evaluations.
-- Cost: hit = 1 + key size; miss = 1 + key size + calls inside `F`.
+- The type checker enforces the key restriction with a `Key` constraint on the
+  key type variable. Binding a `Key` variable to `Int`, `Bool` or `Unit`
+  discharges it, binding it to a pair puts the constraint on both components, and
+  binding it to any other type is a `BadMemoKey` type error. The constraint is
+  kept when a `let` generalises the variable, so it also holds through let-bound
+  helpers and library abstractions. A closed term whose key type is still a
+  variable gets a constrained scheme, for example
+  `Key a => ((a -> b) -> a -> b) -> a -> b`. The evaluator also checks each key
+  and raises `InvalidMemoKey`, charged 0 steps, but a well-typed program never
+  reaches that error.
+- Each application of the `memorec` primitive creates a new table. Calls through
+  its `self` use that table. Tables are never shared between `memorec`
+  applications or between evaluations.
+- A table lives until the evaluation ends, not until its `memorec` returns. A
+  `memorec` whose result is a function (a curried `F`) returns a closure that calls
+  `self` later, and that `self` keeps working with its own table and its remaining
+  misses. Releasing a table that nothing can reach changes no step count.
+- A `self` returned by one evaluation and called in a later one (only host code
+  can do this) raises `MemoSelfEscaped`, charged 0 steps.
+- Cost: hit = 1 + key size; miss = 1 + key size + calls inside `F`. Key size is
+  the number of value nodes in the key: 1 for each `Int`, `Bool`, `Unit` and pair.
+  So an `Int` key costs 2 per call.
+- The first call `memorec n F x` is a memo call on `x`, and with the empty table it
+  is a miss. A result is stored only when its call returns, so a call on a key that
+  is still being computed is another miss and uses another unit of miss fuel.
+- A miss with no misses left raises `FuelExhausted` and is not charged.
 - Hash function: a fixed, unseeded hash (e.g. FxHash). Iteration order of the
   table is never observable, so costs stay deterministic.
 
@@ -215,6 +268,50 @@ steps taken by the abstract strict machine of §4, where a step is:
 
 Free: variable lookup, `let` binding (the bound expression's own evaluation is
 charged as usual), literals, closure creation.
+
+**Readings.** These state exactly what the evaluator charges where §5 and §6 leave
+a choice open. `crates/dc-eval/src/cost.rs` holds the same table, and the machine
+charges only through it.
+
+- **Primitives as values.** Evaluating a primitive of arity 1 or more to a function
+  value costs 0, and so does applying it to fewer arguments than its arity. A
+  nullary primitive (`nil`, `none`, `leaf`) costs 1 each time it is evaluated.
+- **Charge timing.** A primitive's cost is charged when it is applied to its last
+  argument, before it computes its result. A per-element or per-call cost of a
+  combinator is charged just before the call of its function argument for that
+  element. `unfold` is the exception: it charges an element when `g` returns
+  `some`, so the final call that returns `none` costs only its own steps.
+  `tree_fold` charges a node when it combines the node's two subtree results, so in
+  post-order.
+- **Failing primitives are charged in full.** A primitive that raises an error
+  (`div` or `mod` by zero, overflow, an array index out of bounds) is charged its
+  full cost first, so the step count of the error includes the failing
+  application. An `eq` that reaches a function is charged the node pairs compared
+  up to and including the pair with the function.
+- **Failing recursive calls are not charged.** A `bfix` call with fuel ≤ 0 and a
+  `memorec` miss with no misses left raise `FuelExhausted` without a charge (§6).
+- **Empty iterations cost 0.** `foldl` and `foldr` on an empty list, `loop` with
+  `n ≤ 0` and `array_tabulate` with `n ≤ 0` charge nothing beyond their arguments.
+- **`&&` and `||` decide once**, on their left operand. When the right operand is
+  evaluated, its own steps are added, but no second decision is charged.
+- **`eq` node count.** Each scalar, pair, option, array, list cell, `nil`, tree
+  node and `leaf` counts as one node. The comparison runs in pre-order, left to
+  right, and stops at the first difference. Arrays of different sizes differ at
+  their own node.
+- **Timeout steps.** The machine stops with `Timeout(s)` at the first charge that
+  takes the step count above the fuel. So `s > fuel`, and `s = fuel + 1` when that
+  charge is a single step.
+- **`eq` near the fuel limit.** An `eq` that would compare more node pairs than the
+  fuel left stops counting one pair above it, so it ends with
+  `Timeout(fuel + 1)`. Sharing can make a value exponentially larger than the steps
+  that built it, so the full count is not computed. A `memorec` key larger than the
+  fuel left is sized without being built, so its timeout count is exact.
+- **Escaped memo selves.** A `memorec` `self` called after its `memorec` returned,
+  within the same evaluation, costs what any `memorec` call costs (§6). A `self`
+  called in a later evaluation raises `MemoSelfEscaped`, charged 0 steps.
+- **Applying a program to inputs.** The evaluator evaluates the program term (free
+  for a `lam`) and applies it to each input in turn. Each application of a closure
+  is one β step. A program that is a primitive is charged as a primitive.
 
 **Invariants** (each becomes a property test in phase 2):
 
@@ -239,7 +336,9 @@ binders. The implementation expands abstractions before evaluation. Expansion is
 cheap because terms are hash-consed, and the expanded term is a DAG, not a tree.
 
 Unsaturated uses (the LLM writes `L a0` where `L` takes two parameters) are
-η-expanded at elaboration to `λy. L a0 y`. That adds one β step, so invariant 2
+η-expanded at elaboration to `λy. L a0 y`. In general a use with `n` of `k`
+arguments, a bare `L` included, gets `k - n` η binders, and applying the result
+costs one β step per binder: one β step per missing argument. So invariant 2
 holds only for saturated uses. Stitch's rewriter always produces saturated uses.
 
 **Why macro semantics and not ordinary function calls.** Under call-by-value, turning
@@ -382,6 +481,22 @@ LLM will reach for `map` constantly. The compressor treats prelude names as opaq
 primitives. An ablation turns the prelude off and checks whether the compressor
 rediscovers `map`/`filter` from the base combinators, as a sanity check on the
 compressor.
+
+Prelude conventions (source: `crates/dc-surface/src/prelude.dc`):
+
+- `range lo hi` is `[lo; lo + 1; ...; hi - 1]`, and empty when `hi <= lo`. A range
+  of more than `max_int` elements raises `Overflow`.
+- `nth xs i` takes the list first. It returns the element at index `i`, counting
+  from 0. An index out of range, negative included, raises `IndexOutOfBounds`.
+- A prelude reference is a function, not a macro. It is replaced by the closed term
+  of its definition (a `lam` or a literal), and applying it is ordinary
+  application, charged one β step per argument. So a prelude function costs exactly
+  what the same definition costs as a top-level `let` in the program. Learned
+  abstractions (§8) keep macro semantics.
+- Prelude references are expanded first: in the program and in each learned
+  abstraction's closed term, before learned abstractions are expanded. Prelude
+  definitions are closed and contain no library references, so the order does not
+  change the expanded term.
 
 **Stitch serialisation.** Core terms print to Stitch's input format: `(lam body)`,
 `$i` for de Bruijn variables, application as `(f a b)`, primitives and library
