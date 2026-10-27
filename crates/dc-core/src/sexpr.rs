@@ -32,9 +32,10 @@ pub fn print(arena: &Arena, id: TermId) -> String {
 }
 
 /// Appends `id` in core syntax to `out`, stopping as soon as `out` is longer than
-/// `limit` bytes. The cost is bounded by `limit` plus the length of the longest
-/// atom or application spine, not by the size of the term. Returns whether the
-/// whole term was written.
+/// `limit` bytes. Each application visited pushes its whole spine first, and up
+/// to about `limit` nodes are visited, so the cost is bounded by about `limit`
+/// times the length of the longest atom or application spine, not by the size of
+/// the term. Returns whether the whole term was written.
 pub fn print_bounded(arena: &Arena, id: TermId, limit: usize, out: &mut String) -> bool {
     enum Item {
         Term(TermId),

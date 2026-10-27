@@ -23,15 +23,25 @@
 //!
 //! **Shared subterms.** Terms are DAGs too: `(if c t t)` nested `n` deep has `n`
 //! distinct nodes but `2^n` as a tree. A non-leaf subterm reached by more than one
-//! edge of the DAG is inferred once for each different set of bindings it can see,
-//! and the result is reused (see [`TypeChecker::walk`] for why that is sound).
+//! edge of the DAG is inferred once for each different set of bindings its free
+//! variables refer to, and the result is reused (see [`TypeChecker::walk`] for why
+//! that is sound). The DAG here takes an application spine `(f a1 ... an)` as one
+//! node, so `t` is shared in `(add t 1)` and `(add t 2)`, which share `(add t)`.
 //! Bindings count as the same when both are monomorphic (the subterm's type is
 //! kept as a function of theirs), or when both are polymorphic with the same type
 //! up to renaming and no free variables. So `(if c t t)`, `(let t t)` and
-//! `((lam t) t)`, nested `n` deep, take time linear in `n`. The exception is a
-//! polymorphic binding whose type has a free variable: it counts as the same only
-//! as itself, so a subterm under a new such binding at every use is inferred again
-//! at every use, and a DAG that does that at every level is not linear.
+//! `((lam t) t)`, nested `n` deep, take time linear in `n`, however far out the
+//! binders of `t`'s variables are. The exception is a polymorphic binding whose
+//! type has a free variable: it counts as the same only as itself, so a subterm
+//! under a new such binding at every use is inferred again at every use, and a
+//! DAG that does that at every level is not linear. A use of a shared subterm
+//! costs time linear in the number of its distinct free variables, or, past 64 of
+//! them, in the number of binders out to the outermost one it uses.
+//!
+//! An ill-typed term is walked a second time as a tree, within a step budget, so
+//! that its error names the subterm where the clash happens, as it would without
+//! the sharing (see [`TypeChecker::run`]). A term too large for the budget gets
+//! the first walk's error, which may name a whole shared subterm instead.
 //!
 //! **Checking.** [`TypeChecker::check`] pushes the expected type into the term:
 //! through `lam` (parameter and body), the body of `let`, both branches of `if`, and
@@ -170,9 +180,6 @@ struct Binding {
     /// Whether the type contains generalised variables (a `let` binding with
     /// something to quantify).
     poly: bool,
-    /// Unique per push in one walk, so a scope can be recognised (see
-    /// [`Scope::Innermost`]).
-    serial: u32,
     /// For a polymorphic type with no free variables, its [`Canon`] id: the same
     /// for every binding whose type is the same up to renaming of the quantified
     /// variables.
@@ -254,21 +261,34 @@ enum Frame {
     Memo,
 }
 
-/// The most bindings a [`Scope::Slots`] lists. A shared subterm that can see more
-/// is keyed by [`Scope::Innermost`].
-const MAX_SLOTS: usize = 64;
+/// The most distinct free variables recorded for a subterm (see [`FreeVars`]).
+const MAX_FREE_VARS: usize = 64;
 
-/// What the type of a shared subterm depends on: the bindings its free variables
-/// may refer to.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Scope {
-    /// One entry for each of the subterm's `d` innermost bindings, outermost
-    /// first, where `d` is its free depth (none for a closed subterm).
-    Slots(Vec<Slot>),
-    /// The serial of the innermost binding. Bindings form a stack, so the same
-    /// innermost binding means the very same bindings all the way out.
-    Innermost(u32),
+/// The free variables of a subterm, for keying the memo of shared subterms.
+#[derive(Clone, Debug)]
+struct FreeVars {
+    /// One more than the largest free de Bruijn index; 0 for a closed subterm.
+    depth: u32,
+    /// The free de Bruijn indices, ascending, or `None` if there are more than
+    /// [`MAX_FREE_VARS`]. Then the subterm is taken to use all `depth` innermost
+    /// bindings.
+    vars: Option<Box<[u32]>>,
 }
+
+impl FreeVars {
+    /// The indices a [`Scope`] has a [`Slot`] for, in its order.
+    fn indices(&self) -> Vec<u32> {
+        match &self.vars {
+            Some(v) => v.to_vec(),
+            None => (0..self.depth).collect(),
+        }
+    }
+}
+
+/// What the type of a shared subterm depends on: one [`Slot`] for each binding its
+/// free variables refer to, in the order of [`FreeVars::indices`]. Bindings it
+/// does not use do not matter, however far out its variables reach.
+type Scope = Vec<Slot>;
 
 /// A binding as far as the type of a shared subterm that can see it depends on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -292,10 +312,11 @@ type MemoKey = (TermId, Scope);
 #[derive(Debug)]
 struct Pending {
     key: MemoKey,
-    /// The fresh variables standing for its monomorphic bindings, outermost first.
+    /// The fresh variables standing for its monomorphic bindings, in slot order.
     params: Vec<Ty>,
-    /// How many bindings were pushed for it, to pop afterwards.
-    pushed: usize,
+    /// The bindings replaced by those variables, by position in `env`, to put
+    /// back afterwards.
+    saved: Vec<(usize, Binding)>,
 }
 
 /// An application `app` = `head a1 ... an`, with the arguments at
@@ -337,26 +358,33 @@ pub struct TypeChecker {
     spine: Vec<TermId>,
     /// Non-leaf subterms of the current root reached by more than one edge.
     shared: FxHashSet<TermId>,
-    /// Free depths of the shared subterms and the nodes under them.
-    free_depths: FxHashMap<TermId, u32>,
+    /// Free variables of the shared subterms and the nodes under them.
+    free_vars: FxHashMap<TermId, FreeVars>,
     /// Generalised types of shared subterms already inferred, by scope.
     memo: FxHashMap<MemoKey, Ty>,
     /// Shared subterms being inferred, innermost last; one per [`Frame::Memo`].
     pending: Vec<Pending>,
     /// Ids of the [`Canon`] nodes met in this walk.
     canon: FxHashMap<Canon, u32>,
-    next_serial: u32,
-    /// Walks every term as a tree, without reusing shared subterms: the reference
-    /// the tests compare the memoised walk with.
-    #[cfg(test)]
+    /// Walks every term as a tree, without reusing shared subterms. Used to
+    /// locate an error (see [`TypeChecker::run`]), and the reference the tests
+    /// compare the memoised walk with.
     pub(super) tree_walk: bool,
+    /// The most steps a tree walk to locate an error may take; past it the walk
+    /// stops and sets `out_of_budget`.
+    budget: Option<u64>,
+    out_of_budget: bool,
+    /// Steps taken by the term walk of the current call.
+    steps: u64,
     /// The most steps of the term walk one call may take; more is a panic. Lets
     /// the tests bound the work without a timer.
     #[cfg(test)]
     pub(super) step_limit: Option<u64>,
-    #[cfg(test)]
-    steps: u64,
 }
+
+/// The fewest steps a tree walk to locate an error may take (see
+/// [`TypeChecker::run`]).
+const MIN_LOCATE_STEPS: u64 = 1_000_000;
 
 /// Where a unification happens, for the error message.
 struct Site {
@@ -389,8 +417,7 @@ impl TypeChecker {
         term: TermId,
         libs: &L,
     ) -> Result<Scheme, TypeError> {
-        self.reset();
-        let t = self.walk(arena, libs, term, None)?;
+        let t = self.run(arena, libs, term, None)?;
         self.export_scheme(t).map_err(|TooLarge| {
             let mut e = plain_error(arena, term, too_large());
             e.context = "the type of the whole term".into();
@@ -405,7 +432,8 @@ impl TypeChecker {
     /// used as a `memorec` key only if `expected` gives it a `Key` constraint.
     ///
     /// The expected type is pushed into the term (see the module documentation), so
-    /// an error names the subterm where the clash happens.
+    /// an error names the subterm where the clash happens (with the exception
+    /// given under "Shared subterms" there).
     pub fn check<L: LibEnv + ?Sized>(
         &mut self,
         arena: &Arena,
@@ -413,15 +441,63 @@ impl TypeChecker {
         libs: &L,
         expected: &Scheme,
     ) -> Result<(), TypeError> {
-        self.reset();
-        let mut rigid: FxHashMap<TyVar, Ty> = FxHashMap::default();
-        for v in expected.vars() {
-            let key = expected.keys().contains(&v);
-            rigid.insert(v, self.push(Node::Rigid { key }));
+        self.run(arena, libs, term, Some(expected)).map(|_| ())
+    }
+
+    /// Finds the type of `term`, checked against `expected` if given.
+    ///
+    /// If that fails, and the walk reused shared subterms, the term is walked
+    /// again as a tree, for at most [`MIN_LOCATE_STEPS`] steps or four times the
+    /// steps the first walk took, whichever is more. An error found by that walk
+    /// is returned instead, since it names the subterm where the clash happens.
+    /// A reused subterm has its uses checked as a whole (see
+    /// [`TypeChecker::walk`]), so the first error would depend on whether the
+    /// same text appears elsewhere in the term. Both walks accept the same terms.
+    fn run<L: LibEnv + ?Sized>(
+        &mut self,
+        arena: &Arena,
+        libs: &L,
+        term: TermId,
+        expected: Option<&Scheme>,
+    ) -> Result<Ty, TypeError> {
+        let first = self.walk_from_scratch(arena, libs, term, expected);
+        let Err(e) = first else {
+            return first;
+        };
+        if self.tree_walk || self.shared.is_empty() {
+            return Err(e);
         }
-        let want = self.import(expected.ty(), &mut |_, v| rigid[&v]);
-        let want = Want::at(want, "the whole term, checked against its expected type");
-        self.walk(arena, libs, term, Some(want)).map(|_| ())
+        let budget = (self.steps.saturating_mul(4)).max(MIN_LOCATE_STEPS);
+        self.tree_walk = true;
+        self.budget = Some(budget);
+        let again = self.walk_from_scratch(arena, libs, term, expected);
+        self.tree_walk = false;
+        self.budget = None;
+        match again {
+            Err(located) if !self.out_of_budget => Err(located),
+            _ => Err(e),
+        }
+    }
+
+    /// Resets the checker and walks `term`, against `expected` if given.
+    fn walk_from_scratch<L: LibEnv + ?Sized>(
+        &mut self,
+        arena: &Arena,
+        libs: &L,
+        term: TermId,
+        expected: Option<&Scheme>,
+    ) -> Result<Ty, TypeError> {
+        self.reset();
+        let want = expected.map(|expected| {
+            let mut rigid: FxHashMap<TyVar, Ty> = FxHashMap::default();
+            for v in expected.vars() {
+                let key = expected.keys().contains(&v);
+                rigid.insert(v, self.push(Node::Rigid { key }));
+            }
+            let want = self.import(expected.ty(), &mut |_, v| rigid[&v]);
+            Want::at(want, "the whole term, checked against its expected type")
+        });
+        self.walk(arena, libs, term, want)
     }
 
     fn reset(&mut self) {
@@ -434,34 +510,18 @@ impl TypeChecker {
         self.frames.clear();
         self.spine.clear();
         self.shared.clear();
-        self.free_depths.clear();
+        self.free_vars.clear();
         self.memo.clear();
         self.pending.clear();
         self.canon.clear();
-        self.next_serial = 0;
-        #[cfg(test)]
-        {
-            self.steps = 0;
-        }
+        self.steps = 0;
+        self.out_of_budget = false;
     }
 
     /// Pushes a binding for a new innermost variable.
     fn bind_var(&mut self, ty: Ty, poly: bool) {
         let class = if poly { self.canonical(ty) } else { None };
-        self.bind_class(ty, poly, class);
-    }
-
-    /// Pushes a binding for a new innermost variable whose [`Binding::class`] is
-    /// known.
-    fn bind_class(&mut self, ty: Ty, poly: bool, class: Option<u32>) {
-        let serial = self.next_serial;
-        self.next_serial = serial.checked_add(1).expect("fewer than 2^32 binders");
-        self.env.push(Binding {
-            ty,
-            poly,
-            serial,
-            class,
-        });
+        self.env.push(Binding { ty, poly, class });
     }
 
     /// The [`Canon`] id of `t`, or `None` if `t` has a variable that is not
@@ -514,14 +574,31 @@ impl TypeChecker {
     }
 
     /// Finds the non-leaf subterms of `root` that more than one edge of the DAG
-    /// reaches.
+    /// reaches, where the DAG is the one the term walk sees: an application spine
+    /// `(f a1 ... an)` is one node with children `f, a1, ..., an`, since the walk
+    /// never infers a prefix `(f a1 ... ai)` on its own. So `t` in `(add t 1)` and
+    /// `(add t 2)` counts as reached twice, although both reach it through the one
+    /// node `(add t)`.
     fn find_shared(&mut self, arena: &Arena, root: TermId) {
         let mut seen: FxHashSet<TermId> = FxHashSet::default();
         let mut edges: FxHashSet<TermId> = FxHashSet::default();
         let mut stack = vec![root];
+        let mut kids = Vec::new();
         seen.insert(root);
         while let Some(id) = stack.pop() {
-            for c in children(&arena.get(id)) {
+            kids.clear();
+            let node = arena.get(id);
+            if let Term::App(..) = node {
+                let mut head = id;
+                while let Term::App(f, a) = arena.get(head) {
+                    kids.push(a);
+                    head = f;
+                }
+                kids.push(head);
+            } else {
+                kids.extend(children(&node));
+            }
+            for &c in &kids {
                 if !edges.insert(c) && !children(&arena.get(c)).is_empty() {
                     self.shared.insert(c);
                 }
@@ -1180,8 +1257,11 @@ impl TypeChecker {
     /// `let`.
     ///
     /// A shared subterm is inferred without the expected type of its position;
-    /// the type is checked against it afterwards. So in [`TypeChecker::check`] a
-    /// clash inside a shared subterm is reported at that subterm, not deeper.
+    /// the type is checked against it afterwards, and the types of the
+    /// monomorphic bindings it uses are checked against its kept type at each use.
+    /// So a clash found that way is reported at the whole shared subterm. When
+    /// that happens, [`TypeChecker::run`] walks the term again as a tree to find
+    /// where the clash is.
     fn walk<L: LibEnv + ?Sized>(
         &mut self,
         arena: &Arena,
@@ -1189,18 +1269,18 @@ impl TypeChecker {
         root: TermId,
         want: Option<Want>,
     ) -> Result<Ty, TypeError> {
-        #[cfg(test)]
-        let skip = self.tree_walk;
-        #[cfg(not(test))]
-        let skip = false;
-        if !skip {
+        if !self.tree_walk {
             self.find_shared(arena, root);
         }
         let mut step = Step::Eval(root, want);
         loop {
+            self.steps += 1;
+            if self.budget.is_some_and(|b| self.steps > b) {
+                self.out_of_budget = true;
+                return Err(plain_error(arena, root, too_large()));
+            }
             #[cfg(test)]
             {
-                self.steps += 1;
                 if let Some(limit) = self.step_limit {
                     assert!(
                         self.steps <= limit,
@@ -1233,33 +1313,29 @@ impl TypeChecker {
         id: TermId,
         want: Option<Want>,
     ) -> Result<Step, TypeError> {
-        if !self.free_depths.contains_key(&id) {
-            arena.free_depths(id, &mut self.free_depths);
+        if !self.free_vars.contains_key(&id) {
+            free_vars(arena, id, &mut self.free_vars);
         }
-        let depth = self.free_depths[&id] as usize;
+        let fv = &self.free_vars[&id];
         let len = self.env.len();
-        if depth > len {
+        if fv.depth as usize > len {
             // A free variable is unbound: walk it as a tree to report it.
             return self.descend_unshared(id, want);
         }
-        let scope = if depth > MAX_SLOTS {
-            Scope::Innermost(self.env[len - 1].serial)
-        } else {
-            let mut slots = Vec::with_capacity(depth);
-            for i in len - depth..len {
-                let b = self.env[i];
-                slots.push(match (b.poly, b.class) {
-                    (false, _) => Slot::Mono,
-                    (true, Some(c)) => Slot::Closed(c),
-                    (true, None) => Slot::Poly(self.resolve(b.ty)),
-                });
-            }
-            Scope::Slots(slots)
-        };
+        let indices = fv.indices();
+        let mut scope = Vec::with_capacity(indices.len());
+        for &i in &indices {
+            let b = self.env[len - 1 - i as usize];
+            scope.push(match (b.poly, b.class) {
+                (false, _) => Slot::Mono,
+                (true, Some(c)) => Slot::Closed(c),
+                (true, None) => Slot::Poly(self.resolve(b.ty)),
+            });
+        }
         let key = (id, scope);
         if let Some(&kept) = self.memo.get(&key) {
             let t = self.instantiate(kept);
-            let t = self.apply_scope(arena, id, &key.1, t)?;
+            let t = self.apply_scope(arena, id, &key.1, &indices, t)?;
             if let Some(w) = want {
                 self.expect(arena, w.ty, t, Site::new(id, w.context))?;
             }
@@ -1268,27 +1344,26 @@ impl TypeChecker {
         if let Some(w) = want {
             self.frames.push(Frame::Check { want: w, term: id });
         }
+        // The monomorphic bindings it uses are replaced, in place, by fresh
+        // variables one level deeper, which the kept type takes as parameters.
+        // The other bindings stay as they are.
         self.level += 1;
         let mut params = Vec::new();
-        let mut pushed = 0;
-        if let Scope::Slots(slots) = &key.1 {
-            for (i, slot) in slots.iter().enumerate() {
-                let b = self.env[len - depth + i];
-                if *slot == Slot::Mono {
-                    let p = self.fresh();
-                    params.push(p);
-                    self.bind_var(p, false);
-                } else {
-                    self.bind_class(b.ty, b.poly, b.class);
-                }
-                pushed += 1;
+        let mut saved = Vec::new();
+        for (slot, &i) in key.1.iter().zip(&indices) {
+            if *slot == Slot::Mono {
+                let pos = len - 1 - i as usize;
+                let p = self.fresh();
+                params.push(p);
+                saved.push((pos, self.env[pos]));
+                self.env[pos] = Binding {
+                    ty: p,
+                    poly: false,
+                    class: None,
+                };
             }
         }
-        self.pending.push(Pending {
-            key,
-            params,
-            pushed,
-        });
+        self.pending.push(Pending { key, params, saved });
         self.frames.push(Frame::Memo);
         Ok(Step::EvalShared(id))
     }
@@ -1302,20 +1377,19 @@ impl TypeChecker {
     }
 
     /// Takes instance `t` of the kept type of shared subterm `id` and, for each
-    /// monomorphic binding in `scope`, unifies the binding's type with the
-    /// parameter that stands for it; returns the type of the subterm.
+    /// monomorphic binding in `scope` (whose slots are for the de Bruijn
+    /// `indices`), unifies the binding's type with the parameter that stands for
+    /// it; returns the type of the subterm.
     fn apply_scope(
         &mut self,
         arena: &Arena,
         id: TermId,
         scope: &Scope,
+        indices: &[u32],
         mut t: Ty,
     ) -> Result<Ty, TypeError> {
-        let Scope::Slots(slots) = scope else {
-            return Ok(t);
-        };
-        let first = self.env.len() - slots.len();
-        for (i, slot) in slots.iter().enumerate() {
+        let len = self.env.len();
+        for (slot, &i) in scope.iter().zip(indices) {
             if *slot != Slot::Mono {
                 continue;
             }
@@ -1323,7 +1397,7 @@ impl TypeChecker {
             let Node::Con(Head::Arrow, param, rest) = self.node(r) else {
                 unreachable!("a kept type has one parameter per monomorphic binding");
             };
-            let bound = self.env[first + i].ty;
+            let bound = self.env[len - 1 - i as usize].ty;
             let ctx = "this shared subterm, which uses a variable at a type that does not \
                        fit its binder";
             self.expect(arena, bound, param, Site::new(id, ctx))?;
@@ -1510,20 +1584,19 @@ impl TypeChecker {
                 Step::Return(t)
             }
             Frame::Memo => {
-                let Pending {
-                    key,
-                    params,
-                    pushed,
-                } = self
+                let Pending { key, params, saved } = self
                     .pending
                     .pop()
                     .expect("a pending shared subterm per memo frame");
-                self.env.truncate(self.env.len() - pushed);
+                for (pos, b) in saved {
+                    self.env[pos] = b;
+                }
                 self.level -= 1;
                 let kept = self.fun(&params, t);
                 self.generalize(kept);
                 let t = self.instantiate(kept);
-                let t = self.apply_scope(arena, key.0, &key.1, t)?;
+                let indices = self.free_vars[&key.0].indices();
+                let t = self.apply_scope(arena, key.0, &key.1, &indices, t)?;
                 self.memo.insert(key, kept);
                 Step::Return(t)
             }
@@ -1728,6 +1801,66 @@ impl TypeChecker {
     fn is_rigid(&mut self, t: Ty) -> bool {
         let r = self.resolve(t);
         matches!(self.node(r), Node::Rigid { .. })
+    }
+}
+
+/// Records in `memo` the [`FreeVars`] of `id` and of every node under it that
+/// `memo` does not already hold. It walks with an explicit stack and visits each
+/// distinct node once; a node's list is at most [`MAX_FREE_VARS`] long, so the
+/// cost is linear in the number of distinct nodes.
+fn free_vars(arena: &Arena, id: TermId, memo: &mut FxHashMap<TermId, FreeVars>) {
+    // A node is pushed with `false` to be expanded, and again with `true` to be
+    // computed once its children are done.
+    let mut stack = vec![(id, false)];
+    while let Some((t, children_done)) = stack.pop() {
+        if memo.contains_key(&t) {
+            continue;
+        }
+        let node = arena.get(t);
+        if !children_done {
+            stack.push((t, true));
+            stack.extend(
+                children(&node)
+                    .into_iter()
+                    .filter(|c| !memo.contains_key(c))
+                    .map(|c| (c, false)),
+            );
+            continue;
+        }
+        // The free variables of each child, shifted out of the binders between
+        // `t` and the child.
+        let parts: Vec<(TermId, u32)> = match node {
+            Term::Lam(b) => vec![(b, 1)],
+            Term::Let(x, b) => vec![(x, 0), (b, 1)],
+            ref other => children(other).into_iter().map(|c| (c, 0)).collect(),
+        };
+        let fv = match node {
+            Term::Var(i) => FreeVars {
+                depth: i.saturating_add(1),
+                vars: Some(Box::new([i])),
+            },
+            _ => {
+                let mut depth = 0u32;
+                let mut vars: Option<Vec<u32>> = Some(Vec::new());
+                for (c, shift) in parts {
+                    let child = &memo[&c];
+                    depth = depth.max(child.depth.saturating_sub(shift));
+                    match (&mut vars, &child.vars) {
+                        (Some(acc), Some(cv)) => {
+                            acc.extend(cv.iter().filter(|&&i| i >= shift).map(|&i| i - shift));
+                        }
+                        _ => vars = None,
+                    }
+                }
+                let vars = vars.and_then(|mut v| {
+                    v.sort_unstable();
+                    v.dedup();
+                    (v.len() <= MAX_FREE_VARS).then(|| v.into_boxed_slice())
+                });
+                FreeVars { depth, vars }
+            }
+        };
+        memo.insert(t, fv);
     }
 }
 

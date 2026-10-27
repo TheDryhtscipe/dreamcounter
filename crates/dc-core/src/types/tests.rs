@@ -938,6 +938,149 @@ fn open_shared_subterms_are_reused_across_scopes() {
 }
 
 #[test]
+fn shared_spine_prefixes_do_not_hide_shared_arguments() {
+    // t' = (if (lt $0 0) (add t 1) (add t 2)): the two applications share the
+    // prefix `(add t)`, which the walk never infers on its own, so `t` must be
+    // reused as an argument of both spines.
+    const N: usize = 30;
+    const STEPS: u64 = 100 * N as u64;
+    let mut a = Arena::new();
+    let v = a.var(0);
+    let (zero, one, two) = (a.int(0), a.int(1), a.int(2));
+    let (add, lt) = (a.prim(Prim::Add), a.prim(Prim::Lt));
+    let cond = a.apps(lt, &[v, zero]);
+    let mut t = v;
+    for _ in 0..N {
+        let l = a.apps(add, &[t, one]);
+        let r = a.apps(add, &[t, two]);
+        t = a.if_(cond, l, r);
+    }
+    let f = a.lam(t);
+    let want = sch("Int -> Int");
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), Ok(want.clone()));
+    assert_eq!(bounded(STEPS).check(&a, f, NO_LIBS, &want), Ok(()));
+    // The prefix is a whole argument of `fst`: ((pair t) 1) and ((pair t) 2).
+    let yes = a.bool(true);
+    let (pair, fst) = (a.prim(Prim::Pair), a.prim(Prim::Fst));
+    let mut t = v;
+    for _ in 0..N {
+        let l = a.apps(pair, &[t, one]);
+        let l = a.app(fst, l);
+        let r = a.apps(pair, &[t, two]);
+        let r = a.app(fst, r);
+        t = a.if_(yes, l, r);
+    }
+    let f = a.lam(t);
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), Ok(sch("a -> a")));
+}
+
+#[test]
+fn shared_subterms_far_from_their_binders_are_reused_across_scopes() {
+    // As in `open_shared_subterms_are_reused_across_scopes`, but the variable is
+    // bound more than 64 binders out, as a reference to an early definition in a
+    // long chain of lets is.
+    const N: usize = 30;
+    const STEPS: u64 = 400 * N as u64;
+    const OUTER: u32 = 70;
+    let mut a = Arena::new();
+    let v = a.var(OUTER - 1);
+    let wrap = |a: &mut Arena, mut t: TermId| {
+        for _ in 0..OUTER {
+            t = a.lam(t);
+        }
+        t
+    };
+    let mut t = v;
+    for _ in 0..N {
+        t = a.let_(t, t);
+    }
+    let f = wrap(&mut a, t);
+    let got = bounded(STEPS).infer(&a, f, NO_LIBS);
+    assert!(got.is_ok(), "{got:?}");
+    let v = a.var(OUTER - 1);
+    let mut t = v;
+    for _ in 0..N {
+        let l = a.lam(t);
+        t = a.app(l, t);
+    }
+    let f = wrap(&mut a, t);
+    let got = bounded(STEPS).infer(&a, f, NO_LIBS);
+    assert!(got.is_ok(), "{got:?}");
+}
+
+#[test]
+fn errors_inside_shared_subterms_are_located_as_in_the_tree() {
+    // A duplicate of an ill-typed subterm does not change where the error is
+    // reported: it names the variable and its argument position, as it would
+    // without the duplicate.
+    let e = expect_err("(lam (if $0 (add $0 1) (add $0 1)))");
+    assert_eq!(e.term_text, "$0", "{e}");
+    assert!(e.context.contains("argument 1 of `add`"), "{e}");
+    let cases = [
+        ("(lam (if $0 (add $0 1) (add $0 1)))", None),
+        (
+            "(lam (lam (pair (add $0 1) (pair (cons $1 (cons $0 nil)) \
+             (cons $1 (cons $0 nil))))))",
+            Some("a -> a"),
+        ),
+        (
+            "(lam (lam (pair (add $0 1) (pair (cons $1 (cons $0 nil)) \
+             (cons $1 (cons $0 nil))))))",
+            Some("a -> b -> (Int, (List a, List a))"),
+        ),
+        (
+            "(lam (pair (fst $0) (and (fst $0) (add (fst $0) 1))))",
+            None,
+        ),
+    ];
+    for (src, expected) in cases {
+        let mut a = Arena::new();
+        let id = parse_term(&mut a, src);
+        let mut memo = TypeChecker::new();
+        let mut tree = TypeChecker::new();
+        tree.tree_walk = true;
+        let (got, want) = match expected {
+            None => (
+                memo.infer(&a, id, NO_LIBS).map(|_| ()),
+                tree.infer(&a, id, NO_LIBS).map(|_| ()),
+            ),
+            Some(s) => (
+                memo.check(&a, id, NO_LIBS, &sch(s)),
+                tree.check(&a, id, NO_LIBS, &sch(s)),
+            ),
+        };
+        assert!(want.is_err(), "{src}");
+        assert_eq!(got, want, "{src}");
+    }
+}
+
+#[test]
+fn shared_subterms_with_many_free_variables_agree_with_the_tree() {
+    // More free variables than the memo records one by one: the scope is all the
+    // bindings out to the outermost one used.
+    const VARS: u32 = 70;
+    let mut a = Arena::new();
+    let mut t = a.int(1);
+    let pair = a.prim(Prim::Pair);
+    for i in 0..VARS {
+        let v = a.var(i);
+        t = a.apps(pair, &[v, t]);
+    }
+    // In one scope twice, and in a scope one binder further in.
+    let l = a.lam(t);
+    let both = a.apps(pair, &[t, t]);
+    let mut f = a.apps(pair, &[both, l]);
+    for _ in 0..VARS {
+        f = a.lam(f);
+    }
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, f, NO_LIBS);
+    assert!(want.is_ok(), "{want:?}");
+    assert_eq!(bounded(10_000).infer(&a, f, NO_LIBS), want);
+}
+
+#[test]
 fn shared_subterms_stay_polymorphic_and_constrain_their_scope() {
     // The two `(lam $0)` are one TermId, used at Int and at Bool.
     assert_infers(
@@ -983,7 +1126,11 @@ fn arb_shared_src() -> impl Strategy<Value = String> {
             1 => inner.clone().prop_map(|t| format!("(pair {t} (lam {t}))")),
             1 => inner.clone().prop_map(|t| format!("((lam {t}) {t})")),
             1 => inner.clone().prop_map(|t| format!("(if true {t} (let (lam $0) {t}))")),
-            1 => (inner.clone(), inner).prop_map(|(t, u)| format!("(let {t} ({u} {t}))")),
+            1 => (inner.clone(), inner.clone()).prop_map(|(t, u)| format!("(let {t} ({u} {t}))")),
+            // Two spines sharing the prefix `({f} {t})`.
+            1 => (inner.clone(), inner).prop_map(|(f, t)| {
+                format!("(if true ({f} {t} 1) ({f} {t} true))")
+            }),
         ]
     })
 }
@@ -1001,7 +1148,8 @@ fn reusing_shared_subterms_agrees_with_walking_the_tree() {
             tree.tree_walk = true;
             let got = memo.infer(&a, id, NO_LIBS);
             let want = tree.infer(&a, id, NO_LIBS);
-            prop_assert_eq!(got.as_ref().ok(), want.as_ref().ok(), "{}", src);
+            // Errors too: an error is located by walking the tree again.
+            prop_assert_eq!(&got, &want, "{}", src);
             if let Ok(s) = &want {
                 typed.set(typed.get() + 1);
                 prop_assert!(memo.check(&a, id, NO_LIBS, s).is_ok(), "{}", src);
@@ -1009,8 +1157,8 @@ fn reusing_shared_subterms_agrees_with_walking_the_tree() {
                 for t in ["Int", "Bool -> Bool", "List Int"] {
                     let s = sch(t);
                     prop_assert_eq!(
-                        memo.check(&a, id, NO_LIBS, &s).is_ok(),
-                        tree.check(&a, id, NO_LIBS, &s).is_ok(),
+                        memo.check(&a, id, NO_LIBS, &s),
+                        tree.check(&a, id, NO_LIBS, &s),
                         "{} against {}",
                         src,
                         t
