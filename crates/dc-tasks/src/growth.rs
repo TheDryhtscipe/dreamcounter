@@ -208,10 +208,12 @@ pub enum GrowthError {
         /// The size concerned.
         n: u64,
     },
-    /// The fit window has fewer than two sizes.
+    /// The fit window has too few sizes for the estimator.
     TooFewPoints {
         /// The number of sizes in the window.
         points: usize,
+        /// The number the estimator needs.
+        needed: usize,
     },
     /// Sizes inside the fit window timed out or failed; the fit refuses rather
     /// than drop them.
@@ -246,8 +248,11 @@ impl fmt::Display for GrowthError {
             GrowthError::ZeroSize => write!(f, "sweep contains size n = 0"),
             GrowthError::DuplicateSize { n } => write!(f, "sweep contains size n = {n} twice"),
             GrowthError::NoSeeds { n } => write!(f, "size n = {n} has no seed step counts"),
-            GrowthError::TooFewPoints { points } => {
-                write!(f, "fit window has {points} size(s); at least 2 are needed")
+            GrowthError::TooFewPoints { points, needed } => {
+                write!(
+                    f,
+                    "fit window has {points} size(s); at least {needed} are needed"
+                )
             }
             GrowthError::IncompleteWindow { timed_out, errored } => write!(
                 f,
@@ -393,7 +398,7 @@ impl LogLogSlope {
     ///
     /// See [`GrowthError`].
     pub fn fit(&self, sweep: &Sweep) -> Result<LogLogFit, GrowthError> {
-        let (points, window) = window_points(sweep, self.window, 1)?;
+        let (points, window) = window_points(sweep, self.window, 2, 1)?;
         let xs: Vec<f64> = points.iter().map(|&(n, _)| ln_u64(n)).collect();
         let ys: Vec<f64> = points.iter().map(|&(_, s)| ln_u64(s)).collect();
         let ols = ols(&xs, &ys)?;
@@ -429,6 +434,10 @@ impl GrowthEstimator for LogLogSlope {
 /// `3n + 5`) do not push it towards a spurious `γ`, and so the two estimators
 /// see the same data. Every size in the window must be at least 2, since
 /// `ln ln 1` is undefined.
+///
+/// B needs at least [`PowerLogGrid::MIN_POINTS`] = 3 sizes in the window.
+/// Each candidate has two free parameters, so on two points every `γ` fits
+/// exactly and the choice of `γ` would be decided by rounding noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PowerLogGrid {
     /// The sizes to fit over.
@@ -439,13 +448,16 @@ pub struct PowerLogGrid {
 pub const GAMMAS: [u8; 3] = [0, 1, 2];
 
 impl PowerLogGrid {
+    /// The fewest sizes in the window for which `γ` can be chosen.
+    pub const MIN_POINTS: usize = 3;
+
     /// Fits the sweep and returns the estimator's own result type.
     ///
     /// # Errors
     ///
     /// See [`GrowthError`].
     pub fn fit(&self, sweep: &Sweep) -> Result<PowerLogFit, GrowthError> {
-        let (points, window) = window_points(sweep, self.window, 2)?;
+        let (points, window) = window_points(sweep, self.window, Self::MIN_POINTS, 2)?;
         let xs: Vec<f64> = points.iter().map(|&(n, _)| ln_u64(n)).collect();
         let lnln: Vec<f64> = xs.iter().map(|x| x.ln()).collect();
         let ln_steps: Vec<f64> = points.iter().map(|&(_, s)| ln_u64(s)).collect();
@@ -466,12 +478,7 @@ impl PowerLogGrid {
                 rss: fit.rss,
             };
         }
-        let mut best = candidates[0];
-        for c in &candidates[1..] {
-            if c.rss < best.rss {
-                best = *c;
-            }
-        }
+        let best = select_best(&candidates);
         Ok(PowerLogFit {
             best,
             candidates,
@@ -490,6 +497,18 @@ impl GrowthEstimator for PowerLogGrid {
     }
 }
 
+/// The candidate with the smallest RSS; on a tie, the earliest (smallest `γ`,
+/// the simpler model).
+fn select_best(candidates: &[GammaFit; 3]) -> GammaFit {
+    let mut best = candidates[0];
+    for c in &candidates[1..] {
+        if c.rss < best.rss {
+            best = *c;
+        }
+    }
+    best
+}
+
 /// `ln` of a positive integer.
 fn ln_u64(v: u64) -> f64 {
     // u64 -> f64 is exact up to 2^53 and correctly rounded above; step counts
@@ -498,19 +517,21 @@ fn ln_u64(v: u64) -> f64 {
     f.ln()
 }
 
-/// Selects the window and checks it: at least two sizes, none incomplete, no
-/// zero medians, every size at least `min_n`.
+/// Selects the window and checks it: at least `min_points` sizes, none
+/// incomplete, no zero medians, every size at least `min_n`.
 fn window_points(
     sweep: &Sweep,
     window: Window,
+    min_points: usize,
     min_n: u64,
 ) -> Result<(Vec<(u64, u64)>, FitWindow), GrowthError> {
     let obs = sweep.observations();
     let start = window.start(obs.len());
     let in_window = &obs[start..];
-    if in_window.len() < 2 {
+    if in_window.len() < min_points {
         return Err(GrowthError::TooFewPoints {
             points: in_window.len(),
+            needed: min_points,
         });
     }
     let mut timed_out = Vec::new();
@@ -569,7 +590,10 @@ struct Ols {
 fn ols(xs: &[f64], ys: &[f64]) -> Result<Ols, GrowthError> {
     debug_assert_eq!(xs.len(), ys.len());
     if xs.len() < 2 {
-        return Err(GrowthError::TooFewPoints { points: xs.len() });
+        return Err(GrowthError::TooFewPoints {
+            points: xs.len(),
+            needed: 2,
+        });
     }
     let (x0, y0) = (xs[0], ys[0]);
     let dx: Vec<f64> = xs.iter().map(|x| x - x0).collect();

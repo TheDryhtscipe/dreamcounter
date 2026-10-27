@@ -230,6 +230,24 @@ fn a_on_constant_has_zero_slope_and_undefined_r_squared() {
     assert!((fit.ln_c - 42f64.ln()).abs() < EXACT);
 }
 
+/// The mean of repeated copies of a float is not always that float (for
+/// example seven copies of `ln 5`), so a naive OLS reports rounding noise as
+/// slope and variance. The fit must still give exactly 0 and
+/// [`FitQuality::ZeroVariance`].
+#[test]
+fn a_on_constant_is_exact_where_naive_means_round() {
+    let all = LogLogSlope {
+        window: Window::All,
+    };
+    for (sizes, c) in [(&DEFAULT_SIZES[..], 5), (&DEFAULT_SIZES[..5], 6)] {
+        let fit = all
+            .fit(&Sweep::from_fn(sizes, |_| c).expect("valid"))
+            .expect("fits");
+        assert_eq!(fit.alpha, 0.0, "c {c}");
+        assert_eq!(fit.quality, FitQuality::ZeroVariance, "c {c}");
+    }
+}
+
 #[test]
 fn a_on_n_log_n_reads_about_1_17() {
     // Local slope of n log n is 1 + 1/ln n, decreasing in n (spec §9).
@@ -418,16 +436,25 @@ fn too_few_points_is_an_error() {
     let empty = Sweep::new(vec![]).expect("valid");
     assert_eq!(
         LogLogSlope::default().fit(&empty),
-        Err(GrowthError::TooFewPoints { points: 0 })
+        Err(GrowthError::TooFewPoints {
+            points: 0,
+            needed: 2
+        })
     );
     let two = Sweep::from_fn(&[16, 32], |n| n).expect("valid");
     assert_eq!(
         LogLogSlope::default().fit(&two),
-        Err(GrowthError::TooFewPoints { points: 1 })
+        Err(GrowthError::TooFewPoints {
+            points: 1,
+            needed: 2
+        })
     );
     assert_eq!(
         PowerLogGrid::default().fit(&two),
-        Err(GrowthError::TooFewPoints { points: 1 })
+        Err(GrowthError::TooFewPoints {
+            points: 1,
+            needed: 3
+        })
     );
     // The same two sizes are enough over the whole sweep.
     let all = LogLogSlope {
@@ -436,6 +463,46 @@ fn too_few_points_is_an_error() {
     .fit(&two)
     .expect("fits");
     assert!((all.alpha - 1.0).abs() < EXACT);
+}
+
+#[test]
+fn b_needs_three_points_to_choose_gamma() {
+    // Four sizes: the upper half has two, which A can fit but B cannot use,
+    // because every γ fits two points exactly.
+    let four = Sweep::from_fn(&[16, 32, 64, 128], |n| n * log2(n)).expect("valid");
+    assert!(LogLogSlope::default().fit(&four).is_ok());
+    assert_eq!(
+        PowerLogGrid::default().fit(&four),
+        Err(GrowthError::TooFewPoints {
+            points: 2,
+            needed: 3
+        })
+    );
+    // Five sizes: three in the upper half, enough for B to find γ = 1.
+    let five = Sweep::from_fn(&[16, 32, 64, 128, 256], |n| n * log2(n)).expect("valid");
+    assert_eq!(b(&five).best.gamma, 1);
+}
+
+#[test]
+fn b_ties_go_to_the_smaller_gamma() {
+    let fit = |gamma, rss| GammaFit {
+        gamma,
+        alpha: 1.0,
+        ln_c: 0.0,
+        rss,
+    };
+    assert_eq!(
+        select_best(&[fit(0, 0.5), fit(1, 0.5), fit(2, 0.5)]).gamma,
+        0
+    );
+    assert_eq!(
+        select_best(&[fit(0, 0.9), fit(1, 0.5), fit(2, 0.5)]).gamma,
+        1
+    );
+    assert_eq!(
+        select_best(&[fit(0, 0.9), fit(1, 0.7), fit(2, 0.5)]).gamma,
+        2
+    );
 }
 
 #[test]
@@ -489,7 +556,7 @@ fn zero_steps_below_window_does_not_affect_the_fit() {
 
 #[test]
 fn b_rejects_size_one_and_a_accepts_it() {
-    let sweep = Sweep::from_fn(&[1, 2], |n| 5 * n).expect("valid");
+    let sweep = Sweep::from_fn(&[1, 2, 4], |n| 5 * n).expect("valid");
     let all_b = PowerLogGrid {
         window: Window::All,
     };
