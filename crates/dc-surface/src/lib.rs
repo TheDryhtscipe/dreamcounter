@@ -65,6 +65,18 @@ pub use desugar::{compile_expression, TopLevel};
 pub use error::{ErrorKind, Span, SurfaceError};
 pub use pretty::pretty;
 
+/// The deepest nesting the front end accepts; deeper input is an
+/// [`ErrorKind::TooDeep`] error instead of a stack overflow, which would abort the
+/// process.
+///
+/// Brackets, operators, `let`/`fun`/`if`/`match`, and each element of a list,
+/// tuple, argument list or parameter list count towards it (see the parser's
+/// module docs for the exact measure). Anything within the limit parses,
+/// desugars and pretty-prints on a 1 MiB stack in a debug build. Hand-written
+/// programs nest far less deeply than this; a long list literal is the case most
+/// likely to reach it.
+pub const MAX_DEPTH: usize = 100;
+
 /// Parses a program into its surface definitions without desugaring them.
 pub fn parse_program(source_name: &str, text: &str) -> Result<Vec<ast::Def>, SurfaceError> {
     parser::parse_program(&error::Source::new(source_name, text))

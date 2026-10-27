@@ -68,10 +68,10 @@
 //! Anything deeper is an [`ErrorKind::NestedPattern`] error suggesting a second
 //! match or let.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
-use dc_core::{Arena, Prim, TermId};
+use dc_core::{term, Arena, Prim, Term, TermId};
 
 use crate::ast::{Arm, BinOp, Ctor, Def, Expr, ExprKind, LetLhs, Pat, PatKind};
 use crate::error::{ErrorKind, Source, Span, SurfaceError};
@@ -95,7 +95,8 @@ pub(crate) enum GlobalKind {
         /// Indices of the globals its body refers to.
         deps: Vec<usize>,
     },
-    /// A closed core term substituted at each use.
+    /// A closed core term substituted at each use. The id is in
+    /// [`TopLevel`]'s own arena, never in a caller's.
     Inline(TermId),
 }
 
@@ -198,6 +199,10 @@ enum ArmCase<'p> {
 pub(crate) struct Ctx<'a> {
     arena: &'a mut Arena,
     globals: &'a [Global],
+    /// The arena that holds the inline names' terms.
+    store: &'a Arena,
+    /// Inline terms already copied from `store` into `arena`.
+    imported: HashMap<TermId, TermId>,
     scope: Vec<Binder>,
     /// Function definitions being compiled: (name, scope length at their start).
     defining: Vec<(String, usize)>,
@@ -214,12 +219,15 @@ impl<'a> Ctx<'a> {
     pub fn new(
         arena: &'a mut Arena,
         globals: &'a [Global],
+        store: &'a Arena,
         src: Rc<Source>,
         validating: bool,
     ) -> Ctx<'a> {
         Ctx {
             arena,
             globals,
+            store,
+            imported: HashMap::new(),
             scope: vec![],
             defining: vec![],
             deps: BTreeSet::new(),
@@ -322,7 +330,9 @@ impl<'a> Ctx<'a> {
                     Binder::Inline(g) => {
                         self.deps.insert(g);
                         match self.globals[g].kind {
-                            GlobalKind::Inline(t) if !self.validating => t,
+                            GlobalKind::Inline(t) if !self.validating => {
+                                copy_term(self.store, t, self.arena, &mut self.imported)
+                            }
                             _ => self.arena.unit(),
                         }
                     }
@@ -626,9 +636,11 @@ impl<'a> Ctx<'a> {
             }
             BinOp::Gt | BinOp::Ge => {
                 let p = self.prim(if op == BinOp::Gt { Prim::Lt } else { Prim::Le });
+                // Each operand is compiled exactly once: compiling `b` twice would
+                // make nested comparisons take exponential time.
                 let ta = self.expr(a)?;
-                let tb = self.expr(b)?;
-                if self.is_trivial(ta) || self.is_trivial(tb) {
+                if self.is_trivial(ta) {
+                    let tb = self.expr(b)?;
                     return Ok(self.arena.apps(p, &[tb, ta]));
                 }
                 // Evaluate a first, then b: let-bind a and compile b under it.
@@ -637,7 +649,14 @@ impl<'a> Ctx<'a> {
                 let tb = self.expr(b);
                 let va = self.hidden_var(h);
                 self.scope.truncate(mark);
-                let body = self.arena.apps(p, &[tb?, va]);
+                let tb = tb?;
+                // A trivial `b` needs no let. It cannot be the hidden binder
+                // (`$0`), which no source name refers to, so it is either closed
+                // or a variable whose index drops by one outside the let.
+                if let Some(outer) = self.unshift_trivial(tb) {
+                    return Ok(self.arena.apps(p, &[outer, ta]));
+                }
+                let body = self.arena.apps(p, &[tb, va]);
                 Ok(self.arena.let_(ta, body))
             }
             _ => {
@@ -657,6 +676,18 @@ impl<'a> Ctx<'a> {
             self.arena.get(t),
             Term::Var(_) | Term::Int(_) | Term::Bool(_) | Term::Unit
         )
+    }
+
+    /// If `t`, compiled under one extra binder, is trivial, the same term outside
+    /// that binder.
+    fn unshift_trivial(&mut self, t: TermId) -> Option<TermId> {
+        use dc_core::Term;
+        match self.arena.get(t) {
+            Term::Var(0) => unreachable!("the hidden binder of '>' has no name"),
+            Term::Var(k) => Some(self.arena.var(k - 1)),
+            Term::Int(_) | Term::Bool(_) | Term::Unit => Some(t),
+            _ => None,
+        }
     }
 
     fn function_like(lhs: &LetLhs, rhs: &Expr) -> bool {
@@ -981,6 +1012,50 @@ pub(crate) fn op_prim(op: BinOp) -> Option<Prim> {
     })
 }
 
+/// Copies the term `t` of arena `from` into arena `to`, without recursion on the
+/// host stack. `memo` maps ids already copied, so shared subterms are copied once.
+pub(crate) fn copy_term(
+    from: &Arena,
+    t: TermId,
+    to: &mut Arena,
+    memo: &mut HashMap<TermId, TermId>,
+) -> TermId {
+    let mut stack = vec![(t, false)];
+    while let Some((id, children_done)) = stack.pop() {
+        if memo.contains_key(&id) {
+            continue;
+        }
+        let node = from.get(id);
+        if !children_done {
+            stack.push((id, true));
+            for c in term::children(&node) {
+                if !memo.contains_key(&c) {
+                    stack.push((c, false));
+                }
+            }
+            continue;
+        }
+        let m = |c: TermId| memo[&c];
+        let copied = match node {
+            Term::Var(_)
+            | Term::Int(_)
+            | Term::Bool(_)
+            | Term::Unit
+            | Term::Prim(_)
+            | Term::Lib(_) => node,
+            Term::Lam(b) => Term::Lam(m(b)),
+            Term::App(a, b) => Term::App(m(a), m(b)),
+            Term::Let(a, b) => Term::Let(m(a), m(b)),
+            Term::And(a, b) => Term::And(m(a), m(b)),
+            Term::Or(a, b) => Term::Or(m(a), m(b)),
+            Term::If(a, b, c) => Term::If(m(a), m(b), m(c)),
+        };
+        let new = to.intern(copied);
+        memo.insert(id, new);
+    }
+    memo[&t]
+}
+
 /// Levenshtein distance over characters.
 fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
@@ -1011,6 +1086,9 @@ fn edit_distance(a: &str, b: &str) -> usize {
 #[derive(Clone, Debug, Default)]
 pub struct TopLevel {
     globals: Vec<Global>,
+    /// Holds the terms of inline names, so they do not depend on the arena they
+    /// were given in or the arena a program is closed in.
+    store: Arena,
 }
 
 impl TopLevel {
@@ -1035,7 +1113,7 @@ impl TopLevel {
         for def in defs {
             let deps = {
                 let mut scratch = Arena::new();
-                let mut ctx = Ctx::new(&mut scratch, &globals, src.clone(), true);
+                let mut ctx = Ctx::new(&mut scratch, &globals, &self.store, src.clone(), true);
                 for g in 0..globals.len() {
                     ctx.push_global(g);
                 }
@@ -1057,7 +1135,8 @@ impl TopLevel {
     }
 
     /// Adds `name` for the closed term `term` (in `arena`), substituted directly at
-    /// each use. Meant for terms whose evaluation is free, such as library
+    /// each use. The term is copied, so `arena` need not be the arena programs are
+    /// later closed in. Meant for terms whose evaluation is free, such as library
     /// references ([`dc_core::Term::Lib`]) or lambdas; a term that costs steps to
     /// evaluate would be charged at every use.
     pub fn define_inline(&mut self, arena: &Arena, name: &str, term: TermId) -> DResult<()> {
@@ -1071,9 +1150,10 @@ impl TopLevel {
                 message: format!("the term given for '{name}' has free variables"),
             });
         }
+        let stored = copy_term(arena, term, &mut self.store, &mut HashMap::new());
         self.globals.push(Global {
             name: name.to_owned(),
-            kind: GlobalKind::Inline(term),
+            kind: GlobalKind::Inline(stored),
         });
         Ok(())
     }
@@ -1129,11 +1209,11 @@ impl TopLevel {
             });
         };
         if let GlobalKind::Inline(t) = self.globals[g].kind {
-            return Ok(t);
+            return Ok(copy_term(&self.store, t, arena, &mut HashMap::new()));
         }
         let keep = self.reachable([g]);
         let src = Rc::new(Source::new("<entry>", ""));
-        let mut ctx = Ctx::new(arena, &self.globals, src, false);
+        let mut ctx = Ctx::new(arena, &self.globals, &self.store, src, false);
         let mut defs = Self::bind_reachable(&mut ctx, &self.globals, &keep)?;
         // The entry is the last definition kept: `let d in $0` is just `d`.
         let last = defs.pop().expect("the entry is a definition");
@@ -1151,7 +1231,7 @@ impl TopLevel {
         let e = parser::parse_expression(&src)?;
         let deps = {
             let mut scratch = Arena::new();
-            let mut ctx = Ctx::new(&mut scratch, &self.globals, src.clone(), true);
+            let mut ctx = Ctx::new(&mut scratch, &self.globals, &self.store, src.clone(), true);
             for g in 0..self.globals.len() {
                 ctx.push_global(g);
             }
@@ -1159,7 +1239,7 @@ impl TopLevel {
             ctx.deps
         };
         let keep = self.reachable(deps);
-        let mut ctx = Ctx::new(arena, &self.globals, src.clone(), false);
+        let mut ctx = Ctx::new(arena, &self.globals, &self.store, src.clone(), false);
         let defs = Self::bind_reachable(&mut ctx, &self.globals, &keep)?;
         ctx.set_source(src);
         let body = ctx.entry(&e)?;

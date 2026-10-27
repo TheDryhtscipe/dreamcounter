@@ -91,6 +91,8 @@ pub enum ErrorKind {
     SelfReference,
     /// A name that is not bound locally, defined at top level, or a primitive.
     UnknownName,
+    /// An expression nested more deeply than [`crate::MAX_DEPTH`] allows.
+    TooDeep,
 }
 
 /// An error in surface source, with its position.

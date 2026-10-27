@@ -26,10 +26,25 @@
 //! ```
 //!
 //! As in OCaml, `f -1` is a subtraction; write `f (-1)`. A tuple needs parentheses.
+//!
+//! # Nesting limit
+//!
+//! The parser, the desugarer and the pretty-printer recurse on the host stack, and
+//! a stack overflow aborts the process. So the parser rejects input nested more
+//! than [`MAX_DEPTH`] deep with an [`ErrorKind::TooDeep`] error, in two checks:
+//!
+//! 1. While parsing, each nested expression, operand of a right-associative or
+//!    unary operator, and pattern counts one level, as does each operator of a
+//!    chain like `a + b + c` (which is built in a loop, and is deep all the same).
+//! 2. After parsing, [`check_depth`] measures, without recursion, how deeply the
+//!    core term will nest: each node is one level, and a list, tuple, argument
+//!    list or parameter list adds a level per element, since each becomes one
+//!    more nested application, lambda or `let` in core.
 
 use crate::ast::{Arm, BinOp, Ctor, Def, Expr, ExprKind, LetLhs, Pat, PatKind};
 use crate::error::{ErrorKind, Source, Span, SurfaceError};
 use crate::lexer::{lex, Tok, Token};
+use crate::MAX_DEPTH;
 
 type PResult<T> = Result<T, SurfaceError>;
 
@@ -40,7 +55,11 @@ pub(crate) fn parse_program(src: &Source) -> PResult<Vec<Def>> {
     loop {
         match p.peek() {
             Tok::Eof => break,
-            Tok::Let => defs.push(p.top_def()?),
+            Tok::Let => {
+                let def = p.top_def()?;
+                check_depth(src, &def.body, 1 + pats_weight(&def.params))?;
+                defs.push(def);
+            }
             _ => {
                 return Err(
                     p.expected("a top-level definition 'let name args = expr' or end of input")
@@ -58,6 +77,7 @@ pub(crate) fn parse_expression(src: &Source) -> PResult<Expr> {
     if *p.peek() != Tok::Eof {
         return Err(p.expected("end of input after the expression"));
     }
+    check_depth(src, &e, 0)?;
     Ok(e)
 }
 
@@ -86,6 +106,86 @@ fn binop_info(t: &Tok) -> Option<(BinOp, u8, Assoc)> {
         Tok::Mod => (BinOp::Mod, 6, Assoc::Left),
         _ => return None,
     })
+}
+
+/// The error for input nested deeper than [`MAX_DEPTH`].
+fn too_deep(src: &Source, span: Span) -> SurfaceError {
+    src.error(
+        ErrorKind::TooDeep,
+        span,
+        format!(
+            "this expression is nested more than {MAX_DEPTH} levels deep (brackets, \
+             operators, let/fun/if/match, and the elements of a list, tuple or \
+             argument list all count). Split it into separate top-level definitions"
+        ),
+    )
+}
+
+/// How many levels a binder pattern adds in core: one per node.
+fn pat_weight(p: &Pat) -> usize {
+    1 + match &p.kind {
+        PatKind::Tuple(ps) | PatKind::List(ps) => pats_weight(ps),
+        PatKind::Cons(a, b) => pat_weight(a) + pat_weight(b),
+        PatKind::Ctor(_, Some(a)) => pat_weight(a),
+        _ => 0,
+    }
+}
+
+fn pats_weight(ps: &[Pat]) -> usize {
+    ps.iter().map(pat_weight).sum()
+}
+
+/// Checks, without recursion, that `e` (starting at depth `base`) and the core
+/// term it becomes nest at most [`MAX_DEPTH`] deep.
+fn check_depth(src: &Source, e: &Expr, base: usize) -> PResult<()> {
+    let mut stack: Vec<(&Expr, usize)> = vec![(e, base + 1)];
+    while let Some((e, d)) = stack.pop() {
+        if d > MAX_DEPTH {
+            return Err(too_deep(src, e.span));
+        }
+        match &e.kind {
+            ExprKind::Int(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Unit
+            | ExprKind::Var(_)
+            | ExprKind::Ctor(_)
+            | ExprKind::OpSection(_) => {}
+            ExprKind::App(f, args) => {
+                let inner = d + args.len();
+                stack.push((f, inner));
+                stack.extend(args.iter().map(|a| (a, inner)));
+            }
+            ExprKind::Bin(op, a, b) => {
+                // '>' and '>=' may add a let.
+                let extra = usize::from(matches!(op, BinOp::Gt | BinOp::Ge));
+                stack.push((a, d + 1));
+                stack.push((b, d + 1 + extra));
+            }
+            ExprKind::Neg(a) => stack.push((a, d + 1)),
+            ExprKind::Tuple(es) | ExprKind::List(es) => {
+                stack.extend(es.iter().enumerate().map(|(i, x)| (x, d + 1 + i)));
+            }
+            ExprKind::Fun(ps, body) => stack.push((body, d + pats_weight(ps))),
+            ExprKind::Let(lhs, rhs, body) => {
+                let w = match lhs {
+                    LetLhs::Name { params, .. } => 1 + pats_weight(params),
+                    LetLhs::Pattern(p) => pat_weight(p),
+                };
+                stack.push((rhs, d + w));
+                stack.push((body, d + w));
+            }
+            ExprKind::If(c, t, f) => {
+                stack.extend([(&**c, d + 1), (&**t, d + 1), (&**f, d + 1)]);
+            }
+            ExprKind::Match(scrutinee, arms) => {
+                stack.push((scrutinee, d + 1));
+                for arm in arms {
+                    stack.push((&arm.body, d + 1 + pat_weight(&arm.pat)));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn starts_atom(t: &Tok) -> bool {
@@ -121,6 +221,8 @@ struct Parser<'s> {
     toks: Vec<Token>,
     pos: usize,
     src: &'s Source,
+    /// Current nesting of recursive calls; see the module docs.
+    depth: usize,
 }
 
 impl<'s> Parser<'s> {
@@ -129,6 +231,7 @@ impl<'s> Parser<'s> {
             toks: lex(src)?,
             pos: 0,
             src,
+            depth: 0,
         })
     }
 
@@ -249,7 +352,22 @@ impl<'s> Parser<'s> {
         Ok(params)
     }
 
+    /// Runs `f` one nesting level deeper, or fails past [`MAX_DEPTH`].
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        if self.depth >= MAX_DEPTH {
+            return Err(too_deep(self.src, self.span()));
+        }
+        self.depth += 1;
+        let r = f(self);
+        self.depth -= 1;
+        r
+    }
+
     fn expr(&mut self) -> PResult<Expr> {
+        self.nested(Self::expr_inner)
+    }
+
+    fn expr_inner(&mut self) -> PResult<Expr> {
         match self.peek() {
             Tok::Let => self.let_expr(),
             Tok::Fun => self.fun_expr(),
@@ -351,9 +469,16 @@ impl<'s> Parser<'s> {
 
     fn binary(&mut self, min_prec: u8) -> PResult<Expr> {
         let mut lhs = self.unary()?;
+        // Each operator of a left-associative chain nests the tree one level
+        // deeper without a recursive call, so it counts here.
+        let mut chain = 0;
         while let Some((op, prec, assoc)) = binop_info(self.peek()) {
             if prec < min_prec {
                 break;
+            }
+            chain += 1;
+            if self.depth + chain > MAX_DEPTH {
+                return Err(too_deep(self.src, self.span()));
             }
             self.bump();
             let next_min = if assoc == Assoc::Right {
@@ -361,7 +486,7 @@ impl<'s> Parser<'s> {
             } else {
                 prec + 1
             };
-            let rhs = self.binary(next_min)?;
+            let rhs = self.nested(|p| p.binary(next_min))?;
             if assoc == Assoc::None {
                 if let Some((op2, prec2, _)) = binop_info(self.peek()) {
                     if prec2 == prec {
@@ -408,7 +533,7 @@ impl<'s> Parser<'s> {
                     };
                     return self.app_args(head);
                 }
-                let e = self.unary()?;
+                let e = self.nested(Self::unary)?;
                 let span = start.to(e.span);
                 Ok(Expr {
                     kind: ExprKind::Neg(Box::new(e)),
@@ -596,6 +721,10 @@ impl<'s> Parser<'s> {
     // ---- patterns ----
 
     fn pattern(&mut self) -> PResult<Pat> {
+        self.nested(Self::pattern_inner)
+    }
+
+    fn pattern_inner(&mut self) -> PResult<Pat> {
         let head = self.pat_app()?;
         if *self.peek() == Tok::ColonColon {
             self.bump();
