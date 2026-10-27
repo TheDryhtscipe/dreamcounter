@@ -11,8 +11,22 @@
 //! result with the input term. If the sugared text does not compile back to the
 //! same term, it prints again without sugar (only `fun`, `let`, application,
 //! `if`, `&&`, `||` and infix operators), which always round-trips.
+//!
+//! # Depth limit
+//!
+//! The printer recurses on the host stack, once or a few times per level of the
+//! core term, and a stack overflow aborts the process. So it first measures, with
+//! an explicit stack, how deep the term nests, and refuses a term deeper than
+//! [`MAX_PRETTY_DEPTH`] with a [`TooDeep`] error. Every node counts one level,
+//! including each application in a spine `f a b c`. The limit is five times what
+//! the front end accepts ([`crate::MAX_DEPTH`]), so it also covers a closed
+//! program wrapped in one `let` per definition it uses, for up to about 400
+//! definitions. The printer stays recursive because its sugar recognition and
+//! name scoping read much more plainly that way, and a deeper term could not be
+//! read back by the front end anyway.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use dc_core::term::children;
 use dc_core::{sexpr, Arena, LibId, Prim, Term, TermId};
@@ -34,15 +48,43 @@ const P_ATOM: u8 = 9;
 /// A name pushed for a binder the printed text never mentions.
 const HIDDEN: &str = "%hidden";
 
+/// The deepest core term [`pretty`] prints; see the module documentation. Any term
+/// within it prints on a 2 MiB stack (the default for a spawned thread) in a debug
+/// build, using about half of it.
+pub const MAX_PRETTY_DEPTH: usize = 500;
+
+/// A term nests more deeply than [`MAX_PRETTY_DEPTH`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooDeep;
+
+impl fmt::Display for TooDeep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the term nests more than {MAX_PRETTY_DEPTH} levels deep, too deep to print \
+             as surface syntax"
+        )
+    }
+}
+
+impl std::error::Error for TooDeep {}
+
 /// Prints `id` as surface syntax. Library references print as `lib_name(l)`.
 /// Free variables (when `id` is open) print as `free0`, `free1`, ... with `free0`
 /// the innermost.
-pub fn pretty(arena: &Arena, id: TermId, lib_name: impl Fn(LibId) -> String) -> String {
+///
+/// Fails if `id` nests more than [`MAX_PRETTY_DEPTH`] levels deep.
+pub fn pretty(
+    arena: &Arena,
+    id: TermId,
+    lib_name: impl Fn(LibId) -> String,
+) -> Result<String, TooDeep> {
+    check_depth(arena, id)?;
     let sugared = Printer::new(arena, &lib_name, true).top(id);
     if round_trips(arena, id, &sugared, &lib_name) {
-        return sugared;
+        return Ok(sugared);
     }
-    Printer::new(arena, &lib_name, false).top(id)
+    Ok(Printer::new(arena, &lib_name, false).top(id))
 }
 
 /// Prints without checking the result. With `sugar` false only `fun`, `let`,
@@ -55,29 +97,68 @@ pub fn pretty_unchecked(
     id: TermId,
     lib_name: impl Fn(LibId) -> String,
     sugar: bool,
-) -> String {
-    Printer::new(arena, &lib_name, sugar).top(id)
+) -> Result<String, TooDeep> {
+    check_depth(arena, id)?;
+    Ok(Printer::new(arena, &lib_name, sugar).top(id))
 }
 
-fn libs_in(arena: &Arena, id: TermId, out: &mut HashSet<LibId>, seen: &mut HashSet<TermId>) {
-    if !seen.insert(id) {
-        return;
+/// Fails if `id` nests more than [`MAX_PRETTY_DEPTH`] levels deep. It walks with an
+/// explicit stack and visits each distinct node once.
+fn check_depth(arena: &Arena, id: TermId) -> Result<(), TooDeep> {
+    // The height of each finished node: the most levels from it down to a leaf.
+    let mut height: HashMap<TermId, usize> = HashMap::new();
+    let mut stack = vec![(id, 1usize, false)];
+    while let Some((t, depth, children_done)) = stack.pop() {
+        if depth > MAX_PRETTY_DEPTH {
+            return Err(TooDeep);
+        }
+        if let Some(&h) = height.get(&t) {
+            // Done already, reached again by another path.
+            if depth + h - 1 > MAX_PRETTY_DEPTH {
+                return Err(TooDeep);
+            }
+            continue;
+        }
+        let cs = children(&arena.get(t));
+        if children_done {
+            let h = 1 + cs.iter().map(|c| height[c]).max().unwrap_or(0);
+            height.insert(t, h);
+            continue;
+        }
+        stack.push((t, depth, true));
+        for c in cs {
+            match height.get(&c) {
+                Some(&h) if depth + h > MAX_PRETTY_DEPTH => return Err(TooDeep),
+                Some(_) => {}
+                None => stack.push((c, depth + 1, false)),
+            }
+        }
     }
-    let t = arena.get(id);
-    if let Term::Lib(l) = t {
-        out.insert(l);
+    Ok(())
+}
+
+/// The library abstractions `id` refers to.
+fn libs_in(arena: &Arena, id: TermId) -> HashSet<LibId> {
+    let mut out = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![id];
+    while let Some(t) = stack.pop() {
+        if !seen.insert(t) {
+            continue;
+        }
+        let node = arena.get(t);
+        if let Term::Lib(l) = node {
+            out.insert(l);
+        }
+        stack.extend(children(&node));
     }
-    for c in children(&t) {
-        libs_in(arena, c, out, seen);
-    }
+    out
 }
 
 fn round_trips(arena: &Arena, id: TermId, text: &str, lib_name: &impl Fn(LibId) -> String) -> bool {
     let mut scratch = Arena::new();
     let mut env = TopLevel::new();
-    let mut libs = HashSet::new();
-    libs_in(arena, id, &mut libs, &mut HashSet::new());
-    for l in libs {
+    for l in libs_in(arena, id) {
         let t = scratch.lib(l);
         if env.define_inline(&scratch, &lib_name(l), t).is_err() {
             return false;
@@ -174,9 +255,10 @@ impl<'a, F: Fn(LibId) -> String> Printer<'a, F> {
     }
 
     fn top(&mut self, id: TermId) -> String {
-        let mut libs = HashSet::new();
-        libs_in(self.arena, id, &mut libs, &mut HashSet::new());
-        self.reserved = libs.into_iter().map(|l| (self.lib_name)(l)).collect();
+        self.reserved = libs_in(self.arena, id)
+            .into_iter()
+            .map(|l| (self.lib_name)(l))
+            .collect();
         self.go(id, P_OPEN)
     }
 

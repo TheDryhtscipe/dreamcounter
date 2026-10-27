@@ -828,6 +828,142 @@ fn shared_type_structure_is_walked_once() {
     );
 }
 
+/// Runs `f` on another thread and fails if it takes longer than `secs` seconds.
+fn within<T: Send + 'static>(secs: u64, what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs))
+        .unwrap_or_else(|_| panic!("{what} took longer than {secs}s"))
+}
+
+/// `(if c t t)` nested `n` deep around `leaf`: a DAG of `n` nodes that is a tree of
+/// `2^n` nodes. Every level's two branches are the same `TermId`.
+fn shared_ifs(a: &mut Arena, n: usize, c: TermId, leaf: TermId) -> TermId {
+    let mut t = leaf;
+    for _ in 0..n {
+        t = a.if_(c, t, t);
+    }
+    t
+}
+
+#[test]
+fn shared_subterms_are_inferred_once() {
+    // Walking the term as a tree takes time exponential in n: 2^30 visits at n = 30.
+    const N: usize = 30;
+    within(20, "inferring shared ifs", || {
+        // Closed.
+        let mut a = Arena::new();
+        let c = a.bool(true);
+        let one = a.int(1);
+        let t = shared_ifs(&mut a, N, c, one);
+        assert_eq!(infer(&a, t, NO_LIBS), Ok(sch("Int")));
+        assert_eq!(check(&a, t, NO_LIBS, &sch("Int")), Ok(()));
+        assert!(check(&a, t, NO_LIBS, &sch("Bool")).is_err());
+        // Open: the shared subterms use the lambda's variable.
+        let v = a.var(0);
+        let body = shared_ifs(&mut a, N, v, v);
+        let f = a.lam(body);
+        assert_eq!(infer(&a, f, NO_LIBS), Ok(sch("Bool -> Bool")));
+        assert_eq!(check(&a, f, NO_LIBS, &sch("Bool -> Bool")), Ok(()));
+        // Under a let, so the shared subterms see a polymorphic binding.
+        let id = a.lam(v);
+        let inner = a.app(v, one);
+        let body = shared_ifs(&mut a, N, c, inner);
+        let l = a.let_(id, body);
+        assert_eq!(infer(&a, l, NO_LIBS), Ok(sch("Int")));
+    });
+}
+
+#[test]
+fn shared_subterms_stay_polymorphic_and_constrain_their_scope() {
+    // The two `(lam $0)` are one TermId, used at Int and at Bool.
+    assert_infers(
+        "((lam (lam (pair ($1 1) ($0 true)))) (lam $0) (lam $0))",
+        "(Int, Bool)",
+    );
+    // An open shared subterm: `(snd (pair $0 nil))` is one TermId, in the same scope,
+    // used as a List Int and as a List Bool.
+    assert_infers(
+        "(lam ((lam (lam (pair $1 $0))) (cons 1 (snd (pair $0 nil))) \
+         (cons true (snd (pair $0 nil)))))",
+        "a -> (List Int, List Bool)",
+    );
+    // A shared subterm still constrains the variables it uses, at each use.
+    assert_infers("(lam (pair (add $0 1) (add $0 1)))", "Int -> (Int, Int)");
+    assert_infers("(lam (pair (fst $0) (fst $0)))", "(a, b) -> (a, a)");
+    let e = expect_err("(lam (pair (fst $0) (and (fst $0) (add (fst $0) 1))))");
+    assert!(matches!(*e.kind, TypeErrorKind::Mismatch { .. }), "{e}");
+    // The same subterm under different scopes is not confused.
+    assert_infers(
+        "(lam (pair (fst $0) (lam (fst $0))))",
+        "(a, b) -> (a, (c, d) -> c)",
+    );
+}
+
+/// Random terms with many shared subterms: the same subterm twice in one form,
+/// under the same binders or in different scopes.
+fn arb_shared_src() -> impl Strategy<Value = String> {
+    let leaf = prop_oneof![
+        (0u32..3).prop_map(|i| format!("${i}")),
+        (-1i64..2).prop_map(|n| n.to_string()),
+        Just("true".to_string()),
+        Just("nil".to_string()),
+        proptest::sample::select(Prim::ALL).prop_map(|p| p.name().to_string()),
+    ];
+    leaf.prop_recursive(6, 64, 3, |inner| {
+        prop_oneof![
+            3 => inner.clone().prop_map(|b| format!("(lam {b})")),
+            3 => (inner.clone(), inner.clone()).prop_map(|(f, a)| format!("({f} {a})")),
+            1 => (inner.clone(), inner.clone()).prop_map(|(x, b)| format!("(let {x} {b})")),
+            2 => (inner.clone(), inner.clone()).prop_map(|(c, t)| format!("(if {c} {t} {t})")),
+            2 => inner.clone().prop_map(|t| format!("((lam (lam (pair $1 $0))) {t} {t})")),
+            1 => inner.clone().prop_map(|t| format!("(pair {t} (lam {t}))")),
+            1 => (inner.clone(), inner).prop_map(|(t, u)| format!("(let {t} ({u} {t}))")),
+        ]
+    })
+}
+
+#[test]
+fn reusing_shared_subterms_agrees_with_walking_the_tree() {
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(4000));
+    let (typed, untyped) = (std::cell::Cell::new(0u32), std::cell::Cell::new(0u32));
+    runner
+        .run(&arb_shared_src(), |src| {
+            let mut a = Arena::new();
+            let id = sexpr::parse(&mut a, &src).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let mut memo = TypeChecker::new();
+            let mut tree = TypeChecker::new();
+            tree.tree_walk = true;
+            let got = memo.infer(&a, id, NO_LIBS);
+            let want = tree.infer(&a, id, NO_LIBS);
+            prop_assert_eq!(got.as_ref().ok(), want.as_ref().ok(), "{}", src);
+            if let Ok(s) = &want {
+                typed.set(typed.get() + 1);
+                prop_assert!(memo.check(&a, id, NO_LIBS, s).is_ok(), "{}", src);
+                // Checking against a less general type agrees too.
+                for t in ["Int", "Bool -> Bool", "List Int"] {
+                    let s = sch(t);
+                    prop_assert_eq!(
+                        memo.check(&a, id, NO_LIBS, &s).is_ok(),
+                        tree.check(&a, id, NO_LIBS, &s).is_ok(),
+                        "{} against {}",
+                        src,
+                        t
+                    );
+                }
+            } else {
+                untyped.set(untyped.get() + 1);
+            }
+            Ok(())
+        })
+        .unwrap();
+    // Both outcomes must be exercised for the comparison to mean anything.
+    assert!(typed.get() > 400, "only {} well typed", typed.get());
+    assert!(untyped.get() > 400, "only {} ill typed", untyped.get());
+}
+
 // ---------------------------------------------------------------- check locates errors
 
 #[test]

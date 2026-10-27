@@ -4,7 +4,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use dc_core::{sexpr, Arena, LibId};
+use dc_core::{sexpr, Arena, LibId, Prim, TermId};
+use dc_surface::pretty::{pretty_unchecked, TooDeep, MAX_PRETTY_DEPTH};
 use dc_surface::{compile_expression, pretty, ErrorKind, SurfaceError, TopLevel, MAX_DEPTH};
 
 /// Compiles `src` on another thread and fails if it takes longer than `limit`.
@@ -121,7 +122,7 @@ fn input_just_inside_the_limit_compiles_and_pretty_prints() {
         assert!(lo >= MAX_DEPTH / 5, "{shape}: only {lo} levels accepted");
         let mut arena = Arena::new();
         let t = compile_expression(&mut arena, &nested(shape, lo)).unwrap();
-        let printed = pretty(&arena, t, |l: LibId| format!("lib_{}", l.0));
+        let printed = pretty(&arena, t, |l: LibId| format!("lib_{}", l.0)).unwrap();
         assert!(!printed.is_empty(), "{shape}");
         let s = sexpr::print(&arena, t);
         assert_eq!(sexpr::parse(&mut arena, &s).ok(), Some(t), "{shape}");
@@ -150,4 +151,169 @@ fn inline_names_work_with_a_different_arena() {
     assert_eq!(sexpr::print(&a2, f), "(lam ((lam (lib_4 $0)) $0))");
     let k2 = env.close_definition(&mut a2, "k").unwrap();
     assert_eq!(sexpr::print(&a2, k2), "(lam (lib_4 $0))");
+}
+
+/// A core term with `n` levels of one shape around `1`, built directly (the
+/// surface front end does not accept anything this deep).
+fn core_nested(a: &mut Arena, shape: &str, n: usize) -> TermId {
+    let one = a.int(1);
+    let v0 = a.var(0);
+    let v1 = a.var(1);
+    let tt = a.bool(true);
+    let lt = a.prim(Prim::Lt);
+    let not = a.prim(Prim::Not);
+    let fst = a.prim(Prim::Fst);
+    let snd = a.prim(Prim::Snd);
+    let cons = a.prim(Prim::Cons);
+    let nil = a.prim(Prim::Nil);
+    let pair = a.prim(Prim::Pair);
+    let list_case = a.prim(Prim::ListCase);
+    let some = a.prim(Prim::Some);
+    let mut t = one;
+    for _ in 0..n {
+        t = match shape {
+            // fun x -> fun x1 -> ... (each binder used below)
+            "lam" => {
+                let body = a.apps(pair, &[v0, t]);
+                a.lam(body)
+            }
+            // let v = 1 in v + ...
+            "let" => {
+                let add = a.prim(Prim::Add);
+                let body = a.apps(add, &[v0, t]);
+                a.let_(one, body)
+            }
+            // let f x = x in f (...)
+            "let_fun" => {
+                let id = a.lam(v0);
+                let body = a.app(v0, t);
+                a.let_(id, body)
+            }
+            "if" => a.if_(tt, t, one),
+            "and_or" => {
+                let o = a.or(tt, t);
+                a.and(o, tt)
+            }
+            "arg" => a.app(not, t),
+            "head" => a.app(t, one),
+            "some" => a.app(some, t),
+            "cons" => a.apps(cons, &[t, nil]),
+            "tuple" => a.apps(pair, &[t, one]),
+            // match xs with [] -> 1 | h :: tl -> (...)
+            "match" => {
+                let empty = a.lam(one);
+                let full_body = a.lam(t);
+                let full = a.lam(full_body);
+                a.apps(list_case, &[v0, empty, full])
+            }
+            // fun (a, b) -> ... via fst/snd lets
+            "tuple_binder" => {
+                let f = a.app(fst, v0);
+                let s = a.app(snd, v1);
+                let inner = a.apps(pair, &[v0, t]);
+                let l2 = a.let_(s, inner);
+                let l1 = a.let_(f, l2);
+                a.lam(l1)
+            }
+            // (t + 1) > (...) as a let around lt
+            "greater" => {
+                let add = a.prim(Prim::Add);
+                let lhs = a.apps(add, &[v0, one]);
+                let cmp = a.apps(lt, &[t, v0]);
+                let l = a.let_(lhs, cmp);
+                a.lam(l)
+            }
+            _ => unreachable!("{shape}"),
+        };
+    }
+    t
+}
+
+const CORE_SHAPES: [&str; 13] = [
+    "lam",
+    "let",
+    "let_fun",
+    "if",
+    "and_or",
+    "arg",
+    "head",
+    "some",
+    "cons",
+    "tuple",
+    "match",
+    "tuple_binder",
+    "greater",
+];
+
+fn lib_text(l: LibId) -> String {
+    format!("lib_{}", l.0)
+}
+
+#[test]
+fn deep_core_terms_are_a_pretty_error_not_a_stack_overflow() {
+    for shape in CORE_SHAPES {
+        let mut arena = Arena::new();
+        let t = core_nested(&mut arena, shape, 100_000);
+        assert_eq!(pretty(&arena, t, lib_text), Err(TooDeep), "{shape}");
+        for sugar in [true, false] {
+            assert_eq!(
+                pretty_unchecked(&arena, t, lib_text, sugar),
+                Err(TooDeep),
+                "{shape}"
+            );
+        }
+    }
+}
+
+#[test]
+fn core_terms_up_to_the_pretty_limit_print() {
+    // Everything within the limit must print on a test thread's default stack in a
+    // debug build. Find each shape's deepest accepted term and print it.
+    for shape in CORE_SHAPES {
+        let accepts = |n: usize| {
+            let mut arena = Arena::new();
+            let t = core_nested(&mut arena, shape, n);
+            pretty(&arena, t, lib_text).is_ok()
+        };
+        let (mut lo, mut hi) = (0, MAX_PRETTY_DEPTH + 1);
+        assert!(!accepts(hi), "{shape} past the limit");
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if accepts(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        // The heaviest shape costs six levels each.
+        assert!(
+            lo >= MAX_PRETTY_DEPTH / 6,
+            "{shape}: only {lo} levels accepted"
+        );
+        let mut arena = Arena::new();
+        let t = core_nested(&mut arena, shape, lo);
+        for sugar in [true, false] {
+            let text = pretty_unchecked(&arena, t, lib_text, sugar).unwrap();
+            assert!(!text.is_empty(), "{shape}");
+        }
+    }
+}
+
+#[test]
+fn pretty_depth_counts_the_deepest_path_through_shared_nodes() {
+    // `deep` is reached both at the top and under a long chain; the second path is
+    // the one over the limit, and it is found second.
+    let mut arena = Arena::new();
+    let deep = core_nested(&mut arena, "arg", MAX_PRETTY_DEPTH - 10);
+    let mut chain = deep;
+    for _ in 0..20 {
+        chain = arena.lam(chain);
+    }
+    let pair = arena.prim(Prim::Pair);
+    let both = arena.apps(pair, &[deep, chain]);
+    assert_eq!(pretty(&arena, both, lib_text), Err(TooDeep));
+    let both = arena.apps(pair, &[chain, deep]);
+    assert_eq!(pretty(&arena, both, lib_text), Err(TooDeep));
+    assert!(pretty(&arena, deep, lib_text).is_ok());
+    assert!(TooDeep.to_string().contains(&MAX_PRETTY_DEPTH.to_string()));
 }

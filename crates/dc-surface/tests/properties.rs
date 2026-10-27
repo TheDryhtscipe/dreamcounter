@@ -288,13 +288,13 @@ proptest! {
         let id = realise(&mut arena, &g, 0);
         prop_assume!(arena.is_closed(id));
         let expected = sexpr::print(&arena, id);
-        let text = pretty(&arena, id, lib_name);
+        let text = pretty(&arena, id, lib_name).unwrap();
         let back = recompile(&text).map_err(TestCaseError::fail)?;
         prop_assert_eq!(&back, &expected, "printed as: {}", text);
         // pretty() falls back to the plain printer, so that one must round-trip
         // on its own; and the sugared printer should not need the fallback.
         for sugar in [false, true] {
-            let text = pretty_unchecked(&arena, id, lib_name, sugar);
+            let text = pretty_unchecked(&arena, id, lib_name, sugar).unwrap();
             let back = recompile(&text).map_err(TestCaseError::fail)?;
             prop_assert_eq!(&back, &expected, "sugar {}: printed as: {}", sugar, text);
         }
@@ -351,7 +351,7 @@ fn pretty_prints_spec_examples_readably() {
         env.add_source("p", src).unwrap();
         let mut arena = Arena::new();
         let id = env.close_definition(&mut arena, name).unwrap();
-        let text = pretty(&arena, id, lib_name);
+        let text = pretty(&arena, id, lib_name).unwrap();
         assert_eq!(text, expected, "{name}");
         assert_eq!(
             recompile(&text).unwrap(),
@@ -369,7 +369,7 @@ fn pretty_names_free_variables_and_never_reuses_a_prim_name() {
     let body = arena.app(len, v);
     let applied = arena_app(&mut arena, body, 1);
     let open = arena.lam(applied);
-    let text = pretty(&arena, open, lib_name);
+    let text = pretty(&arena, open, lib_name).unwrap();
     assert!(matches!(arena.get(open), Term::Lam(_)));
     assert_eq!(text, "fun x -> length x free0");
 }

@@ -21,6 +21,12 @@
 //! in the size of the types involved, so inference is not linear in the worst case,
 //! but it is polynomial.
 //!
+//! **Shared subterms.** Terms are DAGs too: `(if c t t)` nested `n` deep has `n`
+//! distinct nodes but `2^n` as a tree. A non-leaf subterm reached by more than one
+//! edge of the DAG is inferred once per scope and reused (see
+//! [`TypeChecker::walk`] for why that is sound), so the walk is linear in the
+//! number of distinct nodes, not in the size of the tree.
+//!
 //! **Checking.** [`TypeChecker::check`] pushes the expected type into the term:
 //! through `lam` (parameter and body), the body of `let`, both branches of `if`, and
 //! the result of an application before its arguments. So a clash with a task
@@ -37,14 +43,13 @@
 //! `Key a => ((a -> b) -> a -> b) -> a -> b`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fmt::Write;
 use std::hash::BuildHasher;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{Scheme, TyVar, Type, TypeError, TypeErrorKind};
 use crate::prim::Prim;
-use crate::term::{Arena, LibId, Term, TermId};
+use crate::term::{children, Arena, LibId, Term, TermId};
 
 /// The types of library abstractions (spec §8), looked up by [`LibId`].
 ///
@@ -158,6 +163,9 @@ struct Binding {
     ty: Ty,
     /// Whether the type may contain generalised variables (a `let` binding).
     poly: bool,
+    /// Unique per push in one walk, so a scope can be recognised (see
+    /// [`MemoKey`]).
+    serial: u32,
 }
 
 /// An expected type pushed into a subterm by [`TypeChecker::check`], with the
@@ -220,7 +228,16 @@ enum Frame {
     },
     /// Unify the subterm's type with `want`.
     Check { want: Want, term: TermId },
+    /// After the first inference of a shared subterm in a scope: generalise its
+    /// type, keep it under `key`, and return an instance.
+    Memo { key: MemoKey },
 }
+
+/// A shared subterm and the scope it is inferred in: `None` for a closed subterm,
+/// whose type does not depend on the scope, or else the serial of the innermost
+/// binding in scope. Bindings form a stack, so the same innermost binding means
+/// the very same bindings all the way out.
+type MemoKey = (TermId, Option<u32>);
 
 /// An application `app` = `head a1 ... an`, with the arguments at
 /// `TypeChecker::spine[start..]`.
@@ -235,6 +252,8 @@ struct Spine {
 enum Step {
     /// Find the type of a subterm, optionally against an expected type.
     Eval(TermId, Option<Want>),
+    /// Infer a shared subterm afresh (not from the memo), with no expected type.
+    EvalShared(TermId),
     /// A subterm has this type; hand it to the top frame.
     Return(Ty),
 }
@@ -257,6 +276,17 @@ pub struct TypeChecker {
     seen_pairs: FxHashSet<(Ty, Ty)>,
     frames: Vec<Frame>,
     spine: Vec<TermId>,
+    /// Non-leaf subterms of the current root reached by more than one edge.
+    shared: FxHashSet<TermId>,
+    /// Free depths of the shared subterms and the nodes under them.
+    free_depths: FxHashMap<TermId, u32>,
+    /// Generalised types of shared subterms already inferred, by scope.
+    memo: FxHashMap<MemoKey, Ty>,
+    next_serial: u32,
+    /// Walks every term as a tree, without reusing shared subterms: the reference
+    /// the tests compare the memoised walk with.
+    #[cfg(test)]
+    pub(super) tree_walk: bool,
 }
 
 /// Where a unification happens, for the error message.
@@ -334,6 +364,36 @@ impl TypeChecker {
         self.env.clear();
         self.frames.clear();
         self.spine.clear();
+        self.shared.clear();
+        self.free_depths.clear();
+        self.memo.clear();
+        self.next_serial = 0;
+    }
+
+    /// Pushes a binding for a new innermost variable.
+    fn bind_var(&mut self, ty: Ty, poly: bool) {
+        let serial = self.next_serial;
+        self.next_serial = serial.checked_add(1).expect("fewer than 2^32 binders");
+        self.env.push(Binding { ty, poly, serial });
+    }
+
+    /// Finds the non-leaf subterms of `root` that more than one edge of the DAG
+    /// reaches.
+    fn find_shared(&mut self, arena: &Arena, root: TermId) {
+        let mut seen: FxHashSet<TermId> = FxHashSet::default();
+        let mut edges: FxHashSet<TermId> = FxHashSet::default();
+        let mut stack = vec![root];
+        seen.insert(root);
+        while let Some(id) = stack.pop() {
+            for c in children(&arena.get(id)) {
+                if !edges.insert(c) && !children(&arena.get(c)).is_empty() {
+                    self.shared.insert(c);
+                }
+                if seen.insert(c) {
+                    stack.push(c);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------ store
@@ -955,6 +1015,25 @@ impl TypeChecker {
 
     /// Finds the type of `root`, against `want` if given, walking the term with an
     /// explicit stack of [`Frame`]s.
+    ///
+    /// A shared subterm (one the DAG reaches by more than one edge) is inferred
+    /// once per scope, as if it were `let`-bound at that point: the first time, at
+    /// one level deeper, after which its type is generalised and kept; every use,
+    /// the first included, gets a fresh instance. This is sound and complete
+    /// because let-expansion preserves typing in Hindley-Milner: `let x = e in
+    /// C[x, x]` is typable with type τ exactly when `C[e, e]` is, provided `e` is
+    /// typable (Damas and Milner 1982; here there are no side effects, so no value
+    /// restriction). The memo key ([`MemoKey`]) makes sure both uses see the same
+    /// bindings for the free variables of `e`, so the let could be placed at that
+    /// point: closed subterms need no bindings, open ones are reused only under the
+    /// same innermost binding, which means the same scope. The types of those
+    /// bindings may be refined between the uses, but the kept type stays linked to
+    /// them, so it is refined along with them. `Key` flags are kept by
+    /// generalisation and copied by instantiation, as for `let`.
+    ///
+    /// A shared subterm is inferred without the expected type of its position;
+    /// the type is checked against it afterwards. So in [`TypeChecker::check`] a
+    /// clash inside a shared subterm is reported at that subterm, not deeper.
     fn walk<L: LibEnv + ?Sized>(
         &mut self,
         arena: &Arena,
@@ -962,16 +1041,62 @@ impl TypeChecker {
         root: TermId,
         want: Option<Want>,
     ) -> Result<Ty, TypeError> {
+        #[cfg(test)]
+        let skip = self.tree_walk;
+        #[cfg(not(test))]
+        let skip = false;
+        if !skip {
+            self.find_shared(arena, root);
+        }
         let mut step = Step::Eval(root, want);
         loop {
             step = match step {
-                Step::Eval(id, want) => self.descend(arena, libs, id, want)?,
+                Step::Eval(id, want) => {
+                    if self.shared.contains(&id) {
+                        self.shared_subterm(arena, id, want)?
+                    } else {
+                        self.descend(arena, libs, id, want)?
+                    }
+                }
+                Step::EvalShared(id) => self.descend(arena, libs, id, None)?,
                 Step::Return(t) => match self.frames.pop() {
                     None => return Ok(t),
                     Some(frame) => self.resume(arena, frame, t)?,
                 },
             };
         }
+    }
+
+    /// Starts on shared subterm `id`: reuses its kept type in this scope, or infers
+    /// it afresh (see [`TypeChecker::walk`]).
+    fn shared_subterm(
+        &mut self,
+        arena: &Arena,
+        id: TermId,
+        want: Option<Want>,
+    ) -> Result<Step, TypeError> {
+        if !self.free_depths.contains_key(&id) {
+            arena.free_depths(id, &mut self.free_depths);
+        }
+        let scope = if self.free_depths[&id] == 0 {
+            None
+        } else {
+            self.env.last().map(|b| b.serial)
+        };
+        let key = (id, scope);
+        if let Some(&kept) = self.memo.get(&key) {
+            let t = self.instantiate(kept);
+            if let Some(w) = want {
+                self.expect(arena, w.ty, t, Site::new(id, w.context))?;
+            }
+            return Ok(Step::Return(t));
+        }
+        if let Some(w) = want {
+            self.frames.push(Frame::Check { want: w, term: id });
+        }
+        self.level += 1;
+        self.frames.push(Frame::Memo { key });
+        Ok(Step::EvalShared(id))
     }
 
     /// Starts on subterm `id`: either its type is known at once, or frames are
@@ -1015,7 +1140,7 @@ impl TypeChecker {
                 if let Some(w) = want {
                     let rw = self.resolve(w.ty);
                     if let Node::Con(Head::Arrow, p, r) = self.node(rw) {
-                        self.env.push(Binding { ty: p, poly: false });
+                        self.bind_var(p, false);
                         self.frames.push(Frame::LamChecked { arrow: rw });
                         let ctx = "the body of `lam` (its type is fixed by the expected type)";
                         return Ok(Step::Eval(body, Some(Want::at(r, ctx))));
@@ -1023,7 +1148,7 @@ impl TypeChecker {
                     self.frames.push(Frame::Check { want: w, term: id });
                 }
                 let a = self.fresh();
-                self.env.push(Binding { ty: a, poly: false });
+                self.bind_var(a, false);
                 self.frames.push(Frame::Lam { param: a });
                 return Ok(Step::Eval(body, None));
             }
@@ -1090,7 +1215,7 @@ impl TypeChecker {
             Frame::LetBound { body, want } => {
                 self.level -= 1;
                 self.generalize(t);
-                self.env.push(Binding { ty: t, poly: true });
+                self.bind_var(t, true);
                 self.frames.push(Frame::LetBody);
                 let ctx = "the body of `let` (its type is fixed by the expected type)";
                 Step::Eval(body, want.map(|w| Want::at(w.ty, ctx)))
@@ -1147,6 +1272,12 @@ impl TypeChecker {
             Frame::Check { want, term } => {
                 self.expect(arena, want.ty, t, Site::new(term, want.context))?;
                 Step::Return(t)
+            }
+            Frame::Memo { key } => {
+                self.level -= 1;
+                self.generalize(t);
+                self.memo.insert(key, t);
+                Step::Return(self.instantiate(t))
             }
             Frame::AppHead { sp, want } => {
                 let pending = match want {
@@ -1373,80 +1504,8 @@ fn plain_error(arena: &Arena, term: TermId, kind: TypeErrorKind) -> TypeError {
 /// [`MAX_TERM_TEXT`] bytes followed by ` ...`. It stops writing once past the limit,
 /// so its cost does not depend on the size or depth of the term.
 pub(super) fn short(arena: &Arena, id: TermId) -> String {
-    enum Item {
-        Term(TermId),
-        Text(&'static str),
-    }
     let mut out = String::new();
-    let mut todo = vec![Item::Term(id)];
-    let mut spine = vec![];
-    while let Some(item) = todo.pop() {
-        if out.len() > MAX_TERM_TEXT {
-            break;
-        }
-        let t = match item {
-            Item::Text(s) => {
-                out.push_str(s);
-                continue;
-            }
-            Item::Term(t) => t,
-        };
-        let (keyword, children): (&str, &[TermId]) = match arena.get(t) {
-            Term::Var(i) => {
-                let _ = write!(out, "${i}");
-                continue;
-            }
-            Term::Int(n) => {
-                let _ = write!(out, "{n}");
-                continue;
-            }
-            Term::Bool(b) => {
-                let _ = write!(out, "{b}");
-                continue;
-            }
-            Term::Unit => {
-                out.push_str("unit");
-                continue;
-            }
-            Term::Prim(p) => {
-                out.push_str(p.name());
-                continue;
-            }
-            Term::Lib(LibId(l)) => {
-                let _ = write!(out, "lib_{l}");
-                continue;
-            }
-            Term::Lam(b) => ("lam", &[b]),
-            Term::Let(x, b) => ("let", &[x, b]),
-            Term::If(c, th, e) => ("if", &[c, th, e]),
-            Term::And(x, y) => ("and", &[x, y]),
-            Term::Or(x, y) => ("or", &[x, y]),
-            Term::App(..) => {
-                spine.clear();
-                let mut head = t;
-                while let Term::App(f, a) = arena.get(head) {
-                    spine.push(a);
-                    head = f;
-                }
-                // `spine` holds the arguments last first, which is push order.
-                out.push('(');
-                todo.push(Item::Text(")"));
-                for &a in &spine {
-                    todo.push(Item::Term(a));
-                    todo.push(Item::Text(" "));
-                }
-                todo.push(Item::Term(head));
-                continue;
-            }
-        };
-        out.push('(');
-        out.push_str(keyword);
-        todo.push(Item::Text(")"));
-        for &c in children.iter().rev() {
-            todo.push(Item::Term(c));
-            todo.push(Item::Text(" "));
-        }
-    }
+    crate::sexpr::print_bounded(arena, id, MAX_TERM_TEXT, &mut out);
     if out.len() > MAX_TERM_TEXT {
         let mut cut = MAX_TERM_TEXT;
         while !out.is_char_boundary(cut) {
