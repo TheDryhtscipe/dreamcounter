@@ -1443,3 +1443,86 @@ proptest! {
         }
     }
 }
+
+/// A well-typed closed term of type `Int` whose shared subterms see exponentially
+/// many different scopes: `t_0 = (let (pair $0 (pair $1 ... unit)) 0)` uses all
+/// `n` bindings, and `t_{k+1} = (let (pair (let (lam $0) t_k) (let (lam (lam $1))
+/// t_k)) 0)`. Each path to `t_0` binds every variable to one of two closed
+/// polymorphic helpers of different types, so `t_k` is inferred for up to
+/// `2^(n-k)` scopes. Returns `t_n`.
+fn helper_choices(a: &mut Arena, n: usize) -> TermId {
+    let mut pairs = String::from("unit");
+    for i in (0..n).rev() {
+        pairs = format!("(pair ${i} {pairs})");
+    }
+    let mut t = parse_term(a, &format!("(let {pairs} 0)"));
+    let pair = a.prim(Prim::Pair);
+    let id = parse_term(a, "(lam $0)");
+    let konst = parse_term(a, "(lam (lam $1))");
+    let zero = a.int(0);
+    for _ in 0..n {
+        let l = a.let_(id, t);
+        let r = a.let_(konst, t);
+        let p = a.apps(pair, &[l, r]);
+        t = a.let_(p, zero);
+    }
+    t
+}
+
+fn too_much_work(limit: u64) -> TypeErrorKind {
+    TypeErrorKind::TooMuchWork { limit }
+}
+
+#[test]
+fn exponential_work_is_refused_quickly() {
+    // 151 distinct nodes. Without a budget this takes about 10 s in a release
+    // build and minutes in a debug one; the default budget stops it in about
+    // 0.35 s in a release build (debug builds are about 13 times slower).
+    let mut a = Arena::new();
+    let t = helper_choices(&mut a, 18);
+    let start = std::time::Instant::now();
+    let e = infer(&a, t, NO_LIBS).unwrap_err();
+    let elapsed = start.elapsed();
+    assert_eq!(*e.kind, too_much_work(DEFAULT_WORK_BUDGET), "{e}");
+    assert!(e.to_string().contains("units of work"), "{e}");
+    let limit = if cfg!(debug_assertions) { 15 } else { 1 };
+    assert!(
+        elapsed < std::time::Duration::from_secs(limit),
+        "{elapsed:?}"
+    );
+}
+
+#[test]
+fn default_budget_admits_normal_programs() {
+    let mut a = Arena::new();
+    // Two to the eight scopes for the innermost shared subterm: real work, far
+    // below the budget.
+    let t = helper_choices(&mut a, 8);
+    let mut tc = TypeChecker::new();
+    assert_eq!(tc.work_budget(), DEFAULT_WORK_BUDGET);
+    assert_eq!(tc.infer(&a, t, NO_LIBS), Ok(sch("Int")));
+    assert_eq!(tc.check(&a, t, NO_LIBS, &sch("Int")), Ok(()));
+    let src = "(lam (foldl (lam (lam (add $1 (length (array_to_list (array_of_list $0)))))) \
+               0 $0))";
+    assert_infers(src, "List (List a) -> Int");
+}
+
+#[test]
+fn a_smaller_budget_refuses_what_the_default_admits() {
+    let mut a = Arena::new();
+    let t = helper_choices(&mut a, 8);
+    assert_eq!(infer(&a, t, NO_LIBS), Ok(sch("Int")));
+    let mut tc = TypeChecker::with_work_budget(1_000);
+    assert_eq!(tc.work_budget(), 1_000);
+    let e = tc.infer(&a, t, NO_LIBS).unwrap_err();
+    assert_eq!(*e.kind, too_much_work(1_000), "{e}");
+    let e = tc.check(&a, t, NO_LIBS, &sch("Int")).unwrap_err();
+    assert_eq!(*e.kind, too_much_work(1_000), "{e}");
+    // A small term fits in the small budget, and the budget applies per call.
+    let one = parse_term(&mut a, "(add 1 2)");
+    assert_eq!(tc.infer(&a, one, NO_LIBS), Ok(sch("Int")));
+    assert_eq!(tc.infer(&a, one, NO_LIBS), Ok(sch("Int")));
+    // Raising the budget again admits the term on the same checker.
+    tc.set_work_budget(DEFAULT_WORK_BUDGET);
+    assert_eq!(tc.infer(&a, t, NO_LIBS), Ok(sch("Int")));
+}

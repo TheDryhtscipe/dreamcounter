@@ -43,6 +43,12 @@
 //! into one only where its use fails, so its cost is polynomial, not
 //! exponential, in the size of the DAG.
 //!
+//! **Work budget.** Reuse of shared subterms is keyed on the bindings they see,
+//! and a well-typed term can make exponentially many different sets of them, so
+//! each call has a budget of work ([`DEFAULT_WORK_BUDGET`] unless
+//! [`TypeChecker::set_work_budget`] says otherwise). A call that runs out fails
+//! with [`TypeErrorKind::TooMuchWork`], whether or not the term is well typed.
+//!
 //! **Checking.** [`TypeChecker::check`] pushes the expected type into the term:
 //! through `lam` (parameter and body), the body of `let`, both branches of `if`, and
 //! the result of an application before its arguments. So a clash with a task
@@ -106,6 +112,31 @@ pub const MAX_TYPE_NODES: usize = 10_000;
 
 /// The deepest nesting a [`Type`] produced by the checker may have.
 pub const MAX_TYPE_DEPTH: usize = 500;
+
+/// The most units of work one call of [`TypeChecker::infer`] or
+/// [`TypeChecker::check`] may do unless [`TypeChecker::set_work_budget`] says
+/// otherwise; more is a [`TypeErrorKind::TooMuchWork`] error.
+///
+/// A unit is a step of the term walk, a type node made, or a node looked up in
+/// the store, so every walk over the store pays for the nodes it visits. The
+/// budget is checked between steps of the term walk, so a call can overrun it
+/// by the work of one step. Each walk over the store in a step visits a node (for
+/// unification, a pair of nodes) at most once, and the store has no more nodes
+/// than the units already spent. One unit takes about
+/// 20 ns in a release build. Well-typed terms can need work exponential in their
+/// size: a shared subterm is inferred once for each different set of bindings
+/// its free variables see (see the module documentation), and polymorphic
+/// helpers of different types can make that set exponentially large. So the
+/// budget is what keeps the checker from hanging on an untrusted term.
+///
+/// Measured (October 2026): the reference programs, the prelude and every
+/// program in the test suites outside the checker's own stress tests take at
+/// most about 11 000 units, and the stress tests at most 6.3 million (the tree
+/// walk of a shared `if` nest 18 deep; 200 000-deep terms take under 6
+/// million). The default of 16 million admits all of those, the realistic
+/// programs by a factor of over 1 000, and refuses a well-typed 151-node term
+/// that takes about 10 s without it (450 million units) in about 0.35 s.
+pub const DEFAULT_WORK_BUDGET: u64 = 16_000_000;
 
 /// Index of a node in the type store.
 type Ty = u32;
@@ -398,10 +429,24 @@ pub struct TypeChecker {
     failed: FxHashSet<MemoKey>,
     /// Steps taken by the term walk of the current call.
     steps: u64,
+    /// Units of work done by the current call (see [`DEFAULT_WORK_BUDGET`]).
+    spent: u64,
+    /// The most units of work one call may do.
+    budget: WorkBudget,
     /// The most steps of the term walk one call may take; more is a panic. Lets
     /// the tests bound the work without a timer.
     #[cfg(test)]
     pub(super) step_limit: Option<u64>,
+}
+
+/// The work budget of a [`TypeChecker`]; [`DEFAULT_WORK_BUDGET`] unless set.
+#[derive(Clone, Copy, Debug)]
+struct WorkBudget(u64);
+
+impl Default for WorkBudget {
+    fn default() -> WorkBudget {
+        WorkBudget(DEFAULT_WORK_BUDGET)
+    }
 }
 
 /// The state of the checker before a use of a shared subterm is tried, to go
@@ -442,6 +487,27 @@ impl TypeChecker {
     /// A new checker.
     pub fn new() -> TypeChecker {
         TypeChecker::default()
+    }
+
+    /// A new checker whose calls may each do at most `limit` units of work (see
+    /// [`TypeChecker::set_work_budget`]).
+    pub fn with_work_budget(limit: u64) -> TypeChecker {
+        let mut tc = TypeChecker::new();
+        tc.set_work_budget(limit);
+        tc
+    }
+
+    /// Limits each later call of [`TypeChecker::infer`] or [`TypeChecker::check`]
+    /// to `limit` units of work; one that needs more fails with
+    /// [`TypeErrorKind::TooMuchWork`]. See [`DEFAULT_WORK_BUDGET`] for what a unit
+    /// is and how far past the limit a call can go before it stops.
+    pub fn set_work_budget(&mut self, limit: u64) {
+        self.budget = WorkBudget(limit);
+    }
+
+    /// The most units of work each call may do.
+    pub fn work_budget(&self) -> u64 {
+        self.budget.0
     }
 
     /// Infers the principal type scheme of `term`, closed under `libs`.
@@ -503,6 +569,11 @@ impl TypeChecker {
     /// fails is walked in place at once from then on, since it fails in every
     /// state of the store; without that, a chain of shared subterms over a leaf
     /// that is ill typed on its own takes time exponential in its length.
+    ///
+    /// Both walks share the call's work budget. If the first runs out, that is
+    /// the error. If only the second does, the first walk's error is returned:
+    /// the term is ill typed either way, and only where the error is named
+    /// changes.
     fn run<L: LibEnv + ?Sized>(
         &mut self,
         arena: &Arena,
@@ -510,11 +581,12 @@ impl TypeChecker {
         term: TermId,
         expected: Option<&Scheme>,
     ) -> Result<Ty, TypeError> {
+        self.spent = 0;
         let first = self.walk_from_scratch(arena, libs, term, expected);
         let Err(e) = first else {
             return first;
         };
-        if self.tree_walk || self.shared.is_empty() {
+        if self.tree_walk || self.shared.is_empty() || out_of_budget(&e) {
             return Err(e);
         }
         self.locate = true;
@@ -522,8 +594,8 @@ impl TypeChecker {
         self.locate = false;
         debug_assert!(again.is_err(), "both walks accept the same terms");
         match again {
-            Err(located) => Err(located),
-            Ok(_) => Err(e),
+            Err(located) if !out_of_budget(&located) => Err(located),
+            _ => Err(e),
         }
     }
 
@@ -675,6 +747,7 @@ impl TypeChecker {
     // ------------------------------------------------------------ store
 
     fn push(&mut self, n: Node) -> Ty {
+        self.spent += 1;
         let id = Ty::try_from(self.nodes.len()).expect("fewer than 2^32 type nodes");
         self.nodes.push(n);
         id
@@ -737,6 +810,7 @@ impl TypeChecker {
 
     /// Follows links to the representative node, compressing the path.
     fn resolve(&mut self, t: Ty) -> Ty {
+        self.spent += 1;
         let mut root = t;
         while let Node::Link(next) = self.node(root) {
             root = next;
@@ -1343,6 +1417,12 @@ impl TypeChecker {
         let mut step = Step::Eval(root, want);
         loop {
             self.steps += 1;
+            self.spent += 1;
+            if self.spent > self.budget.0 {
+                let mut e = plain_error(arena, root, too_much_work(self.budget.0));
+                e.context = "the whole term".into();
+                return Err(e);
+            }
             #[cfg(test)]
             {
                 if let Some(limit) = self.step_limit {
@@ -2108,6 +2188,15 @@ fn free_vars(arena: &Arena, id: TermId, memo: &mut FxHashMap<TermId, FreeVars>) 
         };
         memo.insert(t, fv);
     }
+}
+
+/// Whether `e` says that the call ran out of work budget.
+fn out_of_budget(e: &TypeError) -> bool {
+    matches!(*e.kind, TypeErrorKind::TooMuchWork { .. })
+}
+
+fn too_much_work(limit: u64) -> TypeErrorKind {
+    TypeErrorKind::TooMuchWork { limit }
 }
 
 fn too_large() -> TypeErrorKind {
