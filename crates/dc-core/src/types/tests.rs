@@ -828,14 +828,12 @@ fn shared_type_structure_is_walked_once() {
     );
 }
 
-/// Runs `f` on another thread and fails if it takes longer than `secs` seconds.
-fn within<T: Send + 'static>(secs: u64, what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    rx.recv_timeout(std::time::Duration::from_secs(secs))
-        .unwrap_or_else(|_| panic!("{what} took longer than {secs}s"))
+/// A checker whose term walk panics after `steps` steps, so a test of how much
+/// work inference does fails fast, without a timer or a thread left running.
+fn bounded(steps: u64) -> TypeChecker {
+    let mut tc = TypeChecker::new();
+    tc.step_limit = Some(steps);
+    tc
 }
 
 /// `(if c t t)` nested `n` deep around `leaf`: a DAG of `n` nodes that is a tree of
@@ -850,30 +848,93 @@ fn shared_ifs(a: &mut Arena, n: usize, c: TermId, leaf: TermId) -> TermId {
 
 #[test]
 fn shared_subterms_are_inferred_once() {
-    // Walking the term as a tree takes time exponential in n: 2^30 visits at n = 30.
+    // Walking the term as a tree takes 2^30 steps at n = 30; the budget is linear.
     const N: usize = 30;
-    within(20, "inferring shared ifs", || {
-        // Closed.
-        let mut a = Arena::new();
-        let c = a.bool(true);
-        let one = a.int(1);
-        let t = shared_ifs(&mut a, N, c, one);
-        assert_eq!(infer(&a, t, NO_LIBS), Ok(sch("Int")));
-        assert_eq!(check(&a, t, NO_LIBS, &sch("Int")), Ok(()));
-        assert!(check(&a, t, NO_LIBS, &sch("Bool")).is_err());
-        // Open: the shared subterms use the lambda's variable.
-        let v = a.var(0);
-        let body = shared_ifs(&mut a, N, v, v);
-        let f = a.lam(body);
-        assert_eq!(infer(&a, f, NO_LIBS), Ok(sch("Bool -> Bool")));
-        assert_eq!(check(&a, f, NO_LIBS, &sch("Bool -> Bool")), Ok(()));
-        // Under a let, so the shared subterms see a polymorphic binding.
-        let id = a.lam(v);
-        let inner = a.app(v, one);
-        let body = shared_ifs(&mut a, N, c, inner);
-        let l = a.let_(id, body);
-        assert_eq!(infer(&a, l, NO_LIBS), Ok(sch("Int")));
-    });
+    const STEPS: u64 = 100 * N as u64;
+    // Closed.
+    let mut a = Arena::new();
+    let c = a.bool(true);
+    let one = a.int(1);
+    let t = shared_ifs(&mut a, N, c, one);
+    assert_eq!(bounded(STEPS).infer(&a, t, NO_LIBS), Ok(sch("Int")));
+    assert_eq!(bounded(STEPS).check(&a, t, NO_LIBS, &sch("Int")), Ok(()));
+    assert!(bounded(STEPS).check(&a, t, NO_LIBS, &sch("Bool")).is_err());
+    // Open: the shared subterms use the lambda's variable.
+    let v = a.var(0);
+    let body = shared_ifs(&mut a, N, v, v);
+    let f = a.lam(body);
+    let want = sch("Bool -> Bool");
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), Ok(want.clone()));
+    assert_eq!(bounded(STEPS).check(&a, f, NO_LIBS, &want), Ok(()));
+    // Under a let, so the shared subterms see a polymorphic binding.
+    let id = a.lam(v);
+    let inner = a.app(v, one);
+    let body = shared_ifs(&mut a, N, c, inner);
+    let l = a.let_(id, body);
+    assert_eq!(bounded(STEPS).infer(&a, l, NO_LIBS), Ok(sch("Int")));
+}
+
+/// `t' = (pair (fst t) (lam (snd t)))` nested `n` deep around `(pair $0 $0)`, under
+/// a lambda: the two uses of `t` see different binders for `$0`.
+fn pairs_across_scopes(a: &mut Arena, n: usize) -> TermId {
+    let v = a.var(0);
+    let (pair, fst, snd) = (a.prim(Prim::Pair), a.prim(Prim::Fst), a.prim(Prim::Snd));
+    let mut t = a.apps(pair, &[v, v]);
+    for _ in 0..n {
+        let l = a.app(fst, t);
+        let r = a.app(snd, t);
+        let r = a.lam(r);
+        t = a.apps(pair, &[l, r]);
+    }
+    a.lam(t)
+}
+
+#[test]
+fn open_shared_subterms_are_reused_across_scopes() {
+    // Each level uses the open subterm below it twice, in two different scopes, so
+    // the tree has 2^n nodes. Keying the reuse on the scope alone never hits.
+    const N: usize = 40;
+    const STEPS: u64 = 100 * N as u64;
+    let mut a = Arena::new();
+    let v = a.var(0);
+    // t' = (let t t): in the scope of the let, and under the let's binder.
+    let mut t = v;
+    for _ in 0..N {
+        t = a.let_(t, t);
+    }
+    let f = a.lam(t);
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), Ok(sch("a -> a")));
+    // t' = ((lam t) t): under a new lambda binder, and outside it.
+    let mut t = v;
+    for _ in 0..N {
+        let l = a.lam(t);
+        t = a.app(l, t);
+    }
+    let f = a.lam(t);
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), Ok(sch("a -> a")));
+    let want = sch("Int -> Int");
+    assert_eq!(bounded(STEPS).check(&a, f, NO_LIBS, &want), Ok(()));
+    // t' = (if true t (let (lam $0) t)) around ($0 1), under (let (lam $0) ...): the
+    // uses see different polymorphic bindings of the same type.
+    let (yes, one) = (a.bool(true), a.int(1));
+    let id = a.lam(v);
+    let mut t = a.app(v, one);
+    for _ in 0..N {
+        let l = a.let_(id, t);
+        t = a.if_(yes, t, l);
+    }
+    let f = a.let_(id, t);
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), Ok(sch("Int")));
+    // Uses at different types, compared with the tree walk at a size it can do.
+    let small = pairs_across_scopes(&mut a, 8);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, small, NO_LIBS);
+    assert!(want.is_ok(), "{want:?}");
+    assert_eq!(bounded(STEPS).infer(&a, small, NO_LIBS), want);
+    let big = pairs_across_scopes(&mut a, N);
+    let got = bounded(STEPS).infer(&a, big, NO_LIBS);
+    assert!(got.is_ok(), "{got:?}");
 }
 
 #[test]
@@ -920,6 +981,8 @@ fn arb_shared_src() -> impl Strategy<Value = String> {
             2 => (inner.clone(), inner.clone()).prop_map(|(c, t)| format!("(if {c} {t} {t})")),
             2 => inner.clone().prop_map(|t| format!("((lam (lam (pair $1 $0))) {t} {t})")),
             1 => inner.clone().prop_map(|t| format!("(pair {t} (lam {t}))")),
+            1 => inner.clone().prop_map(|t| format!("((lam {t}) {t})")),
+            1 => inner.clone().prop_map(|t| format!("(if true {t} (let (lam $0) {t}))")),
             1 => (inner.clone(), inner).prop_map(|(t, u)| format!("(let {t} ({u} {t}))")),
         ]
     })

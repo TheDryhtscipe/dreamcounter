@@ -185,7 +185,7 @@ impl Arena {
 
     /// Records in `memo` the [`free_depth`](Arena::free_depth) of `id` and of every
     /// node under it that `memo` does not already hold.
-    pub fn free_depths(&self, id: TermId, memo: &mut FxHashMap<TermId, u32>) {
+    pub(crate) fn free_depths(&self, id: TermId, memo: &mut FxHashMap<TermId, u32>) {
         // A node is pushed with `false` to be expanded, and again with `true` to be
         // computed once its children are done.
         let mut stack = vec![(id, false)];

@@ -5,7 +5,9 @@ use std::thread;
 use std::time::Duration;
 
 use dc_core::{sexpr, Arena, LibId, Prim, TermId};
-use dc_surface::pretty::{pretty_unchecked, TooDeep, MAX_PRETTY_DEPTH};
+use dc_surface::pretty::{
+    pretty_unchecked, PrettyError, INLINE_DEPTH, MAX_PRETTY_DEPTH, MAX_PRETTY_NODES,
+};
 use dc_surface::{compile_expression, pretty, ErrorKind, SurfaceError, TopLevel, MAX_DEPTH};
 
 /// Compiles `src` on another thread and fails if it takes longer than `limit`.
@@ -254,11 +256,15 @@ fn deep_core_terms_are_a_pretty_error_not_a_stack_overflow() {
     for shape in CORE_SHAPES {
         let mut arena = Arena::new();
         let t = core_nested(&mut arena, shape, 100_000);
-        assert_eq!(pretty(&arena, t, lib_text), Err(TooDeep), "{shape}");
+        assert_eq!(
+            pretty(&arena, t, lib_text),
+            Err(PrettyError::TooDeep),
+            "{shape}"
+        );
         for sugar in [true, false] {
             assert_eq!(
                 pretty_unchecked(&arena, t, lib_text, sugar),
-                Err(TooDeep),
+                Err(PrettyError::TooDeep),
                 "{shape}"
             );
         }
@@ -311,9 +317,134 @@ fn pretty_depth_counts_the_deepest_path_through_shared_nodes() {
     }
     let pair = arena.prim(Prim::Pair);
     let both = arena.apps(pair, &[deep, chain]);
-    assert_eq!(pretty(&arena, both, lib_text), Err(TooDeep));
+    assert_eq!(pretty(&arena, both, lib_text), Err(PrettyError::TooDeep));
     let both = arena.apps(pair, &[chain, deep]);
-    assert_eq!(pretty(&arena, both, lib_text), Err(TooDeep));
+    assert_eq!(pretty(&arena, both, lib_text), Err(PrettyError::TooDeep));
     assert!(pretty(&arena, deep, lib_text).is_ok());
-    assert!(TooDeep.to_string().contains(&MAX_PRETTY_DEPTH.to_string()));
+    assert!(PrettyError::TooDeep
+        .to_string()
+        .contains(&MAX_PRETTY_DEPTH.to_string()));
+}
+
+/// The deepest term of `shape` that [`pretty`] accepts.
+fn deepest_printable(shape: &str) -> (Arena, TermId) {
+    let accepts = |n: usize| {
+        let mut arena = Arena::new();
+        let t = core_nested(&mut arena, shape, n);
+        pretty(&arena, t, lib_text).is_ok()
+    };
+    let (mut lo, mut hi) = (0, MAX_PRETTY_DEPTH + 1);
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if accepts(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut arena = Arena::new();
+    let t = core_nested(&mut arena, shape, lo);
+    (arena, t)
+}
+
+/// Set for the child process that [`pretty_needs_little_of_the_callers_stack`]
+/// starts.
+const STACK_PROBE: &str = "DC_PRETTY_STACK_PROBE";
+
+#[test]
+fn pretty_needs_little_of_the_callers_stack() {
+    // A stack overflow aborts the process, so the probe runs in a child process.
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "pretty_stack_probe",
+            "--test-threads",
+            "1",
+        ])
+        .env(STACK_PROBE, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the probe failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+        "the probe did not run: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+#[ignore = "run in a child process by pretty_needs_little_of_the_callers_stack"]
+fn pretty_stack_probe() {
+    if std::env::var_os(STACK_PROBE).is_none() {
+        return;
+    }
+    // A caller with only 256 KiB of stack left prints the deepest term of every
+    // shape, and every term shallow enough to be printed on the caller's thread.
+    thread::Builder::new()
+        .stack_size(256 << 10)
+        .spawn(|| {
+            for shape in CORE_SHAPES {
+                for n in 1..=INLINE_DEPTH {
+                    let mut arena = Arena::new();
+                    let t = core_nested(&mut arena, shape, n);
+                    assert!(pretty(&arena, t, lib_text).is_ok(), "{shape} {n}");
+                    for sugar in [true, false] {
+                        assert!(pretty_unchecked(&arena, t, lib_text, sugar).is_ok());
+                    }
+                }
+                let (arena, t) = deepest_printable(shape);
+                assert!(pretty(&arena, t, lib_text).is_ok(), "{shape}");
+                for sugar in [true, false] {
+                    assert!(pretty_unchecked(&arena, t, lib_text, sugar).is_ok());
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn pretty_refuses_terms_too_large_written_out() {
+    // `(if c t t)` nested n deep has n + 2 distinct nodes and about 2^(n+1) as a
+    // tree.
+    let shared_ifs = |arena: &mut Arena, n: usize| {
+        let c = arena.bool(true);
+        let mut t = arena.int(1);
+        for _ in 0..n {
+            t = arena.if_(c, t, t);
+        }
+        t
+    };
+    let mut arena = Arena::new();
+    let small = shared_ifs(&mut arena, 10);
+    assert!(pretty(&arena, small, lib_text).is_ok());
+    // Past the node limit, though far within the depth limit.
+    let n = (MAX_PRETTY_NODES as f64).log2().ceil() as usize;
+    let big = shared_ifs(&mut arena, n);
+    assert_eq!(
+        pretty(&arena, big, lib_text).err(),
+        Some(PrettyError::TooLarge)
+    );
+    for sugar in [true, false] {
+        assert_eq!(
+            pretty_unchecked(&arena, big, lib_text, sugar).err(),
+            Some(PrettyError::TooLarge)
+        );
+    }
+    // The largest: would print 2^60 subterms.
+    let huge = shared_ifs(&mut arena, 60);
+    assert_eq!(
+        pretty(&arena, huge, lib_text).err(),
+        Some(PrettyError::TooLarge)
+    );
+    assert!(PrettyError::TooLarge
+        .to_string()
+        .contains(&MAX_PRETTY_NODES.to_string()));
 }

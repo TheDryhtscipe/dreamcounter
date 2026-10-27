@@ -23,9 +23,15 @@
 //!
 //! **Shared subterms.** Terms are DAGs too: `(if c t t)` nested `n` deep has `n`
 //! distinct nodes but `2^n` as a tree. A non-leaf subterm reached by more than one
-//! edge of the DAG is inferred once per scope and reused (see
-//! [`TypeChecker::walk`] for why that is sound), so the walk is linear in the
-//! number of distinct nodes, not in the size of the tree.
+//! edge of the DAG is inferred once for each different set of bindings it can see,
+//! and the result is reused (see [`TypeChecker::walk`] for why that is sound).
+//! Bindings count as the same when both are monomorphic (the subterm's type is
+//! kept as a function of theirs), or when both are polymorphic with the same type
+//! up to renaming and no free variables. So `(if c t t)`, `(let t t)` and
+//! `((lam t) t)`, nested `n` deep, take time linear in `n`. The exception is a
+//! polymorphic binding whose type has a free variable: it counts as the same only
+//! as itself, so a subterm under a new such binding at every use is inferred again
+//! at every use, and a DAG that does that at every level is not linear.
 //!
 //! **Checking.** [`TypeChecker::check`] pushes the expected type into the term:
 //! through `lam` (parameter and body), the body of `let`, both branches of `if`, and
@@ -106,7 +112,7 @@ const UNIT: Ty = 2;
 /// Longest subterm text put into an error message.
 const MAX_TERM_TEXT: usize = 200;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Head {
     Int,
     Bool,
@@ -161,11 +167,25 @@ struct TooLarge;
 #[derive(Clone, Copy, Debug)]
 struct Binding {
     ty: Ty,
-    /// Whether the type may contain generalised variables (a `let` binding).
+    /// Whether the type contains generalised variables (a `let` binding with
+    /// something to quantify).
     poly: bool,
     /// Unique per push in one walk, so a scope can be recognised (see
-    /// [`MemoKey`]).
+    /// [`Scope::Innermost`]).
     serial: u32,
+    /// For a polymorphic type with no free variables, its [`Canon`] id: the same
+    /// for every binding whose type is the same up to renaming of the quantified
+    /// variables.
+    class: Option<u32>,
+}
+
+/// A node of a type with no free variables, with its quantified variables
+/// numbered in order of first occurrence and its children given as [`Canon`] ids,
+/// so equal types up to renaming get the same id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Canon {
+    Var { index: u32, key: bool },
+    Con(Head, u32, u32),
 }
 
 /// An expected type pushed into a subterm by [`TypeChecker::check`], with the
@@ -228,16 +248,55 @@ enum Frame {
     },
     /// Unify the subterm's type with `want`.
     Check { want: Want, term: TermId },
-    /// After the first inference of a shared subterm in a scope: generalise its
-    /// type, keep it under `key`, and return an instance.
-    Memo { key: MemoKey },
+    /// After the first inference of a shared subterm for its [`Scope`]: generalise
+    /// its type, keep it, and return an instance. The details are on top of
+    /// `TypeChecker::pending`.
+    Memo,
 }
 
-/// A shared subterm and the scope it is inferred in: `None` for a closed subterm,
-/// whose type does not depend on the scope, or else the serial of the innermost
-/// binding in scope. Bindings form a stack, so the same innermost binding means
-/// the very same bindings all the way out.
-type MemoKey = (TermId, Option<u32>);
+/// The most bindings a [`Scope::Slots`] lists. A shared subterm that can see more
+/// is keyed by [`Scope::Innermost`].
+const MAX_SLOTS: usize = 64;
+
+/// What the type of a shared subterm depends on: the bindings its free variables
+/// may refer to.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Scope {
+    /// One entry for each of the subterm's `d` innermost bindings, outermost
+    /// first, where `d` is its free depth (none for a closed subterm).
+    Slots(Vec<Slot>),
+    /// The serial of the innermost binding. Bindings form a stack, so the same
+    /// innermost binding means the very same bindings all the way out.
+    Innermost(u32),
+}
+
+/// A binding as far as the type of a shared subterm that can see it depends on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Slot {
+    /// A monomorphic binding. The subterm is inferred with a fresh variable in
+    /// its place, and the kept type takes that variable as a parameter, so the
+    /// kept type does not depend on the binding.
+    Mono,
+    /// A polymorphic binding with no free variables, by its [`Canon`] id: every
+    /// such binding of that id gives the subterm the same type.
+    Closed(u32),
+    /// Any other polymorphic binding, by its type node, which the kept type may
+    /// share.
+    Poly(Ty),
+}
+
+/// A shared subterm and what its type depends on.
+type MemoKey = (TermId, Scope);
+
+/// A shared subterm being inferred for the memo.
+#[derive(Debug)]
+struct Pending {
+    key: MemoKey,
+    /// The fresh variables standing for its monomorphic bindings, outermost first.
+    params: Vec<Ty>,
+    /// How many bindings were pushed for it, to pop afterwards.
+    pushed: usize,
+}
 
 /// An application `app` = `head a1 ... an`, with the arguments at
 /// `TypeChecker::spine[start..]`.
@@ -282,11 +341,21 @@ pub struct TypeChecker {
     free_depths: FxHashMap<TermId, u32>,
     /// Generalised types of shared subterms already inferred, by scope.
     memo: FxHashMap<MemoKey, Ty>,
+    /// Shared subterms being inferred, innermost last; one per [`Frame::Memo`].
+    pending: Vec<Pending>,
+    /// Ids of the [`Canon`] nodes met in this walk.
+    canon: FxHashMap<Canon, u32>,
     next_serial: u32,
     /// Walks every term as a tree, without reusing shared subterms: the reference
     /// the tests compare the memoised walk with.
     #[cfg(test)]
     pub(super) tree_walk: bool,
+    /// The most steps of the term walk one call may take; more is a panic. Lets
+    /// the tests bound the work without a timer.
+    #[cfg(test)]
+    pub(super) step_limit: Option<u64>,
+    #[cfg(test)]
+    steps: u64,
 }
 
 /// Where a unification happens, for the error message.
@@ -367,14 +436,81 @@ impl TypeChecker {
         self.shared.clear();
         self.free_depths.clear();
         self.memo.clear();
+        self.pending.clear();
+        self.canon.clear();
         self.next_serial = 0;
+        #[cfg(test)]
+        {
+            self.steps = 0;
+        }
     }
 
     /// Pushes a binding for a new innermost variable.
     fn bind_var(&mut self, ty: Ty, poly: bool) {
+        let class = if poly { self.canonical(ty) } else { None };
+        self.bind_class(ty, poly, class);
+    }
+
+    /// Pushes a binding for a new innermost variable whose [`Binding::class`] is
+    /// known.
+    fn bind_class(&mut self, ty: Ty, poly: bool, class: Option<u32>) {
         let serial = self.next_serial;
         self.next_serial = serial.checked_add(1).expect("fewer than 2^32 binders");
-        self.env.push(Binding { ty, poly, serial });
+        self.env.push(Binding {
+            ty,
+            poly,
+            serial,
+            class,
+        });
+    }
+
+    /// The [`Canon`] id of `t`, or `None` if `t` has a variable that is not
+    /// quantified, or a rigid one.
+    fn canonical(&mut self, t: Ty) -> Option<u32> {
+        let mut ids: FxHashMap<Ty, u32> = FxHashMap::default();
+        let mut vars = 0u32;
+        // A constructor is pushed with `false` to be expanded, and again with `true`
+        // once its children are done. Children are popped left to right, so the
+        // variables are numbered in order of first occurrence.
+        let root = self.resolve(t);
+        let mut stack = vec![(root, false)];
+        while let Some((r, children_done)) = stack.pop() {
+            if ids.contains_key(&r) {
+                continue;
+            }
+            let canon = match self.node(r) {
+                Node::Var {
+                    level: GENERIC,
+                    key,
+                } => {
+                    vars += 1;
+                    Canon::Var {
+                        index: vars - 1,
+                        key,
+                    }
+                }
+                Node::Var { .. } | Node::Rigid { .. } | Node::Link(_) => return None,
+                Node::Con(h, a, b) => {
+                    let (a, b) = (self.resolve(a), self.resolve(b));
+                    if !children_done {
+                        stack.push((r, true));
+                        if h.arity() >= 2 {
+                            stack.push((b, false));
+                        }
+                        if h.arity() >= 1 {
+                            stack.push((a, false));
+                        }
+                        continue;
+                    }
+                    let id = |c: Ty, used: bool| if used { ids[&c] } else { 0 };
+                    Canon::Con(h, id(a, h.arity() >= 1), id(b, h.arity() >= 2))
+                }
+            };
+            let next = u32::try_from(self.canon.len()).expect("fewer than 2^32 types");
+            let id = *self.canon.entry(canon).or_insert(next);
+            ids.insert(r, id);
+        }
+        ids.get(&root).copied()
     }
 
     /// Finds the non-leaf subterms of `root` that more than one edge of the DAG
@@ -631,8 +767,10 @@ impl TypeChecker {
 
     // ------------------------------------------------------------ polymorphism
 
-    /// Quantifies the variables of `t` created deeper than the current level.
-    fn generalize(&mut self, t: Ty) {
+    /// Quantifies the variables of `t` created deeper than the current level, and
+    /// says whether `t` then has any quantified variable.
+    fn generalize(&mut self, t: Ty) -> bool {
+        let mut poly = false;
         self.new_walk();
         let mut work = std::mem::take(&mut self.work);
         work.clear();
@@ -644,7 +782,8 @@ impl TypeChecker {
             }
             let n = self.node(r);
             match n {
-                Node::Var { level, key } if level > self.level && level != GENERIC => {
+                Node::Var { level, key } if level > self.level => {
+                    poly = true;
                     self.set(
                         r,
                         Node::Var {
@@ -658,6 +797,7 @@ impl TypeChecker {
             }
         }
         self.work = work;
+        poly
     }
 
     /// A copy of `t` with fresh variables for its quantified ones. Subtrees without
@@ -1017,19 +1157,27 @@ impl TypeChecker {
     /// explicit stack of [`Frame`]s.
     ///
     /// A shared subterm (one the DAG reaches by more than one edge) is inferred
-    /// once per scope, as if it were `let`-bound at that point: the first time, at
-    /// one level deeper, after which its type is generalised and kept; every use,
-    /// the first included, gets a fresh instance. This is sound and complete
-    /// because let-expansion preserves typing in Hindley-Milner: `let x = e in
-    /// C[x, x]` is typable with type τ exactly when `C[e, e]` is, provided `e` is
-    /// typable (Damas and Milner 1982; here there are no side effects, so no value
-    /// restriction). The memo key ([`MemoKey`]) makes sure both uses see the same
-    /// bindings for the free variables of `e`, so the let could be placed at that
-    /// point: closed subterms need no bindings, open ones are reused only under the
-    /// same innermost binding, which means the same scope. The types of those
-    /// bindings may be refined between the uses, but the kept type stays linked to
-    /// them, so it is refined along with them. `Key` flags are kept by
-    /// generalisation and copied by instantiation, as for `let`.
+    /// once per [`Scope`], as if it were `let`-bound at that point: the first
+    /// time, at one level deeper, after which its type is generalised and kept;
+    /// every use, the first included, gets a fresh instance. This is sound and
+    /// complete because let-expansion preserves typing in Hindley-Milner: `let x =
+    /// e in C[x, x]` is typable with type τ exactly when `C[e, e]` is, provided `e`
+    /// is typable (Damas and Milner 1982; here there are no side effects, so no
+    /// value restriction).
+    ///
+    /// The free variables of `e` are what the memo key ([`MemoKey`]) is about.
+    /// A monomorphic one, `y`, is abstracted: `e` is inferred with a fresh
+    /// variable for `y`, and what is kept is the type of `(lam y. e)`, whose
+    /// parameter is unified with the type of `y` at every use. That is the
+    /// expansion `let f = (lam y. e) in C[f y, f y]`, which types the same as
+    /// `C[e, e]` because every occurrence of a monomorphic `y` has the one type.
+    /// A polymorphic one cannot be abstracted (HM has no polymorphic parameters),
+    /// so the key holds it: two bindings whose types have no free variables and
+    /// are the same up to renaming give `e` the same type, and any other is kept
+    /// by its type node, whose free variables the kept type then shares, as a
+    /// `let` would. Bindings refined between uses refine the kept type with them.
+    /// `Key` flags are kept by generalisation and copied by instantiation, as for
+    /// `let`.
     ///
     /// A shared subterm is inferred without the expected type of its position;
     /// the type is checked against it afterwards. So in [`TypeChecker::check`] a
@@ -1050,6 +1198,16 @@ impl TypeChecker {
         }
         let mut step = Step::Eval(root, want);
         loop {
+            #[cfg(test)]
+            {
+                self.steps += 1;
+                if let Some(limit) = self.step_limit {
+                    assert!(
+                        self.steps <= limit,
+                        "the term walk took more than {limit} steps"
+                    );
+                }
+            }
             step = match step {
                 Step::Eval(id, want) => {
                     if self.shared.contains(&id) {
@@ -1067,8 +1225,8 @@ impl TypeChecker {
         }
     }
 
-    /// Starts on shared subterm `id`: reuses its kept type in this scope, or infers
-    /// it afresh (see [`TypeChecker::walk`]).
+    /// Starts on shared subterm `id`: reuses its kept type for this [`Scope`], or
+    /// infers it afresh (see [`TypeChecker::walk`]).
     fn shared_subterm(
         &mut self,
         arena: &Arena,
@@ -1078,14 +1236,30 @@ impl TypeChecker {
         if !self.free_depths.contains_key(&id) {
             arena.free_depths(id, &mut self.free_depths);
         }
-        let scope = if self.free_depths[&id] == 0 {
-            None
+        let depth = self.free_depths[&id] as usize;
+        let len = self.env.len();
+        if depth > len {
+            // A free variable is unbound: walk it as a tree to report it.
+            return self.descend_unshared(id, want);
+        }
+        let scope = if depth > MAX_SLOTS {
+            Scope::Innermost(self.env[len - 1].serial)
         } else {
-            self.env.last().map(|b| b.serial)
+            let mut slots = Vec::with_capacity(depth);
+            for i in len - depth..len {
+                let b = self.env[i];
+                slots.push(match (b.poly, b.class) {
+                    (false, _) => Slot::Mono,
+                    (true, Some(c)) => Slot::Closed(c),
+                    (true, None) => Slot::Poly(self.resolve(b.ty)),
+                });
+            }
+            Scope::Slots(slots)
         };
         let key = (id, scope);
         if let Some(&kept) = self.memo.get(&key) {
             let t = self.instantiate(kept);
+            let t = self.apply_scope(arena, id, &key.1, t)?;
             if let Some(w) = want {
                 self.expect(arena, w.ty, t, Site::new(id, w.context))?;
             }
@@ -1095,8 +1269,67 @@ impl TypeChecker {
             self.frames.push(Frame::Check { want: w, term: id });
         }
         self.level += 1;
-        self.frames.push(Frame::Memo { key });
+        let mut params = Vec::new();
+        let mut pushed = 0;
+        if let Scope::Slots(slots) = &key.1 {
+            for (i, slot) in slots.iter().enumerate() {
+                let b = self.env[len - depth + i];
+                if *slot == Slot::Mono {
+                    let p = self.fresh();
+                    params.push(p);
+                    self.bind_var(p, false);
+                } else {
+                    self.bind_class(b.ty, b.poly, b.class);
+                }
+                pushed += 1;
+            }
+        }
+        self.pending.push(Pending {
+            key,
+            params,
+            pushed,
+        });
+        self.frames.push(Frame::Memo);
         Ok(Step::EvalShared(id))
+    }
+
+    /// Walks shared subterm `id` without the memo, checking it against `want`.
+    fn descend_unshared(&mut self, id: TermId, want: Option<Want>) -> Result<Step, TypeError> {
+        if let Some(w) = want {
+            self.frames.push(Frame::Check { want: w, term: id });
+        }
+        Ok(Step::EvalShared(id))
+    }
+
+    /// Takes instance `t` of the kept type of shared subterm `id` and, for each
+    /// monomorphic binding in `scope`, unifies the binding's type with the
+    /// parameter that stands for it; returns the type of the subterm.
+    fn apply_scope(
+        &mut self,
+        arena: &Arena,
+        id: TermId,
+        scope: &Scope,
+        mut t: Ty,
+    ) -> Result<Ty, TypeError> {
+        let Scope::Slots(slots) = scope else {
+            return Ok(t);
+        };
+        let first = self.env.len() - slots.len();
+        for (i, slot) in slots.iter().enumerate() {
+            if *slot != Slot::Mono {
+                continue;
+            }
+            let r = self.resolve(t);
+            let Node::Con(Head::Arrow, param, rest) = self.node(r) else {
+                unreachable!("a kept type has one parameter per monomorphic binding");
+            };
+            let bound = self.env[first + i].ty;
+            let ctx = "this shared subterm, which uses a variable at a type that does not \
+                       fit its binder";
+            self.expect(arena, bound, param, Site::new(id, ctx))?;
+            t = rest;
+        }
+        Ok(t)
     }
 
     /// Starts on subterm `id`: either its type is known at once, or frames are
@@ -1214,8 +1447,11 @@ impl TypeChecker {
             }
             Frame::LetBound { body, want } => {
                 self.level -= 1;
-                self.generalize(t);
-                self.bind_var(t, true);
+                // A let whose type has nothing to quantify binds a monomorphic
+                // variable, so shared subterms that use it can be reused (see
+                // [`Scope`]).
+                let poly = self.generalize(t);
+                self.bind_var(t, poly);
                 self.frames.push(Frame::LetBody);
                 let ctx = "the body of `let` (its type is fixed by the expected type)";
                 Step::Eval(body, want.map(|w| Want::at(w.ty, ctx)))
@@ -1273,11 +1509,23 @@ impl TypeChecker {
                 self.expect(arena, want.ty, t, Site::new(term, want.context))?;
                 Step::Return(t)
             }
-            Frame::Memo { key } => {
+            Frame::Memo => {
+                let Pending {
+                    key,
+                    params,
+                    pushed,
+                } = self
+                    .pending
+                    .pop()
+                    .expect("a pending shared subterm per memo frame");
+                self.env.truncate(self.env.len() - pushed);
                 self.level -= 1;
-                self.generalize(t);
-                self.memo.insert(key, t);
-                Step::Return(self.instantiate(t))
+                let kept = self.fun(&params, t);
+                self.generalize(kept);
+                let t = self.instantiate(kept);
+                let t = self.apply_scope(arena, key.0, &key.1, t)?;
+                self.memo.insert(key, kept);
+                Step::Return(t)
             }
             Frame::AppHead { sp, want } => {
                 let pending = match want {
