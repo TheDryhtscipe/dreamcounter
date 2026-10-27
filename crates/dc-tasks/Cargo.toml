@@ -1,0 +1,16 @@
+[package]
+name = "dc-tasks"
+description = "dc task families: generators, oracles, and growth estimation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+dc-core.workspace = true
+dc-eval.workspace = true
+
+[lints]
+workspace = true

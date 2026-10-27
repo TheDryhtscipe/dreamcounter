@@ -1,0 +1,15 @@
+[package]
+name = "dc-core"
+description = "dc core: term arena with hash-consing, types, and type inference"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+
+
+[lints]
+workspace = true

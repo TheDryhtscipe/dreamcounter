@@ -1,0 +1,17 @@
+[package]
+name = "dc-bench"
+description = "dc throughput benchmark"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+dc-core.workspace = true
+dc-eval.workspace = true
+dc-surface.workspace = true
+
+[lints]
+workspace = true
