@@ -185,3 +185,86 @@ proptest! {
         prop_assert_eq!(o.steps(), 1 + 6 * k);
     }
 }
+
+// ---------------------------------------------------------------- tree_fold laws
+
+/// A combiner that is not symmetric in its subtrees and uses the value:
+/// f l x r = 3l + x - 2r. One call costs β 3 + mul 1 + add 1 + mul 1 + sub 1 = 7.
+const SKEW: &str = "(lam (lam (lam (sub (add (mul $2 3) $1) (mul 2 $0)))))";
+
+/// `fun t -> tree_fold 0 SKEW t`.
+fn fold_skew() -> String {
+    format!("(lam (tree_fold 0 {SKEW} $0))")
+}
+
+fn host_skew(t: &Tree) -> i64 {
+    match &t.0 {
+        None => 0,
+        Some(n) => 3 * host_skew(&n.left) + n.value.as_int().unwrap() - 2 * host_skew(&n.right),
+    }
+}
+
+#[test]
+fn tree_fold_of_leaf_is_the_initial_value_without_calling_f() {
+    // f divides by zero, so any call of it would be an error.
+    let boom = "(lam (lam (lam (div 1 0))))";
+    // β 1 + leaf 1 = 2; tree_fold on a leaf charges nothing and calls nothing.
+    assert_value_on(
+        &format!("(lam (tree_fold $0 {boom} leaf))"),
+        &[int(42)],
+        int(42),
+        2,
+    );
+    // One node: the call happens and fails after β 1 + leaf 2 + node 1 + iteration 1
+    // + β 3 + div 1.
+    assert_error_on(
+        &format!("(lam (tree_fold $0 {boom} (node leaf 1 leaf)))"),
+        &[int(42)],
+        dc_eval::ErrorKind::DivisionByZero,
+        9,
+    );
+}
+
+proptest! {
+    #[test]
+    fn tree_fold_node_law(l in arb_tree(), x in -100i64..100, r in arb_tree()) {
+        // tree_fold z f (node l x r) = f (tree_fold z f l) x (tree_fold z f r).
+        let whole = Tree::node(l.clone(), int(x), r.clone());
+        let lhs = run_on(&fold_skew(), &[Value::Tree(whole.clone())]);
+        let rhs_src = format!(
+            "(lam (lam (lam ({SKEW} (tree_fold 0 {SKEW} $2) $1 (tree_fold 0 {SKEW} $0)))))"
+        );
+        let rhs = run_on(&rhs_src, &[Value::Tree(l.clone()), int(x), Value::Tree(r.clone())]);
+        prop_assert_eq!(lhs.value().cloned(), rhs.value().cloned());
+        prop_assert_eq!(lhs.value().cloned(), Some(int(host_skew(&whole))));
+
+        // Cost is additive over the node: the two subtree folds (less their outer β),
+        // plus one iteration and one call of f for the root, plus the outer β.
+        let sl = value_steps(&run_on(&fold_skew(), &[Value::Tree(l)]));
+        let sr = value_steps(&run_on(&fold_skew(), &[Value::Tree(r)]));
+        prop_assert_eq!(value_steps(&lhs), (sl - 1) + (sr - 1) + (1 + 7) + 1);
+        // And so linear in the internal nodes: β 1 + 8 per node.
+        prop_assert_eq!(value_steps(&lhs), 1 + 8 * whole.size());
+    }
+
+    #[test]
+    fn tree_fold_with_node_is_the_identity(t in arb_tree()) {
+        // tree_fold leaf node t = t. β 1 + leaf 1 + per node: 1 + β 3 + node 1.
+        let p = "(lam (tree_fold leaf (lam (lam (lam (node $2 $1 $0)))) $0))";
+        let k = t.size();
+        let o = run_on(p, &[Value::Tree(t.clone())]);
+        prop_assert_eq!(o.value().cloned(), Some(Value::Tree(t)));
+        prop_assert_eq!(o.steps(), 2 + 5 * k);
+    }
+
+    #[test]
+    fn tree_case_then_fold_agrees_with_fold(t in arb_tree()) {
+        // Unfolding one level by tree_case and folding the subtrees gives the fold.
+        let one_level = format!(
+            "(lam (tree_case $0 (lam 0) (lam (lam (lam ({SKEW} (tree_fold 0 {SKEW} $2) $1 (tree_fold 0 {SKEW} $0)))))))"
+        );
+        let a = run_on(&fold_skew(), &[Value::Tree(t.clone())]);
+        let b = run_on(&one_level, &[Value::Tree(t)]);
+        prop_assert_eq!(a.value().cloned(), b.value().cloned());
+    }
+}

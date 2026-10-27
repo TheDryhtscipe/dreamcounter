@@ -307,6 +307,60 @@ fn bfix_list_length() {
 }
 
 #[test]
+fn tree_programs_get_principal_types() {
+    // tree_fold sum: the element type is fixed to Int by add.
+    assert_infers(
+        "(lam (tree_fold 0 (lam (lam (lam (add (add $2 $1) $0)))) $0))",
+        "Tree Int -> Int",
+    );
+    // tree_fold size: the element type stays free.
+    assert_infers(
+        "(lam (tree_fold 0 (lam (lam (lam (add (add $2 1) $0)))) $0))",
+        "Tree a -> Int",
+    );
+    // tree_fold with node as the combiner rebuilds a tree of the same type.
+    assert_infers(
+        "(lam (tree_fold leaf (lam (lam (lam (node $2 $1 $0)))) $0))",
+        "Tree a -> Tree a",
+    );
+    // tree_case: the node branch receives left subtree, value, right subtree.
+    assert_infers(
+        "(lam (lam (tree_case $0 (lam $2) (lam (lam (lam $1))))))",
+        "a -> Tree a -> a",
+    );
+    assert_infers(
+        "(lam (tree_case $0 (lam leaf) (lam (lam (lam $2)))))",
+        "Tree a -> Tree a",
+    );
+    // Recursion over a tree through bfix: the height.
+    assert_infers(
+        "(lam (bfix 64 (lam (lam (tree_case $0 (lam 0) (lam (lam (lam (add 1 (add ($4 $2) ($4 $0))))))))) $0))",
+        "Tree a -> Int",
+    );
+    assert_infers("(node leaf (pair 1 true) leaf)", "Tree (Int, Bool)");
+}
+
+#[test]
+fn tree_element_types_must_agree() {
+    // A node whose subtree holds a different element type.
+    let e = expect_err("(node leaf 1 (node leaf true leaf))");
+    assert!(matches!(*e.kind, TypeErrorKind::Mismatch { .. }), "{e}");
+    // tree_case branches must return the same type.
+    let e = expect_err("(tree_case leaf (lam 0) (lam (lam (lam true))))");
+    assert!(matches!(*e.kind, TypeErrorKind::Mismatch { .. }), "{e}");
+    // A tree is not a list.
+    let e = expect_err("(length (node leaf 1 leaf))");
+    assert!(matches!(*e.kind, TypeErrorKind::Mismatch { .. }), "{e}");
+    // tree_fold passes the element as the combiner's middle argument.
+    assert_infers(
+        "(tree_fold 0 (lam (lam (lam (add $2 $0)))) (node leaf true leaf))",
+        "Int",
+    );
+    let e = expect_err("(tree_fold 0 (lam (lam (lam (add $1 $0)))) (node leaf true leaf))");
+    assert!(matches!(*e.kind, TypeErrorKind::Mismatch { .. }), "{e}");
+}
+
+#[test]
 fn memorec_fib() {
     assert_infers(
         "(lam (memorec (add $0 1) (lam (lam (if (lt $0 2) $0 (add ($1 (sub $0 1)) ($1 (sub $0 2)))))) $0))",

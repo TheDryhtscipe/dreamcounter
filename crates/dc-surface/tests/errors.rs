@@ -164,6 +164,36 @@ fn match_must_cover_both_cases() {
 }
 
 #[test]
+fn tree_patterns_are_checked() {
+    // Both tree cases must be covered.
+    let e = expr_error("match Leaf with Leaf -> 0");
+    assert_eq!(e.kind, ErrorKind::Pattern);
+    assert_mentions(&e, &["Node (l, x, r)"]);
+    let e = expr_error("match Leaf with Node (l, x, r) -> x");
+    assert_eq!(e.kind, ErrorKind::Pattern);
+    assert_mentions(&e, &["Leaf"]);
+    // A Node pattern has exactly three fields.
+    let e = expr_error("match Leaf with Leaf -> 0 | Node (l, r) -> 1");
+    assert_mentions(&e, &["three fields"]);
+    // Leaf has no fields.
+    let e = expr_error("match Leaf with Leaf x -> 0 | Node (l, x, r) -> 1");
+    assert_eq!(e.kind, ErrorKind::Pattern);
+    // Patterns are one level deep, inside Node too.
+    let e = expr_error("match Leaf with Leaf -> 0 | Node (Leaf, x, r) -> x");
+    assert_eq!(e.kind, ErrorKind::NestedPattern);
+    assert_mentions(&e, &["one level deep"]);
+    // Tree and list constructors do not mix in one match.
+    let e = expr_error("match Leaf with Leaf -> 0 | h :: t -> 1");
+    assert_eq!(e.kind, ErrorKind::Pattern);
+}
+
+#[test]
+fn node_expression_takes_three_fields() {
+    let e = expr_error("Node (Leaf, 1)");
+    assert_mentions(&e, &["three fields"]);
+}
+
+#[test]
 fn unparenthesised_inner_match_is_explained() {
     // The inner match takes the '| [] -> 0' arm, so the outer one lacks '[]'.
     let e = expr_error("match [] with x :: t -> match t with [] -> 1 | _ -> 2 | [] -> 0");
