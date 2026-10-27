@@ -5,6 +5,8 @@ use crate::prim::Prim;
 use crate::sexpr;
 use crate::term::Term;
 
+mod types;
+
 fn parse(arena: &mut Arena, src: &str) -> TermId {
     sexpr::parse(arena, src).unwrap_or_else(|e| panic!("{src}: {e}"))
 }
