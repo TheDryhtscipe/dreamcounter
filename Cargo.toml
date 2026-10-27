@@ -10,6 +10,9 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/TheDryhtscipe/dreamcounter"
 
 [workspace.dependencies]
+rustc-hash = "2.1"
+proptest = "1.12"
+imbl = "7.0"
 dc-core = { path = "crates/dc-core" }
 dc-surface = { path = "crates/dc-surface" }
 dc-eval = { path = "crates/dc-eval" }

@@ -1,0 +1,283 @@
+//! Core terms in a hash-consed arena (spec §3).
+//!
+//! Terms use de Bruijn indices: `Var(0)` is the nearest enclosing binder. `Lam` and
+//! `Let` bind one variable each (`Let` binds index 0 in its body). Each distinct
+//! node is stored once, so two structurally equal terms built in the same arena get
+//! the same [`TermId`], and comparing terms is comparing ids.
+
+use rustc_hash::FxHashMap;
+
+use crate::prim::Prim;
+
+/// Index of a term in an [`Arena`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TermId(u32);
+
+impl TermId {
+    /// The raw index, for use as a table key.
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Index of a library abstraction (spec §8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LibId(pub u32);
+
+/// One core term node. Children are [`TermId`]s in the same arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Term {
+    /// De Bruijn variable.
+    Var(u32),
+    /// Lambda abstraction binding index 0 in its body.
+    Lam(TermId),
+    /// Application of a function to one argument.
+    App(TermId, TermId),
+    /// `Let(bound, body)`: evaluates `bound`, then `body` with it at index 0.
+    Let(TermId, TermId),
+    /// Integer literal.
+    Int(i64),
+    /// Boolean literal.
+    Bool(bool),
+    /// The unit value.
+    Unit,
+    /// A primitive or combinator.
+    Prim(Prim),
+    /// A reference to a library abstraction.
+    Lib(LibId),
+    /// `If(cond, then, else)`: lazy in both branches.
+    If(TermId, TermId, TermId),
+    /// Short-circuit conjunction.
+    And(TermId, TermId),
+    /// Short-circuit disjunction.
+    Or(TermId, TermId),
+}
+
+/// A hash-consing store of terms.
+#[derive(Debug, Default, Clone)]
+pub struct Arena {
+    nodes: Vec<Term>,
+    index: FxHashMap<Term, TermId>,
+}
+
+impl Arena {
+    /// An empty arena.
+    pub fn new() -> Arena {
+        Arena::default()
+    }
+
+    /// Returns the id of `term`, adding it if it is new.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a child id is not in this arena, or if the arena holds 2³² terms.
+    pub fn intern(&mut self, term: Term) -> TermId {
+        if let Some(&id) = self.index.get(&term) {
+            return id;
+        }
+        for child in children(&term) {
+            assert!(
+                child.index() < self.nodes.len(),
+                "child {child:?} is not in this arena"
+            );
+        }
+        let id = TermId(u32::try_from(self.nodes.len()).expect("arena is full"));
+        self.nodes.push(term);
+        self.index.insert(term, id);
+        id
+    }
+
+    /// The node stored at `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is not in this arena.
+    pub fn get(&self, id: TermId) -> Term {
+        self.nodes[id.index()]
+    }
+
+    /// The number of distinct nodes stored.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Whether the arena holds no terms.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// `Var(i)`.
+    pub fn var(&mut self, i: u32) -> TermId {
+        self.intern(Term::Var(i))
+    }
+
+    /// `Lam(body)`.
+    pub fn lam(&mut self, body: TermId) -> TermId {
+        self.intern(Term::Lam(body))
+    }
+
+    /// `App(f, a)`.
+    pub fn app(&mut self, f: TermId, a: TermId) -> TermId {
+        self.intern(Term::App(f, a))
+    }
+
+    /// `f a0 a1 ...`, applied left to right.
+    pub fn apps(&mut self, f: TermId, args: &[TermId]) -> TermId {
+        args.iter().fold(f, |acc, &a| self.app(acc, a))
+    }
+
+    /// `Let(bound, body)`.
+    pub fn let_(&mut self, bound: TermId, body: TermId) -> TermId {
+        self.intern(Term::Let(bound, body))
+    }
+
+    /// Integer literal.
+    pub fn int(&mut self, n: i64) -> TermId {
+        self.intern(Term::Int(n))
+    }
+
+    /// Boolean literal.
+    pub fn bool(&mut self, b: bool) -> TermId {
+        self.intern(Term::Bool(b))
+    }
+
+    /// The unit literal.
+    pub fn unit(&mut self) -> TermId {
+        self.intern(Term::Unit)
+    }
+
+    /// A primitive.
+    pub fn prim(&mut self, p: Prim) -> TermId {
+        self.intern(Term::Prim(p))
+    }
+
+    /// A library reference.
+    pub fn lib(&mut self, l: LibId) -> TermId {
+        self.intern(Term::Lib(l))
+    }
+
+    /// `If(c, t, e)`.
+    pub fn if_(&mut self, c: TermId, t: TermId, e: TermId) -> TermId {
+        self.intern(Term::If(c, t, e))
+    }
+
+    /// `And(a, b)`.
+    pub fn and(&mut self, a: TermId, b: TermId) -> TermId {
+        self.intern(Term::And(a, b))
+    }
+
+    /// `Or(a, b)`.
+    pub fn or(&mut self, a: TermId, b: TermId) -> TermId {
+        self.intern(Term::Or(a, b))
+    }
+
+    /// The number of binders a context must supply for `id` to be closed: one more
+    /// than the largest free de Bruijn index, or 0 for a closed term.
+    pub fn free_depth(&self, id: TermId) -> u32 {
+        let mut memo = FxHashMap::default();
+        self.free_depth_memo(id, &mut memo)
+    }
+
+    fn free_depth_memo(&self, id: TermId, memo: &mut FxHashMap<TermId, u32>) -> u32 {
+        if let Some(&d) = memo.get(&id) {
+            return d;
+        }
+        let d = match self.get(id) {
+            Term::Var(i) => i + 1,
+            Term::Lam(b) => self.free_depth_memo(b, memo).saturating_sub(1),
+            Term::Let(x, b) => self
+                .free_depth_memo(x, memo)
+                .max(self.free_depth_memo(b, memo).saturating_sub(1)),
+            t => children(&t)
+                .into_iter()
+                .map(|c| self.free_depth_memo(c, memo))
+                .max()
+                .unwrap_or(0),
+        };
+        memo.insert(id, d);
+        d
+    }
+
+    /// Whether `id` has no free variables.
+    pub fn is_closed(&self, id: TermId) -> bool {
+        self.free_depth(id) == 0
+    }
+}
+
+/// The direct children of a node, in left-to-right order.
+pub fn children(term: &Term) -> Vec<TermId> {
+    match *term {
+        Term::Var(_) | Term::Int(_) | Term::Bool(_) | Term::Unit | Term::Prim(_) | Term::Lib(_) => {
+            vec![]
+        }
+        Term::Lam(b) => vec![b],
+        Term::App(a, b) | Term::Let(a, b) | Term::And(a, b) | Term::Or(a, b) => vec![a, b],
+        Term::If(a, b, c) => vec![a, b, c],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equal_structures_share_an_id() {
+        let mut a = Arena::new();
+        let x = a.var(0);
+        let one = a.int(1);
+        let add = a.prim(Prim::Add);
+        let body1 = a.apps(add, &[x, one]);
+        let f1 = a.lam(body1);
+        let before = a.len();
+        let x2 = a.var(0);
+        let one2 = a.int(1);
+        let add2 = a.prim(Prim::Add);
+        let body2 = a.apps(add2, &[x2, one2]);
+        let f2 = a.lam(body2);
+        assert_eq!(f1, f2);
+        assert_eq!(a.len(), before, "rebuilding an existing term added nodes");
+    }
+
+    #[test]
+    fn different_structures_get_different_ids() {
+        let mut a = Arena::new();
+        let v0 = a.var(0);
+        let v1 = a.var(1);
+        assert_ne!(a.lam(v0), a.lam(v1));
+        let t = a.bool(true);
+        let one = a.int(1);
+        assert_ne!(t, one);
+        let x = a.int(0);
+        assert_ne!(a.app(x, one), a.app(one, x));
+    }
+
+    #[test]
+    fn free_depth_counts_binders() {
+        let mut a = Arena::new();
+        let v0 = a.var(0);
+        let v2 = a.var(2);
+        let id = a.lam(v0);
+        assert!(a.is_closed(id));
+        assert_eq!(a.free_depth(v2), 3);
+        let l = a.lam(v2);
+        assert_eq!(a.free_depth(l), 2);
+        // let binds index 0 in the body only, not in the bound expression.
+        let one = a.int(1);
+        let let_ok = a.let_(one, v0);
+        assert!(a.is_closed(let_ok));
+        let let_free = a.let_(v0, v0);
+        assert_eq!(a.free_depth(let_free), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not in this arena")]
+    fn foreign_child_ids_are_rejected() {
+        let mut big = Arena::new();
+        for i in 0..10 {
+            big.int(i);
+        }
+        let foreign = big.int(9);
+        let mut small = Arena::new();
+        small.lam(foreign);
+    }
+}
