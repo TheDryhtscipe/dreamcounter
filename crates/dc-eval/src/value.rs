@@ -72,10 +72,10 @@ pub enum Fun {
     },
     /// The recursive argument `self` passed by `memorec`.
     MemoSelf {
-        /// The memo table shared by every call in one outermost `memorec`. A
-        /// machine frame owns the table until that call returns; `self` only
-        /// refers to it, so a `self` that escapes cannot keep the table alive
-        /// through a cycle (table, entry, `self`, table). See [`crate::cost`].
+        /// The memo table shared by every call in one `memorec`. The machine owns
+        /// the table until the evaluation ends; `self` only refers to it, so a
+        /// `self` stored in the table cannot keep it alive through a cycle (table,
+        /// entry, `self`, table) after that. See [`crate::cost`].
         table: Weak<RefCell<MemoTable>>,
         /// The functional `F`.
         f: Value,
@@ -137,10 +137,24 @@ impl MemoKey {
     /// distinct pairs).
     pub(crate) fn build_within(v: &Value, limit: u64) -> KeyBuild {
         let mut atoms = Vec::new();
+        let built = MemoKey::fill_within(v, limit, &mut atoms);
+        #[cfg(test)]
+        KEY_ATOMS_BUILT.with(|n| n.set(n.get() + atoms.len() as u64));
+        match built {
+            Some(true) => KeyBuild::Key(MemoKey(atoms)),
+            Some(false) => KeyBuild::OverLimit,
+            None => KeyBuild::Invalid,
+        }
+    }
+
+    /// Pushes the pre-order atoms of `v` to `atoms`. Returns `Some(true)` for a
+    /// complete key, `Some(false)` when it has more than `limit` nodes and `None`
+    /// for an invalid key.
+    fn fill_within(v: &Value, limit: u64, atoms: &mut Vec<KeyAtom>) -> Option<bool> {
         let mut work = vec![v];
         while let Some(v) = work.pop() {
             if atoms.len() as u64 >= limit {
-                return KeyBuild::OverLimit;
+                return Some(false);
             }
             match v {
                 Value::Int(n) => atoms.push(KeyAtom::Int(*n)),
@@ -151,10 +165,10 @@ impl MemoKey {
                     work.push(&p.1);
                     work.push(&p.0);
                 }
-                _ => return KeyBuild::Invalid,
+                _ => return None,
             }
         }
-        KeyBuild::Key(MemoKey(atoms))
+        Some(true)
     }
 
     /// The key size of `v` in value nodes (saturating), or `None` if `v` is not a
@@ -296,13 +310,24 @@ impl Drop for Env {
 pub struct List(pub Option<Rc<Cons>>);
 
 /// A cons cell with the cached length of the list it heads.
+///
+/// Only [`List::cons`] builds a cell, so the cached length is always right: the
+/// cost of `length`, `array_of_list` and `eq` depends on it.
+///
+/// ```compile_fail,E0451
+/// use dc_eval::value::{Cons, List};
+/// use dc_eval::Value;
+/// use std::rc::Rc;
+/// let wrong = List(Some(Rc::new(Cons { head: Value::Unit, tail: List::nil(), len: 5 })));
+/// ```
 pub struct Cons {
     /// The first element.
     pub head: Value,
     /// The rest of the list.
     pub tail: List,
-    /// The length of this list (at least 1).
-    pub len: u64,
+    /// The length of this list (at least 1). Private, so no cell outside this
+    /// module can carry a wrong one.
+    len: u64,
 }
 
 impl List {
@@ -502,6 +527,13 @@ fn detach_env(env: &mut Env, out: &mut Vec<Value>) {
             Err(_) => break,
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Key atoms built on this thread, so tests can check that an over-limit key
+    /// is never built.
+    pub(crate) static KEY_ATOMS_BUILT: Cell<u64> = const { Cell::new(0) };
 }
 
 thread_local! {

@@ -75,8 +75,10 @@ pub enum ErrorKind {
     EqOnFunction,
     /// A `memorec` key that is not built from `Int`, `Bool`, `Unit` and pairs.
     InvalidMemoKey,
-    /// A `memorec` `self` was called after its outermost `memorec` call returned
-    /// and dropped the memo table. Charged 0 steps.
+    /// A `memorec` `self` was called after the evaluation that created it ended
+    /// and dropped its memo table. Charged 0 steps. Unreachable from inside one
+    /// evaluation: only host code that passes a value returned by one evaluation
+    /// into another can raise it.
     MemoSelfEscaped,
     /// The machine cannot continue. Only reachable for ill-typed or unexpanded terms.
     Stuck(Stuck),
@@ -209,9 +211,6 @@ enum Frame {
         table: Rc<RefCell<MemoTable>>,
         key: MemoKey,
     },
-    /// The outermost call of one `memorec` is done. This frame owns the memo table
-    /// and drops it on return (spec §6); every `self` holds only a weak reference.
-    MemoScope { table: Rc<RefCell<MemoTable>> },
 }
 
 struct Machine<'a> {
@@ -219,7 +218,18 @@ struct Machine<'a> {
     stack: Vec<Frame>,
     steps: u64,
     fuel: u64,
+    /// Every memo table this evaluation created. The machine owns them until the
+    /// evaluation ends; a `memorec` `self` holds only a weak reference, so a `self`
+    /// stored in its own table cannot keep the table alive through a reference
+    /// cycle once the machine is dropped. See [`crate::cost`].
+    memo_tables: Vec<Rc<RefCell<MemoTable>>>,
+    /// The number of tables at which [`Machine::adopt_table`] next releases the
+    /// tables nothing can reach any more.
+    memo_prune_at: usize,
 }
+
+/// The fewest tables at which [`Machine::adopt_table`] looks for unreachable ones.
+const MEMO_PRUNE_MIN: usize = 64;
 
 impl<'a> Machine<'a> {
     fn new(arena: &'a Arena, fuel: u64) -> Machine<'a> {
@@ -228,6 +238,8 @@ impl<'a> Machine<'a> {
             stack: Vec::new(),
             steps: 0,
             fuel,
+            memo_tables: Vec::new(),
+            memo_prune_at: MEMO_PRUNE_MIN,
         }
     }
 
@@ -400,10 +412,6 @@ impl<'a> Machine<'a> {
                 table.borrow_mut().entries.insert(key, v.clone());
                 Ok(Control::Return(v))
             }
-            Frame::MemoScope { table } => {
-                drop(table);
-                Ok(Control::Return(v))
-            }
         }
     }
 
@@ -562,9 +570,7 @@ impl<'a> Machine<'a> {
                     entries: Default::default(),
                     misses_left: *n,
                 }));
-                self.stack.push(Frame::MemoScope {
-                    table: table.clone(),
-                });
+                self.adopt_table(table.clone());
                 self.memo_call(&table, f, x.clone())
             }
             _ => Err(bad(p)),
@@ -700,29 +706,50 @@ impl<'a> Machine<'a> {
         call(f, this)
     }
 
+    /// Keeps `table` alive until the evaluation ends.
+    ///
+    /// A table that no `self` and no frame refers to can never be read again, so
+    /// releasing it changes nothing a program can observe. Such tables are
+    /// released whenever the count doubles, so a loop of short `memorec` calls
+    /// holds only the tables still reachable, at amortised O(1) work per table.
+    fn adopt_table(&mut self, table: Rc<RefCell<MemoTable>>) {
+        if self.memo_tables.len() >= self.memo_prune_at {
+            // Strong references: this vector, plus any `MemoStore` frame. Weak
+            // references: every `self` of this table that is still alive.
+            self.memo_tables
+                .retain(|t| Rc::strong_count(t) > 1 || Rc::weak_count(t) > 0);
+            self.memo_prune_at = (2 * self.memo_tables.len()).max(MEMO_PRUNE_MIN);
+        }
+        self.memo_tables.push(table);
+    }
+
     /// One memo call on `x`: a hit returns the stored result, a miss evaluates
     /// `f self x` and stores the result.
     fn memo_call(&mut self, table: &Rc<RefCell<MemoTable>>, f: &Value, x: Value) -> Step {
         // A key of k nodes is charged 1 + k, so a key with more nodes than the fuel
-        // left is never built: the call can only time out, unless it is a miss with
-        // no misses left, which raises FuelExhausted without charging.
-        let key = match MemoKey::build_within(&x, self.fuel_left()) {
+        // left is sized but never built: the call can only time out, unless it is
+        // a miss with no misses left, which raises FuelExhausted without charging.
+        // Sizing first keeps the memory of a call in proportion to its key, not to
+        // the fuel left.
+        let size = MemoKey::size_of(&x).ok_or(error(ErrorKind::InvalidMemoKey))?;
+        if size > self.fuel_left() {
+            let t = table.borrow();
+            let hit = t.entries.keys().any(|k| k.size() == size && k.matches(&x));
+            if t.misses_left <= 0 && !hit {
+                return Err(error(ErrorKind::FuelExhausted));
+            }
+            drop(t);
+            self.charge(cost::memo_call(size))?;
+            // Not reached: the charge is above the fuel left.
+            return Err(Halt::Timeout);
+        }
+        let key = match MemoKey::build_within(&x, size) {
             KeyBuild::Key(key) => key,
-            KeyBuild::Invalid => return Err(error(ErrorKind::InvalidMemoKey)),
-            KeyBuild::OverLimit => {
-                let size = MemoKey::size_of(&x).ok_or(error(ErrorKind::InvalidMemoKey))?;
-                let t = table.borrow();
-                let hit = || t.entries.keys().any(|k| k.size() == size && k.matches(&x));
-                if t.misses_left <= 0 && !hit() {
-                    return Err(error(ErrorKind::FuelExhausted));
-                }
-                drop(t);
-                self.charge(cost::memo_call(size))?;
-                // Not reached: the charge is above the fuel left.
-                MemoKey::from_value(&x).ok_or(error(ErrorKind::InvalidMemoKey))?
+            // Not reached: `size_of` accepted the key and measured `size` nodes.
+            KeyBuild::Invalid | KeyBuild::OverLimit => {
+                return Err(error(ErrorKind::InvalidMemoKey))
             }
         };
-        let size = key.size();
         let hit = table.borrow().entries.get(&key).cloned();
         if let Some(v) = hit {
             self.charge(cost::memo_call(size))?;
@@ -757,4 +784,66 @@ fn index(a: &imbl::Vector<Value>, i: i64) -> Option<usize> {
 fn len_to_int(n: u64) -> i64 {
     // A list or array of 2⁶³ elements cannot exist in memory.
     i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::KEY_ATOMS_BUILT;
+    use dc_core::sexpr;
+    use std::cell::Cell;
+
+    /// Runs the closed term `src` and returns the outcome and the number of memo
+    /// tables the machine still holds at the end.
+    fn run_machine(arena: &mut Arena, src: &str, fuel: u64) -> (Outcome, usize) {
+        let t = sexpr::parse(arena, src).expect("parse");
+        let mut m = Machine::new(arena, fuel);
+        let o = m.run(Control::Eval(t, Env::empty()));
+        (o, m.memo_tables.len())
+    }
+
+    #[test]
+    fn an_over_limit_memo_key_is_sized_without_being_built() {
+        // A key of 2^41 - 1 nodes built in 40 × (1 + β 2 + pair 1) = 160 steps, with
+        // a million steps of fuel. The call times out at 160 + 2^41 without
+        // building any of the key.
+        let mut arena = Arena::new();
+        KEY_ATOMS_BUILT.with(|n| n.set(0));
+        let p = "(memorec 1 (lam (lam 0)) (loop 40 0 (lam (lam (pair $0 $0)))))";
+        let (o, _) = run_machine(&mut arena, p, 1_000_000);
+        assert!(
+            matches!(o, Outcome::Timeout(s) if s == 160 + (1u64 << 41)),
+            "{o}"
+        );
+        assert_eq!(KEY_ATOMS_BUILT.with(Cell::get), 0);
+        // The same with no misses left: FuelExhausted, still without building.
+        let q = "(memorec 0 (lam (lam 0)) (loop 40 0 (lam (lam (pair $0 $0)))))";
+        let (o, _) = run_machine(&mut arena, q, 1_000_000);
+        assert!(
+            matches!(o, Outcome::Error(ErrorKind::FuelExhausted, 160)),
+            "{o}"
+        );
+        assert_eq!(KEY_ATOMS_BUILT.with(Cell::get), 0);
+        // A key within the fuel is built once: 3 atoms for (pair 1 2).
+        let (o, _) = run_machine(&mut arena, "(memorec 1 (lam (lam 0)) (pair 1 2))", 100);
+        assert!(matches!(o, Outcome::Value(Value::Int(0), 7)), "{o}");
+        assert_eq!(KEY_ATOMS_BUILT.with(Cell::get), 3);
+    }
+
+    #[test]
+    fn unreachable_memo_tables_are_released_during_the_evaluation() {
+        let mut arena = Arena::new();
+        // 1000 memorec calls whose selves are all dropped: at most one pruning
+        // threshold's worth of tables is kept.
+        let p = "(loop 1000 0 (lam (lam (memorec 1 (lam (lam 0)) $1))))";
+        let (o, kept) = run_machine(&mut arena, p, UNLIMITED);
+        assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
+        assert!(kept <= MEMO_PRUNE_MIN, "{kept} tables kept");
+        // 200 selves kept in a list: every table stays, and the first is still
+        // usable at the end (a miss on key 5: 2 + β 2).
+        let q = "(list_case (loop 200 nil (lam (lam (cons (memorec 2 (lam (lam $1)) $1) $0)))) (lam 0) (lam (lam (let ($1 5) 1))))";
+        let (o, kept) = run_machine(&mut arena, q, UNLIMITED);
+        assert!(matches!(o, Outcome::Value(Value::Int(1), _)), "{o}");
+        assert_eq!(kept, 200);
+    }
 }

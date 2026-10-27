@@ -242,7 +242,7 @@ fn escaped_table_alive(v: &Value) -> bool {
 }
 
 #[test]
-fn memo_table_is_dropped_when_memorec_returns() {
+fn memo_table_is_dropped_when_the_evaluation_ends() {
     // F returns (self, 0), which is also stored in the table under key 1, so the
     // table holds an entry that holds `self`. If `self` owned the table, this cycle
     // would keep it alive after the evaluation.
@@ -255,20 +255,73 @@ fn memo_table_is_dropped_when_memorec_returns() {
         Outcome::Value(v, 4) => assert!(!escaped_table_alive(&v)),
         other => panic!("{other}"),
     }
+    // A self that escaped, was called within the evaluation and escaped again.
+    match run("((memorec 5 (lam (lam $1)) 1) 2)") {
+        Outcome::Value(v, _) => assert!(!escaped_table_alive(&v)),
+        other => panic!("{other}"),
+    }
+}
+
+/// `fun self x y -> if x <= 0 then y else self (x - 1) (y + 1)`: a functional
+/// whose result type is `Int -> Int`. Indices in the body: y = $0, x = $1,
+/// self = $2.
+const CURRIED_F: &str = "(lam (lam (lam (if (le $1 0) $0 ($2 (sub $1 1) (add $0 1))))))";
+
+#[test]
+fn curried_memorec_calls_self_after_memorec_returns() {
+    // memorec 10 F 3 100. `memorec 10 F 3` misses on key 3 and returns the closure
+    // λy for x = 3; each level then calls `self (x - 1)`, which runs after that
+    // memorec call has returned. Per level x:
+    //   obtaining the closure for x: miss 2 + β 2 (F self, then x)        = 4
+    //   applying it to y: β 1 + le 1 + if 1                               = 3
+    //   for x > 0 also: sub 1 + add 1                                     = 2
+    // x = 3, 2, 1: 9 each = 27; x = 0: 7. Total 34, value 100 + 3.
+    let p = format!("((memorec 10 {CURRIED_F} 3) 100)");
+    assert_value(&p, int(103), 34);
+    // The same with bfix: a call is 1 step instead of a 2-step miss, so 4 fewer.
+    let b = format!("((bfix 10 {CURRIED_F} 3) 100)");
+    assert_value(&b, int(103), 30);
 }
 
 #[test]
-fn calling_an_escaped_memo_self_is_an_error() {
-    // miss 2 + β 2 = 4; the escaped call is charged 0.
+fn a_closure_returned_by_memorec_shares_its_table_across_calls() {
+    // F self x = if x <= 0 then (λy. y) else (λy. self (x - 1) (y + 1)). Indices in
+    // the inner lambda: y = $0, x = $1, self = $2. Four misses allowed: exactly keys
+    // 3, 2, 1, 0. The second call of the returned closure must hit on keys 2, 1, 0;
+    // with a fresh table it would run out of misses.
+    let f = "(lam (lam (if (le $0 0) (lam $0) (lam ($2 (sub $1 1) (add $0 1))))))";
+    let p = format!("(let (memorec 4 {f} 3) (add ($0 100) ($0 200)))");
+    // Making the closure for x on a miss: miss 2 + β 2 + le 1 + if 1 = 6; on a hit,
+    // only the hit: 2. Applying the closure for x > 0: β 1 + sub 1 + add 1 = 3 plus
+    // obtaining the next closure; the closure for 0: β 1.
+    //   memorec 4 F 3: 6
+    //   first call:  3 × (3 + 6) + 1 = 28
+    //   second call: 3 × (3 + 2) + 1 = 16
+    //   add: 1
+    // Total 51.
+    assert_value(&p, int(306), 51);
+}
+
+#[test]
+fn calling_a_memo_self_from_an_earlier_evaluation_is_an_error() {
+    // The table of a memorec lives until its evaluation ends. A self returned from
+    // one evaluation and passed by the host into another finds it gone.
+    let escaped = match run("(memorec 5 (lam (lam $1)) 1)") {
+        Outcome::Value(v, 4) => v,
+        other => panic!("{other}"),
+    };
+    // β 1 to apply the program to the escaped self; the self call is charged 0.
+    assert_error_on("(lam ($0 2))", &[escaped], ErrorKind::MemoSelfEscaped, 1);
+}
+
+#[test]
+fn an_escaped_memo_self_keeps_its_table_and_miss_fuel() {
+    // F self x = self. `memorec 2 F 1` misses on 1 (2 + β 2 = 4) and returns self.
+    // Called on 2 after memorec returned: another miss (4), the last allowed. On 1
+    // again: a hit (2). On 3: no misses left, FuelExhausted, not charged.
     assert_error(
-        "((memorec 5 (lam (lam $1)) 1) 2)",
-        ErrorKind::MemoSelfEscaped,
-        4,
-    );
-    // Through a closure that captured self: miss 2 + β 2 + β 1 (the closure) = 5.
-    assert_error(
-        "((memorec 5 (lam (lam (lam ($2 $0)))) 1) 3)",
-        ErrorKind::MemoSelfEscaped,
-        5,
+        "((((memorec 2 (lam (lam $1)) 1) 2) 1) 3)",
+        ErrorKind::FuelExhausted,
+        10,
     );
 }

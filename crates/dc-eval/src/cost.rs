@@ -24,7 +24,8 @@
 //! | `tree_fold z f t` | 1 per internal node + calls | `leaf`s cost 0 |
 //! | `bfix n F x`, and each call of its `self` | 1 per call + calls inside `F` | [`ITERATION`]; the fuel check is free |
 //! | `memorec n F x`, and each call of its `self` | hit: 1 + key size; miss: 1 + key size + calls inside `F` | [`memo_call`] |
-//! | calling a `memorec` `self` after its `memorec` returned | 0, then `MemoSelfEscaped` | see the decision below |
+//! | calling a `memorec` `self` after its `memorec` returned | as any `memorec` call | the table lives until the evaluation ends; see below |
+//! | calling a `memorec` `self` from an earlier evaluation | 0, then `MemoSelfEscaped` | only host code can do this; see below |
 //!
 //! Readings of the spec's cost table that the spec leaves open. Each is the reading
 //! that matches what the machine does:
@@ -52,11 +53,23 @@
 //!   through a cycle of keys) misses again, uses another unit of miss fuel, and
 //!   ends in `FuelExhausted` if the recursion never bottoms out.
 //!
-//! DECISION (project lead, review of P2.8): the memo table lives exactly as long
-//! as its outermost `memorec` call (spec §6: "dropped when it returns"). A machine
-//! frame owns the table; every `self` holds only a weak reference, so a `self` that
-//! escapes in the result cannot keep the table alive through a reference cycle.
-//! Calling such an escaped `self` raises `MemoSelfEscaped` and is charged 0 steps.
+//! - **A memo table lives until the evaluation ends.** Spec §6 says the table "is
+//!   dropped when it returns". This machine reads that as: the table cannot be
+//!   observed after its `memorec` returns, except through a `self` that the result
+//!   still holds. A `memorec` whose result type is a function (a curried `F`)
+//!   returns a closure that calls `self` later, so dropping the table at return
+//!   would break well-typed programs. The machine owns every table it creates until
+//!   the evaluation ends, and an escaped `self` keeps working with its own table and
+//!   remaining misses. Tables are never shared between `memorec` calls or between
+//!   evaluations. Each `self` holds only a weak reference, so a `self` stored in its
+//!   own table cannot keep it alive after the evaluation. A table that no `self` and
+//!   no pending call can reach is released during the evaluation; that changes no
+//!   step count. DECISION (coordinator, review of PR 7): this replaces the earlier
+//!   reading, under which an escaped `self` raised `MemoSelfEscaped`.
+//! - **A `self` from an earlier evaluation.** A value returned by one evaluation
+//!   can hold a `memorec` `self` whose table was dropped when that evaluation
+//!   ended. Calling it in a later evaluation (only host code can pass it there)
+//!   raises `MemoSelfEscaped`, charged 0 steps.
 //! - **`eq` node count.** Scalars, pairs, options, arrays and each list cell, `nil`,
 //!   tree node and `leaf` count one node each. The comparison is pre-order and left
 //!   to right, and stops at the first difference. Arrays of different sizes differ at

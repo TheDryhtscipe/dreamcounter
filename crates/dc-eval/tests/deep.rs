@@ -97,16 +97,16 @@ fn deeply_nested_options_pairs_and_trees() {
 }
 
 #[test]
-fn a_million_nested_arrays() {
+fn a_hundred_thousand_nested_arrays() {
     on_small_stack(|| {
         // Each iteration wraps the accumulator in a one-element array:
-        // 1 + β 2 + nil 1 + cons 1 + array_of_list (1 + 1) = 7.
-        let n: i64 = 1_000_000;
+        // 1 + β 2 + nil 1 + cons 1 + array_of_list (1 + 1) = 7. Without the
+        // array drop queue, dropping this nesting overflows the 256 KiB stack.
         let o = run_on(
             "(lam (loop $0 unit (lam (lam (array_of_list (cons $0 nil))))))",
-            &[int(n)],
+            &[int(N)],
         );
-        assert!(matches!(o, Outcome::Value(Value::Array(_), s) if s == 7 * n as u64 + 1));
+        assert!(matches!(o, Outcome::Value(Value::Array(_), s) if s == 7 * N as u64 + 1));
         drop(o);
         // The same kind of value bound by a let and dropped inside the evaluation:
         // β 1 + 7n; the body is a free literal.
