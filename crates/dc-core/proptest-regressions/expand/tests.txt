@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 50d867d004e4f70f8d2c26d68682b62d4930cb341e4994ad14573daee82f1cbc # shrinks to g = Var(0), pos = 0, pos2 = 0
+cc 971d1508e2b3d33fac94223bde230fd39197d5c87f7afdb5dd828dc31ed59582 # shrinks to g = Var(0), pos = 0, extra = None
+cc d9e3936917a3b663be695e4c109e9a61525b49b7b0cb0bb5942f19b10079b073 # shrinks to g = Let(Var(0), App(Int(0), Var(0))), pos = 14055502701751221427, pos2 = 3532998108325441773
+cc 0147e9c405fdd9bc4edf71019127255644ca68c0e5633828d361a97c3faaff2a # shrinks to g = If(Lam(Var(0)), Lam(Var(0)), App(Var(1), Var(0))), pos = 11373326814715069577, pos2 = 8612231976535630663
