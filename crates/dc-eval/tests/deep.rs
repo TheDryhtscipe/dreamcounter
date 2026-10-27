@@ -95,3 +95,64 @@ fn deeply_nested_options_pairs_and_trees() {
         assert_value_on(t, &[int(N)], int(N), 10 * N as u64 + 2);
     });
 }
+
+#[test]
+fn a_million_nested_arrays() {
+    on_small_stack(|| {
+        // Each iteration wraps the accumulator in a one-element array:
+        // 1 + β 2 + nil 1 + cons 1 + array_of_list (1 + 1) = 7.
+        let n: i64 = 1_000_000;
+        let o = run_on(
+            "(lam (loop $0 unit (lam (lam (array_of_list (cons $0 nil))))))",
+            &[int(n)],
+        );
+        assert!(matches!(o, Outcome::Value(Value::Array(_), s) if s == 7 * n as u64 + 1));
+        drop(o);
+        // The same kind of value bound by a let and dropped inside the evaluation:
+        // β 1 + 7n; the body is a free literal.
+        let p = "(lam (let (loop $0 unit (lam (lam (array_of_list (cons $0 nil))))) 0))";
+        assert_value_on(p, &[int(N)], int(0), 7 * N as u64 + 1);
+    });
+}
+
+#[test]
+fn a_hundred_thousand_nested_environment_frames() {
+    on_small_stack(|| {
+        // (let 1 (let 1 ... (let 1 $0))) nested n deep: the innermost variable is
+        // looked up in an environment of n frames, which is then dropped at once.
+        // Lets and literals are free: 0 steps.
+        let mut arena = dc_core::Arena::new();
+        let mut t = arena.var(0);
+        for _ in 0..N {
+            let one = arena.int(1);
+            t = arena.let_(one, t);
+        }
+        match dc_eval::eval(&arena, t, dc_eval::UNLIMITED) {
+            Outcome::Value(v, 0) => assert_eq!(v, int(1)),
+            other => panic!("{other}"),
+        }
+    });
+}
+
+#[test]
+fn formatting_deep_values() {
+    on_small_stack(|| {
+        // none 1 + n × (1 + β 2 + some 1) = 400001.
+        let o = run("(loop 100000 none (lam (lam (some $0))))");
+        let s = o.to_string();
+        assert!(s.starts_with("Value(Some (Some ("));
+        assert!(s.ends_with(&format!("None{}, 400001)", ")".repeat(100_000))));
+        let v = o.value().expect("value");
+        assert_eq!(
+            format!("{v:?}").len(),
+            "Some ()".len() * 100_000 + "None".len()
+        );
+        // Nested arrays and a deep tree format too.
+        let a = run("(loop 100000 unit (lam (lam (array_of_list (cons $0 nil)))))");
+        assert!(a.to_string().contains("[|[|[|()|]|]|]"));
+        let t = run("(loop 100000 leaf (lam (lam (node $0 $1 leaf))))");
+        assert!(t
+            .to_string()
+            .contains("Node (Node (Leaf, 0, Leaf), 1, Leaf)"));
+    });
+}

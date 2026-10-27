@@ -24,6 +24,7 @@
 //! | `tree_fold z f t` | 1 per internal node + calls | `leaf`s cost 0 |
 //! | `bfix n F x`, and each call of its `self` | 1 per call + calls inside `F` | [`ITERATION`]; the fuel check is free |
 //! | `memorec n F x`, and each call of its `self` | hit: 1 + key size; miss: 1 + key size + calls inside `F` | [`memo_call`] |
+//! | calling a `memorec` `self` after its `memorec` returned | 0, then `MemoSelfEscaped` | see the decision below |
 //!
 //! Readings of the spec's cost table that the spec leaves open. Each is the reading
 //! that matches what the machine does:
@@ -46,6 +47,16 @@
 //!   like every recursive call, and needs `n ≥ 1`. So `bfix (length xs + 1)` allows
 //!   exactly the `length xs + 1` nested calls of a list recursion. `memorec n F x`
 //!   is a memo call on `x`, and with an empty table it is a miss.
+//! - **A call on a key still being computed is another miss.** A result is stored
+//!   only when its call returns, so a recursive call on the same key (directly or
+//!   through a cycle of keys) misses again, uses another unit of miss fuel, and
+//!   ends in `FuelExhausted` if the recursion never bottoms out.
+//!
+//! DECISION (project lead, review of P2.8): the memo table lives exactly as long
+//! as its outermost `memorec` call (spec §6: "dropped when it returns"). A machine
+//! frame owns the table; every `self` holds only a weak reference, so a `self` that
+//! escapes in the result cannot keep the table alive through a reference cycle.
+//! Calling such an escaped `self` raises `MemoSelfEscaped` and is charged 0 steps.
 //! - **`eq` node count.** Scalars, pairs, options, arrays and each list cell, `nil`,
 //!   tree node and `leaf` count one node each. The comparison is pre-order and left
 //!   to right, and stops at the first difference. Arrays of different sizes differ at

@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use dc_eval::{ErrorKind, Outcome};
+use dc_eval::{ErrorKind, Fun, Outcome, Value};
 
 /// Factorial with depth fuel `n + 1`.
 const FACT: &str =
@@ -228,4 +228,47 @@ fn each_memorec_gets_its_own_table() {
     let inner = "(memorec 1 (lam (lam 7)) 5)";
     let p = format!("(memorec 1 (lam (lam (add {inner} {inner}))) 0)");
     assert_value(&p, int(14), 13);
+}
+
+/// The memo table that an escaped `self` refers to, if it is still alive.
+fn escaped_table_alive(v: &Value) -> bool {
+    match v {
+        Value::Fun(f) => match &**f {
+            Fun::MemoSelf { table, .. } => table.upgrade().is_some(),
+            other => panic!("expected a memorec self, got {other:?}"),
+        },
+        other => panic!("expected a function, got {other}"),
+    }
+}
+
+#[test]
+fn memo_table_is_dropped_when_memorec_returns() {
+    // F returns (self, 0), which is also stored in the table under key 1, so the
+    // table holds an entry that holds `self`. If `self` owned the table, this cycle
+    // would keep it alive after the evaluation.
+    match &run("(memorec 5 (lam (lam (pair $1 0))) 1)") {
+        Outcome::Value(Value::Pair(p), 5) => assert!(!escaped_table_alive(&p.0)),
+        other => panic!("{other}"),
+    }
+    // A bare escaped self: miss 2 + β 2.
+    match run("(memorec 5 (lam (lam $1)) 1)") {
+        Outcome::Value(v, 4) => assert!(!escaped_table_alive(&v)),
+        other => panic!("{other}"),
+    }
+}
+
+#[test]
+fn calling_an_escaped_memo_self_is_an_error() {
+    // miss 2 + β 2 = 4; the escaped call is charged 0.
+    assert_error(
+        "((memorec 5 (lam (lam $1)) 1) 2)",
+        ErrorKind::MemoSelfEscaped,
+        4,
+    );
+    // Through a closure that captured self: miss 2 + β 2 + β 1 (the closure) = 5.
+    assert_error(
+        "((memorec 5 (lam (lam (lam ($2 $0)))) 1) 3)",
+        ErrorKind::MemoSelfEscaped,
+        5,
+    );
 }

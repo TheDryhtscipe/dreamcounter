@@ -4,16 +4,20 @@
 //! arrays are persistent vectors whose updates take O(log n). Lists cache their
 //! length in every cons cell, so `length` is O(1) (spec §5).
 //!
-//! Nothing here recurses on the host stack over the value structure. Dropping a
-//! value frees its uniquely owned parts with an explicit work list (see the `Drop`
-//! impls), so dropping a list of a million elements, a deeply nested option or a
-//! long chain of closures cannot overflow the Rust stack. Structural equality is
-//! iterative too. Only `Display`/`Debug`, which exist for test output, recurse.
+//! Nothing here recurses on the host stack in proportion to the depth of a value.
+//! Dropping a value frees its uniquely owned parts with an explicit work list (see
+//! the `Drop` impls); arrays, whose elements `imbl` drops itself, are handed to a
+//! per-thread queue that the outermost drop empties. So dropping a list of a
+//! million elements, deeply nested options, pairs or arrays, or a long chain of
+//! closures or environment frames does not overflow the Rust stack. Structural
+//! equality, memo keys, `Display` and `Debug` are iterative too. The remaining host
+//! recursion is inside `imbl`'s own tree, whose depth is logarithmic in the size of
+//! one array.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::mem;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use dc_core::{Prim, TermId};
 use rustc_hash::FxHashMap;
@@ -68,8 +72,11 @@ pub enum Fun {
     },
     /// The recursive argument `self` passed by `memorec`.
     MemoSelf {
-        /// The memo table shared by every call in one outermost `memorec`.
-        table: Rc<RefCell<MemoTable>>,
+        /// The memo table shared by every call in one outermost `memorec`. A
+        /// machine frame owns the table until that call returns; `self` only
+        /// refers to it, so a `self` that escapes cannot keep the table alive
+        /// through a cycle (table, entry, `self`, table). See [`crate::cost`].
+        table: Weak<RefCell<MemoTable>>,
         /// The functional `F`.
         f: Value,
     },
@@ -133,11 +140,10 @@ impl MemoKey {
 }
 
 /// A persistent environment: a linked list of frames, innermost binder first.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Env(Option<Rc<EnvNode>>);
 
 /// One environment frame.
-#[derive(Debug)]
 pub struct EnvNode {
     value: Value,
     next: Env,
@@ -165,6 +171,30 @@ impl Env {
             i -= 1;
         }
         Some(&node.value)
+    }
+
+    /// The bound values, innermost first.
+    pub fn values(&self) -> impl Iterator<Item = &Value> {
+        let mut node = self.0.as_deref();
+        std::iter::from_fn(move || {
+            let n = node?;
+            node = n.next.0.as_deref();
+            Some(&n.value)
+        })
+    }
+}
+
+impl fmt::Debug for Env {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.values()).finish()
+    }
+}
+
+impl fmt::Debug for EnvNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnvNode")
+            .field("value", &self.value)
+            .finish_non_exhaustive()
     }
 }
 
@@ -318,9 +348,11 @@ impl Drop for Tree {
 fn detach_children(v: &mut Value, out: &mut Vec<Value>) {
     match v {
         Value::Int(_) | Value::Bool(_) | Value::Unit | Value::Option(None) => {}
-        // Array elements are dropped by `imbl` one at a time, and each element's own
-        // drop is iterative, so arrays only nest as deep as the program nests them.
-        Value::Array(_) => {}
+        // `imbl` drops its elements itself, which would recurse once per level of
+        // array nesting. Instead the vector is queued and dropped by the outermost
+        // drop on this thread. Dropping a shared vector there only decrements a
+        // count, so this costs O(1) per array, not O(size).
+        Value::Array(a) => defer_array_drop(mem::take(a)),
         Value::Pair(rc) => {
             if let Some(p) = Rc::get_mut(rc) {
                 out.push(mem::replace(&mut p.0, Value::Unit));
@@ -360,12 +392,7 @@ fn detach_children(v: &mut Value, out: &mut Vec<Value>) {
                     Fun::Closure { env, .. } => detach_env(env, out),
                     Fun::Partial { args, .. } => out.append(args),
                     Fun::BfixSelf { f, .. } => out.push(mem::replace(f, Value::Unit)),
-                    Fun::MemoSelf { table, f } => {
-                        out.push(mem::replace(f, Value::Unit));
-                        if let Some(cell) = Rc::get_mut(table) {
-                            out.extend(cell.get_mut().entries.drain().map(|(_, v)| v));
-                        }
-                    }
+                    Fun::MemoSelf { f, .. } => out.push(mem::replace(f, Value::Unit)),
                 }
             }
         }
@@ -385,6 +412,48 @@ fn detach_env(env: &mut Env, out: &mut Vec<Value>) {
     }
 }
 
+thread_local! {
+    /// Arrays waiting to be dropped by the outermost drop on this thread.
+    static ARRAY_DROPS: RefCell<Vec<imbl::Vector<Value>>> = const { RefCell::new(Vec::new()) };
+    /// Whether a drop on this thread is already emptying `ARRAY_DROPS`.
+    static DRAINING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn defer_array_drop(a: imbl::Vector<Value>) {
+    if a.is_empty() {
+        return;
+    }
+    let mut slot = Some(a);
+    // During thread teardown the queue may be gone; the array then drops in place
+    // when `slot` goes out of scope.
+    let _ = ARRAY_DROPS.try_with(|q| {
+        if let Some(a) = slot.take() {
+            q.borrow_mut().push(a);
+        }
+    });
+}
+
+/// Drops queued arrays until none are left, unless an outer drop on this thread is
+/// already doing so. Dropping an array drops its elements, which may queue more
+/// arrays; the loop picks those up instead of recursing.
+fn drain_array_drops() {
+    let Ok(false) = DRAINING.try_with(|d| d.replace(true)) else {
+        return;
+    };
+    loop {
+        // The borrow ends before the array drops, so nested drops can queue more.
+        let next = ARRAY_DROPS
+            .try_with(|q| q.borrow_mut().pop())
+            .ok()
+            .flatten();
+        match next {
+            Some(a) => drop(a),
+            None => break,
+        }
+    }
+    let _ = DRAINING.try_with(|d| d.set(false));
+}
+
 impl Drop for Value {
     fn drop(&mut self) {
         let mut work = Vec::new();
@@ -393,6 +462,7 @@ impl Drop for Value {
             detach_children(&mut v, &mut work);
             // `v` now owns nothing unique, so its own drop does not recurse.
         }
+        drain_array_drops();
     }
 }
 
@@ -579,51 +649,90 @@ impl fmt::Debug for TreeNode {
 
 impl fmt::Debug for Tree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&Value::Tree(self.clone()), f)
+        write_value(Piece::Tree(self), f)
     }
+}
+
+/// A piece of output still to write.
+enum Piece<'a> {
+    Value(&'a Value),
+    Tree(&'a Tree),
+    Text(&'static str),
+}
+
+/// Writes a value with an explicit work stack, so deeply nested values format
+/// without host recursion.
+fn write_value(start: Piece<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let mut work = vec![start];
+    while let Some(piece) = work.pop() {
+        match piece {
+            Piece::Text(s) => f.write_str(s)?,
+            Piece::Tree(t) => match &t.0 {
+                None => f.write_str("Leaf")?,
+                Some(n) => {
+                    // Pushed in reverse: `Node (left, value, right)`.
+                    work.push(Piece::Text(")"));
+                    work.push(Piece::Tree(&n.right));
+                    work.push(Piece::Text(", "));
+                    work.push(Piece::Value(&n.value));
+                    work.push(Piece::Text(", "));
+                    work.push(Piece::Tree(&n.left));
+                    work.push(Piece::Text("Node ("));
+                }
+            },
+            Piece::Value(v) => match v {
+                Value::Int(n) => write!(f, "{n}")?,
+                Value::Bool(b) => write!(f, "{b}")?,
+                Value::Unit => f.write_str("()")?,
+                Value::Pair(p) => {
+                    work.push(Piece::Text(")"));
+                    work.push(Piece::Value(&p.1));
+                    work.push(Piece::Text(", "));
+                    work.push(Piece::Value(&p.0));
+                    work.push(Piece::Text("("));
+                }
+                Value::Option(None) => f.write_str("None")?,
+                Value::Option(Some(x)) => {
+                    work.push(Piece::Text(")"));
+                    work.push(Piece::Value(x));
+                    work.push(Piece::Text("Some ("));
+                }
+                Value::List(l) => {
+                    let items: Vec<&Value> = l.iter().collect();
+                    push_seq(&mut work, "[", &items, "]");
+                }
+                Value::Array(a) => {
+                    let items: Vec<&Value> = a.iter().collect();
+                    push_seq(&mut work, "[|", &items, "|]");
+                }
+                Value::Tree(t) => work.push(Piece::Tree(t)),
+                Value::Fun(_) => f.write_str("<fun>")?,
+            },
+        }
+    }
+    Ok(())
+}
+
+/// Pushes `open item; item; ... close` in reverse onto the work stack.
+fn push_seq<'a>(
+    work: &mut Vec<Piece<'a>>,
+    open: &'static str,
+    items: &[&'a Value],
+    close: &'static str,
+) {
+    work.push(Piece::Text(close));
+    for (i, &x) in items.iter().enumerate().rev() {
+        work.push(Piece::Value(x));
+        if i > 0 {
+            work.push(Piece::Text("; "));
+        }
+    }
+    work.push(Piece::Text(open));
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Int(n) => write!(f, "{n}"),
-            Value::Bool(b) => write!(f, "{b}"),
-            Value::Unit => f.write_str("()"),
-            Value::Pair(p) => write!(f, "({}, {})", p.0, p.1),
-            Value::Option(None) => f.write_str("None"),
-            Value::Option(Some(v)) => write!(f, "Some ({v})"),
-            Value::List(l) => {
-                f.write_str("[")?;
-                for (i, v) in l.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str("; ")?;
-                    }
-                    write!(f, "{v}")?;
-                }
-                f.write_str("]")
-            }
-            Value::Array(a) => {
-                f.write_str("[|")?;
-                for (i, v) in a.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str("; ")?;
-                    }
-                    write!(f, "{v}")?;
-                }
-                f.write_str("|]")
-            }
-            Value::Tree(t) => match &t.0 {
-                None => f.write_str("Leaf"),
-                Some(n) => write!(
-                    f,
-                    "Node ({}, {}, {})",
-                    Value::Tree(n.left.clone()),
-                    n.value,
-                    Value::Tree(n.right.clone())
-                ),
-            },
-            Value::Fun(_) => f.write_str("<fun>"),
-        }
+        write_value(Piece::Value(self), f)
     }
 }
 

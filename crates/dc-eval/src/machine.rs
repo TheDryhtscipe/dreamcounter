@@ -70,6 +70,9 @@ pub enum ErrorKind {
     EqOnFunction,
     /// A `memorec` key that is not built from `Int`, `Bool`, `Unit` and pairs.
     InvalidMemoKey,
+    /// A `memorec` `self` was called after its outermost `memorec` call returned
+    /// and dropped the memo table. Charged 0 steps.
+    MemoSelfEscaped,
     /// The machine cannot continue. Only reachable for ill-typed or unexpanded terms.
     Stuck(Stuck),
 }
@@ -191,6 +194,9 @@ enum Frame {
         table: Rc<RefCell<MemoTable>>,
         key: MemoKey,
     },
+    /// The outermost call of one `memorec` is done. This frame owns the memo table
+    /// and drops it on return (spec §6); every `self` holds only a weak reference.
+    MemoScope { table: Rc<RefCell<MemoTable>> },
 }
 
 struct Machine<'a> {
@@ -373,6 +379,10 @@ impl<'a> Machine<'a> {
                 table.borrow_mut().entries.insert(key, v.clone());
                 Ok(Control::Return(v))
             }
+            Frame::MemoScope { table } => {
+                drop(table);
+                Ok(Control::Return(v))
+            }
         }
     }
 
@@ -400,7 +410,10 @@ impl<'a> Machine<'a> {
                 }
             }
             Fun::BfixSelf { fuel, f } => self.bfix_call(*fuel, f, x),
-            Fun::MemoSelf { table, f } => self.memo_call(table, f, x),
+            Fun::MemoSelf { table, f } => match table.upgrade() {
+                Some(table) => self.memo_call(&table, f, x),
+                None => Err(error(ErrorKind::MemoSelfEscaped)),
+            },
         }
     }
 
@@ -525,6 +538,9 @@ impl<'a> Machine<'a> {
                     entries: Default::default(),
                     misses_left: *n,
                 }));
+                self.stack.push(Frame::MemoScope {
+                    table: table.clone(),
+                });
                 self.memo_call(&table, f, x.clone())
             }
             _ => Err(bad(p)),
@@ -684,7 +700,7 @@ impl<'a> Machine<'a> {
         });
         self.stack.push(Frame::ApplyTo(x));
         let this = Value::Fun(Rc::new(Fun::MemoSelf {
-            table: table.clone(),
+            table: Rc::downgrade(table),
             f: f.clone(),
         }));
         self.apply(f, this)

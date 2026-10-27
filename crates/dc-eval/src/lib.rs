@@ -6,9 +6,12 @@
 //! deterministic function of the term and the inputs; [`cost`] holds the whole cost
 //! model in one table.
 //!
-//! The machine keeps its continuation on an explicit stack and never recurses on the
-//! host stack over terms or values, so deep recursion in dc cannot overflow the Rust
-//! stack.
+//! The machine keeps its continuation on an explicit stack, so deep recursion in dc
+//! does not grow the Rust stack. Evaluation, dropping, structural equality and
+//! formatting of values use explicit work lists instead of host recursion over
+//! the value structure (see [`value`]); the one bounded exception is `imbl`'s own
+//! tree inside a single array. The `dc_core::sexpr` parser and printer used to
+//! build test terms do recurse over the term.
 //!
 //! ```
 //! use dc_core::{sexpr, Arena};
