@@ -4,7 +4,27 @@
 //! level-based generalisation (Rémy): every unbound variable records the `let` depth
 //! at which it was created, and a `let` generalises exactly the variables of its
 //! bound expression whose level is deeper than the `let` itself. So generalisation
-//! never scans the environment, and unification is near-linear.
+//! never scans the environment.
+//!
+//! **No host recursion.** Terms and types are walked with explicit work stacks, so
+//! the depth of a term is limited by memory, not by the thread's stack (spec §4 keeps
+//! the evaluator off host recursion for the same reason). Types written out as
+//! [`Type`] trees are limited to [`MAX_TYPE_NODES`] constructors and
+//! [`MAX_TYPE_DEPTH`] levels; a larger one is a [`TypeErrorKind::TypeTooLarge`]
+//! error.
+//!
+//! **Shared structure.** Types in the store are DAGs: `(lam (pair $0 $0))` applied
+//! `n` times has a type of `n` nodes that is `2^n` nodes written out. Every walk over
+//! the store (occurs check, generalisation, instantiation, `Key` checks and
+//! unification) visits each node at most once per walk, so its cost is linear in the
+//! size of the DAG, not of the tree. A single unification can still cost time linear
+//! in the size of the types involved, so inference is not linear in the worst case,
+//! but it is polynomial.
+//!
+//! **Checking.** [`TypeChecker::check`] pushes the expected type into the term:
+//! through `lam` (parameter and body), the body of `let`, both branches of `if`, and
+//! the result of an application before its arguments. So a clash with a task
+//! signature is reported at the subterm where it happens, not at the whole term.
 //!
 //! **`Key` constraints.** `memorec` keys must be `Int`, `Bool`, `Unit` or tuples of
 //! those (spec §6). A variable may carry a `Key` flag. Binding a flagged variable to
@@ -17,13 +37,13 @@
 //! `Key a => ((a -> b) -> a -> b) -> a -> b`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write;
 use std::hash::BuildHasher;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{Scheme, TyVar, Type, TypeError, TypeErrorKind};
 use crate::prim::Prim;
-use crate::sexpr;
 use crate::term::{Arena, LibId, Term, TermId};
 
 /// The types of library abstractions (spec §8), looked up by [`LibId`].
@@ -58,6 +78,13 @@ impl LibEnv for BTreeMap<LibId, Scheme> {
         self.get(&id)
     }
 }
+
+/// The most type constructors and variables a [`Type`] produced by the checker may
+/// have, written out as a tree.
+pub const MAX_TYPE_NODES: usize = 10_000;
+
+/// The deepest nesting a [`Type`] produced by the checker may have.
+pub const MAX_TYPE_DEPTH: usize = 500;
 
 /// Index of a node in the type store.
 type Ty = u32;
@@ -121,11 +148,95 @@ enum UnifyError {
     Key(Ty),
 }
 
+/// A type written out as a [`Type`] would exceed [`MAX_TYPE_NODES`] or
+/// [`MAX_TYPE_DEPTH`].
+#[derive(Clone, Copy, Debug)]
+struct TooLarge;
+
 #[derive(Clone, Copy, Debug)]
 struct Binding {
     ty: Ty,
     /// Whether the type may contain generalised variables (a `let` binding).
     poly: bool,
+}
+
+/// An expected type pushed into a subterm by [`TypeChecker::check`], with the
+/// description of that subterm's position used if it does not fit.
+#[derive(Clone, Copy, Debug)]
+struct Want {
+    ty: Ty,
+    context: &'static str,
+}
+
+impl Want {
+    fn at(ty: Ty, context: &'static str) -> Want {
+        Want { ty, context }
+    }
+}
+
+/// What to do with the type of a subterm once it is known: the continuation of the
+/// term walk, kept on an explicit stack instead of the host stack.
+#[derive(Clone, Copy, Debug)]
+enum Frame {
+    /// After a lambda body: drop the binder; the lambda has type `param -> body`.
+    Lam { param: Ty },
+    /// After a lambda body checked against the result of `arrow`: drop the binder;
+    /// the lambda has type `arrow`.
+    LamChecked { arrow: Ty },
+    /// After the bound expression of a `let`: generalise it and go on to `body`.
+    LetBound { body: TermId, want: Option<Want> },
+    /// After the body of a `let`: drop the binder.
+    LetBody,
+    /// After the condition of an `if`.
+    IfCond {
+        cond: TermId,
+        then: TermId,
+        els: TermId,
+        want: Option<Want>,
+    },
+    /// After the then branch of an `if` checked against an expected type.
+    IfThenChecked { els: TermId, want: Want },
+    /// After the then branch of an `if` without an expected type.
+    IfThen { els: TermId },
+    /// After the else branch of an `if` without an expected type.
+    IfElse { then_ty: Ty, els: TermId },
+    /// After the first operand of `and`/`or`.
+    BoolFirst {
+        first: TermId,
+        second: TermId,
+        op: &'static str,
+    },
+    /// After the second operand of `and`/`or`.
+    BoolSecond { second: TermId, op: &'static str },
+    /// After the head of an application spine.
+    AppHead { sp: Spine, want: Option<Want> },
+    /// After argument `i` of an application spine.
+    AppArg {
+        sp: Spine,
+        i: usize,
+        param: Ty,
+        ret: Ty,
+        want: Option<Want>,
+    },
+    /// Unify the subterm's type with `want`.
+    Check { want: Want, term: TermId },
+}
+
+/// An application `app` = `head a1 ... an`, with the arguments at
+/// `TypeChecker::spine[start..]`.
+#[derive(Clone, Copy, Debug)]
+struct Spine {
+    app: TermId,
+    head: TermId,
+    start: usize,
+}
+
+/// One step of the term walk.
+enum Step {
+    /// Find the type of a subterm, optionally against an expected type.
+    Eval(TermId, Option<Want>),
+    /// A subterm has this type; hand it to the top frame.
+    Return(Ty),
 }
 
 /// A reusable type checker. Reusing one across many terms keeps its allocations.
@@ -134,13 +245,33 @@ pub struct TypeChecker {
     nodes: Vec<Node>,
     level: u32,
     env: Vec<Binding>,
+    /// Instantiation map: generalised variables and constructor nodes to copies.
     inst: FxHashMap<Ty, Ty>,
+    /// Visit marks for walks over the store; a node is visited in the current walk
+    /// when its mark equals `epoch`.
+    marks: Vec<u32>,
+    epoch: u32,
+    /// Scratch stacks, kept to reuse their allocations.
+    work: Vec<Ty>,
+    pairs: Vec<(Ty, Ty)>,
+    seen_pairs: FxHashSet<(Ty, Ty)>,
+    frames: Vec<Frame>,
+    spine: Vec<TermId>,
 }
 
 /// Where a unification happens, for the error message.
 struct Site {
     term: TermId,
     context: String,
+}
+
+impl Site {
+    fn new(term: TermId, context: impl Into<String>) -> Site {
+        Site {
+            term,
+            context: context.into(),
+        }
+    }
 }
 
 impl TypeChecker {
@@ -160,8 +291,12 @@ impl TypeChecker {
         libs: &L,
     ) -> Result<Scheme, TypeError> {
         self.reset();
-        let t = self.infer_term(arena, libs, term)?;
-        Ok(self.export_scheme(t))
+        let t = self.walk(arena, libs, term, None)?;
+        self.export_scheme(t).map_err(|TooLarge| {
+            let mut e = plain_error(arena, term, too_large());
+            e.context = "the type of the whole term".into();
+            e
+        })
     }
 
     /// Checks that `term` has type `expected`.
@@ -169,6 +304,9 @@ impl TypeChecker {
     /// The variables of `expected` are rigid: the term must work for every choice of
     /// them, so `(lam (add $0 1))` does not check against `a -> a`. A variable may be
     /// used as a `memorec` key only if `expected` gives it a `Key` constraint.
+    ///
+    /// The expected type is pushed into the term (see the module documentation), so
+    /// an error names the subterm where the clash happens.
     pub fn check<L: LibEnv + ?Sized>(
         &mut self,
         arena: &Arena,
@@ -183,14 +321,8 @@ impl TypeChecker {
             rigid.insert(v, self.push(Node::Rigid { key }));
         }
         let want = self.import(expected.ty(), &mut |_, v| rigid[&v]);
-        let found = self.infer_term(arena, libs, term)?;
-        self.unify(want, found).map_err(|e| {
-            let site = Site {
-                term,
-                context: "the whole term, checked against its expected type".into(),
-            };
-            self.error(arena, e, want, found, site)
-        })
+        let want = Want::at(want, "the whole term, checked against its expected type");
+        self.walk(arena, libs, term, Some(want)).map(|_| ())
     }
 
     fn reset(&mut self) {
@@ -200,6 +332,8 @@ impl TypeChecker {
         self.nodes.push(Node::Con(Head::Unit, 0, 0));
         self.level = 1;
         self.env.clear();
+        self.frames.clear();
+        self.spine.clear();
     }
 
     // ------------------------------------------------------------ store
@@ -275,40 +409,95 @@ impl TypeChecker {
         root
     }
 
+    /// Starts a new walk over the store: no node is marked visited.
+    fn new_walk(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.marks.iter_mut().for_each(|m| *m = 0);
+            self.epoch = 1;
+        }
+    }
+
+    /// Marks `t` visited in the current walk; false if it already was.
+    fn first_visit(&mut self, t: Ty) -> bool {
+        let i = t as usize;
+        if i >= self.marks.len() {
+            self.marks.resize(self.nodes.len().max(i + 1), 0);
+        }
+        if self.marks[i] == self.epoch {
+            false
+        } else {
+            self.marks[i] = self.epoch;
+            true
+        }
+    }
+
+    /// Pushes the children of constructor node `n`, rightmost first, so they are
+    /// popped left to right.
+    fn push_children(work: &mut Vec<Ty>, n: Node) {
+        if let Node::Con(h, a, b) = n {
+            if h.arity() >= 2 {
+                work.push(b);
+            }
+            if h.arity() >= 1 {
+                work.push(a);
+            }
+        }
+    }
+
     // ------------------------------------------------------------ unification
 
     /// Unifies `expected` with `found`. On failure, the store keeps the partial
     /// unification; inference stops at the first error, so that is harmless.
     fn unify(&mut self, expected: Ty, found: Ty) -> Result<(), UnifyError> {
-        let a = self.resolve(expected);
-        let b = self.resolve(found);
-        if a == b {
-            return Ok(());
-        }
-        match (self.node(a), self.node(b)) {
-            (Node::Var { level: la, key: ka }, Node::Var { level: lb, key: kb }) => {
-                self.set(a, Node::Link(b));
-                self.set(
-                    b,
-                    Node::Var {
-                        level: la.min(lb),
-                        key: ka || kb,
-                    },
-                );
-                Ok(())
+        let mut pairs = std::mem::take(&mut self.pairs);
+        let mut seen = std::mem::take(&mut self.seen_pairs);
+        pairs.clear();
+        seen.clear();
+        pairs.push((expected, found));
+        let mut result = Ok(());
+        while let Some((x, y)) = pairs.pop() {
+            let a = self.resolve(x);
+            let b = self.resolve(y);
+            if a == b {
+                continue;
             }
-            (Node::Var { level, key }, _) => self.bind(a, level, key, b),
-            (_, Node::Var { level, key }) => self.bind(b, level, key, a),
-            (Node::Con(ha, a1, a2), Node::Con(hb, b1, b2)) if ha == hb => match ha.arity() {
-                0 => Ok(()),
-                1 => self.unify(a1, b1),
-                _ => {
-                    self.unify(a1, b1)?;
-                    self.unify(a2, b2)
+            let step = match (self.node(a), self.node(b)) {
+                (Node::Var { level: la, key: ka }, Node::Var { level: lb, key: kb }) => {
+                    self.set(a, Node::Link(b));
+                    self.set(
+                        b,
+                        Node::Var {
+                            level: la.min(lb),
+                            key: ka || kb,
+                        },
+                    );
+                    Ok(())
                 }
-            },
-            _ => Err(UnifyError::Clash(a, b)),
+                (Node::Var { level, key }, _) => self.bind(a, level, key, b),
+                (_, Node::Var { level, key }) => self.bind(b, level, key, a),
+                (Node::Con(ha, a1, a2), Node::Con(hb, b1, b2)) if ha == hb => {
+                    // Constructor nodes are not linked to each other (that would
+                    // change how the expected side prints in an error), so a pair
+                    // met again through shared structure is skipped here instead.
+                    if ha.arity() > 0 && seen.insert((a, b)) {
+                        if ha.arity() >= 2 {
+                            pairs.push((a2, b2));
+                        }
+                        pairs.push((a1, b1));
+                    }
+                    Ok(())
+                }
+                _ => Err(UnifyError::Clash(a, b)),
+            };
+            if step.is_err() {
+                result = step;
+                break;
+            }
         }
+        self.pairs = pairs;
+        self.seen_pairs = seen;
+        result
     }
 
     /// Binds unbound variable `v` (at `level`, with `key`) to non-variable `t`.
@@ -324,118 +513,153 @@ impl TypeChecker {
     /// Fails if `v` occurs in `t`; otherwise lowers the level of every variable in
     /// `t` to at most `level`, so `t` is not generalised earlier than `v` would be.
     fn occurs_adjust(&mut self, v: Ty, level: u32, t: Ty) -> Result<(), UnifyError> {
-        let r = self.resolve(t);
-        match self.node(r) {
-            Node::Var { level: l, key } => {
-                if r == v {
-                    return Err(UnifyError::Occurs(v, t));
-                }
-                if l > level {
-                    self.set(r, Node::Var { level, key });
-                }
-                Ok(())
+        self.new_walk();
+        let mut work = std::mem::take(&mut self.work);
+        work.clear();
+        work.push(t);
+        let mut result = Ok(());
+        while let Some(x) = work.pop() {
+            let r = self.resolve(x);
+            if !self.first_visit(r) {
+                continue;
             }
-            Node::Rigid { .. } | Node::Link(_) => Ok(()),
-            Node::Con(h, a, b) => {
-                let n = h.arity();
-                if n >= 1 {
-                    self.occurs_adjust(v, level, a)
-                        .map_err(|_| UnifyError::Occurs(v, t))?;
+            let n = self.node(r);
+            match n {
+                Node::Var { level: l, key } => {
+                    if r == v {
+                        result = Err(UnifyError::Occurs(v, t));
+                        break;
+                    }
+                    if l > level {
+                        self.set(r, Node::Var { level, key });
+                    }
                 }
-                if n >= 2 {
-                    self.occurs_adjust(v, level, b)
-                        .map_err(|_| UnifyError::Occurs(v, t))?;
-                }
-                Ok(())
+                Node::Con(..) => Self::push_children(&mut work, n),
+                Node::Rigid { .. } | Node::Link(_) => {}
             }
         }
+        self.work = work;
+        result
     }
 
     /// Requires `t` to be a key type, flagging variables inside it.
     fn require_key(&mut self, t: Ty) -> Result<(), UnifyError> {
-        let r = self.resolve(t);
-        match self.node(r) {
-            Node::Var { level, .. } => {
-                self.set(r, Node::Var { level, key: true });
-                Ok(())
+        self.new_walk();
+        let mut work = std::mem::take(&mut self.work);
+        work.clear();
+        work.push(t);
+        let mut result = Ok(());
+        while let Some(x) = work.pop() {
+            let r = self.resolve(x);
+            if !self.first_visit(r) {
+                continue;
             }
-            Node::Rigid { key: true } => Ok(()),
-            Node::Con(Head::Int | Head::Bool | Head::Unit, _, _) => Ok(()),
-            Node::Con(Head::Pair, a, b) => {
-                self.require_key(a)?;
-                self.require_key(b)
+            let n = self.node(r);
+            match n {
+                Node::Var { level, .. } => self.set(r, Node::Var { level, key: true }),
+                Node::Rigid { key: true } | Node::Con(Head::Int | Head::Bool | Head::Unit, ..) => {}
+                Node::Con(Head::Pair, ..) => Self::push_children(&mut work, n),
+                _ => {
+                    result = Err(UnifyError::Key(r));
+                    break;
+                }
             }
-            _ => Err(UnifyError::Key(r)),
         }
+        self.work = work;
+        result
     }
 
     // ------------------------------------------------------------ polymorphism
 
     /// Quantifies the variables of `t` created deeper than the current level.
     fn generalize(&mut self, t: Ty) {
-        let r = self.resolve(t);
-        match self.node(r) {
-            Node::Var { level, key } if level > self.level && level != GENERIC => {
-                self.set(
-                    r,
-                    Node::Var {
-                        level: GENERIC,
-                        key,
-                    },
-                );
+        self.new_walk();
+        let mut work = std::mem::take(&mut self.work);
+        work.clear();
+        work.push(t);
+        while let Some(x) = work.pop() {
+            let r = self.resolve(x);
+            if !self.first_visit(r) {
+                continue;
             }
-            Node::Con(h, a, b) => {
-                let n = h.arity();
-                if n >= 1 {
-                    self.generalize(a);
+            let n = self.node(r);
+            match n {
+                Node::Var { level, key } if level > self.level && level != GENERIC => {
+                    self.set(
+                        r,
+                        Node::Var {
+                            level: GENERIC,
+                            key,
+                        },
+                    );
                 }
-                if n >= 2 {
-                    self.generalize(b);
-                }
+                Node::Con(..) => Self::push_children(&mut work, n),
+                _ => {}
             }
-            _ => {}
         }
+        self.work = work;
     }
 
     /// A copy of `t` with fresh variables for its quantified ones. Subtrees without
-    /// quantified variables are shared, not copied.
+    /// quantified variables are shared, not copied, and each node is copied once, so
+    /// shared structure stays shared.
     fn instantiate(&mut self, t: Ty) -> Ty {
         let mut map = std::mem::take(&mut self.inst);
         map.clear();
-        let out = self.inst_rec(t, &mut map);
-        self.inst = map;
-        out
-    }
-
-    fn inst_rec(&mut self, t: Ty, map: &mut FxHashMap<Ty, Ty>) -> Ty {
-        let r = self.resolve(t);
-        match self.node(r) {
-            Node::Var {
-                level: GENERIC,
-                key,
-            } => {
-                if let Some(&n) = map.get(&r) {
-                    return n;
+        let root = self.resolve(t);
+        // A node is pushed with `true` to be expanded; a constructor is pushed again
+        // with `false` to be rebuilt once its children are done. Entries are
+        // resolved roots.
+        let mut expand: Vec<(Ty, bool)> = vec![(root, true)];
+        while let Some((r, first)) = expand.pop() {
+            if first {
+                if map.contains_key(&r) {
+                    continue;
                 }
-                let n = self.push(Node::Var {
-                    level: self.level,
-                    key,
-                });
-                map.insert(r, n);
-                n
-            }
-            Node::Con(h, a, b) => {
-                let n = h.arity();
-                let na = if n >= 1 { self.inst_rec(a, map) } else { a };
-                let nb = if n >= 2 { self.inst_rec(b, map) } else { b };
-                if na == a && nb == b {
+                match self.node(r) {
+                    Node::Var {
+                        level: GENERIC,
+                        key,
+                    } => {
+                        let n = self.push(Node::Var {
+                            level: self.level,
+                            key,
+                        });
+                        map.insert(r, n);
+                    }
+                    Node::Con(h, a, b) if h.arity() > 0 => {
+                        expand.push((r, false));
+                        if h.arity() >= 2 {
+                            let rb = self.resolve(b);
+                            expand.push((rb, true));
+                        }
+                        let ra = self.resolve(a);
+                        expand.push((ra, true));
+                    }
+                    _ => {
+                        map.insert(r, r);
+                    }
+                }
+            } else if let Node::Con(h, a, b) = self.node(r) {
+                let ra = self.resolve(a);
+                let na = map.get(&ra).copied().unwrap_or(ra);
+                let (rb, nb) = if h.arity() >= 2 {
+                    let rb = self.resolve(b);
+                    (rb, map.get(&rb).copied().unwrap_or(rb))
+                } else {
+                    (b, b)
+                };
+                let out = if na == ra && nb == rb {
                     r
                 } else {
                     self.con2(h, na, nb)
-                }
+                };
+                map.insert(r, out);
             }
-            _ => r,
         }
+        let out = map.get(&root).copied().unwrap_or(root);
+        self.inst = map;
+        out
     }
 
     /// Builds a public type into the store; `var` supplies the node for a variable.
@@ -488,37 +712,75 @@ impl TypeChecker {
     }
 
     /// The public form of `t`; `names` maps variable nodes to [`TyVar`]s and grows as
-    /// new variables are met.
-    fn export(&mut self, t: Ty, names: &mut FxHashMap<Ty, TyVar>) -> Type {
-        let r = self.resolve(t);
-        match self.node(r) {
-            Node::Var { .. } | Node::Rigid { .. } | Node::Link(_) => {
-                let next = TyVar(u32::try_from(names.len()).expect("fewer than 2^32 variables"));
-                Type::Var(*names.entry(r).or_insert(next))
-            }
-            Node::Con(h, a, b) => match h {
-                Head::Int => Type::Int,
-                Head::Bool => Type::Bool,
-                Head::Unit => Type::Unit,
-                Head::List => Type::list(self.export(a, names)),
-                Head::Option => Type::option(self.export(a, names)),
-                Head::Array => Type::array(self.export(a, names)),
-                Head::Tree => Type::tree(self.export(a, names)),
-                Head::Pair => {
-                    let a = self.export(a, names);
-                    Type::pair(a, self.export(b, names))
-                }
-                Head::Arrow => {
-                    let a = self.export(a, names);
-                    Type::arrow(a, self.export(b, names))
-                }
-            },
+    /// new variables are met. Fails if the result would exceed [`MAX_TYPE_NODES`] or
+    /// [`MAX_TYPE_DEPTH`].
+    fn export(&mut self, t: Ty, names: &mut FxHashMap<Ty, TyVar>) -> Result<Type, TooLarge> {
+        enum Item {
+            Visit(Ty, usize),
+            Build(Head),
         }
+        let mut todo = vec![Item::Visit(t, 1)];
+        let mut out: Vec<Type> = vec![];
+        let mut count = 0usize;
+        while let Some(item) = todo.pop() {
+            match item {
+                Item::Visit(x, depth) => {
+                    count += 1;
+                    if count > MAX_TYPE_NODES || depth > MAX_TYPE_DEPTH {
+                        return Err(TooLarge);
+                    }
+                    let r = self.resolve(x);
+                    match self.node(r) {
+                        Node::Var { .. } | Node::Rigid { .. } | Node::Link(_) => {
+                            let next = TyVar(
+                                u32::try_from(names.len()).expect("fewer than 2^32 variables"),
+                            );
+                            out.push(Type::Var(*names.entry(r).or_insert(next)));
+                        }
+                        Node::Con(h, a, b) => match h {
+                            Head::Int => out.push(Type::Int),
+                            Head::Bool => out.push(Type::Bool),
+                            Head::Unit => out.push(Type::Unit),
+                            _ => {
+                                todo.push(Item::Build(h));
+                                if h.arity() >= 2 {
+                                    todo.push(Item::Visit(b, depth + 1));
+                                }
+                                todo.push(Item::Visit(a, depth + 1));
+                            }
+                        },
+                    }
+                }
+                Item::Build(h) => {
+                    let mut pop = || out.pop().expect("children are built before parents");
+                    let built = match h {
+                        Head::List => Type::list(pop()),
+                        Head::Option => Type::option(pop()),
+                        Head::Array => Type::array(pop()),
+                        Head::Tree => Type::tree(pop()),
+                        Head::Pair | Head::Arrow => {
+                            let b = pop();
+                            let a = pop();
+                            if h == Head::Pair {
+                                Type::pair(a, b)
+                            } else {
+                                Type::arrow(a, b)
+                            }
+                        }
+                        Head::Int | Head::Bool | Head::Unit => {
+                            unreachable!("base types are built when visited")
+                        }
+                    };
+                    out.push(built);
+                }
+            }
+        }
+        Ok(out.pop().expect("the root is built last"))
     }
 
-    fn export_scheme(&mut self, t: Ty) -> Scheme {
+    fn export_scheme(&mut self, t: Ty) -> Result<Scheme, TooLarge> {
         let mut names = FxHashMap::default();
-        let ty = self.export(t, &mut names);
+        let ty = self.export(t, &mut names)?;
         let keys: Vec<TyVar> = names
             .iter()
             .filter(|(&node, _)| {
@@ -529,7 +791,7 @@ impl TypeChecker {
             })
             .map(|(_, &v)| v)
             .collect();
-        Scheme::with_keys(ty, &keys)
+        Ok(Scheme::with_keys(ty, &keys))
     }
 
     // ------------------------------------------------------------ primitives
@@ -691,17 +953,41 @@ impl TypeChecker {
 
     // ------------------------------------------------------------ inference
 
-    fn infer_term<L: LibEnv + ?Sized>(
+    /// Finds the type of `root`, against `want` if given, walking the term with an
+    /// explicit stack of [`Frame`]s.
+    fn walk<L: LibEnv + ?Sized>(
+        &mut self,
+        arena: &Arena,
+        libs: &L,
+        root: TermId,
+        want: Option<Want>,
+    ) -> Result<Ty, TypeError> {
+        let mut step = Step::Eval(root, want);
+        loop {
+            step = match step {
+                Step::Eval(id, want) => self.descend(arena, libs, id, want)?,
+                Step::Return(t) => match self.frames.pop() {
+                    None => return Ok(t),
+                    Some(frame) => self.resume(arena, frame, t)?,
+                },
+            };
+        }
+    }
+
+    /// Starts on subterm `id`: either its type is known at once, or frames are
+    /// pushed and a child is evaluated first.
+    fn descend<L: LibEnv + ?Sized>(
         &mut self,
         arena: &Arena,
         libs: &L,
         id: TermId,
-    ) -> Result<Ty, TypeError> {
-        match arena.get(id) {
+        want: Option<Want>,
+    ) -> Result<Step, TypeError> {
+        let t = match arena.get(id) {
             Term::Var(i) => {
                 let depth = self.env.len();
                 if i as usize >= depth {
-                    return Err(self.plain_error(
+                    return Err(plain_error(
                         arena,
                         id,
                         TypeErrorKind::UnboundVariable {
@@ -711,149 +997,280 @@ impl TypeChecker {
                     ));
                 }
                 let b = self.env[depth - 1 - i as usize];
-                Ok(if b.poly { self.instantiate(b.ty) } else { b.ty })
+                if b.poly {
+                    self.instantiate(b.ty)
+                } else {
+                    b.ty
+                }
             }
+            Term::Int(_) => INT,
+            Term::Bool(_) => BOOL,
+            Term::Unit => UNIT,
+            Term::Prim(p) => self.prim_type(p),
+            Term::Lib(l) => match libs.lib_scheme(l) {
+                Some(s) => self.instantiate_scheme(s),
+                None => return Err(plain_error(arena, id, TypeErrorKind::UnknownLib(l))),
+            },
             Term::Lam(body) => {
+                if let Some(w) = want {
+                    let rw = self.resolve(w.ty);
+                    if let Node::Con(Head::Arrow, p, r) = self.node(rw) {
+                        self.env.push(Binding { ty: p, poly: false });
+                        self.frames.push(Frame::LamChecked { arrow: rw });
+                        let ctx = "the body of `lam` (its type is fixed by the expected type)";
+                        return Ok(Step::Eval(body, Some(Want::at(r, ctx))));
+                    }
+                    self.frames.push(Frame::Check { want: w, term: id });
+                }
                 let a = self.fresh();
                 self.env.push(Binding { ty: a, poly: false });
-                let r = self.infer_term(arena, libs, body)?;
-                self.env.pop();
-                Ok(self.arrow(a, r))
+                self.frames.push(Frame::Lam { param: a });
+                return Ok(Step::Eval(body, None));
             }
             Term::Let(bound, body) => {
                 self.level += 1;
-                let t = self.infer_term(arena, libs, bound)?;
-                self.level -= 1;
-                self.generalize(t);
-                self.env.push(Binding { ty: t, poly: true });
-                let r = self.infer_term(arena, libs, body)?;
-                self.env.pop();
-                Ok(r)
+                self.frames.push(Frame::LetBound { body, want });
+                return Ok(Step::Eval(bound, None));
             }
-            Term::Int(_) => Ok(INT),
-            Term::Bool(_) => Ok(BOOL),
-            Term::Unit => Ok(UNIT),
-            Term::Prim(p) => Ok(self.prim_type(p)),
-            Term::Lib(l) => match libs.lib_scheme(l) {
-                Some(s) => Ok(self.instantiate_scheme(s)),
-                None => Err(self.plain_error(arena, id, TypeErrorKind::UnknownLib(l))),
-            },
-            Term::If(c, t, e) => {
-                self.expect_bool(arena, libs, c, "the condition of `if`")?;
-                let tt = self.infer_term(arena, libs, t)?;
-                let te = self.infer_term(arena, libs, e)?;
-                self.unify(tt, te).map_err(|err| {
-                    let site = Site {
-                        term: e,
-                        context: "the else branch of `if` (it must have the same type as \
-                                  the then branch)"
-                            .into(),
-                    };
-                    self.error(arena, err, tt, te, site)
-                })?;
-                Ok(tt)
+            Term::If(cond, then, els) => {
+                self.frames.push(Frame::IfCond {
+                    cond,
+                    then,
+                    els,
+                    want,
+                });
+                return Ok(Step::Eval(cond, None));
             }
-            Term::And(x, y) | Term::Or(x, y) => {
+            Term::And(first, second) | Term::Or(first, second) => {
                 let op = if matches!(arena.get(id), Term::And(..)) {
                     "and"
                 } else {
                     "or"
                 };
-                self.expect_bool(arena, libs, x, &format!("the first operand of `{op}`"))?;
-                self.expect_bool(arena, libs, y, &format!("the second operand of `{op}`"))?;
-                Ok(BOOL)
+                if let Some(w) = want {
+                    self.frames.push(Frame::Check { want: w, term: id });
+                }
+                self.frames.push(Frame::BoolFirst { first, second, op });
+                return Ok(Step::Eval(first, None));
             }
-            Term::App(..) => self.infer_app(arena, libs, id),
+            Term::App(..) => {
+                let start = self.spine.len();
+                let mut head = id;
+                while let Term::App(f, a) = arena.get(head) {
+                    self.spine.push(a);
+                    head = f;
+                }
+                self.spine[start..].reverse();
+                let sp = Spine {
+                    app: id,
+                    head,
+                    start,
+                };
+                self.frames.push(Frame::AppHead { sp, want });
+                return Ok(Step::Eval(head, None));
+            }
+        };
+        if let Some(w) = want {
+            self.expect(arena, w.ty, t, Site::new(id, w.context))?;
         }
+        Ok(Step::Return(t))
     }
 
-    fn expect_bool<L: LibEnv + ?Sized>(
-        &mut self,
-        arena: &Arena,
-        libs: &L,
-        id: TermId,
-        context: &str,
-    ) -> Result<(), TypeError> {
-        let t = self.infer_term(arena, libs, id)?;
-        self.unify(BOOL, t).map_err(|e| {
-            let site = Site {
-                term: id,
-                context: context.into(),
-            };
-            self.error(arena, e, BOOL, t, site)
+    /// Continues `frame` now that its pending subterm has type `t`.
+    fn resume(&mut self, arena: &Arena, frame: Frame, t: Ty) -> Result<Step, TypeError> {
+        Ok(match frame {
+            Frame::Lam { param } => {
+                self.env.pop();
+                Step::Return(self.arrow(param, t))
+            }
+            Frame::LamChecked { arrow } => {
+                self.env.pop();
+                Step::Return(arrow)
+            }
+            Frame::LetBound { body, want } => {
+                self.level -= 1;
+                self.generalize(t);
+                self.env.push(Binding { ty: t, poly: true });
+                self.frames.push(Frame::LetBody);
+                let ctx = "the body of `let` (its type is fixed by the expected type)";
+                Step::Eval(body, want.map(|w| Want::at(w.ty, ctx)))
+            }
+            Frame::LetBody => {
+                self.env.pop();
+                Step::Return(t)
+            }
+            Frame::IfCond {
+                cond,
+                then,
+                els,
+                want,
+            } => {
+                self.expect(arena, BOOL, t, Site::new(cond, "the condition of `if`"))?;
+                match want {
+                    Some(w) => {
+                        self.frames.push(Frame::IfThenChecked { els, want: w });
+                        let ctx =
+                            "the then branch of `if` (its type is fixed by the expected type)";
+                        Step::Eval(then, Some(Want::at(w.ty, ctx)))
+                    }
+                    None => {
+                        self.frames.push(Frame::IfThen { els });
+                        Step::Eval(then, None)
+                    }
+                }
+            }
+            Frame::IfThenChecked { els, want } => {
+                let ctx = "the else branch of `if` (its type is fixed by the expected type)";
+                Step::Eval(els, Some(Want::at(want.ty, ctx)))
+            }
+            Frame::IfThen { els } => {
+                self.frames.push(Frame::IfElse { then_ty: t, els });
+                Step::Eval(els, None)
+            }
+            Frame::IfElse { then_ty, els } => {
+                let ctx = "the else branch of `if` (it must have the same type as the then \
+                           branch)";
+                self.expect(arena, then_ty, t, Site::new(els, ctx))?;
+                Step::Return(then_ty)
+            }
+            Frame::BoolFirst { first, second, op } => {
+                let ctx = format!("the first operand of `{op}`");
+                self.expect(arena, BOOL, t, Site::new(first, ctx))?;
+                self.frames.push(Frame::BoolSecond { second, op });
+                Step::Eval(second, None)
+            }
+            Frame::BoolSecond { second, op } => {
+                let ctx = format!("the second operand of `{op}`");
+                self.expect(arena, BOOL, t, Site::new(second, ctx))?;
+                Step::Return(BOOL)
+            }
+            Frame::Check { want, term } => {
+                self.expect(arena, want.ty, t, Site::new(term, want.context))?;
+                Step::Return(t)
+            }
+            Frame::AppHead { sp, want } => {
+                let pending = match want {
+                    Some(w) => self.expect_result(arena, sp, t, w)?,
+                    None => None,
+                };
+                self.next_arg(arena, sp, 0, t, pending)?
+            }
+            Frame::AppArg {
+                sp,
+                i,
+                param,
+                ret,
+                want,
+            } => {
+                let arg = self.spine[sp.start + i];
+                let ctx = format!("argument {} of `{}`", i + 1, short(arena, sp.head));
+                self.expect(arena, param, t, Site::new(arg, ctx))?;
+                self.next_arg(arena, sp, i + 1, ret, want)?
+            }
         })
     }
 
-    /// Infers an application spine `head a1 ... an` argument by argument, so errors
-    /// can say "argument i of `head`".
-    fn infer_app<L: LibEnv + ?Sized>(
+    /// In checking mode, unifies the result type of application `app` with `want`
+    /// before its arguments are looked at, when the head's type shows how many
+    /// arguments it takes. Returns `want` back if that has to wait until the
+    /// arguments are done (the head is applied to too many arguments, which the
+    /// argument walk reports).
+    fn expect_result(
         &mut self,
         arena: &Arena,
-        libs: &L,
-        id: TermId,
-    ) -> Result<Ty, TypeError> {
-        let mut args = vec![];
-        let mut head = id;
-        while let Term::App(f, a) = arena.get(head) {
-            args.push(a);
-            head = f;
+        sp: Spine,
+        tf: Ty,
+        want: Want,
+    ) -> Result<Option<Want>, TypeError> {
+        let n = self.spine.len() - sp.start;
+        let mut cur = tf;
+        for _ in 0..n {
+            match self.split_arrow(arena, sp, cur)? {
+                Some((_, ret)) => cur = ret,
+                None => return Ok(Some(want)),
+            }
         }
-        args.reverse();
-        let mut tf = self.infer_term(arena, libs, head)?;
-        for (i, &arg) in args.iter().enumerate() {
+        self.expect(arena, want.ty, cur, Site::new(sp.app, want.context))?;
+        Ok(None)
+    }
+
+    /// Goes on to argument `i` of `sp`, with `tf` the type of its head applied to the
+    /// first `i` arguments.
+    fn next_arg(
+        &mut self,
+        arena: &Arena,
+        sp: Spine,
+        i: usize,
+        tf: Ty,
+        want: Option<Want>,
+    ) -> Result<Step, TypeError> {
+        let n = self.spine.len() - sp.start;
+        if i == n {
+            self.spine.truncate(sp.start);
+            if let Some(w) = want {
+                self.expect(arena, w.ty, tf, Site::new(sp.app, w.context))?;
+            }
+            return Ok(Step::Return(tf));
+        }
+        let Some((param, ret)) = self.split_arrow(arena, sp, tf)? else {
             let rf = self.resolve(tf);
-            let (param, ret) = match self.node(rf) {
-                Node::Con(Head::Arrow, p, r) => (p, r),
-                Node::Var { .. } => {
-                    let (p, r) = (self.fresh(), self.fresh());
-                    let want = self.arrow(p, r);
-                    self.unify(rf, want).map_err(|e| {
-                        let site = Site {
-                            term: head,
-                            context: format!("the function position of `{}`", short(arena, id)),
-                        };
-                        self.error(arena, e, want, rf, site)
-                    })?;
-                    (p, r)
-                }
-                _ => {
-                    let mut names = FxHashMap::default();
-                    let found = self.export(rf, &mut names);
-                    return Err(self.plain_error(
-                        arena,
-                        id,
-                        TypeErrorKind::NotAFunction {
-                            found,
-                            applied_to: args.len(),
-                            accepted: i,
-                        },
-                    ));
-                }
+            let mut names = FxHashMap::default();
+            let kind = match self.export(rf, &mut names) {
+                Ok(found) => TypeErrorKind::NotAFunction {
+                    found,
+                    applied_to: n,
+                    accepted: i,
+                },
+                Err(TooLarge) => too_large(),
             };
-            let ta = self.infer_term(arena, libs, arg)?;
-            self.unify(param, ta).map_err(|e| {
-                let site = Site {
-                    term: arg,
-                    context: format!("argument {} of `{}`", i + 1, short(arena, head)),
-                };
-                self.error(arena, e, param, ta, site)
-            })?;
-            tf = ret;
+            return Err(plain_error(arena, sp.app, kind));
+        };
+        self.frames.push(Frame::AppArg {
+            sp,
+            i,
+            param,
+            ret,
+            want,
+        });
+        Ok(Step::Eval(self.spine[sp.start + i], None))
+    }
+
+    /// The parameter and result types of `tf`, the type of the head of `sp` applied
+    /// to some of its arguments. A variable is unified with a fresh arrow; `None` if `tf` is
+    /// some other type, so not a function.
+    fn split_arrow(
+        &mut self,
+        arena: &Arena,
+        sp: Spine,
+        tf: Ty,
+    ) -> Result<Option<(Ty, Ty)>, TypeError> {
+        let rf = self.resolve(tf);
+        match self.node(rf) {
+            Node::Con(Head::Arrow, p, r) => Ok(Some((p, r))),
+            Node::Var { .. } => {
+                let (p, r) = (self.fresh(), self.fresh());
+                let want = self.arrow(p, r);
+                let ctx = format!("the function position of `{}`", short(arena, sp.app));
+                self.expect(arena, want, rf, Site::new(sp.head, ctx))?;
+                Ok(Some((p, r)))
+            }
+            _ => Ok(None),
         }
-        Ok(tf)
+    }
+
+    /// Unifies `expected` with `found`, turning a failure into an error at `site`.
+    fn expect(
+        &mut self,
+        arena: &Arena,
+        expected: Ty,
+        found: Ty,
+        site: Site,
+    ) -> Result<(), TypeError> {
+        self.unify(expected, found)
+            .map_err(|e| self.error(arena, e, expected, found, site))
     }
 
     // ------------------------------------------------------------ errors
-
-    fn plain_error(&self, arena: &Arena, term: TermId, kind: TypeErrorKind) -> TypeError {
-        TypeError {
-            kind: Box::new(kind),
-            term,
-            term_text: short(arena, term),
-            context: String::new(),
-            note: None,
-        }
-    }
 
     /// Turns a unification failure between `expected` and `found` at `site` into a
     /// [`TypeError`]. All types in it share one variable renaming.
@@ -865,14 +1282,32 @@ impl TypeChecker {
         found: Ty,
         site: Site,
     ) -> TypeError {
+        let (kind, note) = self
+            .error_kind(err, expected, found)
+            .unwrap_or_else(|TooLarge| (too_large(), None));
+        TypeError {
+            kind: Box::new(kind),
+            term: site.term,
+            term_text: short(arena, site.term),
+            context: site.context,
+            note,
+        }
+    }
+
+    fn error_kind(
+        &mut self,
+        err: UnifyError,
+        expected: Ty,
+        found: Ty,
+    ) -> Result<(TypeErrorKind, Option<String>), TooLarge> {
         let mut names = FxHashMap::default();
         let mut note = None;
         let kind = match err {
             UnifyError::Clash(x, y) => {
-                let exp = self.export(expected, &mut names);
-                let fnd = self.export(found, &mut names);
-                let cx = self.export(x, &mut names);
-                let cy = self.export(y, &mut names);
+                let exp = self.export(expected, &mut names)?;
+                let fnd = self.export(found, &mut names)?;
+                let cx = self.export(x, &mut names)?;
+                let cy = self.export(y, &mut names)?;
                 if self.is_rigid(x) || self.is_rigid(y) {
                     note = Some(
                         "type variables in the expected type are rigid: the term must work \
@@ -893,12 +1328,12 @@ impl TypeChecker {
                 }
             }
             UnifyError::Occurs(v, t) => {
-                let var = self.export(v, &mut names);
-                let ty = self.export(t, &mut names);
+                let var = self.export(v, &mut names)?;
+                let ty = self.export(t, &mut names)?;
                 TypeErrorKind::InfiniteType { var, ty }
             }
             UnifyError::Key(t) => {
-                let found = self.export(t, &mut names);
+                let found = self.export(t, &mut names)?;
                 if self.is_rigid(t) {
                     note = Some(format!(
                         "the expected type must declare `Key {found} =>` to use `{found}` \
@@ -908,13 +1343,7 @@ impl TypeChecker {
                 TypeErrorKind::BadMemoKey { found }
             }
         };
-        TypeError {
-            kind: Box::new(kind),
-            term: site.term,
-            term_text: short(arena, site.term),
-            context: site.context,
-            note,
-        }
+        Ok((kind, note))
     }
 
     fn is_rigid(&mut self, t: Ty) -> bool {
@@ -923,18 +1352,110 @@ impl TypeChecker {
     }
 }
 
-/// `id` in core syntax, cut to [`MAX_TERM_TEXT`] bytes.
-fn short(arena: &Arena, id: TermId) -> String {
-    let mut s = sexpr::print(arena, id);
-    if s.len() > MAX_TERM_TEXT {
+fn too_large() -> TypeErrorKind {
+    TypeErrorKind::TypeTooLarge {
+        max_nodes: MAX_TYPE_NODES,
+        max_depth: MAX_TYPE_DEPTH,
+    }
+}
+
+fn plain_error(arena: &Arena, term: TermId, kind: TypeErrorKind) -> TypeError {
+    TypeError {
+        kind: Box::new(kind),
+        term,
+        term_text: short(arena, term),
+        context: String::new(),
+        note: None,
+    }
+}
+
+/// `id` in core syntax (as [`crate::sexpr::print`] writes it), cut to
+/// [`MAX_TERM_TEXT`] bytes followed by ` ...`. It stops writing once past the limit,
+/// so its cost does not depend on the size or depth of the term.
+pub(super) fn short(arena: &Arena, id: TermId) -> String {
+    enum Item {
+        Term(TermId),
+        Text(&'static str),
+    }
+    let mut out = String::new();
+    let mut todo = vec![Item::Term(id)];
+    let mut spine = vec![];
+    while let Some(item) = todo.pop() {
+        if out.len() > MAX_TERM_TEXT {
+            break;
+        }
+        let t = match item {
+            Item::Text(s) => {
+                out.push_str(s);
+                continue;
+            }
+            Item::Term(t) => t,
+        };
+        let (keyword, children): (&str, &[TermId]) = match arena.get(t) {
+            Term::Var(i) => {
+                let _ = write!(out, "${i}");
+                continue;
+            }
+            Term::Int(n) => {
+                let _ = write!(out, "{n}");
+                continue;
+            }
+            Term::Bool(b) => {
+                let _ = write!(out, "{b}");
+                continue;
+            }
+            Term::Unit => {
+                out.push_str("unit");
+                continue;
+            }
+            Term::Prim(p) => {
+                out.push_str(p.name());
+                continue;
+            }
+            Term::Lib(LibId(l)) => {
+                let _ = write!(out, "lib_{l}");
+                continue;
+            }
+            Term::Lam(b) => ("lam", &[b]),
+            Term::Let(x, b) => ("let", &[x, b]),
+            Term::If(c, th, e) => ("if", &[c, th, e]),
+            Term::And(x, y) => ("and", &[x, y]),
+            Term::Or(x, y) => ("or", &[x, y]),
+            Term::App(..) => {
+                spine.clear();
+                let mut head = t;
+                while let Term::App(f, a) = arena.get(head) {
+                    spine.push(a);
+                    head = f;
+                }
+                // `spine` holds the arguments last first, which is push order.
+                out.push('(');
+                todo.push(Item::Text(")"));
+                for &a in &spine {
+                    todo.push(Item::Term(a));
+                    todo.push(Item::Text(" "));
+                }
+                todo.push(Item::Term(head));
+                continue;
+            }
+        };
+        out.push('(');
+        out.push_str(keyword);
+        todo.push(Item::Text(")"));
+        for &c in children.iter().rev() {
+            todo.push(Item::Term(c));
+            todo.push(Item::Text(" "));
+        }
+    }
+    if out.len() > MAX_TERM_TEXT {
         let mut cut = MAX_TERM_TEXT;
-        while !s.is_char_boundary(cut) {
+        while !out.is_char_boundary(cut) {
             cut -= 1;
         }
-        s.truncate(cut);
-        s.push_str(" ...");
+        out.truncate(cut);
+        out.push_str(" ...");
     }
-    s
+    out
 }
 
 /// Infers the principal type scheme of `term`. See [`TypeChecker::infer`].
@@ -962,4 +1483,5 @@ pub fn prim_scheme(p: Prim) -> Scheme {
     tc.reset();
     let t = tc.prim_type(p);
     tc.export_scheme(t)
+        .expect("primitive types are far below the size limits")
 }

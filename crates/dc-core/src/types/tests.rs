@@ -634,17 +634,19 @@ fn check_rejects_terms_less_general_than_expected() {
 
 #[test]
 fn check_rejects_wrong_types() {
+    // The expected type is pushed through the lambda, so the clash is reported at
+    // its body against the rest of the expected type.
     let e = check_src("(lam 1)", "Int -> Int -> Int").unwrap_err();
     assert_eq!(
         *e.kind,
         TypeErrorKind::Mismatch {
-            expected: ty("Int -> Int -> Int"),
-            // Unification binds the argument type to Int before it reaches the clash,
-            // and errors show types as they stand at the point of failure.
-            found: ty("Int -> Int"),
-            conflict: Some((ty("Int -> Int"), Type::Int)),
+            expected: ty("Int -> Int"),
+            found: Type::Int,
+            conflict: None,
         }
     );
+    assert_eq!(e.term_text, "1", "{e}");
+    assert!(e.context.contains("the body of `lam`"), "{e}");
     assert!(check_src("(lam $0)", "Int -> Bool").is_err());
 }
 
@@ -723,4 +725,180 @@ fn laws_on_random_terms() {
         "only {} of 2000 random terms were well typed",
         typed.get()
     );
+}
+
+// ---------------------------------------------------------------- depth and sharing
+
+/// `(cons 1 (cons 1 ... (cons last nil)))` with `n` elements, built without the
+/// (recursive) s-expression parser.
+fn deep_list(a: &mut Arena, n: usize, last: TermId) -> TermId {
+    let cons = a.prim(Prim::Cons);
+    let one = a.int(1);
+    let nil = a.prim(Prim::Nil);
+    let mut t = a.apps(cons, &[last, nil]);
+    for _ in 1..n {
+        t = a.apps(cons, &[one, t]);
+    }
+    t
+}
+
+#[test]
+fn deep_terms_are_checked_without_host_recursion() {
+    // Far deeper than the host stack of a test thread allows for a recursive walk.
+    const N: usize = 200_000;
+    let mut a = Arena::new();
+    let one = a.int(1);
+    let list = deep_list(&mut a, N, one);
+    assert_eq!(infer(&a, list, NO_LIBS), Ok(sch("List Int")));
+    assert_eq!(check(&a, list, NO_LIBS, &sch("List Int")), Ok(()));
+
+    // An error at the bottom is still found, and its subterm text stays short.
+    let t = a.bool(true);
+    let bad = deep_list(&mut a, N, t);
+    let e = infer(&a, bad, NO_LIBS).unwrap_err();
+    assert!(matches!(*e.kind, TypeErrorKind::Mismatch { .. }), "{e}");
+    assert!(e.term_text.len() < 300, "{}", e.term_text.len());
+    let e = check(&a, bad, NO_LIBS, &sch("List Int")).unwrap_err();
+    assert!(e.term_text.len() < 300, "{}", e.term_text.len());
+
+    // Deep lets and ifs.
+    let mut t = a.int(7);
+    for _ in 0..N {
+        let c = a.bool(false);
+        let other = a.int(8);
+        let body = a.if_(c, t, other);
+        let v = a.var(0);
+        let bound = a.lam(v);
+        t = a.let_(bound, body);
+    }
+    assert_eq!(infer(&a, t, NO_LIBS), Ok(sch("Int")));
+    assert_eq!(check(&a, t, NO_LIBS, &sch("Int")), Ok(()));
+}
+
+#[test]
+fn deep_lambda_nests_report_a_too_large_type() {
+    // N nested lambdas have an arrow type N levels deep. That is reported as an
+    // error rather than built (and later printed or dropped) recursively.
+    let mut a = Arena::new();
+    let mut t = a.var(0);
+    for _ in 0..100_000 {
+        t = a.lam(t);
+    }
+    let e = infer(&a, t, NO_LIBS).unwrap_err();
+    assert!(matches!(*e.kind, TypeErrorKind::TypeTooLarge { .. }), "{e}");
+    assert!(e.to_string().contains("too large"), "{e}");
+}
+
+/// The doubler `$0 = (lam (pair $0 $0))` applied `n` times to `1`: its type is a
+/// DAG with `n` nodes but a tree with `2^n` leaves.
+fn doubled(n: usize) -> String {
+    let mut x = String::from("1");
+    for _ in 0..n {
+        x = format!("($0 {x})");
+    }
+    x
+}
+
+#[test]
+fn shared_type_structure_is_walked_once() {
+    // Before the store walks were memoised these took time exponential in n
+    // (about a minute at n = 30 in a release build).
+    let start = std::time::Instant::now();
+    let d = doubled(60);
+    assert_infers(
+        &format!("(let (lam (pair $0 $0)) (length (cons {d} nil)))"),
+        "Int",
+    );
+    // The same through a let: generalisation and instantiation of the shared type.
+    assert_infers(
+        &format!("(let (lam (pair $0 $0)) (let {d} (length (cons $0 (cons $0 nil)))))"),
+        "Int",
+    );
+    // A principal type that is exponentially large as a tree is an error, not an
+    // attempt to build it.
+    let e = expect_err(&format!("(let (lam (pair $0 $0)) {d})"));
+    assert!(matches!(*e.kind, TypeErrorKind::TypeTooLarge { .. }), "{e}");
+    // A clash inside such a type is reported without printing it in full.
+    let e = expect_err(&format!("(let (lam (pair $0 $0)) (add 1 {d}))"));
+    assert!(e.to_string().len() < 2000, "{}", e.to_string().len());
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+// ---------------------------------------------------------------- check locates errors
+
+#[test]
+fn check_reports_the_subterm_where_the_expected_type_clashes() {
+    // The expected parameter type reaches the memorec key argument.
+    let e = check_src("(lam (memorec 5 (lam (lam 0)) $0))", "List Int -> Int").unwrap_err();
+    assert!(matches!(&*e.kind, TypeErrorKind::BadMemoKey { .. }), "{e}");
+    assert_eq!(e.term_text, "$0", "{e}");
+    assert!(e.context.contains("argument 3 of `memorec`"), "{e}");
+
+    // The expected result type reaches the branches of an if.
+    let e = check_src("(lam (lam (if $1 1 true)))", "Bool -> a -> Int").unwrap_err();
+    assert_eq!(e.term_text, "true", "{e}");
+    assert_eq!(
+        *e.kind,
+        TypeErrorKind::Mismatch {
+            expected: Type::Int,
+            found: Type::Bool,
+            conflict: None,
+        }
+    );
+
+    // ... and the result of an application, before its arguments are looked at.
+    let e = check_src("(lam (let 3 (add $1 $0)))", "Int -> Bool").unwrap_err();
+    assert_eq!(e.term_text, "(add $1 $0)", "{e}");
+    assert!(e.context.contains("expected type"), "{e}");
+
+    // A lambda where the expected type is not a function is reported at the lambda.
+    let e = check_src("(if true (lam $0) 1)", "Int").unwrap_err();
+    assert_eq!(e.term_text, "(lam $0)", "{e}");
+    assert!(e.context.contains("then branch"), "{e}");
+
+    // An over-applied head is still reported as such, not as a result mismatch.
+    let e = check_src("(1 2)", "Int").unwrap_err();
+    assert!(
+        matches!(*e.kind, TypeErrorKind::NotAFunction { accepted: 0, .. }),
+        "{e}"
+    );
+
+    // Operands of and/or keep their own positions.
+    let e = check_src("(lam (and $0 1))", "Bool -> Bool").unwrap_err();
+    assert_eq!(e.term_text, "1", "{e}");
+    assert!(e.context.contains("second operand of `and`"), "{e}");
+}
+
+#[test]
+fn bounded_printing_agrees_with_sexpr_print() {
+    let mut a = Arena::new();
+    for src in [
+        "(lam (foldl (lam (lam (add $1 $0))) 0 $0))",
+        "(let (lam $0) (if (and true (or false true)) ($0 unit) lib_3))",
+        "((lam $0) -7 (pair 1 2))",
+    ] {
+        let id = parse_term(&mut a, src);
+        assert_eq!(super::infer::short(&a, id), src);
+    }
+}
+
+proptest! {
+    #[test]
+    fn bounded_printing_is_a_prefix_of_sexpr_print(src in arb_src()) {
+        let mut a = Arena::new();
+        let id = parse_term(&mut a, &src);
+        let full = sexpr::print(&a, id);
+        let short = super::infer::short(&a, id);
+        if full.len() <= 200 {
+            prop_assert_eq!(short, full);
+        } else {
+            let kept = short.strip_suffix(" ...").expect("long text ends with ...");
+            prop_assert!(full.starts_with(kept));
+            prop_assert_eq!(kept.len(), 200);
+        }
+    }
 }

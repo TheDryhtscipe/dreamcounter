@@ -57,6 +57,15 @@ pub enum TypeErrorKind {
         /// The offending type, or the part of it that is not a key type.
         found: Type,
     },
+    /// A type involved is too large to build or print: more than `max_nodes`
+    /// constructors in total, or nested more than `max_depth` levels deep. Types that
+    /// share structure can be exponentially larger written out than in the checker.
+    TypeTooLarge {
+        /// The limit on the number of type constructors.
+        max_nodes: usize,
+        /// The limit on nesting depth.
+        max_depth: usize,
+    },
 }
 
 /// A type error at one subterm.
@@ -132,6 +141,16 @@ impl fmt::Display for TypeError {
                 f,
                 "`{found}` cannot be a memorec key; keys must be Int, Bool, Unit or \
                  tuples of those"
+            )?,
+            TypeErrorKind::TypeTooLarge {
+                max_nodes,
+                max_depth,
+            } => write!(
+                f,
+                "the type here is too large (more than {max_nodes} type constructors \
+                 written out, or nested more than {max_depth} deep); a common cause \
+                 is a function that duplicates its argument's type, such as \
+                 `(lam (pair $0 $0))`, applied many times"
             )?,
         }
         write!(f, "\n  term: {}", self.term_text)?;
