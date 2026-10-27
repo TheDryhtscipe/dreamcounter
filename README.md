@@ -21,6 +21,7 @@ Phase 1 (literature and language specification) is drafted. Three open questions
 
 The `docs/` directory holds the project documentation:
 
+- `docs/context/`: the original project brief.
 - `docs/reference/`: the `dc` language specification and the literature notes.
 - `docs/decisions/`: design decisions, with the alternatives considered.
 - `docs/findings/`: the results log, a dated record of every experiment.
