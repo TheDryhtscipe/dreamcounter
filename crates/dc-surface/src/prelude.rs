@@ -28,8 +28,20 @@
 //! exactly what the same definition costs as a top-level `let` in the program:
 //! the step count of a prelude function is the honest cost of its definition.
 //! Learned abstractions keep the ids below the block (`LibId(0)`, `LibId(1)`,
-//! ..., which matches Stitch's `fn_0`, `fn_1`, ...); their expander must leave
-//! the block alone, and [`Prelude::expand`] leaves every other id alone.
+//! ..., which matches Stitch's `fn_0`, `fn_1`, ...), and [`Prelude::expand`]
+//! leaves every id outside the block alone.
+//!
+//! # Order of expansion
+//!
+//! Expand prelude references **first**: run [`Prelude::expand`] on the program
+//! and on each learned abstraction's closed term `λ^k. body`, then give the
+//! results to the learned-abstraction expander. That expander then never sees a
+//! prelude id, so it can reject every id it does not define. The order is sound
+//! because every prelude definition is closed and contains no library
+//! references: substituting arguments into a learned body never reaches inside
+//! one, so expanding prelude references before or after the learned
+//! abstractions gives the same term. [`Prelude::expand`] keeps a learned term's
+//! leading lambdas, so its arity is unchanged.
 //!
 //! # Ablation
 //!

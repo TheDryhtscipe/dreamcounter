@@ -29,10 +29,11 @@
 use std::sync::OnceLock;
 
 use dc_core::types::infer;
+use dc_core::types::LibEnv;
 use dc_core::{Arena, LibId, Scheme, Term, TermId};
 use dc_eval::{apply, ErrorKind, Outcome, Value};
 use dc_stitch::LibNames;
-use dc_surface::prelude::{Prelude, PreludeMode, PRELUDE_LIB_BASE};
+use dc_surface::prelude::{Prelude, PreludeError, PreludeMode, PRELUDE_LIB_BASE};
 use dc_surface::TopLevel;
 use proptest::prelude::*;
 
@@ -185,6 +186,89 @@ fn expansion_leaves_other_library_references_alone() {
     assert!(matches!(arena.get(a), Term::Lam(_)));
 }
 
+#[test]
+fn a_name_defined_twice_is_reported() {
+    let e = Prelude::from_source("dup", "let f x = x\nlet g x = x\nlet f y = y").unwrap_err();
+    assert!(
+        matches!(&e, PreludeError::Duplicate(n) if n == "f"),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn with_libs_layers_the_prelude_over_learned_schemes() {
+    let p = prelude();
+    let learned: Vec<Scheme> = vec![p.get("sum").unwrap().scheme().clone()];
+    let env = p.with_libs(&learned);
+    assert_eq!(env.lib_scheme(LibId(0)), Some(&learned[0]));
+    assert_eq!(env.lib_scheme(LibId(1)), None);
+    let map = p.get("map").unwrap();
+    assert_eq!(env.lib_scheme(map.lib()), Some(map.scheme()));
+    assert_eq!(env.lib_scheme(LibId(PRELUDE_LIB_BASE + 1000)), None);
+}
+
+/// Every `Lib` id in `t`.
+fn lib_ids(arena: &Arena, t: TermId) -> Vec<LibId> {
+    let mut out = vec![];
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![t];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let node = arena.get(id);
+        if let Term::Lib(l) = node {
+            out.push(l);
+        }
+        stack.extend(dc_core::term::children(&node));
+    }
+    out
+}
+
+#[test]
+fn prelude_expansion_commutes_with_learned_abstraction_expansion() {
+    // The pipeline expands prelude references first, in the program and in each
+    // learned abstraction's term, then hands the result to the learned expander,
+    // which therefore never sees a prelude id. That order is sound because every
+    // prelude definition is closed and has no library references: substituting
+    // arguments into a learned body never reaches inside one.
+    let p = prelude();
+    let mut arena = Arena::new();
+    for e in p.entries() {
+        let d = p.definition(&mut arena, e.name()).unwrap();
+        assert!(arena.is_closed(d), "{}", e.name());
+        assert_eq!(lib_ids(&arena, d), vec![], "{}", e.name());
+    }
+    // A learned abstraction `λx. map x` (arity 1) used as `L0 reverse`.
+    let map = arena.lib(p.get("map").unwrap().lib());
+    let reverse = arena.lib(p.get("reverse").unwrap().lib());
+    let x = arena.var(0);
+    let body_use = arena.app(map, x);
+    let learned = arena.lam(body_use);
+    // Learned expansion first (by hand: `map reverse`), then the prelude.
+    let macro_first = arena.app(map, reverse);
+    let a = p.expand(&mut arena, macro_first);
+    // Prelude first, in the learned term and at the use site, then substitution.
+    let learned_x = p.expand(&mut arena, learned);
+    assert!(arena.is_closed(learned_x));
+    assert_eq!(lib_ids(&arena, learned_x), vec![]);
+    let Term::Lam(b) = arena.get(learned_x) else {
+        panic!("{learned_x:?}")
+    };
+    let Term::App(f, v) = arena.get(b) else {
+        panic!("{b:?}")
+    };
+    assert_eq!(arena.get(v), Term::Var(0));
+    let arg = p.expand(&mut arena, reverse);
+    let b_first = arena.app(f, arg);
+    assert_eq!(a, b_first);
+    // A learned id is left for the learned expander.
+    let l0 = arena.lib(LibId(0));
+    let use_site = arena.app(l0, reverse);
+    let y = p.expand(&mut arena, use_site);
+    assert_eq!(lib_ids(&arena, y), vec![LibId(0)]);
+}
+
 // ---- the off-switch ----
 
 #[test]
@@ -310,11 +394,16 @@ fn sum_steps(n: u64) -> u64 {
     2 + 2 * n
 }
 
-/// range lo hi: 2 (program β) + 2 (β) + 1 (sub for top) + 1 (sub for
-/// hi - lo) + 1 (nil) + per element [1 (loop) + 2 (β) + 1 (sub) + 1 (cons)] = 7 + 5n,
-/// n = max(hi - lo, 0).
+/// range lo hi, n = max(hi - lo, 0): 2 (program β) + 2 (β) + le 1 + if 1, then
+/// - n = 0: nil 1, so 7 in all;
+/// - n > 0: 1 (sub for top) + 1 (sub for hi - lo) + 1 (nil) + per element
+///   [1 (loop) + 2 (β) + 1 (sub) + 1 (cons)], so 9 + 5n.
 fn range_steps(n: u64) -> u64 {
-    7 + 5 * n
+    if n == 0 {
+        7
+    } else {
+        9 + 5 * n
+    }
 }
 
 /// take k xs, n = |xs|. Setup: 2 (program β) + 2 (β into take) + 2 (fuel: length,
@@ -334,13 +423,14 @@ fn take_steps(k: i64, n: u64) -> u64 {
 
 /// drop k xs: as take, but each element dropped costs le + if + list_case +
 /// 2 β + sub + the next call's 4 = 10, and a last call with k ≤ 0 costs le + if = 2.
+/// An exhausted list returns `ys` itself: le + if + list_case + 1 β = 4.
 fn drop_steps(k: i64, n: u64) -> u64 {
     if k < 0 {
         12
     } else if (k as u64) <= n {
         12 + 10 * k as u64
     } else {
-        15 + 10 * n
+        14 + 10 * n
     }
 }
 
@@ -476,14 +566,45 @@ fn cost_formulas_at_several_sizes() {
 
 #[test]
 fn growth_is_linear_where_it_should_be() {
-    // Doubling n doubles the per-element part of each count: the formulas are
-    // affine in n with the slopes above, so reverse and append are linear and
-    // take is linear in its count, not in the list length.
+    // Measured counts, not the formulas: take is linear in its count, not in the
+    // list length, and reverse and append are linear in the list length.
     let long: Vec<i64> = (0..1000).collect();
     let l = ints(&long);
     let t = |k: i64| value("fun k xs -> take k xs", &[int(k), l.clone()]).1;
     assert_eq!(t(20) - t(10), 110);
     assert_eq!(t(10), take_steps(10, 1000));
+    let list = |n: i64| ints(&(0..n).collect::<Vec<i64>>());
+    let r = |n: i64| value("fun xs -> reverse xs", &[list(n)]).1;
+    assert_eq!(r(200) - r(100), r(100) - r(0));
+    assert_eq!(r(100) - r(0), 400);
+    let a = |n: i64| value("fun xs ys -> append xs ys", &[list(n), list(7)]).1;
+    assert_eq!(a(200) - a(100), a(100) - a(0));
+    assert_eq!(a(100) - a(0), 200);
+}
+
+#[test]
+fn range_is_empty_at_extreme_bounds() {
+    // `hi - 1` and `hi - lo` would overflow here; an empty range must not.
+    for (lo, hi) in [
+        (i64::MIN, i64::MIN),
+        (i64::MAX, i64::MIN),
+        (0, i64::MIN),
+        (i64::MAX, i64::MAX),
+    ] {
+        assert_eq!(
+            value("fun a b -> range a b", &[int(lo), int(hi)]),
+            (ints(&[]), range_steps(0)),
+            "range {lo} {hi}"
+        );
+    }
+    assert_eq!(
+        value("fun a b -> range a b", &[int(i64::MAX - 2), int(i64::MAX)]),
+        (ints(&[i64::MAX - 2, i64::MAX - 1]), range_steps(2))
+    );
+    assert_eq!(
+        value("fun a b -> range a b", &[int(i64::MIN), int(i64::MIN + 2)]),
+        (ints(&[i64::MIN, i64::MIN + 1]), range_steps(2))
+    );
 }
 
 #[test]
