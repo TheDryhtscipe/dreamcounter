@@ -15,6 +15,22 @@
 //!
 //! Both fit over the same [`Window`] of the sweep, by default its upper half.
 //!
+//! # How decisive estimator B's `γ` is
+//!
+//! Neighbouring `γ` differ only by the `ln ln n` term, which is nearly linear
+//! in `ln n` over a short sweep. Over the default window
+//! `n ∈ {128, ..., 1024}`, moving `γ` one step from the truth raises B's RSS
+//! by only about `2.0e-4`. So B's choice holds only for low noise in the
+//! median step counts. [`PowerLogFit::gamma_stability`] reports the exact
+//! margin: any change of at most that much to each `ln` median (a relative
+//! change of about the same size to each step count) leaves `γ` unchanged,
+//! and a worst-case change slightly larger flips it. For an exact `n log n`
+//! series on the default sweep it is about `0.0035`, so B separates
+//! `n log n` from `n^1.17` only when each median is accurate to about
+//! 0.35 %. Deterministic step counts on fixed inputs meet that; medians that
+//! vary by around 1 % with the seeded inputs may not. Check the reported
+//! stability before relying on `γ`.
+//!
 //! # Conventions
 //!
 //! * **Median over seeds.** Each size's step count is the median of its seed
@@ -240,6 +256,10 @@ pub enum GrowthError {
     DegenerateSizes,
     /// A computed quantity was not finite.
     NonFinite,
+    /// Estimator B cannot tell `γ` values apart: over the window, `ln ln n`
+    /// is (to rounding) a linear function of `ln n`, so every `γ` fits
+    /// equally well.
+    GammaUnidentifiable,
 }
 
 impl fmt::Display for GrowthError {
@@ -267,6 +287,12 @@ impl fmt::Display for GrowthError {
             }
             GrowthError::DegenerateSizes => write!(f, "sizes in the fit window do not vary"),
             GrowthError::NonFinite => write!(f, "fit produced a non-finite value"),
+            GrowthError::GammaUnidentifiable => {
+                write!(
+                    f,
+                    "ln ln n is linear in ln n over the window; gamma is unidentifiable"
+                )
+            }
         }
     }
 }
@@ -332,6 +358,18 @@ pub struct PowerLogFit {
     pub best: GammaFit,
     /// The fits for `γ = 0, 1, 2`, in that order.
     pub candidates: [GammaFit; 3],
+    /// The least-squares `γ` if `γ` were continuous. Each candidate's RSS is
+    /// `RSS(γ̂) + r · (γ − γ̂)²`, where `r` is the RSS of `ln ln n` regressed
+    /// on `ln n`, so the chosen `γ` is the grid point nearest `γ̂`.
+    pub gamma_hat: f64,
+    /// The largest `δ` such that changing each window size's `ln` median step
+    /// count by less than `δ` cannot change the chosen `γ`. It is the
+    /// distance from `γ̂` to the nearest decision boundary (0.5 or 1.5) times
+    /// `r / Σ|p_i|`, where `p` are the residuals of `ln ln n` on `ln n`: a
+    /// change `ε` moves `γ̂` by `Σ ε_i p_i / r`, at most `δ · Σ|p_i| / r`.
+    /// The bound is tight: `ε = ±δ · sign(p)` reaches it. In ln units, so
+    /// `0.0035` means about 0.35 % per step count. Always finite and `≥ 0`.
+    pub gamma_stability: f64,
     /// The sizes fitted.
     pub window: FitWindow,
 }
@@ -341,6 +379,17 @@ impl PowerLogFit {
     /// infinity for extreme fits; [`GammaFit::ln_c`] is always finite.
     pub fn c(&self) -> f64 {
         self.best.ln_c.exp()
+    }
+
+    /// The RSS of the runner-up `γ` minus the RSS of the best: how much worse
+    /// the next-best candidate fits. Always `≥ 0`.
+    pub fn rss_margin(&self) -> f64 {
+        self.candidates
+            .iter()
+            .filter(|c| c.gamma != self.best.gamma)
+            .map(|c| c.rss - self.best.rss)
+            .fold(f64::INFINITY, f64::min)
+            .max(0.0)
     }
 }
 
@@ -461,6 +510,8 @@ impl PowerLogGrid {
         let xs: Vec<f64> = points.iter().map(|&(n, _)| ln_u64(n)).collect();
         let lnln: Vec<f64> = xs.iter().map(|x| x.ln()).collect();
         let ln_steps: Vec<f64> = points.iter().map(|&(_, s)| ln_u64(s)).collect();
+        let lnln_fit = ols(&xs, &lnln)?;
+        let mut gamma0_residuals = Vec::new();
         let mut candidates = [GammaFit {
             gamma: 0,
             alpha: 0.0,
@@ -471,6 +522,9 @@ impl PowerLogGrid {
             let g = f64::from(gamma);
             let ys: Vec<f64> = ln_steps.iter().zip(&lnln).map(|(y, l)| y - g * l).collect();
             let fit = ols(&xs, &ys)?;
+            if gamma == 0 {
+                gamma0_residuals = fit.residuals.clone();
+            }
             *slot = GammaFit {
                 gamma,
                 alpha: fit.slope,
@@ -479,9 +533,13 @@ impl PowerLogGrid {
             };
         }
         let best = select_best(&candidates);
+        let (gamma_hat, gamma_stability) =
+            gamma_decision(best.gamma, &gamma0_residuals, &lnln_fit.residuals)?;
         Ok(PowerLogFit {
             best,
             candidates,
+            gamma_hat,
+            gamma_stability,
             window,
         })
     }
@@ -507,6 +565,43 @@ fn select_best(candidates: &[GammaFit; 3]) -> GammaFit {
         }
     }
     best
+}
+
+/// The continuous least-squares `γ̂` and the stability radius of the chosen
+/// `best` (see [`PowerLogFit::gamma_stability`]).
+///
+/// `py` are the residuals of `ln steps` on `ln n` (the `γ = 0` fit) and `pl`
+/// the residuals of `ln ln n` on `ln n`. The `γ` fit's residuals are
+/// `py − γ · pl`, so its RSS is a quadratic in `γ` minimised at
+/// `γ̂ = ⟨py, pl⟩ / ‖pl‖²`.
+fn gamma_decision(best: u8, py: &[f64], pl: &[f64]) -> Result<(f64, f64), GrowthError> {
+    let r: f64 = pl.iter().map(|p| p * p).sum();
+    let l1: f64 = pl.iter().map(|p| p.abs()).sum();
+    if r <= 0.0 || l1 <= 0.0 {
+        return Err(GrowthError::GammaUnidentifiable);
+    }
+    let dot: f64 = py.iter().zip(pl).map(|(y, p)| y * p).sum();
+    let gamma_hat = dot / r;
+    let g = f64::from(best);
+    let lo = if best == GAMMAS[0] {
+        f64::NEG_INFINITY
+    } else {
+        g - 0.5
+    };
+    let hi = if best == GAMMAS[GAMMAS.len() - 1] {
+        f64::INFINITY
+    } else {
+        g + 0.5
+    };
+    // Rounding can put γ̂ a hair outside the chosen γ's band at a near-tie;
+    // the choice is then as fragile as it gets, so the radius is 0.
+    let distance = (gamma_hat - lo).min(hi - gamma_hat).max(0.0);
+    let stability = distance * r / l1;
+    if gamma_hat.is_finite() && stability.is_finite() {
+        Ok((gamma_hat, stability))
+    } else {
+        Err(GrowthError::NonFinite)
+    }
 }
 
 /// `ln` of a positive integer.
@@ -573,12 +668,14 @@ fn window_points(
 }
 
 /// An ordinary least-squares line `y = intercept + slope · x`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Ols {
     slope: f64,
     intercept: f64,
     rss: f64,
     syy: f64,
+    /// `y_i − (intercept + slope · x_i)`, computed in centred form.
+    residuals: Vec<f64>,
 }
 
 /// Fits `ys` on `xs` by OLS.
@@ -614,23 +711,23 @@ fn ols(xs: &[f64], ys: &[f64]) -> Result<Ols, GrowthError> {
         return Err(GrowthError::DegenerateSizes);
     }
     let slope = sxy / sxx;
-    let rss = dx
+    let residuals: Vec<f64> = dx
         .iter()
         .zip(&dy)
-        .map(|(x, y)| {
-            let r = (y - ybar) - slope * (x - xbar);
-            r * r
-        })
-        .sum::<f64>();
+        .map(|(x, y)| (y - ybar) - slope * (x - xbar))
+        .collect();
+    let rss = residuals.iter().map(|r| r * r).sum::<f64>();
     let intercept = (y0 + ybar) - slope * (x0 + xbar);
     let out = Ols {
         slope,
         intercept,
         rss,
         syy,
+        residuals,
     };
     if [out.slope, out.intercept, out.rss, out.syy]
         .iter()
+        .chain(&out.residuals)
         .all(|v| v.is_finite())
     {
         Ok(out)

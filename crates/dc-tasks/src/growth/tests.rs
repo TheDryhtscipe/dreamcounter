@@ -351,6 +351,99 @@ fn b_wrong_gamma_costs_exactly_the_lnln_residual() {
     );
 }
 
+/// The residuals of `ln ln n` regressed on `ln n` over the default window,
+/// computed independently of the module's OLS.
+fn lnln_residuals() -> [f64; 4] {
+    let xs = [128u64, 256, 512, 1024].map(|n| (n as f64).ln());
+    let ls = xs.map(f64::ln);
+    let xbar = xs.iter().sum::<f64>() / 4.0;
+    let lbar = ls.iter().sum::<f64>() / 4.0;
+    let sxx: f64 = xs.iter().map(|x| (x - xbar).powi(2)).sum();
+    let sxl: f64 = xs
+        .iter()
+        .zip(&ls)
+        .map(|(x, l)| (x - xbar) * (l - lbar))
+        .sum();
+    let slope = sxl / sxx;
+    let mut out = [0.0; 4];
+    for (o, (x, l)) in out.iter_mut().zip(xs.iter().zip(&ls)) {
+        *o = (l - lbar) - slope * (x - xbar);
+    }
+    out
+}
+
+/// The stability radius of an exact series whose `γ̂` is an integer: `γ̂` is
+/// 0.5 from the decision boundary, and a perturbation bounded by `δ` per
+/// point moves `γ̂` by at most `δ · Σ|p_i| / Σ p_i²`, with `p` the `ln ln n`
+/// residuals.
+fn exact_stability() -> f64 {
+    let p = lnln_residuals();
+    let r: f64 = p.iter().map(|v| v * v).sum();
+    let l1: f64 = p.iter().map(|v| v.abs()).sum();
+    0.5 * r / l1
+}
+
+/// A sweep of `1e9 · n · ln n · e^(ε_i)` over the default sizes, with `ε_i`
+/// applied to the `i`-th window size (`n = 128 · 2^i`). Rounding to integers
+/// adds at most `0.5 / 1e11` to each `ln steps`, far below the margins tested.
+fn perturbed_n_log_n(eps: [f64; 4]) -> Sweep {
+    default_sweep(|n| {
+        let e = if n >= 128 {
+            eps[n.trailing_zeros() as usize - 7]
+        } else {
+            0.0
+        };
+        (1e9 * (n as f64) * (n as f64).ln() * e.exp()).round() as u64
+    })
+}
+
+#[test]
+fn b_reports_continuous_gamma_and_its_stability_on_n_log_n() {
+    let fit = b(&default_sweep(|n| n * log2(n)));
+    assert!((fit.gamma_hat - 1.0).abs() < 1e-6, "γ̂ {}", fit.gamma_hat);
+    let s = exact_stability();
+    assert!(
+        (fit.gamma_stability - s).abs() < 1e-9,
+        "{} vs {s}",
+        fit.gamma_stability
+    );
+    // About 0.35 % per point in step-count terms, the figure the docs give.
+    assert!(s > 0.0034 && s < 0.0036, "{s}");
+    // The runner-up is one γ step away and pays the ln ln n residual.
+    assert!((fit.rss_margin() - lnln_residual()).abs() < 1e-9);
+}
+
+/// The stability radius is tight: the worst-case perturbation `±δ · sign(p)`
+/// keeps `γ` just below the radius and flips it just above, towards either
+/// neighbour.
+#[test]
+fn b_gamma_flips_exactly_at_the_stability_radius() {
+    let s = exact_stability();
+    let sign = lnln_residuals().map(f64::signum);
+    for (dir, flipped) in [(-1.0, 0u8), (1.0, 2u8)] {
+        let below = b(&perturbed_n_log_n(sign.map(|v| dir * 0.98 * s * v)));
+        assert_eq!(below.best.gamma, 1, "dir {dir}, 0.98 δ");
+        assert!(
+            below.gamma_stability > 0.0 && below.gamma_stability < 0.03 * s,
+            "{}",
+            below.gamma_stability
+        );
+        let above = b(&perturbed_n_log_n(sign.map(|v| dir * 1.02 * s * v)));
+        assert_eq!(above.best.gamma, flipped, "dir {dir}, 1.02 δ");
+    }
+    // A ±1 % perturbation, as on noisy data, is well past the radius.
+    let one_pct = b(&perturbed_n_log_n(sign.map(|v| -0.01 * v)));
+    assert_eq!(one_pct.best.gamma, 0);
+}
+
+#[test]
+fn b_gamma_decision_refuses_when_ln_ln_n_is_explained_by_ln_n() {
+    assert_eq!(
+        gamma_decision(0, &[0.1, -0.2, 0.1], &[0.0, 0.0, 0.0]),
+        Err(GrowthError::GammaUnidentifiable)
+    );
+}
+
 /// The spec's warning (§9): over `n ∈ [128, 1024]`, A gives `n log n` and a
 /// pure power `n^β`, with `β` set to A's own reading of `n log n`, the same
 /// slope. B separates them.
@@ -651,5 +744,47 @@ proptest! {
         for c in b(&sweep).candidates {
             prop_assert!(c.alpha.is_finite() && c.ln_c.is_finite() && c.rss.is_finite());
         }
+    }
+
+    /// Any perturbation of the window's `ln steps` by less than the reported
+    /// stability radius leaves B's choice of `γ` unchanged.
+    #[test]
+    fn gamma_is_unchanged_within_the_stability_radius(
+        u in prop::array::uniform4(-0.99f64..0.99)
+    ) {
+        let clean = b(&perturbed_n_log_n([0.0; 4]));
+        prop_assert_eq!(clean.best.gamma, 1);
+        let s = clean.gamma_stability;
+        prop_assert!(s > 0.0034);
+        let noisy = b(&perturbed_n_log_n(u.map(|v| v * s)));
+        prop_assert_eq!(noisy.best.gamma, 1);
+    }
+
+    /// B's RSS is a quadratic in `γ` with curvature `r` (the `ln ln n`
+    /// residual) and minimum at `γ̂`; the chosen `γ` is the grid point
+    /// nearest `γ̂`; the margin is the gap to the runner-up; the stability
+    /// radius is never negative.
+    #[test]
+    fn gamma_geometry_laws(steps in prop::collection::vec(1u64..1_000_000, 7)) {
+        let sweep = Sweep::from_fn(&DEFAULT_SIZES, |n| {
+            steps[n.trailing_zeros() as usize - 4]
+        }).expect("valid");
+        let fit = b(&sweep);
+        let r = lnln_residual();
+        let g = fit.gamma_hat;
+        prop_assert!(g.is_finite() && fit.gamma_stability.is_finite());
+        prop_assert!(fit.gamma_stability >= 0.0);
+        let base = fit.best.rss - r * (f64::from(fit.best.gamma) - g).powi(2);
+        for c in fit.candidates {
+            let predicted = base + r * (f64::from(c.gamma) - g).powi(2);
+            prop_assert!((c.rss - predicted).abs() < 1e-9 * (1.0 + c.rss));
+        }
+        // Away from a boundary the chosen γ is the grid point nearest γ̂.
+        if (g - g.floor() - 0.5).abs() > 1e-6 {
+            prop_assert_eq!(f64::from(fit.best.gamma), g.round().clamp(0.0, 2.0));
+        }
+        let mut rss = fit.candidates.map(|c| c.rss);
+        rss.sort_by(f64::total_cmp);
+        prop_assert!((fit.rss_margin() - (rss[1] - rss[0])).abs() < 1e-12);
     }
 }
