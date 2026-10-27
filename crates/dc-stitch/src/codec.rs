@@ -9,7 +9,7 @@ use dc_core::{Arena, LibId, Prim, Term, TermId};
 use crate::expr::{self, Expr, ParseError};
 use crate::names::LibNames;
 
-/// Reserved token for `Let`: `(let_ bound (lam body))`.
+/// Reserved token for `Let`: `(let_ bound (lam_0 body))`.
 pub const LET: &str = "let_";
 /// Reserved token for `If`: `(if_ cond then else)`.
 pub const IF: &str = "if_";
@@ -17,6 +17,9 @@ pub const IF: &str = "if_";
 pub const AND: &str = "and_";
 /// Reserved token for `Or`: `(or_ a b)`.
 pub const OR: &str = "or_";
+/// The Stitch tag of the lambda that binds a `Let` body: `(let_ x (lam_0 body))`.
+/// Stitch must run with `--fused-lambda-tags 0` (see the crate docs).
+pub const LET_LAMBDA_TAG: u32 = 0;
 /// Prefix of integer literal tokens: `int_3`, `int_-3`.
 pub const INT_PREFIX: &str = "int_";
 
@@ -71,6 +74,8 @@ pub enum DecodeError {
     },
     /// A de Bruijn index would not fit in a `u32`.
     TooDeep,
+    /// A tagged lambda `(lam_tag ...)` whose tag the encoding does not use.
+    UnknownLambdaTag(u32),
 }
 
 impl fmt::Display for DecodeError {
@@ -95,6 +100,7 @@ impl fmt::Display for DecodeError {
                 write!(f, "malformed '{token}': {message}")
             }
             DecodeError::TooDeep => f.write_str("de Bruijn index does not fit in a u32"),
+            DecodeError::UnknownLambdaTag(t) => write!(f, "unknown lambda tag 'lam_{t}'"),
         }
     }
 }
@@ -108,23 +114,78 @@ impl From<ParseError> for DecodeError {
 }
 
 /// Converts the core term `id` to a Stitch expression.
+///
+/// Works with an explicit stack, so the depth of `id` is limited only by memory.
 pub fn to_expr(arena: &Arena, id: TermId, names: &LibNames) -> Result<Expr, EncodeError> {
-    let enc = |t: TermId| to_expr(arena, t, names);
+    /// `Visit` a term, or `Build` a node from the expressions its children left.
+    enum Job {
+        Visit(TermId),
+        Build(Term),
+    }
     let form = |token: &str, args: Vec<Expr>| args.into_iter().fold(Expr::sym(token), Expr::app);
-    Ok(match arena.get(id) {
-        Term::Var(i) => Expr::Var(i),
-        Term::Lam(b) => Expr::lam(enc(b)?),
-        Term::App(f, a) => Expr::app(enc(f)?, enc(a)?),
-        Term::Let(x, b) => form(LET, vec![enc(x)?, Expr::lam(enc(b)?)]),
-        Term::If(c, t, e) => form(IF, vec![enc(c)?, enc(t)?, enc(e)?]),
-        Term::And(x, y) => form(AND, vec![enc(x)?, enc(y)?]),
-        Term::Or(x, y) => form(OR, vec![enc(x)?, enc(y)?]),
-        Term::Int(n) => Expr::sym(format!("{INT_PREFIX}{n}")),
-        Term::Bool(b) => Expr::sym(if b { "true" } else { "false" }),
-        Term::Unit => Expr::sym("unit"),
-        Term::Prim(p) => Expr::sym(p.name()),
-        Term::Lib(l) => Expr::sym(names.name(l).ok_or(EncodeError::UnnamedLib(l))?),
-    })
+    let mut jobs = vec![Job::Visit(id)];
+    let mut built: Vec<Expr> = vec![];
+    while let Some(job) = jobs.pop() {
+        let term = match job {
+            Job::Visit(t) => {
+                let term = arena.get(t);
+                let children: &[TermId] = match &term {
+                    Term::Lam(b) => &[*b],
+                    Term::App(x, y) | Term::Let(x, y) | Term::And(x, y) | Term::Or(x, y) => {
+                        &[*x, *y]
+                    }
+                    Term::If(c, x, y) => &[*c, *x, *y],
+                    _ => &[],
+                };
+                if !children.is_empty() {
+                    jobs.push(Job::Build(term));
+                    jobs.extend(children.iter().rev().map(|&c| Job::Visit(c)));
+                    continue;
+                }
+                term
+            }
+            Job::Build(term) => term,
+        };
+        let e = match term {
+            Term::Var(i) => Expr::Var(i),
+            Term::Int(n) => Expr::sym(format!("{INT_PREFIX}{n}")),
+            Term::Bool(b) => Expr::sym(if b { "true" } else { "false" }),
+            Term::Unit => Expr::sym("unit"),
+            Term::Prim(p) => Expr::sym(p.name()),
+            Term::Lib(l) => Expr::sym(names.name(l).ok_or(EncodeError::UnnamedLib(l))?),
+            Term::Lam(_) => Expr::lam(pop(&mut built)),
+            Term::App(..) => {
+                let a = pop(&mut built);
+                Expr::app(pop(&mut built), a)
+            }
+            Term::Let(..) => {
+                let body = Expr::tagged_lam(LET_LAMBDA_TAG, pop(&mut built));
+                form(LET, vec![pop(&mut built), body])
+            }
+            Term::If(..) => {
+                let e = pop(&mut built);
+                let t = pop(&mut built);
+                form(IF, vec![pop(&mut built), t, e])
+            }
+            Term::And(..) => {
+                let y = pop(&mut built);
+                form(AND, vec![pop(&mut built), y])
+            }
+            Term::Or(..) => {
+                let y = pop(&mut built);
+                form(OR, vec![pop(&mut built), y])
+            }
+        };
+        built.push(e);
+    }
+    Ok(pop(&mut built))
+}
+
+/// Pops a value a work list has just pushed.
+fn pop<T>(built: &mut Vec<T>) -> T {
+    built
+        .pop()
+        .expect("every build job follows the jobs that push its operands")
 }
 
 /// Prints the core term `id` in Stitch's input format.
@@ -146,7 +207,7 @@ pub fn from_expr(
         context,
         arity: None,
     }
-    .term(arena, e, 0)
+    .term(arena, e)
 }
 
 /// Decoding state that does not change while descending.
@@ -169,16 +230,84 @@ fn special_form(s: &str) -> Option<(&'static str, usize)> {
     }
 }
 
+/// A step of the decoder's work list.
+enum Job<'e> {
+    /// Decode the expression, found under this many binders of the whole.
+    Visit(&'e Expr, u32),
+    /// Build a node from the terms its operands left, last operand on top.
+    Lam,
+    App,
+    Let,
+    If,
+    And,
+    Or,
+}
+
 impl Decoder<'_> {
-    /// Decodes `e`, found under `depth` binders of the expression being decoded.
-    fn term(&self, arena: &mut Arena, e: &Expr, depth: u32) -> Result<TermId, DecodeError> {
+    /// Decodes `e`, with an explicit stack so its depth is limited only by memory.
+    /// Operands are decoded left to right, so the first error in reading order is
+    /// the one reported.
+    fn term(&self, arena: &mut Arena, e: &Expr) -> Result<TermId, DecodeError> {
+        let mut jobs = vec![Job::Visit(e, 0)];
+        let mut built: Vec<TermId> = vec![];
+        while let Some(job) = jobs.pop() {
+            let t = match job {
+                Job::Visit(e, depth) => match self.visit(arena, e, depth, &mut jobs)? {
+                    Some(t) => t,
+                    None => continue,
+                },
+                Job::Lam => {
+                    let b = pop(&mut built);
+                    arena.lam(b)
+                }
+                Job::App => {
+                    let a = pop(&mut built);
+                    let f = pop(&mut built);
+                    arena.app(f, a)
+                }
+                Job::Let => {
+                    let b = pop(&mut built);
+                    let x = pop(&mut built);
+                    arena.let_(x, b)
+                }
+                Job::If => {
+                    let z = pop(&mut built);
+                    let y = pop(&mut built);
+                    let x = pop(&mut built);
+                    arena.if_(x, y, z)
+                }
+                Job::And => {
+                    let y = pop(&mut built);
+                    let x = pop(&mut built);
+                    arena.and(x, y)
+                }
+                Job::Or => {
+                    let y = pop(&mut built);
+                    let x = pop(&mut built);
+                    arena.or(x, y)
+                }
+            };
+            built.push(t);
+        }
+        Ok(pop(&mut built))
+    }
+
+    /// Decodes a leaf of `e` at once, or schedules the jobs that decode `e`.
+    fn visit<'e>(
+        &self,
+        arena: &mut Arena,
+        e: &'e Expr,
+        depth: u32,
+        jobs: &mut Vec<Job<'e>>,
+    ) -> Result<Option<TermId>, DecodeError> {
+        let under = |depth: u32| depth.checked_add(1).ok_or(DecodeError::TooDeep);
         match e {
             Expr::Var(i) => {
                 let binders = depth
                     .checked_add(self.context)
                     .ok_or(DecodeError::TooDeep)?;
                 if *i < binders {
-                    Ok(arena.var(*i))
+                    Ok(Some(arena.var(*i)))
                 } else {
                     Err(DecodeError::FreeVariable { index: *i, binders })
                 }
@@ -191,18 +320,23 @@ impl Decoder<'_> {
                 }),
                 Some(k) => {
                     let index = depth.checked_add(k - 1 - i).ok_or(DecodeError::TooDeep)?;
-                    Ok(arena.var(index))
+                    Ok(Some(arena.var(index)))
                 }
             },
             Expr::Lam(b) => {
-                let inner = depth.checked_add(1).ok_or(DecodeError::TooDeep)?;
-                let body = self.term(arena, b, inner)?;
-                Ok(arena.lam(body))
+                jobs.push(Job::Lam);
+                jobs.push(Job::Visit(b, under(depth)?));
+                Ok(None)
             }
-            Expr::Sym(s) => self.atom(arena, s),
+            Expr::TaggedLam(LET_LAMBDA_TAG, _) => Err(DecodeError::MalformedSpecialForm {
+                token: LET,
+                message: format!("(lam_{LET_LAMBDA_TAG} ...) may only be the body of a {LET}"),
+            }),
+            Expr::TaggedLam(t, _) => Err(DecodeError::UnknownLambdaTag(*t)),
+            Expr::Sym(s) => self.atom(arena, s).map(Some),
             Expr::App(..) => {
                 let (head, args) = e.spine();
-                let (applied, rest) = match head {
+                let (form, rest) = match head {
                     Expr::Sym(s) => match special_form(s) {
                         Some((token, n)) => {
                             if args.len() < n {
@@ -211,54 +345,56 @@ impl Decoder<'_> {
                                     message: format!("needs {n} operands, got {}", args.len()),
                                 });
                             }
-                            let form = self.special(arena, token, &args[..n], depth)?;
-                            (form, &args[n..])
+                            (Some((token, &args[..n])), &args[n..])
                         }
-                        None => (self.atom(arena, s)?, &args[..]),
+                        None => (None, &args[..]),
                     },
-                    _ => (self.term(arena, head, depth)?, &args[..]),
+                    _ => (None, &args[..]),
                 };
-                let mut out = applied;
-                for a in rest {
-                    let a = self.term(arena, a, depth)?;
-                    out = arena.app(out, a);
+                // Jobs run last pushed first: the extra arguments are applied after
+                // the head or special form is built.
+                for a in rest.iter().rev() {
+                    jobs.push(Job::App);
+                    jobs.push(Job::Visit(a, depth));
                 }
-                Ok(out)
+                match form {
+                    None => jobs.push(Job::Visit(head, depth)),
+                    Some((token, ops)) => self.special(token, ops, depth, jobs)?,
+                }
+                Ok(None)
             }
         }
     }
 
-    /// Builds the special form `token` from exactly its operands.
-    fn special(
+    /// Schedules the special form `token` on exactly its operands.
+    fn special<'e>(
         &self,
-        arena: &mut Arena,
         token: &'static str,
-        ops: &[&Expr],
+        ops: &[&'e Expr],
         depth: u32,
-    ) -> Result<TermId, DecodeError> {
-        if token == LET {
-            let Expr::Lam(body) = ops[1] else {
-                return Err(DecodeError::MalformedSpecialForm {
-                    token,
-                    message: format!("the body must be a (lam ...), got {}", ops[1]),
-                });
-            };
-            let bound = self.term(arena, ops[0], depth)?;
-            let inner = depth.checked_add(1).ok_or(DecodeError::TooDeep)?;
-            let body = self.term(arena, body, inner)?;
-            return Ok(arena.let_(bound, body));
-        }
-        // `ops` has exactly the operand count `special_form` gives `token`.
-        let x = self.term(arena, ops[0], depth)?;
-        let y = self.term(arena, ops[1], depth)?;
-        Ok(match token {
-            IF => {
-                let z = self.term(arena, ops[2], depth)?;
-                arena.if_(x, y, z)
+        jobs: &mut Vec<Job<'e>>,
+    ) -> Result<(), DecodeError> {
+        let (build, operands) = match (token, ops) {
+            (LET, [bound, binder]) => {
+                let Expr::TaggedLam(LET_LAMBDA_TAG, body) = binder else {
+                    return Err(DecodeError::MalformedSpecialForm {
+                        token,
+                        message: format!(
+                            "the body must be a (lam_{LET_LAMBDA_TAG} ...), got {binder}"
+                        ),
+                    });
+                };
+                let inner = depth.checked_add(1).ok_or(DecodeError::TooDeep)?;
+                (Job::Let, vec![(*bound, depth), (&**body, inner)])
             }
-            AND => arena.and(x, y),
-            _ => arena.or(x, y),
-        })
+            (IF, [c, t, e]) => (Job::If, vec![(*c, depth), (*t, depth), (*e, depth)]),
+            (AND, [x, y]) => (Job::And, vec![(*x, depth), (*y, depth)]),
+            (OR, [x, y]) => (Job::Or, vec![(*x, depth), (*y, depth)]),
+            _ => unreachable!("special_form gives each token its operand count"),
+        };
+        jobs.push(build);
+        jobs.extend(operands.into_iter().rev().map(|(e, d)| Job::Visit(e, d)));
+        Ok(())
     }
 
     fn atom(&self, arena: &mut Arena, s: &str) -> Result<TermId, DecodeError> {
@@ -321,7 +457,7 @@ pub fn decode_abstraction(
         context: 0,
         arity: Some(arity),
     };
-    let mut out = decoder.term(arena, &e, 0)?;
+    let mut out = decoder.term(arena, &e)?;
     for _ in 0..arity {
         out = arena.lam(out);
     }
@@ -365,7 +501,7 @@ mod tests {
             "(foldl (lam (lam (add $1 $0))) 0 $0)",
             "(foldl (lam (lam (add $1 $0))) int_0 $0)",
         );
-        check_encoding("(let 5 (mul $0 $0))", "(let_ int_5 (lam (mul $0 $0)))");
+        check_encoding("(let 5 (mul $0 $0))", "(let_ int_5 (lam_0 (mul $0 $0)))");
         check_encoding(
             "(if (and true false) (or false true) unit)",
             "(if_ (and_ true false) (or_ false true) unit)",
@@ -387,14 +523,46 @@ mod tests {
         let e = to_expr(&a, id, &names()).unwrap();
         let (head, args) = e.spine();
         assert_eq!(head, &Expr::sym(LET));
-        assert_eq!(args, vec![&Expr::sym("int_1"), &Expr::lam(Expr::Var(0))]);
+        let binder = Expr::TaggedLam(LET_LAMBDA_TAG, Box::new(Expr::Var(0)));
+        assert_eq!(args, vec![&Expr::sym("int_1"), &binder]);
+        assert_eq!(expr::print(&e), "(let_ int_1 (lam_0 $0))");
+    }
+
+    /// Under `--fused-lambda-tags 0` Stitch never roots an abstraction at, or puts a
+    /// parameter on, a `lam_0` node, so a let's body stays a `(lam_0 ...)` in every
+    /// rewritten program and abstraction, and abstractions can still match inside it.
+    #[test]
+    fn stitch_rewrites_around_a_let_decode() {
+        let n = names();
+        let mut a = Arena::new();
+        // The abstraction fn_0 = (add #0 int_1) used inside a let body.
+        let got = decode(&mut a, "(let_ int_5 (lam_0 (fn_0 $0)))", &n).unwrap();
+        assert_eq!(sexpr::print(&a, got), "(let 5 (lib_0 $0))");
+        // An abstraction that contains a whole let, with parameters around the binder.
+        let got = decode_abstraction(&mut a, "(let_ #0 (lam_0 (add $0 #1)))", 2, &n).unwrap();
+        assert_eq!(sexpr::print(&a, got), "(lam (lam (let $1 (add $0 $1))))");
+        // The shapes the flag rules out are errors, not guesses: an abstraction
+        // rooted at the binder, and a use of one in the binder's place.
+        for (src, arity) in [("(lam_0 (add $0 int_1))", 0), ("(lam_0 (add $0 #0))", 1)] {
+            assert!(
+                matches!(
+                    decode_abstraction(&mut a, src, arity, &n),
+                    Err(DecodeError::MalformedSpecialForm { token: LET, .. })
+                ),
+                "{src}"
+            );
+        }
+        assert!(matches!(
+            decode(&mut a, "(let_ int_5 fn_0)", &n),
+            Err(DecodeError::MalformedSpecialForm { token: LET, .. })
+        ));
     }
 
     #[test]
     fn special_forms_applied_to_more_arguments_round_trip() {
         // Stitch prints ((if_ c t e) x) as (if_ c t e x); decoding must split it back.
         check_encoding("((if true $0 $1) 7)", "(if_ true $0 $1 int_7)");
-        check_encoding("((let 1 $0) 2 3)", "(let_ int_1 (lam $0) int_2 int_3)");
+        check_encoding("((let 1 $0) 2 3)", "(let_ int_1 (lam_0 $0) int_2 int_3)");
         check_encoding("((and true false) unit)", "(and_ true false unit)");
         check_encoding("((or true false) unit)", "(or_ true false unit)");
         let mut a = Arena::new();
@@ -460,13 +628,15 @@ mod tests {
                 },
             ),
             (
-                "(let_ $0 (lam $0))",
+                "(let_ $0 (lam_0 $0))",
                 DecodeError::FreeVariable {
                     index: 0,
                     binders: 0,
                 },
             ),
             ("(lam #0)", DecodeError::ParameterInProgram(0)),
+            ("(lam_3 $0)", DecodeError::UnknownLambdaTag(3)),
+            ("(add (lam_9 $0) int_1)", DecodeError::UnknownLambdaTag(9)),
         ];
         for (src, expected) in cases {
             let mut a = Arena::new();
@@ -508,6 +678,13 @@ mod tests {
             // through the binder yields this shape.
             ("(let_ int_1 int_2)", LET),
             ("(let_ int_1 fn_0)", LET),
+            // Only the tagged binder lambda is a let body.
+            ("(let_ int_1 (lam $0))", LET),
+            ("(let_ int_1 (lam_3 $0))", LET),
+            // The binder lambda appears nowhere but as a let body.
+            ("(lam_0 $0)", LET),
+            ("(add int_1 (lam_0 $0))", LET),
+            ("((lam_0 $0) int_1)", LET),
         ] {
             let mut a = Arena::new();
             match decode(&mut a, src, &n) {
@@ -537,7 +714,7 @@ mod tests {
         let got = decode_abstraction(&mut a, "(sub #0 #1)", 2, &n).unwrap();
         assert_eq!(sexpr::print(&a, got), "(lam (lam (sub $1 $0)))");
         // Under a let binder the indices shift by one.
-        let got = decode_abstraction(&mut a, "(let_ #1 (lam (add $0 #0)))", 2, &n).unwrap();
+        let got = decode_abstraction(&mut a, "(let_ #1 (lam_0 (add $0 #0)))", 2, &n).unwrap();
         assert_eq!(sexpr::print(&a, got), "(lam (lam (let $0 (add $0 $2))))");
         // A parameter in function position, and a reference to an earlier abstraction.
         let got = decode_abstraction(&mut a, "(fn_1 (lam (#0 $0)))", 1, &n).unwrap();
@@ -643,6 +820,90 @@ mod tests {
         );
     }
 
+    /// Nesting this deep overflows a test thread's stack if encoding or decoding
+    /// recurses on the host stack.
+    const DEEP: u32 = 100_000;
+
+    #[test]
+    fn long_list_literals_round_trip() {
+        let n = names();
+        let mut a = Arena::new();
+        let cons = a.prim(Prim::from_name("cons").unwrap());
+        let mut list = a.prim(Prim::from_name("nil").unwrap());
+        for i in (0..i64::from(DEEP)).rev() {
+            let x = a.int(i);
+            list = a.apps(cons, &[x, list]);
+        }
+        let text = encode(&a, list, &n).unwrap();
+        let mut expected = String::new();
+        for i in 0..DEEP {
+            expected.push_str(&format!("(cons int_{i} "));
+        }
+        expected.push_str("nil");
+        expected.push_str(&")".repeat(DEEP as usize));
+        assert_eq!(text, expected);
+        assert_eq!(decode(&mut a, &text, &n), Ok(list));
+    }
+
+    #[test]
+    fn deeply_nested_binders_round_trip() {
+        let n = names();
+        let mut a = Arena::new();
+        // Alternating lambdas and lets, with a variable reaching the outermost binder.
+        let mut t = a.var(DEEP - 1);
+        let one = a.int(1);
+        for i in 0..DEEP {
+            t = if i % 2 == 0 { a.lam(t) } else { a.let_(one, t) };
+        }
+        let text = encode(&a, t, &n).unwrap();
+        assert!(text.starts_with("(let_ int_1 (lam_0 (lam (let_ int_1 (lam_0 (lam "));
+        assert_eq!(decode(&mut a, &text, &n), Ok(t));
+        // One binder short is a clean error, not a crash.
+        let inner = text
+            .strip_prefix("(let_ int_1 (lam_0 ")
+            .and_then(|s| s.strip_suffix("))"))
+            .unwrap();
+        assert_eq!(
+            decode(&mut a, inner, &n),
+            Err(DecodeError::FreeVariable {
+                index: DEEP - 1,
+                binders: DEEP - 1
+            })
+        );
+    }
+
+    #[test]
+    fn deep_abstraction_bodies_decode() {
+        let n = names();
+        let mut a = Arena::new();
+        let body = format!(
+            "{}#0{}",
+            "(lam ".repeat(DEEP as usize),
+            ")".repeat(DEEP as usize)
+        );
+        let got = decode_abstraction(&mut a, &body, 1, &n).unwrap();
+        let mut expected = a.var(DEEP);
+        for _ in 0..=DEEP {
+            expected = a.lam(expected);
+        }
+        assert_eq!(got, expected);
+        // A long left-nested spine headed by a special form.
+        let src = format!(
+            "{}(if_ true int_1 int_2){}",
+            "(".repeat(DEEP as usize),
+            " int_3)".repeat(DEEP as usize)
+        );
+        let mut want = {
+            let (t, x, y) = (a.bool(true), a.int(1), a.int(2));
+            a.if_(t, x, y)
+        };
+        let three = a.int(3);
+        for _ in 0..DEEP {
+            want = a.app(want, three);
+        }
+        assert_eq!(decode(&mut a, &src, &n), Ok(want));
+    }
+
     fn arb_term(arena: Rc<RefCell<Arena>>) -> impl Strategy<Value = TermId> {
         let leaf = prop_oneof![
             (0u32..4).prop_map(Term::Var),
@@ -720,6 +981,9 @@ mod tests {
         match e {
             Expr::Var(i) if *i >= binders => Expr::IVar(arity - 1 - (i - binders)),
             Expr::Lam(b) => Expr::lam(abstract_free_vars(b, binders + 1, arity)),
+            Expr::TaggedLam(t, b) => {
+                Expr::TaggedLam(*t, Box::new(abstract_free_vars(b, binders + 1, arity)))
+            }
             Expr::App(f, x) => Expr::app(
                 abstract_free_vars(f, binders, arity),
                 abstract_free_vars(x, binders, arity),
