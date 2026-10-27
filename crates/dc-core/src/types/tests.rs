@@ -1087,6 +1087,57 @@ fn errors_in_large_shared_terms_are_located_as_in_the_tree() {
     assert_eq!(bounded(STEPS).check(&a, f, NO_LIBS, &s), want);
 }
 
+/// `t_n`, with `t_(k+1) = (if true t_k t_k)` and `t_0 = (add true 1)` if `open` is
+/// false, else `lam x. t_n` with `t_0 = (add x true)`: a leaf that is ill typed on
+/// its own, shared down a chain.
+fn ill_typed_leaf_chain(a: &mut Arena, n: usize, open: bool) -> TermId {
+    let (add, yes, one) = (a.prim(Prim::Add), a.bool(true), a.int(1));
+    let mut t = if open {
+        let v0 = a.var(0);
+        a.apps(add, &[v0, yes])
+    } else {
+        a.apps(add, &[yes, one])
+    };
+    for _ in 0..n {
+        t = a.if_(yes, t, t);
+    }
+    if open {
+        a.lam(t)
+    } else {
+        t
+    }
+}
+
+#[test]
+fn ill_typed_shared_leaves_are_located_in_polynomial_steps() {
+    // Each use of a subterm whose fresh inference failed is walked in place at
+    // once, not tried again from a checkpoint: otherwise every level doubles the
+    // work of locating the error.
+    for open in [false, true] {
+        let mut a = Arena::new();
+        let small = ill_typed_leaf_chain(&mut a, 10, open);
+        let mut tree = TypeChecker::new();
+        tree.tree_walk = true;
+        let want = tree.infer(&a, small, NO_LIBS);
+        assert!(want.is_err());
+        assert_eq!(TypeChecker::new().infer(&a, small, NO_LIBS), want);
+
+        const N: usize = 40;
+        const STEPS: u64 = 100 * (N * N) as u64;
+        let big = ill_typed_leaf_chain(&mut a, N, open);
+        let e = bounded(STEPS)
+            .infer(&a, big, NO_LIBS)
+            .expect_err("ill typed");
+        assert_eq!(e.context, want.clone().unwrap_err().context, "open {open}");
+        let s = if open { sch("Int -> Int") } else { sch("Int") };
+        let e = bounded(STEPS)
+            .check(&a, big, NO_LIBS, &s)
+            .expect_err("ill typed");
+        let want = tree.check(&a, small, NO_LIBS, &s).unwrap_err();
+        assert_eq!(e.context, want.context, "open {open}");
+    }
+}
+
 /// `lam x. let (lam (pair x $0)) in t_n`, with `t_0 = ($0 1)` and `t_(k+1) =
 /// (if true t_k (let (lam (pair (fst ($1 0)) $0)) t_k))`: every level binds a new
 /// polymorphic helper whose type has the free variable `x`.

@@ -392,6 +392,10 @@ pub struct TypeChecker {
     trail: Vec<(Ty, Node)>,
     /// The memo keys added since the oldest checkpoint, in the order added.
     memo_log: Vec<MemoKey>,
+    /// The keys with a closed scope whose fresh inference failed while uses were
+    /// being tried. It fails whatever the state of the store, so their uses are
+    /// walked in place at once (see [`TypeChecker::shared_subterm`]).
+    failed: FxHashSet<MemoKey>,
     /// Steps taken by the term walk of the current call.
     steps: u64,
     /// The most steps of the term walk one call may take; more is a panic. Lets
@@ -402,11 +406,13 @@ pub struct TypeChecker {
 
 /// The state of the checker before a use of a shared subterm is tried, to go
 /// back to if the use fails (see [`TypeChecker::run`]).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Checkpoint {
     /// The shared subterm and the expected type of its position.
     id: TermId,
     want: Option<Want>,
+    /// The use's memo key, if its scope is closed.
+    closed_key: Option<MemoKey>,
     nodes: usize,
     trail: usize,
     frames: usize,
@@ -493,7 +499,10 @@ impl TypeChecker {
     /// the same unifications as the tree walk, up to the one that fails, and
     /// reports the same error. An error unwinds to the innermost use being
     /// tried, so every use is walked in place at most once for each use being
-    /// tried around it: the cost is polynomial in the size of the DAG.
+    /// tried around it. A use whose subterm, inferred afresh for a closed scope,
+    /// fails is walked in place at once from then on, since it fails in every
+    /// state of the store; without that, a chain of shared subterms over a leaf
+    /// that is ill typed on its own takes time exponential in its length.
     fn run<L: LibEnv + ?Sized>(
         &mut self,
         arena: &Arena,
@@ -558,6 +567,7 @@ impl TypeChecker {
         self.checkpoints.clear();
         self.trail.clear();
         self.memo_log.clear();
+        self.failed.clear();
     }
 
     /// Pushes a binding for a new innermost variable.
@@ -1362,7 +1372,16 @@ impl TypeChecker {
                 // Only the second walk of [`TypeChecker::run`] has checkpoints.
                 Err(e) => match self.checkpoints.pop() {
                     None => return Err(e),
-                    Some(cp) => self.back_to(cp),
+                    Some(cp) => {
+                        // A use whose key is not in the memo failed while its
+                        // subterm was being inferred afresh.
+                        if let Some(key) = &cp.closed_key {
+                            if !self.memo.contains_key(key) {
+                                self.failed.insert(key.clone());
+                            }
+                        }
+                        self.back_to(cp)
+                    }
                 },
             };
         }
@@ -1399,9 +1418,15 @@ impl TypeChecker {
         }
         let key = (id, scope);
         if self.locate {
+            if self.failed.contains(&key) {
+                // Fresh inference fails in every context, so this use fails too:
+                // trying it again would redo that work at every level of sharing.
+                return Ok(Step::InPlace(id, want));
+            }
             self.checkpoints.push(Checkpoint {
                 id,
                 want,
+                closed_key: self.scope_closed(&key.1).then(|| key.clone()),
                 nodes: self.nodes.len(),
                 trail: self.trail.len(),
                 frames: self.frames.len(),
@@ -1449,6 +1474,15 @@ impl TypeChecker {
         Ok(Step::EvalShared(id))
     }
 
+    /// Whether no binding in `scope` has a type with free variables: then
+    /// inferring a subterm for it uses only nodes it makes itself.
+    fn scope_closed(&self, scope: &Scope) -> bool {
+        scope.iter().all(|slot| match *slot {
+            Slot::Mono => true,
+            Slot::Poly(c) => self.canon_closed[c as usize],
+        })
+    }
+
     /// Drops the innermost checkpoint, once the use it was for has worked.
     fn drop_checkpoint(&mut self) {
         self.checkpoints.pop();
@@ -1466,10 +1500,7 @@ impl TypeChecker {
     /// back to a checkpoint, and stays in the memo. Otherwise going back to a
     /// checkpoint before it removes it.
     fn keep_past_checkpoints(&mut self, key: &MemoKey, kept: Ty) -> Ty {
-        let closed = key.1.iter().all(|slot| match *slot {
-            Slot::Mono => true,
-            Slot::Poly(c) => self.canon_closed[c as usize],
-        });
+        let closed = self.scope_closed(&key.1);
         if let Some(frozen) = closed.then(|| self.freeze(kept)).flatten() {
             return frozen;
         }
