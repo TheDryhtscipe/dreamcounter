@@ -130,6 +130,7 @@ name = "dc-stitch"
 version = "0.1.0"
 dependencies = [
  "dc-core",
+ "proptest",
 ]
 
 [[package]]
@@ -145,6 +146,7 @@ version = "0.1.0"
 dependencies = [
  "dc-core",
  "dc-eval",
+ "proptest",
 ]
 
 [[package]]
