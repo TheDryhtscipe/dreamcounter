@@ -4,11 +4,12 @@ title: 'D2: Recursion through measure-checked `wfrec` / `memorec`, not a fuel ar
 type: decision
 scope: internal
 created_at: '2026-10-27T17:11:06.019928Z'
-updated_at: '2026-10-27T17:11:16.493960Z'
+updated_at: '2026-10-27T18:08:00.680948Z'
 ---
 
-- **Date:** 2026-10-27. **Status:** needs the project lead (it interprets "bounded fixpoint with
-  fuel").
+- **Date:** 2026-10-27. **Status:** rejected by the project lead on 2026-10-27; superseded by D9. `bfix` is
+  what "bounded fixpoint with fuel" meant, because `wfrec` rejects recursion that
+  halts but has no simple integer measure.
 - **Decision:** `wfrec m F x` requires each recursive call to strictly decrease the
   non-negative integer measure `m`, checked at runtime. `memorec` is the same plus a
   memo table. Global fuel remains as a safety net.
@@ -20,3 +21,4 @@ updated_at: '2026-10-27T17:11:16.493960Z'
   meaningful shared syntax (`length` for D&C, `hi - lo` for binary search), and cost
   little at runtime (ghost, capped at 64 steps).
 - **See:** language spec §6.
+

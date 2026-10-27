@@ -4,13 +4,14 @@ title: dc language specification (draft v0)
 type: reference
 scope: internal
 created_at: '2026-10-27T17:11:12.135054Z'
-updated_at: '2026-10-27T17:11:22.746504Z'
+updated_at: '2026-10-27T18:07:45.032272Z'
 ---
 
 Status: phase 1 draft, 2026-10-27. Nothing here is implemented yet. Items marked
 **[ask]** are listed in the `question` beads (Q1 to Q8) and need a decision from the project lead before
 phase 2 relies on them. Design choices and rejected alternatives are logged in
-the decision docs (D1 to D8).
+the decision docs (D1 to D10). Q1 to Q3 were answered on 2026-10-27 (decisions D4,
+D9 and D10).
 
 Working name for the language: **dc**.
 
@@ -29,16 +30,17 @@ Working name for the language: **dc**.
     | List τ
     | Option τ
     | Array τ           -- persistent, indexed
+    | Tree τ            -- built-in binary tree
     | τ -> τ
     | α                 -- type variable
 ```
 
 - Inference: Hindley-Milner with let-polymorphism. Top-level definitions and
   library abstractions are generalised. Lambda-bound variables are monomorphic.
-- No user-defined algebraic data types in v0. **[ask]** A built-in binary tree type
-  `Tree τ` with its own fold would unlock heaps, BSTs and segment trees. Without it,
-  trees must be encoded in arrays (heap indexing), which works but is awkward for
-  the LLM and hides structure from the compressor.
+- No user-defined algebraic data types in v0. A built-in binary tree type `Tree τ`
+  (§5) supports heaps, binary search trees and segment trees (decision D10).
+- No map type in v0. `memorec` (§6) covers memo tables, and persistent arrays cover
+  indexed state.
 - `Int` is 64-bit signed with **checked** arithmetic: overflow is a runtime error,
   not wraparound. This stops solutions that accidentally depend on wrapping.
 
@@ -72,7 +74,7 @@ e ::= x_i                    -- de Bruijn index
 - Every evaluation returns exactly one of:
   - `Value(v, steps)`
   - `Error(kind, steps)`: division by zero, overflow, array index out of bounds,
-    measure violation (§6), equality on functions, expensive measure (§6).
+    fuel exhausted inside `bfix` or `memorec` (§6), equality on functions.
   - `Timeout(steps)`: fuel exhausted.
 - **Fuel** is a global step budget per evaluation. It is a safety net: every
   combinator except `unfold` terminates without it.
@@ -101,10 +103,14 @@ taken inside function arguments are added on top.
 | `array_set` | `Array a -> Int -> a -> Array a` | 1 + ⌈log₂(n+1)⌉ |
 | `array_size` | | 1 |
 | `array_of_list`, `array_to_list` | | n + 1 |
+| `leaf` | `Tree a` | 1 |
+| `node` | `Tree a -> a -> Tree a -> Tree a` | 1 |
+| `tree_case` | `Tree a -> (Unit -> b) -> (Tree a -> a -> Tree a -> b) -> b` | 1 + calls |
+| `tree_fold` | `b -> (b -> a -> b -> b) -> Tree a -> b` | 1 per node + calls |
 
 Notes:
 
-- `option_case`/`list_case` take the empty-case branch as a thunk, so under strict
+- `option_case`/`list_case`/`tree_case` take the empty-case branch as a thunk, so under strict
   evaluation it runs only when taken. Calling the thunk costs one β step (§7), so the
   laziness is charged for. The surface `match` produces this form (§10).
 - **No `sort` primitive.** O(n log n) sorting is something the system should have to
@@ -147,49 +153,52 @@ Cost: 1 per produced element + calls. **The one combinator whose termination is 
 structural**: it halts only by returning `none` or by running out of fuel. Kept
 because "generate until" is a recognisable shape the compressor should see.
 
-### `wfrec`: well-founded recursion
+### `bfix`: bounded fixpoint
 
 ```
-wfrec : (a -> Int) -> ((a -> b) -> a -> b) -> a -> b
+bfix : Int -> ((a -> b) -> a -> b) -> a -> b
 ```
 
-`wfrec m F x` evaluates `F self x`, where `self y` first checks `0 ≤ m y < m x`
-and raises `MeasureViolation` otherwise, then continues as `wfrec m F y`.
+`bfix n F x` evaluates `F self x`, where `self` is `bfix (n-1) F`. If `self` is
+called when the fuel `n` is 0, evaluation stops with `FuelExhausted`. The fuel
+bounds the depth of the recursion: each call passes one less fuel to its own
+recursive calls, and sibling calls each receive the same amount (decision D9).
 
-- This is my concrete reading of "bounded fixpoint with fuel". Instead of a fuel
-  argument, recursion must strictly decrease a non-negative integer measure, checked
-  at runtime. That makes every `wfrec` total by construction, and the measure is
-  visible syntax the compressor can share across programs (e.g. `length` for
-  divide-and-conquer on lists, `hi - lo` for binary search). **[ask]** whether this
-  matches what the project lead intended or is too far from "bounded fixpoint".
-- Measure evaluation is **ghost**: its steps are not charged, since its result never
-  reaches the program's output. To keep wall-clock time bounded, a measure that takes
-  more than 64 steps raises `ExpensiveMeasure`. Because lists cache their length,
-  `length` measures cost 1.
-- Cost: 1 per recursive call + calls inside `F`.
-- Covers: divide-and-conquer with any split, binary search, Euclid's gcd, two-list
-  merge (measure `length a + length b`), most non-structural recursion over bounded
-  inputs.
-- Does not directly cover: lexicographic measures (encode as `m1 * K + m2` with a
-  known bound; risks overflow), mutual recursion (encode with a tag in the argument).
-  If either becomes common in practice, I'll write the case up and raise it rather
-  than extending the language quietly.
+- Any recursion pattern is allowed if it finishes within the fuel. This includes
+  iteration to a fixed point, Collatz-style loops and search whose progress is not
+  monotone in any simple integer.
+- Running out of fuel is an error, not a default value. A default would let a
+  truncated program pass its examples by accident.
+- The fuel is an ordinary `Int` expression, not only a literal. A program can tie it
+  to the input, for example `bfix (length xs + 1)` for list recursion. Such
+  expressions are visible syntax that the compressor can share across programs.
+- Depth fuel bounds depth, not total work: a tree recursion of depth n can make up
+  to 2ⁿ calls. The global fuel (§4) bounds total work.
+- Cost: 1 per recursive call + calls inside `F`. The fuel check is free.
+- Mutual recursion needs an encoding: a tag in the argument. If this becomes common
+  in practice, it will be written up and raised with the project lead rather than
+  added to the language quietly.
 
-### `memorec`: memoised well-founded recursion
+### `memorec`: memoised bounded recursion
 
 ```
-memorec : (k -> Int) -> ((k -> v) -> k -> v) -> k -> v
+memorec : Int -> ((k -> v) -> k -> v) -> k -> v
 ```
 
-Same measure discipline as `wfrec`, plus a memo table keyed on the argument.
+`memorec n F x` is open recursion like `bfix`, plus a memo table keyed on the
+argument.
 
+- The fuel `n` bounds the number of table misses across the whole table, not the
+  depth. Exceeding it raises `FuelExhausted`. A per-depth bound would make a cached
+  result depend on how much fuel was left when it was first computed, so the same
+  call could succeed or fail depending on evaluation history. Evaluation is strict
+  and left to right, so the miss count is deterministic.
 - Key types restricted to `Int`, `Bool`, `Unit` and tuples of those, so hashing is
-  O(1) in practice. Subset DP uses an `Int` bitmask.
+  O(1) in practice. Subset DP uses an `Int` bitmask. Memoised recursion over a
+  lattice is `memorec` over keys that encode the lattice elements.
 - The table is created at the outermost `memorec` call and dropped when it returns.
   Nothing is shared between evaluations.
 - Cost: hit = 1 + key size; miss = 1 + key size + calls inside `F`.
-- The measure plays the role of the lattice rank in "memoised recursion over a
-  lattice".
 - Hash function: a fixed, unseeded hash (e.g. FxHash). Iteration order of the
   table is never observable, so costs stay deterministic.
 
@@ -328,7 +337,7 @@ let max_subarray xs =
        (min_int, 0) xs)
 
 let merge ab =
-  wfrec (fun (a, b) -> length a + length b)
+  bfix (length (fst ab) + length (snd ab) + 1)
     (fun self (a, b) ->
       match a with
       | [] -> b
@@ -339,7 +348,7 @@ let merge ab =
     ab
 
 let msort xs =
-  wfrec length
+  bfix (length xs + 1)
     (fun self xs ->
       if length xs <= 1 then xs
       else
@@ -348,7 +357,7 @@ let msort xs =
     xs
 
 let fib n =
-  memorec (fun k -> k)
+  memorec (n + 1)
     (fun self k -> if k < 2 then k else self (k - 1) + self (k - 2))
     n
 ```
@@ -359,7 +368,9 @@ Desugaring:
   and uses `fst`/`snd`.
 - `match xs with [] -> e1 | h :: t -> e2` becomes
   `list_case xs (fun _ -> e1) (fun h t -> e2)`. Likewise `match o with None -> e1 |
-  Some x -> e2` becomes `option_case o (fun _ -> e1) (fun x -> e2)`.
+  Some x -> e2` becomes `option_case o (fun _ -> e1) (fun x -> e2)`, and
+  `match t with Leaf -> e1 | Node (l, x, r) -> e2` becomes
+  `tree_case t (fun _ -> e1) (fun l x r -> e2)`.
 - Patterns are one level deep. Nested patterns are a parse error with a message the
   LLM can act on. This keeps desugaring trivial and error messages clear.
 - Infix `::`, `+`, `<=` etc. map to primitives; `/` is `div`.
@@ -408,9 +419,12 @@ needed, as the handoff specifies.
 - **No mutable arrays.** Union-find, in-place partitioning and similar get an extra
   log factor from persistent arrays, and amortised analyses (path compression) do
   not carry over. Graph families should expect this.
-- **No trees** unless `Tree τ` is added (see §2).
-- **Lexicographic and mutual recursion** need encodings (§6).
+- **Mutual recursion** needs an encoding (§6).
+- **Fuel is chosen by the program.** A fuel expression that is too small for large
+  inputs makes a correct algorithm fail at those sizes. The growth sweeps (§9) record
+  this as errors at large n.
 - **Single size parameter per family** in v0. Graph tasks with independent V and E
   will need either a fixed density or a two-parameter sweep later.
 - **`unfold` relies on fuel.** If proposals often time out inside `unfold`, give it a
-  measure as well.
+  fuel argument like `bfix`.
+

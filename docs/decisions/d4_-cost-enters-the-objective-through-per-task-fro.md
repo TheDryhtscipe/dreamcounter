@@ -4,10 +4,10 @@ title: 'D4: Cost enters the objective through per-task frontier selection'
 type: decision
 scope: internal
 created_at: '2026-10-27T17:11:07.726395Z'
-updated_at: '2026-10-27T17:11:18.268986Z'
+updated_at: '2026-10-27T18:08:02.474203Z'
 ---
 
-- **Date:** 2026-10-27. **Status:** needs the project lead (it reframes how criterion (b) works).
+- **Date:** 2026-10-27. **Status:** accepted by the project lead on 2026-10-27.
 - **Decision:** keep up to K verified solutions per task. Score a library with
   `J(L) = DL(L) + Σ_t min_{p ∈ F_t} [DL(p | L) + λ·C(p)]`. Log component (b) as the
   change in `Σ_t C(selected_t)`. Integrate with plain Stitch by alternating
@@ -20,3 +20,4 @@ updated_at: '2026-10-27T17:11:18.268986Z'
   then pure MDL); a cost term inside Stitch's per-node utility (rejected: it would
   reward abstracting expensive *syntax*, not expensive *behaviour*).
 - **See:** language spec §8.
+
