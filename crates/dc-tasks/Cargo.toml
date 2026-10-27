@@ -17,4 +17,5 @@ rand_chacha.workspace = true
 workspace = true
 
 [dev-dependencies]
+dc-surface.workspace = true
 proptest.workspace = true

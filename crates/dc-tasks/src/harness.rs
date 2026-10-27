@@ -31,6 +31,10 @@
 //!
 //! [`check_generated`] checks a program against the oracle on generated
 //! inputs without measuring it, to test families and reference solutions.
+//! [`validate_family`] checks a family's own definition (sizes, examples
+//! against the oracle, a repeatable generator) before anything runs, and
+//! [`FuelPlan::from_reference`] refuses a family that fails it.
+//! [`check_input_sizes`] checks that generated inputs have the size asked for.
 //!
 //! Every step count is a deterministic function of the program and the
 //! input, and every input of `(n, seed)`, so a sweep repeats exactly.
@@ -43,7 +47,9 @@ use std::fmt;
 use dc_core::{types, Arena, Scheme, TermId, TypeError};
 use dc_eval::{apply, ErrorKind, Outcome, Value};
 
-use crate::growth::{GrowthError, GrowthEstimator, GrowthFit, SizeObservation, Sweep};
+use crate::growth::{
+    GrowthError, GrowthEstimator, GrowthFit, PowerLogGrid, SizeObservation, Sweep,
+};
 use crate::task::{generate_input, TaskFamily};
 
 /// The number of seeded inputs per size (spec §9).
@@ -115,6 +121,9 @@ pub enum RunFailure {
 /// Why a program failed a check.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CheckFailure {
+    /// The family itself is defective, so no program can be checked against
+    /// it. Only [`FuelPlan::from_reference`] reports this.
+    Family(FamilyDefect),
     /// The program does not have the family's signature.
     Type(TypeError),
     /// The program failed an example.
@@ -162,6 +171,128 @@ pub fn run_on(
         Outcome::Error(kind, steps) => Err(RunFailure::Error { kind, steps }),
         Outcome::Timeout(_) => Err(RunFailure::Timeout { fuel }),
     }
+}
+
+/// A defect in a task family's definition, found without running any program.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FamilyDefect {
+    /// [`TaskFamily::sizes`] is not strictly increasing and positive.
+    BadSizes {
+        /// The sizes the family declares.
+        sizes: Vec<u64>,
+    },
+    /// The default fit window (the upper half of the sizes) has fewer sizes
+    /// than estimator B needs, so the sweep is too short to fit growth.
+    WindowTooSmall {
+        /// The sizes in the window.
+        points: usize,
+        /// The sizes needed, [`PowerLogGrid::MIN_POINTS`].
+        needed: usize,
+    },
+    /// The family has no examples, so the examples gate would pass anything
+    /// of the right type.
+    NoExamples,
+    /// An example's stated output differs from the oracle's output on the
+    /// example's inputs.
+    ExampleDisagrees {
+        /// The example's position in [`TaskFamily::examples`].
+        index: usize,
+        /// The output the example states.
+        stated: Box<Value>,
+        /// The output the oracle gives.
+        oracle: Box<Value>,
+    },
+    /// Two calls of the generator with the same `(n, seed)` gave different
+    /// inputs.
+    NotDeterministic {
+        /// The size.
+        n: u64,
+        /// The seed.
+        seed: u64,
+    },
+    /// A generated input does not have the size it was generated for.
+    WrongInputSize {
+        /// The size asked for.
+        n: u64,
+        /// The seed.
+        seed: u64,
+        /// The size of the input generated.
+        actual: u64,
+    },
+}
+
+/// Checks a family's definition before anything is run on it: its sizes are
+/// strictly increasing and positive, the upper half of them holds at least
+/// [`PowerLogGrid::MIN_POINTS`] sizes, it has examples and each agrees with
+/// the oracle, and its generator gives the same input twice for every size
+/// and seed `0..config.seeds`. [`FuelPlan::from_reference`] calls it.
+///
+/// # Errors
+///
+/// The first defect found, in the order above.
+pub fn validate_family<F: TaskFamily + ?Sized>(
+    family: &F,
+    config: &HarnessConfig,
+) -> Result<(), FamilyDefect> {
+    let sizes = family.sizes();
+    let increasing = sizes.windows(2).all(|w| w[0] < w[1]);
+    if sizes.first() == Some(&0) || !increasing {
+        return Err(FamilyDefect::BadSizes { sizes });
+    }
+    // The upper half of k sizes is the last ⌈k/2⌉ (growth::Window::UpperHalf).
+    let points = sizes.len() - sizes.len() / 2;
+    if points < PowerLogGrid::MIN_POINTS {
+        return Err(FamilyDefect::WindowTooSmall {
+            points,
+            needed: PowerLogGrid::MIN_POINTS,
+        });
+    }
+    let examples = family.examples();
+    if examples.is_empty() {
+        return Err(FamilyDefect::NoExamples);
+    }
+    for (index, e) in examples.iter().enumerate() {
+        let oracle = family.oracle(&e.inputs);
+        if oracle != e.output {
+            return Err(FamilyDefect::ExampleDisagrees {
+                index,
+                stated: Box::new(e.output.clone()),
+                oracle: Box::new(oracle),
+            });
+        }
+    }
+    for &n in &sizes {
+        for seed in 0..config.seeds {
+            if generate_input(family, n, seed) != generate_input(family, n, seed) {
+                return Err(FamilyDefect::NotDeterministic { n, seed });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks that every generated input for the family's sizes and seeds
+/// `0..seeds` has size `n`, as measured by `size_of`. The family format does
+/// not say what an input's size is (a list's length, an integer's value, ...),
+/// so the caller supplies the measure.
+///
+/// # Errors
+///
+/// The first input of the wrong size.
+pub fn check_input_sizes<F: TaskFamily + ?Sized>(
+    family: &F,
+    seeds: u64,
+    size_of: impl Fn(&[Value]) -> u64,
+) -> Result<(), FamilyDefect> {
+    for n in family.sizes() {
+        for seed in 0..seeds {
+            let actual = size_of(&generate_input(family, n, seed));
+            if actual != n {
+                return Err(FamilyDefect::WrongInputSize { n, seed, actual });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Proof that a program passed a family's type check and examples. Only
@@ -319,20 +450,23 @@ impl FuelPlan {
     /// The plan from the family's reference solution over the family's sizes
     /// (spec §9): `min(fuel_multiplier × reference steps, max_fuel)` per size.
     ///
-    /// The reference is checked like a candidate (type and examples) and its
+    /// The family is first checked with [`validate_family`]. The reference is
+    /// then checked like a candidate (type and examples) and its
     /// every output is checked against the oracle: a reference that fails is
     /// a broken family. A reference that runs out of the global cap at a size
     /// is not a failure; that size gets the cap as its fuel.
     ///
     /// # Errors
     ///
-    /// The reference's first failure other than a timeout at the cap.
+    /// [`CheckFailure::Family`] if the family is defective; otherwise the
+    /// reference's first failure other than a timeout at the cap.
     pub fn from_reference<F: TaskFamily + ?Sized>(
         family: &F,
         arena: &Arena,
         reference: TermId,
         config: &HarnessConfig,
     ) -> Result<FuelPlan, CheckFailure> {
+        validate_family(family, config).map_err(CheckFailure::Family)?;
         check_examples(family, arena, reference, config)?;
         let mut sizes = Vec::new();
         for n in family.sizes() {
