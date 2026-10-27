@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 dc-core.workspace = true
 dc-eval.workspace = true
+rand_chacha.workspace = true
 
 [lints]
 workspace = true
