@@ -3,6 +3,8 @@
 pub mod prim;
 pub mod sexpr;
 pub mod term;
+pub mod types;
 
 pub use prim::Prim;
 pub use term::{Arena, LibId, Term, TermId};
+pub use types::{Scheme, TyVar, Type, TypeChecker, TypeError, TypeErrorKind};
