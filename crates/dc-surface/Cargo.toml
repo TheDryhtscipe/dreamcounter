@@ -15,4 +15,6 @@ dc-core.workspace = true
 workspace = true
 
 [dev-dependencies]
+dc-eval.workspace = true
+dc-stitch.workspace = true
 proptest.workspace = true
