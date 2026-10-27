@@ -29,19 +29,19 @@
 //! node, so `t` is shared in `(add t 1)` and `(add t 2)`, which share `(add t)`.
 //! Bindings count as the same when both are monomorphic (the subterm's type is
 //! kept as a function of theirs), or when both are polymorphic with the same type
-//! up to renaming and no free variables. So `(if c t t)`, `(let t t)` and
-//! `((lam t) t)`, nested `n` deep, take time linear in `n`, however far out the
-//! binders of `t`'s variables are. The exception is a polymorphic binding whose
-//! type has a free variable: it counts as the same only as itself, so a subterm
-//! under a new such binding at every use is inferred again at every use, and a
-//! DAG that does that at every level is not linear. A use of a shared subterm
-//! costs time linear in the number of its distinct free variables, or, past 64 of
-//! them, in the number of binders out to the outermost one it uses.
+//! up to renaming of their quantified variables, free variables included. So
+//! `(if c t t)`, `(let t t)` and `((lam t) t)`, nested `n` deep, take time linear
+//! in `n`, however far out the binders of `t`'s variables are, and so does a
+//! helper bound again at every level whose type mentions a lambda's variable. A
+//! use of a shared subterm costs time linear in the number of its distinct free
+//! variables, or, past 64 of them, in the number of binders out to the outermost
+//! one it uses.
 //!
-//! An ill-typed term is walked a second time as a tree, within a step budget, so
-//! that its error names the subterm where the clash happens, as it would without
-//! the sharing (see [`TypeChecker::run`]). A term too large for the budget gets
-//! the first walk's error, which may name a whole shared subterm instead.
+//! An ill-typed term is walked a second time, so that its error is the one
+//! tree-walking HM reports, which names the subterm where the clash happens
+//! (see [`TypeChecker::run`]). That walk reuses shared subterms too, and goes
+//! into one only where its use fails, so its cost is polynomial, not
+//! exponential, in the size of the DAG.
 //!
 //! **Checking.** [`TypeChecker::check`] pushes the expected type into the term:
 //! through `lam` (parameter and body), the body of `let`, both branches of `if`, and
@@ -177,21 +177,26 @@ struct TooLarge;
 #[derive(Clone, Copy, Debug)]
 struct Binding {
     ty: Ty,
-    /// Whether the type contains generalised variables (a `let` binding with
-    /// something to quantify).
-    poly: bool,
-    /// For a polymorphic type with no free variables, its [`Canon`] id: the same
-    /// for every binding whose type is the same up to renaming of the quantified
-    /// variables.
+    /// `None` for a monomorphic binding. For a polymorphic one (a `let` binding
+    /// with something to quantify), the [`Canon`] id of its type: the same for
+    /// every binding whose type has the same shape, the same free variables and
+    /// quantified variables that differ only in name.
     class: Option<u32>,
 }
 
-/// A node of a type with no free variables, with its quantified variables
-/// numbered in order of first occurrence and its children given as [`Canon`] ids,
-/// so equal types up to renaming get the same id.
+/// A node of a type, with its quantified variables numbered in order of first
+/// occurrence, its other variables given by their store node, and its children
+/// given as [`Canon`] ids. So two types get the same id when they are equal up to
+/// renaming of their quantified variables, and they stay equal: anything that
+/// later binds one of their free variables binds it in both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Canon {
-    Var { index: u32, key: bool },
+    Var {
+        index: u32,
+        key: bool,
+    },
+    /// An unbound variable that is not quantified, or a rigid one.
+    Free(Ty),
     Con(Head, u32, u32),
 }
 
@@ -259,6 +264,9 @@ enum Frame {
     /// its type, keep it, and return an instance. The details are on top of
     /// `TypeChecker::pending`.
     Memo,
+    /// After a use of a shared subterm tried from the innermost [`Checkpoint`]:
+    /// the use worked, so drop the checkpoint.
+    Tried,
 }
 
 /// The most distinct free variables recorded for a subterm (see [`FreeVars`]).
@@ -297,12 +305,10 @@ enum Slot {
     /// its place, and the kept type takes that variable as a parameter, so the
     /// kept type does not depend on the binding.
     Mono,
-    /// A polymorphic binding with no free variables, by its [`Canon`] id: every
-    /// such binding of that id gives the subterm the same type.
-    Closed(u32),
-    /// Any other polymorphic binding, by its type node, which the kept type may
-    /// share.
-    Poly(Ty),
+    /// A polymorphic binding, by its [`Canon`] id: every binding of that id
+    /// gives the subterm the same type. The kept type may share the free
+    /// variables of the binding's type, as the type of a `let` body would.
+    Poly(u32),
 }
 
 /// A shared subterm and what its type depends on.
@@ -334,6 +340,9 @@ enum Step {
     Eval(TermId, Option<Want>),
     /// Infer a shared subterm afresh (not from the memo), with no expected type.
     EvalShared(TermId),
+    /// Walk a subterm in place, as part of the term around it, without the memo
+    /// for it, against an expected type if given.
+    InPlace(TermId, Option<Want>),
     /// A subterm has this type; hand it to the top frame.
     Return(Ty),
 }
@@ -366,14 +375,23 @@ pub struct TypeChecker {
     pending: Vec<Pending>,
     /// Ids of the [`Canon`] nodes met in this walk.
     canon: FxHashMap<Canon, u32>,
-    /// Walks every term as a tree, without reusing shared subterms. Used to
-    /// locate an error (see [`TypeChecker::run`]), and the reference the tests
-    /// compare the memoised walk with.
+    /// For each [`Canon`] id, whether that type has no free variables.
+    canon_closed: Vec<bool>,
+    /// Walks every term as a tree, without reusing shared subterms: the
+    /// reference the tests compare the memoised walk with.
     pub(super) tree_walk: bool,
-    /// The most steps a tree walk to locate an error may take; past it the walk
-    /// stops and sets `out_of_budget`.
-    budget: Option<u64>,
-    out_of_budget: bool,
+    /// Tries each use of a shared subterm from a [`Checkpoint`], and walks it
+    /// again in place if that fails (see [`TypeChecker::run`]).
+    locate: bool,
+    /// The uses of shared subterms being tried, innermost last.
+    checkpoints: Vec<Checkpoint>,
+    /// The old contents of the store nodes changed since the oldest checkpoint,
+    /// in the order changed. Nodes made after the innermost checkpoint are left
+    /// out: going back to any checkpoint leaves nothing that refers to them,
+    /// except kept types copied by [`TypeChecker::freeze`], which never change.
+    trail: Vec<(Ty, Node)>,
+    /// The memo keys added since the oldest checkpoint, in the order added.
+    memo_log: Vec<MemoKey>,
     /// Steps taken by the term walk of the current call.
     steps: u64,
     /// The most steps of the term walk one call may take; more is a panic. Lets
@@ -382,9 +400,22 @@ pub struct TypeChecker {
     pub(super) step_limit: Option<u64>,
 }
 
-/// The fewest steps a tree walk to locate an error may take (see
-/// [`TypeChecker::run`]).
-const MIN_LOCATE_STEPS: u64 = 1_000_000;
+/// The state of the checker before a use of a shared subterm is tried, to go
+/// back to if the use fails (see [`TypeChecker::run`]).
+#[derive(Clone, Copy, Debug)]
+struct Checkpoint {
+    /// The shared subterm and the expected type of its position.
+    id: TermId,
+    want: Option<Want>,
+    nodes: usize,
+    trail: usize,
+    frames: usize,
+    spine: usize,
+    env: usize,
+    pending: usize,
+    memo_log: usize,
+    level: u32,
+}
 
 /// Where a unification happens, for the error message.
 struct Site {
@@ -432,8 +463,7 @@ impl TypeChecker {
     /// used as a `memorec` key only if `expected` gives it a `Key` constraint.
     ///
     /// The expected type is pushed into the term (see the module documentation), so
-    /// an error names the subterm where the clash happens (with the exception
-    /// given under "Shared subterms" there).
+    /// an error names the subterm where the clash happens.
     pub fn check<L: LibEnv + ?Sized>(
         &mut self,
         arena: &Arena,
@@ -447,12 +477,23 @@ impl TypeChecker {
     /// Finds the type of `term`, checked against `expected` if given.
     ///
     /// If that fails, and the walk reused shared subterms, the term is walked
-    /// again as a tree, for at most [`MIN_LOCATE_STEPS`] steps or four times the
-    /// steps the first walk took, whichever is more. An error found by that walk
-    /// is returned instead, since it names the subterm where the clash happens.
-    /// A reused subterm has its uses checked as a whole (see
-    /// [`TypeChecker::walk`]), so the first error would depend on whether the
-    /// same text appears elsewhere in the term. Both walks accept the same terms.
+    /// again to find the error tree-walking HM would report, which names the
+    /// subterm where the clash happens. The first walk checks a reused subterm
+    /// as a whole (see [`TypeChecker::walk`]), so its error can name a whole
+    /// shared subterm, and could depend on whether the same text appears
+    /// elsewhere in the term.
+    ///
+    /// The second walk tries each use of a shared subterm as the first does,
+    /// from a [`Checkpoint`]. If the use fails, the checker goes back to the
+    /// checkpoint and walks that subterm in place, as the tree walk would,
+    /// trying the uses of shared subterms inside it in the same way. A use that
+    /// works makes the same unifications, up to renaming of fresh variables, as
+    /// the tree walk of that subterm does, in a different order; unification
+    /// succeeds or fails on the whole set, whatever the order. So the walk takes
+    /// the same unifications as the tree walk, up to the one that fails, and
+    /// reports the same error. An error unwinds to the innermost use being
+    /// tried, so every use is walked in place at most once for each use being
+    /// tried around it: the cost is polynomial in the size of the DAG.
     fn run<L: LibEnv + ?Sized>(
         &mut self,
         arena: &Arena,
@@ -467,15 +508,13 @@ impl TypeChecker {
         if self.tree_walk || self.shared.is_empty() {
             return Err(e);
         }
-        let budget = (self.steps.saturating_mul(4)).max(MIN_LOCATE_STEPS);
-        self.tree_walk = true;
-        self.budget = Some(budget);
+        self.locate = true;
         let again = self.walk_from_scratch(arena, libs, term, expected);
-        self.tree_walk = false;
-        self.budget = None;
+        self.locate = false;
+        debug_assert!(again.is_err(), "both walks accept the same terms");
         match again {
-            Err(located) if !self.out_of_budget => Err(located),
-            _ => Err(e),
+            Err(located) => Err(located),
+            Ok(_) => Err(e),
         }
     }
 
@@ -514,19 +553,21 @@ impl TypeChecker {
         self.memo.clear();
         self.pending.clear();
         self.canon.clear();
+        self.canon_closed.clear();
         self.steps = 0;
-        self.out_of_budget = false;
+        self.checkpoints.clear();
+        self.trail.clear();
+        self.memo_log.clear();
     }
 
     /// Pushes a binding for a new innermost variable.
     fn bind_var(&mut self, ty: Ty, poly: bool) {
-        let class = if poly { self.canonical(ty) } else { None };
-        self.env.push(Binding { ty, poly, class });
+        let class = poly.then(|| self.canonical(ty));
+        self.env.push(Binding { ty, class });
     }
 
-    /// The [`Canon`] id of `t`, or `None` if `t` has a variable that is not
-    /// quantified, or a rigid one.
-    fn canonical(&mut self, t: Ty) -> Option<u32> {
+    /// The [`Canon`] id of `t`.
+    fn canonical(&mut self, t: Ty) -> u32 {
         let mut ids: FxHashMap<Ty, u32> = FxHashMap::default();
         let mut vars = 0u32;
         // A constructor is pushed with `false` to be expanded, and again with `true`
@@ -549,7 +590,8 @@ impl TypeChecker {
                         key,
                     }
                 }
-                Node::Var { .. } | Node::Rigid { .. } | Node::Link(_) => return None,
+                Node::Var { .. } | Node::Rigid { .. } => Canon::Free(r),
+                Node::Link(_) => unreachable!("the stack holds resolved nodes"),
                 Node::Con(h, a, b) => {
                     let (a, b) = (self.resolve(a), self.resolve(b));
                     if !children_done {
@@ -568,9 +610,20 @@ impl TypeChecker {
             };
             let next = u32::try_from(self.canon.len()).expect("fewer than 2^32 types");
             let id = *self.canon.entry(canon).or_insert(next);
+            if id == next {
+                let closed = match canon {
+                    Canon::Var { .. } => true,
+                    Canon::Free(_) => false,
+                    Canon::Con(h, a, b) => {
+                        let closed = |c: u32| self.canon_closed[c as usize];
+                        (h.arity() < 1 || closed(a)) && (h.arity() < 2 || closed(b))
+                    }
+                };
+                self.canon_closed.push(closed);
+            }
             ids.insert(r, id);
         }
-        ids.get(&root).copied()
+        ids[&root]
     }
 
     /// Finds the non-leaf subterms of `root` that more than one edge of the DAG
@@ -622,7 +675,11 @@ impl TypeChecker {
     }
 
     fn set(&mut self, t: Ty, n: Node) {
-        self.nodes[t as usize] = n;
+        let i = t as usize;
+        if self.checkpoints.last().is_some_and(|cp| i < cp.nodes) {
+            self.trail.push((t, self.nodes[i]));
+        }
+        self.nodes[i] = n;
     }
 
     fn fresh(&mut self) -> Ty {
@@ -1249,10 +1306,11 @@ impl TypeChecker {
     /// expansion `let f = (lam y. e) in C[f y, f y]`, which types the same as
     /// `C[e, e]` because every occurrence of a monomorphic `y` has the one type.
     /// A polymorphic one cannot be abstracted (HM has no polymorphic parameters),
-    /// so the key holds it: two bindings whose types have no free variables and
-    /// are the same up to renaming give `e` the same type, and any other is kept
-    /// by its type node, whose free variables the kept type then shares, as a
-    /// `let` would. Bindings refined between uses refine the kept type with them.
+    /// so the key holds it, by its [`Canon`] id: two bindings whose types are the
+    /// same up to renaming of their quantified variables, with the same free
+    /// variables, give `e` the same type, whose free variables the kept type then
+    /// shares, as a `let` would. Bindings refined between uses refine the kept
+    /// type with them, and refine both such bindings alike.
     /// `Key` flags are kept by generalisation and copied by instantiation, as for
     /// `let`.
     ///
@@ -1260,8 +1318,8 @@ impl TypeChecker {
     /// the type is checked against it afterwards, and the types of the
     /// monomorphic bindings it uses are checked against its kept type at each use.
     /// So a clash found that way is reported at the whole shared subterm. When
-    /// that happens, [`TypeChecker::run`] walks the term again as a tree to find
-    /// where the clash is.
+    /// that happens, [`TypeChecker::run`] walks the term again to find where the
+    /// clash is.
     fn walk<L: LibEnv + ?Sized>(
         &mut self,
         arena: &Arena,
@@ -1275,10 +1333,6 @@ impl TypeChecker {
         let mut step = Step::Eval(root, want);
         loop {
             self.steps += 1;
-            if self.budget.is_some_and(|b| self.steps > b) {
-                self.out_of_budget = true;
-                return Err(plain_error(arena, root, too_large()));
-            }
             #[cfg(test)]
             {
                 if let Some(limit) = self.step_limit {
@@ -1288,18 +1342,27 @@ impl TypeChecker {
                     );
                 }
             }
-            step = match step {
+            let next = match step {
                 Step::Eval(id, want) => {
                     if self.shared.contains(&id) {
-                        self.shared_subterm(arena, id, want)?
+                        self.shared_subterm(arena, id, want)
                     } else {
-                        self.descend(arena, libs, id, want)?
+                        self.descend(arena, libs, id, want)
                     }
                 }
-                Step::EvalShared(id) => self.descend(arena, libs, id, None)?,
+                Step::EvalShared(id) => self.descend(arena, libs, id, None),
+                Step::InPlace(id, want) => self.descend(arena, libs, id, want),
                 Step::Return(t) => match self.frames.pop() {
                     None => return Ok(t),
-                    Some(frame) => self.resume(arena, frame, t)?,
+                    Some(frame) => self.resume(arena, frame, t),
+                },
+            };
+            step = match next {
+                Ok(next) => next,
+                // Only the second walk of [`TypeChecker::run`] has checkpoints.
+                Err(e) => match self.checkpoints.pop() {
+                    None => return Err(e),
+                    Some(cp) => self.back_to(cp),
                 },
             };
         }
@@ -1320,26 +1383,48 @@ impl TypeChecker {
         let len = self.env.len();
         if fv.depth as usize > len {
             // A free variable is unbound: walk it as a tree to report it.
+            if self.locate {
+                return Ok(Step::InPlace(id, want));
+            }
             return self.descend_unshared(id, want);
         }
         let indices = fv.indices();
         let mut scope = Vec::with_capacity(indices.len());
         for &i in &indices {
             let b = self.env[len - 1 - i as usize];
-            scope.push(match (b.poly, b.class) {
-                (false, _) => Slot::Mono,
-                (true, Some(c)) => Slot::Closed(c),
-                (true, None) => Slot::Poly(self.resolve(b.ty)),
+            scope.push(match b.class {
+                None => Slot::Mono,
+                Some(c) => Slot::Poly(c),
             });
         }
         let key = (id, scope);
+        if self.locate {
+            self.checkpoints.push(Checkpoint {
+                id,
+                want,
+                nodes: self.nodes.len(),
+                trail: self.trail.len(),
+                frames: self.frames.len(),
+                spine: self.spine.len(),
+                env: self.env.len(),
+                pending: self.pending.len(),
+                memo_log: self.memo_log.len(),
+                level: self.level,
+            });
+        }
         if let Some(&kept) = self.memo.get(&key) {
             let t = self.instantiate(kept);
             let t = self.apply_scope(arena, id, &key.1, &indices, t)?;
             if let Some(w) = want {
                 self.expect(arena, w.ty, t, Site::new(id, w.context))?;
             }
+            if self.locate {
+                self.drop_checkpoint();
+            }
             return Ok(Step::Return(t));
+        }
+        if self.locate {
+            self.frames.push(Frame::Tried);
         }
         if let Some(w) = want {
             self.frames.push(Frame::Check { want: w, term: id });
@@ -1356,16 +1441,127 @@ impl TypeChecker {
                 let p = self.fresh();
                 params.push(p);
                 saved.push((pos, self.env[pos]));
-                self.env[pos] = Binding {
-                    ty: p,
-                    poly: false,
-                    class: None,
-                };
+                self.env[pos] = Binding { ty: p, class: None };
             }
         }
         self.pending.push(Pending { key, params, saved });
         self.frames.push(Frame::Memo);
         Ok(Step::EvalShared(id))
+    }
+
+    /// Drops the innermost checkpoint, once the use it was for has worked.
+    fn drop_checkpoint(&mut self) {
+        self.checkpoints.pop();
+        if self.checkpoints.is_empty() {
+            self.trail.clear();
+            self.memo_log.clear();
+        }
+    }
+
+    /// The kept type to put in the memo for `key` while uses are being tried.
+    ///
+    /// If the scope has no binding whose type has free variables, inferring the
+    /// subterm used only nodes it made itself, so its kept type holds for that
+    /// scope in any state of the store. Then it is copied out of reach of going
+    /// back to a checkpoint, and stays in the memo. Otherwise going back to a
+    /// checkpoint before it removes it.
+    fn keep_past_checkpoints(&mut self, key: &MemoKey, kept: Ty) -> Ty {
+        let closed = key.1.iter().all(|slot| match *slot {
+            Slot::Mono => true,
+            Slot::Poly(c) => self.canon_closed[c as usize],
+        });
+        if let Some(frozen) = closed.then(|| self.freeze(kept)).flatten() {
+            return frozen;
+        }
+        self.memo_log.push(key.clone());
+        kept
+    }
+
+    /// A copy of `t` in new nodes, with no links, or `None` if `t` has a
+    /// variable that is not quantified. No unification changes the copy: it has
+    /// only quantified variables, which instantiation replaces, and constructor
+    /// nodes, which unification never changes.
+    fn freeze(&mut self, t: Ty) -> Option<Ty> {
+        let mut map: FxHashMap<Ty, Ty> = FxHashMap::default();
+        let root = self.resolve(t);
+        // As in `instantiate`: `true` to expand, `false` to rebuild.
+        let mut stack: Vec<(Ty, bool)> = vec![(root, true)];
+        while let Some((r, first)) = stack.pop() {
+            if first {
+                if map.contains_key(&r) {
+                    continue;
+                }
+                match self.node(r) {
+                    Node::Var {
+                        level: GENERIC,
+                        key,
+                    } => {
+                        let n = self.push(Node::Var {
+                            level: GENERIC,
+                            key,
+                        });
+                        map.insert(r, n);
+                    }
+                    Node::Var { .. } | Node::Rigid { .. } | Node::Link(_) => return None,
+                    Node::Con(h, a, b) => {
+                        if r <= UNIT {
+                            map.insert(r, r);
+                            continue;
+                        }
+                        stack.push((r, false));
+                        if h.arity() >= 2 {
+                            let rb = self.resolve(b);
+                            stack.push((rb, true));
+                        }
+                        if h.arity() >= 1 {
+                            let ra = self.resolve(a);
+                            stack.push((ra, true));
+                        }
+                    }
+                }
+            } else if let Node::Con(h, a, b) = self.node(r) {
+                let copy = |this: &mut Self, c: Ty, used: bool| {
+                    if used {
+                        let rc = this.resolve(c);
+                        map[&rc]
+                    } else {
+                        0
+                    }
+                };
+                let na = copy(self, a, h.arity() >= 1);
+                let nb = copy(self, b, h.arity() >= 2);
+                let out = self.con2(h, na, nb);
+                map.insert(r, out);
+            }
+        }
+        map.get(&root).copied()
+    }
+
+    /// Puts the checker back as it was at `cp`, which has been popped, and walks
+    /// its shared subterm in place.
+    fn back_to(&mut self, cp: Checkpoint) -> Step {
+        for (t, n) in self.trail.drain(cp.trail..).rev() {
+            self.nodes[t as usize] = n;
+        }
+        self.frames.truncate(cp.frames);
+        self.spine.truncate(cp.spine);
+        for p in self.pending.drain(cp.pending..).rev() {
+            for (pos, b) in p.saved.into_iter().rev() {
+                if let Some(slot) = self.env.get_mut(pos) {
+                    *slot = b;
+                }
+            }
+        }
+        self.env.truncate(cp.env);
+        for key in self.memo_log.drain(cp.memo_log..) {
+            self.memo.remove(&key);
+        }
+        self.level = cp.level;
+        if self.checkpoints.is_empty() {
+            self.trail.clear();
+            self.memo_log.clear();
+        }
+        Step::InPlace(cp.id, cp.want)
     }
 
     /// Walks shared subterm `id` without the memo, checking it against `want`.
@@ -1429,7 +1625,7 @@ impl TypeChecker {
                     ));
                 }
                 let b = self.env[depth - 1 - i as usize];
-                if b.poly {
+                if b.class.is_some() {
                     self.instantiate(b.ty)
                 } else {
                     b.ty
@@ -1597,7 +1793,16 @@ impl TypeChecker {
                 let t = self.instantiate(kept);
                 let indices = self.free_vars[&key.0].indices();
                 let t = self.apply_scope(arena, key.0, &key.1, &indices, t)?;
+                let kept = if self.checkpoints.is_empty() {
+                    kept
+                } else {
+                    self.keep_past_checkpoints(&key, kept)
+                };
                 self.memo.insert(key, kept);
+                Step::Return(t)
+            }
+            Frame::Tried => {
+                self.drop_checkpoint();
                 Step::Return(t)
             }
             Frame::AppHead { sp, want } => {

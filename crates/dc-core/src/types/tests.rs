@@ -1054,6 +1054,75 @@ fn errors_inside_shared_subterms_are_located_as_in_the_tree() {
     }
 }
 
+/// `(lam (pair t (let true t)))` with `t` = `(if true u u)` nested `n` deep around
+/// `u` = `(add $0 1)`: the second `t` sees `$0` bound to a Bool.
+fn clash_under_let(a: &mut Arena, n: usize) -> TermId {
+    let (v, one, yes) = (a.var(0), a.int(1), a.bool(true));
+    let (add, pair) = (a.prim(Prim::Add), a.prim(Prim::Pair));
+    let leaf = a.apps(add, &[v, one]);
+    let t = shared_ifs(a, n, yes, leaf);
+    let l = a.let_(yes, t);
+    let body = a.apps(pair, &[t, l]);
+    a.lam(body)
+}
+
+#[test]
+fn errors_in_large_shared_terms_are_located_as_in_the_tree() {
+    // At n = 18 the tree walk takes millions of steps; locating the error must
+    // still name the subterm the tree walk names, in a polynomial number of steps.
+    const N: usize = 18;
+    const STEPS: u64 = 100 * (N * N) as u64;
+    let mut a = Arena::new();
+    let f = clash_under_let(&mut a, N);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, f, NO_LIBS);
+    let e = want.clone().expect_err("ill typed");
+    assert!(e.context.contains("argument 1 of `add`"), "{e}");
+    assert_eq!(TypeChecker::new().infer(&a, f, NO_LIBS), want);
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), want);
+    let s = sch("Int -> (Int, Int)");
+    let want = tree.check(&a, f, NO_LIBS, &s);
+    assert!(want.is_err());
+    assert_eq!(bounded(STEPS).check(&a, f, NO_LIBS, &s), want);
+}
+
+/// `lam x. let (lam (pair x $0)) in t_n`, with `t_0 = ($0 1)` and `t_(k+1) =
+/// (if true t_k (let (lam (pair (fst ($1 0)) $0)) t_k))`: every level binds a new
+/// polymorphic helper whose type has the free variable `x`.
+fn helpers_over_a_lambda_variable(a: &mut Arena, n: usize) -> TermId {
+    let (v0, v1, zero, one, yes) = (a.var(0), a.var(1), a.int(0), a.int(1), a.bool(true));
+    let (pair, fst) = (a.prim(Prim::Pair), a.prim(Prim::Fst));
+    let b0 = a.apps(pair, &[v1, v0]);
+    let b0 = a.lam(b0);
+    let prev = a.app(v1, zero);
+    let x = a.app(fst, prev);
+    let b = a.apps(pair, &[x, v0]);
+    let b = a.lam(b);
+    let mut t = a.app(v0, one);
+    for _ in 0..n {
+        let l = a.let_(b, t);
+        t = a.if_(yes, t, l);
+    }
+    let body = a.let_(b0, t);
+    a.lam(body)
+}
+
+#[test]
+fn shared_subterms_under_new_helpers_with_free_type_variables_are_reused() {
+    const N: usize = 30;
+    const STEPS: u64 = 100 * N as u64;
+    let mut a = Arena::new();
+    let small = helpers_over_a_lambda_variable(&mut a, 6);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, small, NO_LIBS);
+    assert_eq!(want, Ok(sch("a -> (a, Int)")));
+    assert_eq!(bounded(STEPS).infer(&a, small, NO_LIBS), want);
+    let big = helpers_over_a_lambda_variable(&mut a, N);
+    assert_eq!(bounded(STEPS).infer(&a, big, NO_LIBS), want);
+}
+
 #[test]
 fn shared_subterms_with_many_free_variables_agree_with_the_tree() {
     // More free variables than the memo records one by one: the scope is all the
@@ -1126,6 +1195,10 @@ fn arb_shared_src() -> impl Strategy<Value = String> {
             1 => inner.clone().prop_map(|t| format!("(pair {t} (lam {t}))")),
             1 => inner.clone().prop_map(|t| format!("((lam {t}) {t})")),
             1 => inner.clone().prop_map(|t| format!("(if true {t} (let (lam $0) {t}))")),
+            // A helper whose type has the free variable of the lambda around it.
+            1 => inner.clone().prop_map(|t| {
+                format!("(lam (if true {t} (let (lam (pair $1 $0)) {t})))")
+            }),
             1 => (inner.clone(), inner.clone()).prop_map(|(t, u)| format!("(let {t} ({u} {t}))")),
             // Two spines sharing the prefix `({f} {t})`.
             1 => (inner.clone(), inner).prop_map(|(f, t)| {
