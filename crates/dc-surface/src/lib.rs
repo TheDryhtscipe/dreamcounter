@@ -12,9 +12,9 @@
 //! use dc_surface::TopLevel;
 //!
 //! let mut env = TopLevel::new();
-//! // The prelude (bead P2.11) is dc source compiled first, so its names are in
-//! // scope for the program.
-//! env.add_source("prelude", "let twice f x = f (f x)").unwrap();
+//! // Definitions added first are in scope for later ones. The standard prelude
+//! // is added as library references instead: see [`prelude`].
+//! env.add_source("helpers", "let twice f x = f (f x)").unwrap();
 //! env.add_source("program", "let main = twice (fun x -> x * 2) 5").unwrap();
 //! let mut arena = Arena::new();
 //! let main = env.close_definition(&mut arena, "main").unwrap();
@@ -57,6 +57,7 @@ pub mod desugar;
 mod error;
 mod lexer;
 mod parser;
+pub mod prelude;
 pub mod pretty;
 
 use dc_core::Arena;

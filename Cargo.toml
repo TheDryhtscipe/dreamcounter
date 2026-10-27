@@ -13,6 +13,8 @@ repository = "https://github.com/TheDryhtscipe/dreamcounter"
 rustc-hash = "2.1"
 proptest = "1.12"
 imbl = "7.0"
+# Pinned exactly: task inputs must be the same on every platform and version.
+rand_chacha = { version = "=0.9.0", default-features = false }
 dc-core = { path = "crates/dc-core" }
 dc-surface = { path = "crates/dc-surface" }
 dc-eval = { path = "crates/dc-eval" }
