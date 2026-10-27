@@ -1,7 +1,10 @@
 //! Library abstractions through the evaluator (spec §8, decision D1): a refactored
 //! program, once expanded, evaluates to the same value in the same number of steps
-//! as the program it came from (spec §7, invariant 2). Unsaturated uses cost one
-//! extra β step per η binder.
+//! as the program it came from (spec §7, invariant 2). That holds for saturated
+//! uses only. An unsaturated use is η-expanded, and the η binders take their
+//! arguments by value: applied to values, it costs one extra β step per η binder,
+//! but a late argument that is not a value is evaluated once, before the call,
+//! however often the body uses it.
 
 mod common;
 
@@ -99,10 +102,19 @@ fn open_arguments_under_binders_keep_their_meaning() {
         // β 2 + β 1 + sub 1 + add 1.
         "Value(8, 5)",
     );
+    // λ#0. λacc. λx. acc + #0, with an argument that binds (a let and a lambda)
+    // and refers to an input from inside both.
+    same(
+        &[("(lam (lam (lam (add $1 $2))))", 1)],
+        "(lam (lam (foldl (lib_0 (let (mul $1 2) ((lam (add $0 $3)) $0))) 0 $0)))",
+        "(lam (lam (foldl (lam (lam (add $1 (let (mul $3 2) ((lam (add $0 $5)) $0))))) 0 $0)))",
+        &[int(3), range1(4)],
+        "Value(36, 30)",
+    );
 }
 
 #[test]
-fn unsaturated_uses_cost_one_beta_step_per_eta_binder() {
+fn unsaturated_uses_applied_to_values_cost_one_beta_step_per_eta_binder() {
     let sub = ("(lam (lam (sub $1 $0)))", 2);
     // Saturated: sub 1.
     same(&[sub], "(lib_0 50 8)", "(sub 50 8)", &[], "Value(42, 1)");
@@ -124,6 +136,32 @@ fn unsaturated_uses_cost_one_beta_step_per_eta_binder() {
         &[range1(4)],
         // β 1 + 4 × (1 + β 2 + sub 1).
         "Value(90, 17)",
+    );
+    // A supplied argument that refers to the program moves under the η binder.
+    assert_eq!(
+        run_with_libs(&[sub], "(lam (let (lib_0 $0) ($0 8)))", &[int(50)]).to_string(),
+        "Value(42, 3)"
+    );
+}
+
+#[test]
+fn an_unsaturated_use_evaluates_a_late_argument_once() {
+    // λ#0 #1. #1 + (#1 + #1).
+    let lib = ("(lam (lam (add $0 (add $0 $0))))", 2);
+    // Saturated: the macro evaluates `mul` at each of the three occurrences.
+    // mul 3 + add 2.
+    same(
+        &[lib],
+        "(lib_0 1 (mul 2 4))",
+        "(add (mul 2 4) (add (mul 2 4) (mul 2 4)))",
+        &[],
+        "Value(24, 5)",
+    );
+    // Unsaturated, then applied: `mul` runs once, before the η binder's β step.
+    // mul 1 + β 1 + add 2.
+    assert_eq!(
+        run_with_libs(&[lib], "(let (lib_0 1) ($0 (mul 2 4)))", &[]).to_string(),
+        "Value(24, 4)"
     );
 }
 
@@ -190,6 +228,10 @@ fn programs() -> Vec<(&'static str, Vec<Value>)> {
             "(lam (lam (let (mul $1 $0) (if (lt $0 10) (div $0 (sub $2 $2)) (add $0 $0)))))",
             vec![int(4), int(5)],
         ),
+        (
+            "(lam (lam (foldl (lam (lam (add $1 (let (mul $3 2) ((lam (add $0 $5)) $0))))) 0 $0)))",
+            vec![int(3), range1(4)],
+        ),
     ]
 }
 
@@ -254,22 +296,69 @@ fn replace_at(a: &mut Arena, t: TermId, pos: &mut usize, with: TermId) -> TermId
     a.intern(rebuild(node, &kids))
 }
 
+/// The preorder positions of a term as a tree, with their binder depths.
+fn preorder_depths(a: &Arena, t: TermId, d: u32, out: &mut Vec<(TermId, u32)>) {
+    out.push((t, d));
+    match a.get(t) {
+        Term::Lam(b) => preorder_depths(a, b, d + 1, out),
+        Term::Let(x, b) => {
+            preorder_depths(a, x, d, out);
+            preorder_depths(a, b, d + 1, out);
+        }
+        node => {
+            for c in children(&node) {
+                preorder_depths(a, c, d, out);
+            }
+        }
+    }
+}
+
+/// The lowest free de Bruijn index of `t` under `d` binders, if any.
+fn lowest_free(a: &Arena, t: TermId, d: u32) -> Option<u32> {
+    match a.get(t) {
+        Term::Var(j) => j.checked_sub(d),
+        Term::Lam(b) => lowest_free(a, b, d + 1),
+        Term::Let(x, b) => {
+            let x = lowest_free(a, x, d);
+            let b = lowest_free(a, b, d + 1);
+            x.into_iter().chain(b).min()
+        }
+        node => children(&node)
+            .into_iter()
+            .filter_map(|c| lowest_free(a, c, d))
+            .min(),
+    }
+}
+
+/// Lowers the free variables of `t` by `by`.
+fn shift_down(a: &mut Arena, t: TermId, by: u32) -> TermId {
+    map_term(a, t, 0, &mut |a, t, d| match a.get(t) {
+        Term::Var(j) if j >= d => Some(a.var(j - by)),
+        _ => None,
+    })
+}
+
 /// Abstracts the subterm at preorder position `pos` into library 0, as Stitch would:
-/// its free variables become parameters, and every occurrence of the closed
-/// subterm `extra` (if it names one) becomes one more parameter.
+/// its free variables become parameters, and, if `extra` is given, one of its
+/// subterms that uses none of its binders becomes one more parameter. Every
+/// occurrence of that subterm at the same depth is replaced, and the use passes the
+/// subterm, which may bind variables and have free ones.
 fn abstract_at(a: &mut Arena, prog: TermId, pos: usize, extra: Option<usize>) -> (LibDef, TermId) {
     let mut nodes = vec![];
     preorder(a, prog, &mut nodes);
     let s = nodes[pos];
     let n = a.free_depth(s);
     let mut inner = vec![];
-    preorder(a, s, &mut inner);
-    let closed = extra
-        .map(|e| inner[e % inner.len()])
-        .filter(|&c| a.is_closed(c));
-    let k = n + u32::from(closed.is_some());
+    preorder_depths(a, s, 0, &mut inner);
+    // `s` itself is always a candidate.
+    let candidates: Vec<(TermId, u32)> = inner
+        .into_iter()
+        .filter(|&(e, d)| lowest_free(a, e, 0).is_none_or(|m| m >= d))
+        .collect();
+    let chosen = extra.map(|e| candidates[e % candidates.len()]);
+    let k = n + u32::from(chosen.is_some());
     let body = map_term(a, s, 0, &mut |a, t, d| {
-        if Some(t) == closed {
+        if chosen == Some((t, d)) {
             return Some(a.var(d + k - 1 - n));
         }
         match a.get(t) {
@@ -283,7 +372,9 @@ fn abstract_at(a: &mut Arena, prog: TermId, pos: usize, extra: Option<usize>) ->
     }
     let lib = a.lib(LibId(0));
     let mut args: Vec<TermId> = (0..n).map(|i| a.var(n - 1 - i)).collect();
-    args.extend(closed);
+    if let Some((e, d)) = chosen {
+        args.push(shift_down(a, e, d));
+    }
     let use_site = a.apps(lib, &args);
     let mut p = pos;
     let rewritten = replace_at(a, prog, &mut p, use_site);
@@ -291,7 +382,7 @@ fn abstract_at(a: &mut Arena, prog: TermId, pos: usize, extra: Option<usize>) ->
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(1024))]
 
     #[test]
     fn refactoring_preserves_value_and_steps(

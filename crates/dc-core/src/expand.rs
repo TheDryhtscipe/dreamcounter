@@ -27,9 +27,17 @@
 //! cut down to the variables the node actually has free, so a closed subterm is
 //! expanded once wherever it occurs. An argument substituted under binders is
 //! expanded directly at its final position instead of being expanded and then
-//! shifted, so a chain of nested uses with open arguments costs time linear in its
-//! length rather than quadratic. Every traversal uses an explicit stack, so the
-//! depth of a term is limited only by memory.
+//! shifted.
+//!
+//! A renaming is a hash-consed list of the indices where its shift grows, each
+//! stored relative to the one before. Moving it under a binder or under a use site
+//! builds one list cell, so a chain of nested uses with open arguments, binders in
+//! the arguments included, costs time and memory linear in its length. Renaming a
+//! variable `$j` walks the breakpoints at or below `j`, of which there are at most
+//! `j + 1`.
+//! Cutting a renaming down costs one step per breakpoint kept and is memoised. Every
+//! traversal uses an explicit stack, so the depth of a term is limited only by
+//! memory.
 
 use std::fmt;
 
@@ -113,8 +121,7 @@ impl std::error::Error for ExpandError {}
 /// Expands every library reference in `root`, using `libs` indexed by [`LibId`].
 ///
 /// To expand many programs with the same libraries, build one [`Expander`] and
-/// reuse it: it checks and expands the library bodies once and keeps its memo
-/// tables between programs.
+/// reuse it: it checks and expands the library bodies once.
 pub fn expand(arena: &mut Arena, libs: &[LibDef], root: TermId) -> Result<TermId, ExpandError> {
     Expander::new(arena, libs)?.expand(arena, root)
 }
@@ -123,6 +130,11 @@ pub fn expand(arena: &mut Arena, libs: &[LibDef], root: TermId) -> Result<TermId
 ///
 /// An expander belongs to the arena it was built with: its library bodies and memo
 /// tables hold ids in that arena. Use it only with that arena.
+///
+/// Between programs it keeps only the expanded library bodies and a table of free
+/// depths with one entry per arena node, which grows as the arena does. The tables
+/// for one program are dropped when its expansion ends, so they are not shared
+/// between programs.
 #[derive(Debug)]
 pub struct Expander {
     /// For each library: its arity and its body with every library use expanded.
@@ -163,7 +175,7 @@ impl Expander {
                 });
             }
             // Library uses inside the body are checked against `bodies.len() == i`.
-            let expanded = ex.run(arena, Task::Expand(def.term, IDENTITY), Some(lib))?;
+            let expanded = ex.run_once(arena, Task::Expand(def.term, IDENTITY), Some(lib))?;
             let mut body = expanded;
             for _ in 0..def.arity {
                 match arena.get(body) {
@@ -179,7 +191,22 @@ impl Expander {
     /// Expands every library reference in `root`. The result contains no
     /// [`Term::Lib`] node.
     pub fn expand(&mut self, arena: &mut Arena, root: TermId) -> Result<TermId, ExpandError> {
-        self.run(arena, Task::Expand(root, IDENTITY), None)
+        self.run_once(arena, Task::Expand(root, IDENTITY), None)
+    }
+
+    /// [`Expander::run`], then drops the tables built for it, whether or not it
+    /// succeeded.
+    fn run_once(
+        &mut self,
+        arena: &mut Arena,
+        root: Task,
+        preparing: Option<LibId>,
+    ) -> Result<TermId, ExpandError> {
+        let out = self.run(arena, root, preparing);
+        self.memo.clear();
+        self.sites.clear();
+        self.renamings.clear();
+        out
     }
 
     /// Runs `root` and everything it depends on with an explicit stack. `preparing`
@@ -484,72 +511,110 @@ struct RenId(u32);
 
 const IDENTITY: RenId = RenId(0);
 
-/// An order-preserving renaming of de Bruijn indices, `j ↦ j + shift(j)`, stored as
-/// the points where `shift` changes: `(c, s)` means `shift(j) = s` from `j = c`
-/// until the next point. `shift` is 0 before the first point and never decreases.
-/// Each distinct renaming is interned once.
+/// One breakpoint of a renaming and the renaming's remaining breakpoints.
+///
+/// The breakpoint sits `gap` indices above the previous one (above 0 for the first)
+/// and raises the shift by `delta`.
+#[derive(Clone, Copy, Debug)]
+struct Point {
+    gap: u32,
+    delta: u32,
+    rest: RenId,
+    /// The position of the last breakpoint, relative to the previous breakpoint's.
+    last: u32,
+}
+
+/// Order-preserving renamings of de Bruijn indices, `j ↦ j + shift(j)`.
+///
+/// `shift` is 0 below the first breakpoint and grows by a positive amount at each
+/// breakpoint. A renaming is a hash-consed list of breakpoints from the lowest
+/// index up, each stored relative to the one before it. Going under a binder
+/// changes only the first breakpoint's position, and shifting the result changes
+/// only the first breakpoint's increase, so both build one list cell and share the
+/// rest. Each distinct renaming is interned once.
 #[derive(Debug)]
 struct Renamings {
-    table: Vec<Vec<(u32, u32)>>,
-    index: FxHashMap<Vec<(u32, u32)>, RenId>,
+    /// The cells; entry 0 stands for the identity and is never read.
+    points: Vec<Point>,
+    index: FxHashMap<(u32, u32, RenId), RenId>,
+    /// Memo of [`Renamings::restrict`] for renamings it had to cut.
+    restricted: FxHashMap<(RenId, u32), RenId>,
 }
 
 impl Renamings {
     fn new() -> Renamings {
-        let mut index = FxHashMap::default();
-        index.insert(vec![], IDENTITY);
+        let unused = Point {
+            gap: 0,
+            delta: 0,
+            rest: IDENTITY,
+            last: 0,
+        };
         Renamings {
-            table: vec![vec![]],
-            index,
+            points: vec![unused],
+            index: FxHashMap::default(),
+            restricted: FxHashMap::default(),
         }
     }
 
-    fn intern(&mut self, points: Vec<(u32, u32)>) -> RenId {
-        // Normalise: one point per cutoff (the last wins), no point that keeps the
-        // previous shift.
-        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(points.len());
-        for (c, s) in points {
-            match merged.last_mut() {
-                Some(last) if last.0 == c => last.1 = s,
-                _ => merged.push((c, s)),
-            }
-        }
-        let mut norm = Vec::with_capacity(merged.len());
-        let mut prev = 0;
-        for (c, s) in merged {
-            if s != prev {
-                norm.push((c, s));
-                prev = s;
-            }
-        }
-        if let Some(&id) = self.index.get(&norm) {
+    /// Drops every renaming but the identity.
+    fn clear(&mut self) {
+        self.points.truncate(1);
+        self.index.clear();
+        self.restricted.clear();
+    }
+
+    fn get(&self, r: RenId) -> Option<Point> {
+        (r != IDENTITY).then(|| self.points[r.0 as usize])
+    }
+
+    /// The renaming with a first breakpoint `gap` above 0, raising the shift by
+    /// `delta`, followed by the breakpoints of `rest`.
+    fn cons(&mut self, gap: u32, delta: u32, rest: RenId) -> RenId {
+        debug_assert!(delta > 0, "a breakpoint must raise the shift");
+        if let Some(&id) = self.index.get(&(gap, delta, rest)) {
             return id;
         }
-        let id = RenId(u32::try_from(self.table.len()).expect("more than 2^32 renamings"));
-        self.table.push(norm.clone());
-        self.index.insert(norm, id);
+        let last = match self.get(rest) {
+            None => gap,
+            Some(p) => {
+                debug_assert!(p.gap > 0, "breakpoints must be distinct");
+                gap.checked_add(p.last).expect("de Bruijn index overflow")
+            }
+        };
+        let id = RenId(u32::try_from(self.points.len()).expect("more than 2^32 renamings"));
+        self.points.push(Point {
+            gap,
+            delta,
+            rest,
+            last,
+        });
+        self.index.insert((gap, delta, rest), id);
         id
     }
 
+    /// `r(j)`. This walks the breakpoints at or below `j`.
     fn apply(&self, r: RenId, j: u32) -> u32 {
-        let shift = self.table[r.0 as usize]
-            .iter()
-            .take_while(|&&(c, _)| c <= j)
-            .last()
-            .map_or(0, |&(_, s)| s);
+        let (mut at, mut shift, mut r) = (0u32, 0u32, r);
+        while let Some(p) = self.get(r) {
+            at = at.saturating_add(p.gap);
+            if at > j {
+                break;
+            }
+            shift += p.delta;
+            r = p.rest;
+        }
         j.checked_add(shift).expect("de Bruijn index overflow")
     }
 
     /// The renaming under one more binder: `0 ↦ 0`, `j + 1 ↦ r(j) + 1`.
     fn lift(&mut self, r: RenId) -> RenId {
-        if r == IDENTITY {
-            return r;
+        match self.get(r) {
+            None => r,
+            Some(p) => {
+                let gap = p.gap.checked_add(1).expect("de Bruijn index overflow");
+                self.cons(gap, p.delta, p.rest)
+            }
         }
-        let points = self.table[r.0 as usize]
-            .iter()
-            .map(|&(c, s)| (c + 1, s))
-            .collect();
-        self.intern(points)
     }
 
     /// `r` followed by shifting every index up by `by`.
@@ -557,24 +622,53 @@ impl Renamings {
         if by == 0 {
             return r;
         }
-        let mut points = vec![(0, by)];
-        points.extend(
-            self.table[r.0 as usize]
-                .iter()
-                .map(|&(c, s)| (c, s.checked_add(by).expect("de Bruijn index overflow"))),
-        );
-        self.intern(points)
+        match self.get(r) {
+            Some(p) if p.gap == 0 => {
+                let delta = p.delta.checked_add(by).expect("de Bruijn index overflow");
+                self.cons(0, delta, p.rest)
+            }
+            _ => self.cons(0, by, r),
+        }
     }
 
-    /// `r` restricted to the indices below `depth`: the rest are not free in the
-    /// term it will rename, so they are reset to the identity.
+    /// The number of breakpoints stored for all interned renamings.
+    #[cfg(test)]
+    fn stored_points(&self) -> usize {
+        self.points.len() - 1
+    }
+
+    /// `r` without its breakpoints at `depth` or above. The indices from `depth` up
+    /// are not free in the term it will rename, so how they map does not matter, and
+    /// equal tasks get equal renamings.
+    ///
+    /// Cutting costs one step per breakpoint kept, and is memoised.
     fn restrict(&mut self, r: RenId, depth: u32) -> RenId {
-        let points = &self.table[r.0 as usize];
-        if points.iter().all(|&(c, _)| c < depth) {
-            return r;
+        // The kept cells whose rest must be cut, with the depth left at each.
+        let mut path: Vec<(RenId, u32, Point)> = vec![];
+        let (mut cur, mut left) = (r, depth);
+        let tail = loop {
+            let Some(p) = self.get(cur) else {
+                break cur;
+            };
+            if p.last < left {
+                break cur;
+            }
+            if p.gap >= left {
+                break IDENTITY;
+            }
+            if let Some(&done) = self.restricted.get(&(cur, left)) {
+                break done;
+            }
+            path.push((cur, left, p));
+            left -= p.gap;
+            cur = p.rest;
+        };
+        let mut acc = tail;
+        for (id, left, p) in path.into_iter().rev() {
+            acc = self.cons(p.gap, p.delta, acc);
+            self.restricted.insert((id, left), acc);
         }
-        let kept = points.iter().copied().filter(|&(c, _)| c < depth).collect();
-        self.intern(kept)
+        acc
     }
 }
 

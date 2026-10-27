@@ -77,6 +77,12 @@ fn arguments_are_shifted_under_binders_of_the_body() {
         "(lam (lib_0 (lam (add $0 $1))))",
         "(lam (lam (let 1 (add (lam (add $0 $3)) $0))))",
     );
+    // A let in the argument: its body sees the let's binder, not a shifted one.
+    check(
+        &[("(lam (lam $1))", 1)],
+        "(lam (lib_0 (let 1 (add $0 $1))))",
+        "(lam (lam (let 1 (add $0 $2))))",
+    );
 }
 
 #[test]
@@ -350,67 +356,113 @@ enum Gen {
     Bool(bool),
     Unit,
     Add,
+    /// A library, by its index modulo the number of libraries in scope.
+    Lib(u8),
     Lam(Box<Gen>),
     App(Box<Gen>, Box<Gen>),
     Let(Box<Gen>, Box<Gen>),
     If(Box<Gen>, Box<Gen>, Box<Gen>),
     And(Box<Gen>, Box<Gen>),
+    /// A library applied to arguments, by index as for `Lib`.
+    Use(u8, Vec<Gen>),
 }
 
-fn gen_term() -> impl Strategy<Value = Gen> {
-    let leaf = prop_oneof![
+fn gen_leaf() -> impl Strategy<Value = Gen> {
+    prop_oneof![
         (0u32..4).prop_map(Gen::Var),
         (0i64..3).prop_map(Gen::Int),
         any::<bool>().prop_map(Gen::Bool),
         Just(Gen::Unit),
         Just(Gen::Add),
+    ]
+}
+
+fn gen_node(inner: BoxedStrategy<Gen>) -> impl Strategy<Value = Gen> {
+    prop_oneof![
+        inner.clone().prop_map(|b| Gen::Lam(Box::new(b))),
+        (inner.clone(), inner.clone()).prop_map(|(f, x)| Gen::App(Box::new(f), Box::new(x))),
+        (inner.clone(), inner.clone()).prop_map(|(x, b)| Gen::Let(Box::new(x), Box::new(b))),
+        (inner.clone(), inner.clone(), inner.clone()).prop_map(|(c, t, e)| Gen::If(
+            Box::new(c),
+            Box::new(t),
+            Box::new(e)
+        )),
+        (inner.clone(), inner).prop_map(|(x, y)| Gen::And(Box::new(x), Box::new(y))),
+    ]
+}
+
+/// Terms without library references.
+fn gen_term() -> impl Strategy<Value = Gen> {
+    gen_leaf().prop_recursive(6, 48, 3, |inner| gen_node(inner.boxed()))
+}
+
+/// Terms with library references and uses with any number of arguments.
+fn gen_term_with_libs() -> impl Strategy<Value = Gen> {
+    // Mostly variables, so that arguments are open and parameters are used.
+    let leaf = prop_oneof![
+        4 => (0u32..4).prop_map(Gen::Var),
+        3 => gen_leaf(),
+        1 => any::<u8>().prop_map(Gen::Lib),
     ];
-    leaf.prop_recursive(6, 48, 3, |inner| {
+    leaf.prop_recursive(6, 48, 4, |inner| {
+        let inner = inner.boxed();
         prop_oneof![
-            inner.clone().prop_map(|b| Gen::Lam(Box::new(b))),
-            (inner.clone(), inner.clone()).prop_map(|(f, x)| Gen::App(Box::new(f), Box::new(x))),
-            (inner.clone(), inner.clone()).prop_map(|(x, b)| Gen::Let(Box::new(x), Box::new(b))),
-            (inner.clone(), inner.clone(), inner.clone()).prop_map(|(c, t, e)| Gen::If(
-                Box::new(c),
-                Box::new(t),
-                Box::new(e)
-            )),
-            (inner.clone(), inner).prop_map(|(x, y)| Gen::And(Box::new(x), Box::new(y))),
+            3 => gen_node(inner.clone()),
+            2 => (any::<u8>(), proptest::collection::vec(inner, 0..4))
+                .prop_map(|(l, args)| Gen::Use(l, args)),
         ]
     })
 }
 
 fn build(a: &mut Arena, g: &Gen) -> TermId {
+    build_in(a, g, 0)
+}
+
+/// Builds `g` where `libs` libraries are in scope. With none, a library is `()`.
+fn build_in(a: &mut Arena, g: &Gen, libs: u32) -> TermId {
+    let lib = |a: &mut Arena, l: u8| {
+        if libs == 0 {
+            a.unit()
+        } else {
+            a.lib(LibId(u32::from(l) % libs))
+        }
+    };
     match g {
         Gen::Var(i) => a.var(*i),
         Gen::Int(n) => a.int(*n),
         Gen::Bool(b) => a.bool(*b),
         Gen::Unit => a.unit(),
         Gen::Add => a.prim(Prim::Add),
+        Gen::Lib(l) => lib(a, *l),
         Gen::Lam(b) => {
-            let b = build(a, b);
+            let b = build_in(a, b, libs);
             a.lam(b)
         }
         Gen::App(f, x) => {
-            let f = build(a, f);
-            let x = build(a, x);
+            let f = build_in(a, f, libs);
+            let x = build_in(a, x, libs);
             a.app(f, x)
         }
         Gen::Let(x, b) => {
-            let x = build(a, x);
-            let b = build(a, b);
+            let x = build_in(a, x, libs);
+            let b = build_in(a, b, libs);
             a.let_(x, b)
         }
         Gen::If(c, t, e) => {
-            let c = build(a, c);
-            let t = build(a, t);
-            let e = build(a, e);
+            let c = build_in(a, c, libs);
+            let t = build_in(a, t, libs);
+            let e = build_in(a, e, libs);
             a.if_(c, t, e)
         }
         Gen::And(x, y) => {
-            let x = build(a, x);
-            let y = build(a, y);
+            let x = build_in(a, x, libs);
+            let y = build_in(a, y, libs);
             a.and(x, y)
+        }
+        Gen::Use(l, args) => {
+            let head = lib(a, *l);
+            let args: Vec<TermId> = args.iter().map(|x| build_in(a, x, libs)).collect();
+            a.apps(head, &args)
         }
     }
 }
@@ -493,9 +545,56 @@ fn replace_at(a: &mut Arena, t: TermId, pos: usize, with: TermId) -> TermId {
     go(a, t, &mut pos, with)
 }
 
+/// The preorder positions of a term as a tree, with their binder depths.
+fn preorder_depths(a: &Arena, t: TermId, d: u32, out: &mut Vec<(TermId, u32)>) {
+    out.push((t, d));
+    match a.get(t) {
+        Term::Lam(b) => preorder_depths(a, b, d + 1, out),
+        Term::Let(x, b) => {
+            preorder_depths(a, x, d, out);
+            preorder_depths(a, b, d + 1, out);
+        }
+        node => {
+            for c in crate::term::children(&node) {
+                preorder_depths(a, c, d, out);
+            }
+        }
+    }
+}
+
+/// The lowest free de Bruijn index of `t` under `d` binders, if any.
+fn lowest_free(a: &Arena, t: TermId, d: u32) -> Option<u32> {
+    match a.get(t) {
+        Term::Var(j) => j.checked_sub(d),
+        Term::Lam(b) => lowest_free(a, b, d + 1),
+        Term::Let(x, b) => {
+            let x = lowest_free(a, x, d);
+            let b = lowest_free(a, b, d + 1);
+            x.into_iter().chain(b).min()
+        }
+        node => crate::term::children(&node)
+            .into_iter()
+            .filter_map(|c| lowest_free(a, c, d))
+            .min(),
+    }
+}
+
+/// Shifts the free variables of `t` by `by`, which may be negative.
+fn shift(a: &mut Arena, t: TermId, by: i64) -> TermId {
+    map_term(a, t, 0, &mut |a, t, d| match a.get(t) {
+        Term::Var(j) if j >= d => {
+            let j = u32::try_from(i64::from(j) + by).expect("shifted below 0");
+            Some(a.var(j))
+        }
+        _ => None,
+    })
+}
+
 /// Abstracts the subterm at `pos` of `prog` into library 0, the way Stitch does: the
-/// subterm's free variables become parameters, and, if `extra` names a closed
-/// subterm of it, every occurrence of that subterm becomes one more parameter.
+/// subterm's free variables become parameters, and, if `extra` is given, one of its
+/// subterms that uses none of its binders becomes one more parameter. Every
+/// occurrence of that subterm at the same depth is replaced, and the use passes the
+/// subterm, which may bind variables and have free ones.
 /// Returns the library and the rewritten program.
 fn abstract_at(a: &mut Arena, prog: TermId, pos: usize, extra: Option<usize>) -> (LibDef, TermId) {
     let mut nodes = vec![];
@@ -503,15 +602,18 @@ fn abstract_at(a: &mut Arena, prog: TermId, pos: usize, extra: Option<usize>) ->
     let s = nodes[pos];
     let n = a.free_depth(s);
     let mut inner = vec![];
-    preorder(a, s, &mut inner);
-    let closed = extra
-        .map(|e| inner[e % inner.len()])
-        .filter(|&c| a.is_closed(c));
-    let k = n + u32::from(closed.is_some());
+    preorder_depths(a, s, 0, &mut inner);
+    // `s` itself is always a candidate.
+    let candidates: Vec<(TermId, u32)> = inner
+        .into_iter()
+        .filter(|&(e, d)| lowest_free(a, e, 0).is_none_or(|m| m >= d))
+        .collect();
+    let chosen = extra.map(|e| candidates[e % candidates.len()]);
+    let k = n + u32::from(chosen.is_some());
     // In the closed form λ^k. body, parameter #i under d binders is $(d + k - 1 - i).
     // A free $(d + p) of s is parameter #(n - 1 - p); the extra one is #n.
     let body = map_term(a, s, 0, &mut |a, t, d| {
-        if Some(t) == closed {
+        if chosen == Some((t, d)) {
             return Some(a.var(d + k - 1 - n));
         }
         match a.get(t) {
@@ -525,7 +627,9 @@ fn abstract_at(a: &mut Arena, prog: TermId, pos: usize, extra: Option<usize>) ->
     }
     let lib = a.lib(LibId(0));
     let mut args: Vec<TermId> = (0..n).map(|i| a.var(n - 1 - i)).collect();
-    args.extend(closed);
+    if let Some((e, d)) = chosen {
+        args.push(shift(a, e, -i64::from(d)));
+    }
     let use_site = a.apps(lib, &args);
     let rewritten = replace_at(a, prog, pos, use_site);
     (LibDef { arity: k, term }, rewritten)
@@ -586,5 +690,244 @@ proptest! {
         let got = expand(&mut a, &[lib0, lib1], twice).expect("expand");
         prop_assert_eq!(sexpr::print(&a, got), sexpr::print(&a, prog));
         prop_assert_eq!(got, prog);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cost and state of the expander, measured by its own tables.
+// ---------------------------------------------------------------------------
+
+/// `λ. L (λ. L (λ. ... (λ. $n)))` with `n` uses of library 0: each use's argument
+/// binds a variable and refers to the outermost binder.
+fn lambda_nested_open_uses(a: &mut Arena, n: u32) -> TermId {
+    let lib = a.lib(LibId(0));
+    let mut t = a.var(n);
+    for _ in 0..n {
+        let l = a.lam(t);
+        t = a.app(lib, l);
+    }
+    a.lam(t)
+}
+
+/// `λ^(2n+1). $(2n)`: the expansion of [`lambda_nested_open_uses`] under
+/// `λ#0. λ. #0`, where every level adds the library's binder and the argument's.
+fn lambda_nested_expected(a: &mut Arena, n: u32) -> TermId {
+    let mut want = a.var(2 * n);
+    for _ in 0..=2 * n {
+        want = a.lam(want);
+    }
+    want
+}
+
+#[test]
+fn renamings_stay_linear_for_open_arguments_that_bind() {
+    let mut a = Arena::new();
+    let libs = defs(&mut a, &[("(lam (lam $1))", 1)]);
+    let n = 2_000;
+    let prog = lambda_nested_open_uses(&mut a, n);
+    let mut ex = Expander::new(&mut a, &libs).expect("libraries");
+    // `run` keeps the per-program tables, so they can be measured.
+    let got = ex
+        .run(&mut a, Task::Expand(prog, IDENTITY), None)
+        .expect("expand");
+    let points = ex.renamings.stored_points();
+    assert_eq!(got, lambda_nested_expected(&mut a, n));
+    let n = n as usize;
+    assert!(
+        points <= 4 * n + 10,
+        "{points} renaming points stored for {n} levels"
+    );
+}
+
+#[test]
+fn deep_open_arguments_that_bind_expand_without_host_recursion() {
+    on_small_stack(|| {
+        let mut a = Arena::new();
+        let libs = defs(&mut a, &[("(lam (lam $1))", 1)]);
+        let n = 200_000;
+        let prog = lambda_nested_open_uses(&mut a, n);
+        let got = expand(&mut a, &libs, prog).expect("expand");
+        assert_eq!(got, lambda_nested_expected(&mut a, n));
+    });
+}
+
+#[test]
+fn an_expander_keeps_no_state_between_programs() {
+    let mut a = Arena::new();
+    let libs = defs(&mut a, &[("(lam (lam (pair $1 $0)))", 1)]);
+    let mut ex = Expander::new(&mut a, &libs).expect("libraries");
+    let state = |ex: &Expander| (ex.memo.len(), ex.sites.len(), ex.renamings.stored_points());
+    assert_eq!(state(&ex), (0, 0, 0), "after preparing the libraries");
+    for i in 0..20 {
+        let p = parse(&mut a, &format!("(lam (lam (lib_0 (add $1 {i}))))"));
+        ex.expand(&mut a, p).expect("expand");
+        assert_eq!(state(&ex), (0, 0, 0), "after program {i}");
+    }
+    let bad = parse(&mut a, "(lam (lib_0 (lib_1 $0)))");
+    assert!(ex.expand(&mut a, bad).is_err());
+    assert_eq!(state(&ex), (0, 0, 0), "after a failed program");
+}
+
+#[test]
+fn a_shared_subterm_is_expanded_once_under_different_renamings() {
+    let mut a = Arena::new();
+    // #0 placed under 0 .. m - 1 binders: m different renamings of the argument.
+    let m = 40;
+    // λ#0. pair #0 (λ. pair #0 (λ. ... (pair #0 ()))).
+    let mut body = a.unit();
+    for d in (0..m).rev() {
+        let param = a.var(d);
+        let pair = a.prim(Prim::Pair);
+        body = a.apps(pair, &[param, body]);
+        if d > 0 {
+            body = a.lam(body);
+        }
+    }
+    let term = a.lam(body);
+    let libs = [LibDef { arity: 1, term }];
+    // The argument: an open part, a closed part and a part that uses only its own
+    // binder, each of size about `size`.
+    let size = 200;
+    let mut closed = a.int(0);
+    let mut own = a.var(0);
+    for i in 0..size {
+        let one = a.int(i);
+        let add = a.prim(Prim::Add);
+        closed = a.apps(add, &[closed, one]);
+        own = a.apps(add, &[own, one]);
+    }
+    let own = a.lam(own);
+    let open = a.var(0);
+    let pair = a.prim(Prim::Pair);
+    let arg = a.apps(pair, &[open, closed, own]);
+    let lib = a.lib(LibId(0));
+    let use_site = a.app(lib, arg);
+    let prog = a.lam(use_site);
+    let mut ex = Expander::new(&mut a, &libs).expect("libraries");
+    let got = ex
+        .run(&mut a, Task::Expand(prog, IDENTITY), None)
+        .expect("expand");
+    let tasks = ex.memo.len();
+    assert_eq!(got, naive_expand(&mut a, &libs, prog));
+    // Each renaming of the argument costs a few tasks; its closed and self-bound
+    // parts are expanded once.
+    let (m, size) = (m as usize, size as usize);
+    assert!(
+        tasks <= 10 * m + 4 * size,
+        "{tasks} tasks for {m} renamings of an argument of size {size}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Property: expansion agrees with a naive reference that expands arguments first,
+// η-expands unsaturated uses by hand and substitutes with explicit shifts.
+// ---------------------------------------------------------------------------
+
+/// `body[#i := args[i]]` for a body with `k` parameters, where `#i` under `d`
+/// binders is `$(d + k - 1 - i)`. Each argument is shifted by the binders it is
+/// placed under.
+fn naive_subst(a: &mut Arena, b: TermId, d: u32, k: u32, args: &[TermId]) -> TermId {
+    let node = a.get(b);
+    let new = match node {
+        Term::Var(j) if j >= d => {
+            let arg = args[(k - 1 - (j - d)) as usize];
+            return shift(a, arg, i64::from(d));
+        }
+        Term::Lam(c) => Term::Lam(naive_subst(a, c, d + 1, k, args)),
+        Term::Let(x, c) => {
+            let x = naive_subst(a, x, d, k, args);
+            Term::Let(x, naive_subst(a, c, d + 1, k, args))
+        }
+        Term::App(x, y) => {
+            let x = naive_subst(a, x, d, k, args);
+            Term::App(x, naive_subst(a, y, d, k, args))
+        }
+        Term::And(x, y) => {
+            let x = naive_subst(a, x, d, k, args);
+            Term::And(x, naive_subst(a, y, d, k, args))
+        }
+        Term::Or(x, y) => {
+            let x = naive_subst(a, x, d, k, args);
+            Term::Or(x, naive_subst(a, y, d, k, args))
+        }
+        Term::If(x, y, z) => {
+            let x = naive_subst(a, x, d, k, args);
+            let y = naive_subst(a, y, d, k, args);
+            Term::If(x, y, naive_subst(a, z, d, k, args))
+        }
+        leaf => leaf,
+    };
+    a.intern(new)
+}
+
+/// The reference expansion of `t`.
+fn naive_expand(a: &mut Arena, libs: &[LibDef], t: TermId) -> TermId {
+    let (head, args) = spine(a, t);
+    if let Term::Lib(LibId(l)) = a.get(head) {
+        let def = libs[l as usize];
+        let k = def.arity as usize;
+        if args.len() < k {
+            // λ^e. L (args ↑ e) $(e-1) ... $0, then expanded.
+            let e = u32::try_from(k - args.len()).unwrap();
+            let mut full: Vec<TermId> = args.iter().map(|&x| shift(a, x, i64::from(e))).collect();
+            full.extend((0..e).rev().map(|i| a.var(i)));
+            let saturated = a.apps(head, &full);
+            let mut out = naive_expand(a, libs, saturated);
+            for _ in 0..e {
+                out = a.lam(out);
+            }
+            return out;
+        }
+        let mut body = naive_expand(a, &libs[..l as usize], def.term);
+        for _ in 0..k {
+            match a.get(body) {
+                Term::Lam(b) => body = b,
+                other => panic!("library lost a lambda: {other:?}"),
+            }
+        }
+        let args: Vec<TermId> = args.iter().map(|&x| naive_expand(a, libs, x)).collect();
+        let instance = naive_subst(a, body, 0, def.arity, &args[..k]);
+        return a.apps(instance, &args[k..]);
+    }
+    if !args.is_empty() {
+        let head = naive_expand(a, libs, head);
+        let args: Vec<TermId> = args.iter().map(|&x| naive_expand(a, libs, x)).collect();
+        return a.apps(head, &args);
+    }
+    map_term(a, t, 0, &mut |a, c, _| {
+        (c != t).then(|| naive_expand(a, libs, c))
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1024))]
+
+    #[test]
+    fn expansion_agrees_with_naive_substitution(
+        lib_gens in proptest::collection::vec((gen_term_with_libs(), 0u32..2), 1..4),
+        prog in gen_term_with_libs(),
+    ) {
+        let mut a = Arena::new();
+        let mut libs = vec![];
+        for (i, (g, extra)) in lib_gens.iter().enumerate() {
+            // Library i may use libraries 0 .. i; its free variables are parameters.
+            let body = build_in(&mut a, g, u32::try_from(i).unwrap());
+            let arity = a.free_depth(body) + extra;
+            let mut term = body;
+            for _ in 0..arity {
+                term = a.lam(term);
+            }
+            libs.push(LibDef { arity, term });
+        }
+        let prog = build_in(&mut a, &prog, u32::try_from(libs.len()).unwrap());
+        let want = naive_expand(&mut a, &libs, prog);
+        let got = expand(&mut a, &libs, prog).expect("expand");
+        prop_assert_eq!(
+            sexpr::print(&a, got),
+            sexpr::print(&a, want),
+            "{}",
+            sexpr::print(&a, prog)
+        );
+        prop_assert_eq!(got, want);
     }
 }
