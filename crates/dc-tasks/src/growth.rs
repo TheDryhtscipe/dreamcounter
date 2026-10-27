@@ -5,15 +5,20 @@
 //! integers. This module turns such a sweep into an estimate of how cost grows
 //! with `n`, so that programs can be compared on computational cost.
 //!
-//! Two estimators sit behind the [`GrowthEstimator`] trait:
+//! Three estimators sit behind the [`GrowthEstimator`] trait:
 //!
 //! * [`LogLogSlope`] (estimator A, the default): ordinary least squares of
 //!   `ln steps` on `ln n`, reporting the slope `α̂` and R².
 //! * [`PowerLogGrid`] (estimator B): `steps ≈ c · n^α · (ln n)^γ` with
 //!   `γ ∈ {0, 1, 2}` and `α` continuous, choosing the `γ` with the smallest
 //!   residual sum of squares.
+//! * [`ClassSelect`] (estimator C): `steps ≈ c · f(n)` for `f` one of the
+//!   [`GrowthClass`]es `1, log n, n, n log n, n², n³, 2ⁿ`, naming a class only
+//!   when exactly one fits within a tolerance that allows for the spread
+//!   between seeds. It refuses rather than guess.
 //!
-//! Both fit over the same [`Window`] of the sweep, by default its upper half.
+//! All three fit over the same [`Window`] of the sweep, by default its upper
+//! half.
 //!
 //! # How decisive estimator B's `γ` is
 //!
@@ -29,7 +34,33 @@
 //! `n log n` from `n^1.17` only when each median is accurate to about
 //! 0.35 %. Deterministic step counts on fixed inputs meet that; medians that
 //! vary by around 1 % with the seeded inputs may not. Check the reported
-//! stability before relying on `γ`.
+//! stability before relying on `γ`, or use estimator C, which fixes the
+//! exponent and so separates the classes by much more (below).
+//!
+//! # How estimator C decides
+//!
+//! Each class has one free parameter, the constant `c`. C fits it in the
+//! Chebyshev (minimax) sense: with `d_i = ln steps_i − ln f(n_i)` over the
+//! window, `ln c` is the midpoint of the `d_i` and the class's *misfit* is
+//! half their range, so every median step count is within a factor
+//! `e^misfit` of `c · f(n)`. Half the range is a seminorm, so the triangle
+//! inequality applies to it: a series within `τ` of two classes `f` and `g`
+//! has `½ range(ln f − ln g) ≤ 2τ`. The *separation* of the window is the
+//! smallest `½ range(ln f − ln g)` over all pairs of classes; over the
+//! default window it is `½ ln(ln 1024 / ln 128) ≈ 0.178`, for `n` against
+//! `n log n` (and `1` against `log n`). That is fifty times B's `γ` margin.
+//!
+//! The *tolerance* `τ` is the larger of a floor, [`ClassSelect::misfit_fraction`]
+//! (default ¼) times the separation, which absorbs lower-order terms such as
+//! the `+ 4n` in `n log n + 4n`, and [`ClassSelect::noise_z`] (default 3)
+//! times the seed noise: the largest standard error of a size's median `ln`
+//! step count, `√(π/2) · s / √k` for `k` seeds with sample standard deviation
+//! `s` of their `ln` steps (the large-sample standard error of a median). A
+//! class is named only if it is the one class with misfit at most `τ`; if none
+//! is, the verdict is [`ClassVerdict::NoFit`] (`n^1.5`, `n² log n`), and if
+//! several are, [`ClassVerdict::Ambiguous`]. While `τ` is below half the
+//! separation, which the default floor guarantees for exact step counts, at
+//! most one class can be within `τ`, so only seed noise can make C ambiguous.
 //!
 //! # Conventions
 //!
@@ -400,14 +431,19 @@ pub enum GrowthFit {
     LogLog(LogLogFit),
     /// From estimator B.
     PowerLog(PowerLogFit),
+    /// From estimator C, boxed because it is several times the size of the
+    /// others.
+    Class(Box<ClassFit>),
 }
 
 impl GrowthFit {
     /// The fitted exponent of `n`: `α̂` for A, the best fit's `α` for B.
-    pub fn alpha(&self) -> f64 {
+    /// `None` for C, which fits classes, not an exponent.
+    pub fn alpha(&self) -> Option<f64> {
         match self {
-            GrowthFit::LogLog(f) => f.alpha,
-            GrowthFit::PowerLog(f) => f.best.alpha,
+            GrowthFit::LogLog(f) => Some(f.alpha),
+            GrowthFit::PowerLog(f) => Some(f.best.alpha),
+            GrowthFit::Class(_) => None,
         }
     }
 
@@ -416,6 +452,7 @@ impl GrowthFit {
         match self {
             GrowthFit::LogLog(f) => &f.window,
             GrowthFit::PowerLog(f) => &f.window,
+            GrowthFit::Class(f) => &f.window,
         }
     }
 }
@@ -553,6 +590,276 @@ impl GrowthEstimator for PowerLogGrid {
     fn estimate(&self, sweep: &Sweep) -> Result<GrowthFit, GrowthError> {
         self.fit(sweep).map(GrowthFit::PowerLog)
     }
+}
+
+/// A growth class of estimator C (spec §9): `steps ≈ c · f(n)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum GrowthClass {
+    /// `f(n) = 1`.
+    Constant,
+    /// `f(n) = ln n`.
+    Log,
+    /// `f(n) = n`.
+    Linear,
+    /// `f(n) = n ln n`.
+    NLogN,
+    /// `f(n) = n²`.
+    Quadratic,
+    /// `f(n) = n³`.
+    Cubic,
+    /// `f(n) = 2ⁿ`.
+    Exponential,
+}
+
+impl GrowthClass {
+    /// Every class, in order of growth. A class's position here is its index
+    /// in [`ClassFit::candidates`].
+    pub const ALL: [GrowthClass; 7] = [
+        GrowthClass::Constant,
+        GrowthClass::Log,
+        GrowthClass::Linear,
+        GrowthClass::NLogN,
+        GrowthClass::Quadratic,
+        GrowthClass::Cubic,
+        GrowthClass::Exponential,
+    ];
+
+    /// `ln f(n)`, for `n ≥ 2` (`ln ln 1` is undefined).
+    pub fn ln_f(self, n: u64) -> f64 {
+        let ln_n = ln_u64(n);
+        match self {
+            GrowthClass::Constant => 0.0,
+            GrowthClass::Log => ln_n.ln(),
+            GrowthClass::Linear => ln_n,
+            GrowthClass::NLogN => ln_n + ln_n.ln(),
+            GrowthClass::Quadratic => 2.0 * ln_n,
+            GrowthClass::Cubic => 3.0 * ln_n,
+            // n ≤ 2^64, so n ln 2 is exact to a few ulps.
+            GrowthClass::Exponential => n as f64 * std::f64::consts::LN_2,
+        }
+    }
+}
+
+impl fmt::Display for GrowthClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            GrowthClass::Constant => "1",
+            GrowthClass::Log => "log n",
+            GrowthClass::Linear => "n",
+            GrowthClass::NLogN => "n log n",
+            GrowthClass::Quadratic => "n^2",
+            GrowthClass::Cubic => "n^3",
+            GrowthClass::Exponential => "2^n",
+        })
+    }
+}
+
+/// Estimator C's fit of one class.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClassCandidate {
+    /// The class.
+    pub class: GrowthClass,
+    /// The minimax `ln c`: the midpoint of `ln steps − ln f(n)` over the
+    /// window.
+    pub ln_c: f64,
+    /// Half the range of `ln steps − ln f(n)` over the window: every median
+    /// step count is within a factor `e^misfit` of `c · f(n)`. In `ln` units,
+    /// `≥ 0`.
+    pub misfit: f64,
+}
+
+/// What estimator C concludes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassVerdict {
+    /// Exactly one class is within tolerance.
+    Class(GrowthClass),
+    /// Several classes are within tolerance, in order of growth. Only seed
+    /// noise above half the separation can cause this.
+    Ambiguous(Vec<GrowthClass>),
+    /// No class is within tolerance: the growth lies between classes (such as
+    /// `n^1.5`) or outside them.
+    NoFit,
+}
+
+/// The result of estimator C.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassFit {
+    /// The conclusion.
+    pub verdict: ClassVerdict,
+    /// Every class's fit, in the order of [`GrowthClass::ALL`].
+    pub candidates: [ClassCandidate; 7],
+    /// The largest misfit at which a class counts as fitting, in `ln` units.
+    pub tolerance: f64,
+    /// The smallest `½ range(ln f − ln g)` over pairs of classes on the
+    /// window: how far apart the closest classes are.
+    pub separation: f64,
+    /// The largest standard error of a median `ln` step count over the
+    /// window, estimated from the seeds. `None` if some size in the window has
+    /// a single seed, so the noise is unknown and only the floor applies.
+    pub noise: Option<f64>,
+    /// The sizes fitted.
+    pub window: FitWindow,
+}
+
+impl ClassFit {
+    /// The class with the smallest misfit; on a tie, the slower-growing.
+    pub fn best(&self) -> ClassCandidate {
+        let mut best = self.candidates[0];
+        for c in &self.candidates[1..] {
+            if c.misfit < best.misfit {
+                best = *c;
+            }
+        }
+        best
+    }
+
+    /// The named class, if the verdict names one.
+    pub fn class(&self) -> Option<GrowthClass> {
+        match self.verdict {
+            ClassVerdict::Class(c) => Some(c),
+            ClassVerdict::Ambiguous(_) | ClassVerdict::NoFit => None,
+        }
+    }
+}
+
+/// Estimator C: class selection among [`GrowthClass::ALL`] (spec §9). See the
+/// module comment for how it decides.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClassSelect {
+    /// The sizes to fit over.
+    pub window: Window,
+    /// The tolerance floor as a fraction of the separation. Below ½ the
+    /// classes are exclusive for exact step counts; the default ¼ leaves half
+    /// of that margin for lower-order terms.
+    pub misfit_fraction: f64,
+    /// How many standard errors of seed noise the tolerance allows.
+    pub noise_z: f64,
+}
+
+impl Default for ClassSelect {
+    fn default() -> Self {
+        Self {
+            window: Window::UpperHalf,
+            misfit_fraction: 0.25,
+            noise_z: 3.0,
+        }
+    }
+}
+
+impl ClassSelect {
+    /// The fewest sizes in the window. On two, every class's misfit is half
+    /// a single difference, so the shape of growth is not tested.
+    pub const MIN_POINTS: usize = 3;
+
+    /// Fits the sweep and returns the estimator's own result type.
+    ///
+    /// # Errors
+    ///
+    /// See [`GrowthError`]. Besides the medians, every seed's step count in
+    /// the window must be positive ([`GrowthError::ZeroSteps`]), since the
+    /// noise is estimated from their logarithms.
+    pub fn fit(&self, sweep: &Sweep) -> Result<ClassFit, GrowthError> {
+        let (points, window) = window_points(sweep, self.window, Self::MIN_POINTS, 2)?;
+        let ln_steps: Vec<f64> = points.iter().map(|&(_, s)| ln_u64(s)).collect();
+        let ln_fs: Vec<Vec<f64>> = GrowthClass::ALL
+            .iter()
+            .map(|k| points.iter().map(|&(n, _)| k.ln_f(n)).collect())
+            .collect();
+        let candidates = std::array::from_fn(|i| {
+            let d: Vec<f64> = ln_steps.iter().zip(&ln_fs[i]).map(|(y, f)| y - f).collect();
+            let (lo, hi) = min_max(&d);
+            ClassCandidate {
+                class: GrowthClass::ALL[i],
+                ln_c: lo + (hi - lo) / 2.0,
+                misfit: (hi - lo) / 2.0,
+            }
+        });
+        let mut separation = f64::INFINITY;
+        for i in 0..ln_fs.len() {
+            for j in i + 1..ln_fs.len() {
+                let d: Vec<f64> = ln_fs[i].iter().zip(&ln_fs[j]).map(|(a, b)| a - b).collect();
+                let (lo, hi) = min_max(&d);
+                separation = separation.min((hi - lo) / 2.0);
+            }
+        }
+        let noise = seed_noise(sweep, window.n_min)?;
+        let tolerance =
+            (self.misfit_fraction * separation).max(self.noise_z * noise.unwrap_or(0.0));
+        let within: Vec<GrowthClass> = candidates
+            .iter()
+            .filter(|c: &&ClassCandidate| c.misfit <= tolerance)
+            .map(|c| c.class)
+            .collect();
+        let verdict = match within.as_slice() {
+            [] => ClassVerdict::NoFit,
+            [one] => ClassVerdict::Class(*one),
+            _ => ClassVerdict::Ambiguous(within),
+        };
+        let finite = [tolerance, separation, noise.unwrap_or(0.0)]
+            .iter()
+            .chain(
+                candidates
+                    .iter()
+                    .flat_map(|c: &ClassCandidate| [&c.ln_c, &c.misfit]),
+            )
+            .all(|v| v.is_finite());
+        if !finite {
+            return Err(GrowthError::NonFinite);
+        }
+        Ok(ClassFit {
+            verdict,
+            candidates,
+            tolerance,
+            separation,
+            noise,
+            window,
+        })
+    }
+}
+
+impl GrowthEstimator for ClassSelect {
+    fn name(&self) -> &'static str {
+        "C:class-select"
+    }
+
+    fn estimate(&self, sweep: &Sweep) -> Result<GrowthFit, GrowthError> {
+        self.fit(sweep).map(|f| GrowthFit::Class(Box::new(f)))
+    }
+}
+
+/// The smallest and largest of a non-empty slice.
+fn min_max(v: &[f64]) -> (f64, f64) {
+    v.iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| {
+            (lo.min(x), hi.max(x))
+        })
+}
+
+/// The largest standard error of a median `ln` step count over the completed
+/// sizes from `n_min` up: `√(π/2) · s / √k` for `k` seeds whose `ln` steps
+/// have sample standard deviation `s`. `None` if some such size has one seed.
+/// The caller has already checked that those sizes completed.
+fn seed_noise(sweep: &Sweep, n_min: u64) -> Result<Option<f64>, GrowthError> {
+    let mut noise = Some(0.0f64);
+    for o in sweep.observations().iter().filter(|o| o.n >= n_min) {
+        let SizeOutcome::Completed { steps } = &o.outcome else {
+            continue;
+        };
+        if steps.contains(&0) {
+            return Err(GrowthError::ZeroSteps { n: o.n });
+        }
+        if steps.len() < 2 {
+            noise = None;
+            continue;
+        }
+        let ys: Vec<f64> = steps.iter().map(|&s| ln_u64(s)).collect();
+        let k = ys.len() as f64;
+        let mean = ys.iter().sum::<f64>() / k;
+        let var = ys.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / (k - 1.0);
+        let se = (std::f64::consts::FRAC_PI_2 * var / k).sqrt();
+        noise = noise.map(|m| m.max(se));
+    }
+    Ok(noise)
 }
 
 /// The candidate with the smallest RSS; on a tie, the earliest (smallest `γ`,

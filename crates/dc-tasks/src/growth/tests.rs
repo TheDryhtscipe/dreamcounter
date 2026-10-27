@@ -516,8 +516,8 @@ fn estimators_are_swappable_behind_the_trait() {
         .collect();
     assert!(matches!(fits[0], GrowthFit::LogLog(_)));
     assert!(matches!(fits[1], GrowthFit::PowerLog(_)));
-    assert!((fits[0].alpha() - a(&sweep).alpha).abs() < EXACT);
-    assert!((fits[1].alpha() - 1.0).abs() < EXACT);
+    assert!((fits[0].alpha().expect("A has an exponent") - a(&sweep).alpha).abs() < EXACT);
+    assert!((fits[1].alpha().expect("B has an exponent") - 1.0).abs() < EXACT);
     assert_eq!(fits[0].window(), fits[1].window());
     assert_ne!(ests[0].name(), ests[1].name());
 }
@@ -786,5 +786,266 @@ proptest! {
         let mut rss = fit.candidates.map(|c| c.rss);
         rss.sort_by(f64::total_cmp);
         prop_assert!((fit.rss_margin() - (rss[1] - rss[0])).abs() < 1e-12);
+    }
+}
+
+// ------------------------------------------------------------- estimator C
+
+fn c(sweep: &Sweep) -> ClassFit {
+    ClassSelect::default().fit(sweep).expect("C fits")
+}
+
+/// Half the range of `ln f₁ − ln f₂` over the default window for `f₁ = n log n`
+/// and `f₂ = n`: `½ ln(ln 1024 / ln 128) = ½ ln(10/7)`. It is also the
+/// separation of `log n` from `1`, and the smallest over all class pairs.
+fn default_separation() -> f64 {
+    0.5 * (10.0f64 / 7.0).ln()
+}
+
+/// A class and an exact step series of it.
+type ClassCase = (GrowthClass, fn(u64) -> u64);
+
+/// Sizes on which `2ⁿ` fits in a `u64`.
+const EXP_SIZES: [u64; 6] = [10, 20, 30, 40, 50, 60];
+
+#[test]
+fn c_names_the_class_of_each_exact_series() {
+    let cases: [ClassCase; 6] = [
+        (GrowthClass::Constant, |_| 7),
+        (GrowthClass::Log, |n| 1000 * log2(n)),
+        (GrowthClass::Linear, |n| 3 * n),
+        (GrowthClass::NLogN, |n| n * log2(n)),
+        (GrowthClass::Quadratic, |n| n * n),
+        (GrowthClass::Cubic, |n| n * n * n),
+    ];
+    for (class, f) in cases {
+        let fit = c(&default_sweep(f));
+        assert_eq!(fit.verdict, ClassVerdict::Class(class), "{class:?}");
+        assert_eq!(fit.best().class, class);
+        assert!(
+            fit.best().misfit < EXACT,
+            "{class:?}: {}",
+            fit.best().misfit
+        );
+    }
+    let exp = Sweep::from_fn(&EXP_SIZES, |n| 1 << n).expect("valid");
+    assert_eq!(
+        c(&exp).verdict,
+        ClassVerdict::Class(GrowthClass::Exponential)
+    );
+}
+
+#[test]
+fn c_absorbs_lower_order_terms() {
+    for (class, f) in [
+        (GrowthClass::Linear, (|n| 3 * n + 5) as fn(u64) -> u64),
+        // 1 + 2/log2 n runs from 1.29 to 1.2 over the window: misfit 0.035.
+        (GrowthClass::NLogN, |n| n * log2(n) + 2 * n),
+        (GrowthClass::Quadratic, |n| n * n / 4 + 3 * n),
+    ] {
+        let fit = c(&default_sweep(f));
+        assert_eq!(fit.verdict, ClassVerdict::Class(class), "{fit:?}");
+    }
+}
+
+#[test]
+fn c_refuses_growth_outside_its_classes() {
+    // n^1.5 and n² log n lie between classes; neither is within tolerance of
+    // any class, so C says so rather than naming the nearest.
+    for f in [
+        (|n| ((n as f64).powf(1.5) * 1000.0) as u64) as fn(u64) -> u64,
+        |n| n * n * log2(n),
+    ] {
+        let fit = c(&default_sweep(f));
+        assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
+        assert!(fit.best().misfit > fit.tolerance);
+    }
+}
+
+#[test]
+fn c_misfit_is_the_half_range_and_ln_c_the_midpoint() {
+    // Against class n, ln(3n + 5) − ln n = ln(3 + 5/n), which falls with n.
+    let fit = c(&default_sweep(|n| 3 * n + 5));
+    let lin = fit.candidates[GrowthClass::Linear as usize];
+    assert_eq!(lin.class, GrowthClass::Linear);
+    let (hi, lo) = ((3.0 + 5.0 / 128.0f64).ln(), (3.0 + 5.0 / 1024.0f64).ln());
+    assert!((lin.misfit - (hi - lo) / 2.0).abs() < EXACT, "{lin:?}");
+    assert!((lin.ln_c - (hi + lo) / 2.0).abs() < EXACT, "{lin:?}");
+}
+
+#[test]
+fn c_separation_and_floor_tolerance_on_the_default_window() {
+    let fit = c(&default_sweep(|n| 3 * n));
+    assert!((fit.separation - default_separation()).abs() < EXACT);
+    assert_eq!(fit.noise, None, "one seed per size: noise unknown");
+    let floor = ClassSelect::default().misfit_fraction * default_separation();
+    assert!((fit.tolerance - floor).abs() < EXACT);
+    // The default floor keeps classes exclusive: no series can lie within
+    // tolerance of two classes.
+    assert!(fit.tolerance < fit.separation / 2.0);
+}
+
+/// A default sweep with five seeds per size: `base(n)` scaled by
+/// `1 + δ · {−2, −1, 0, 1, 2}`.
+fn seeded_sweep(base: impl Fn(u64) -> u64, delta: f64) -> Sweep {
+    Sweep::new(
+        DEFAULT_SIZES
+            .iter()
+            .map(|&n| {
+                let b = base(n) as f64;
+                let steps = [-2.0, -1.0, 0.0, 1.0, 2.0]
+                    .iter()
+                    .map(|k| (b * (1.0 + delta * k)).round() as u64)
+                    .collect();
+                SizeObservation::completed(n, steps)
+            })
+            .collect(),
+    )
+    .expect("valid")
+}
+
+/// The noise C should report for [`seeded_sweep`]: the largest, over the
+/// window, of `√(π/2) · sd / √5`, the standard error of a median of five,
+/// with `sd` the sample standard deviation of the seeds' `ln` steps.
+fn seeded_noise(base: impl Fn(u64) -> u64, delta: f64) -> f64 {
+    [128u64, 256, 512, 1024]
+        .iter()
+        .map(|&n| {
+            let b = base(n) as f64;
+            let ys: Vec<f64> = [-2.0, -1.0, 0.0, 1.0, 2.0]
+                .iter()
+                .map(|k| ((b * (1.0 + delta * k)).round()).ln())
+                .collect();
+            let m = ys.iter().sum::<f64>() / 5.0;
+            let var = ys.iter().map(|y| (y - m) * (y - m)).sum::<f64>() / 4.0;
+            (std::f64::consts::FRAC_PI_2 * var / 5.0).sqrt()
+        })
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn c_widens_its_tolerance_to_the_seed_noise() {
+    let quiet = c(&seeded_sweep(|n| 1000 * n, 0.001));
+    let floor = ClassSelect::default().misfit_fraction * default_separation();
+    assert!((quiet.tolerance - floor).abs() < EXACT, "{quiet:?}");
+    let expected = seeded_noise(|n| 1000 * n, 0.001);
+    assert!((quiet.noise.expect("five seeds") - expected).abs() < EXACT);
+
+    let delta = 0.03;
+    let noisy = c(&seeded_sweep(|n| 1000 * n, delta));
+    let noise = seeded_noise(|n| 1000 * n, delta);
+    assert!((noisy.noise.expect("five seeds") - noise).abs() < EXACT);
+    let z = ClassSelect::default().noise_z;
+    assert!(z * noise > floor, "the test needs noise above the floor");
+    assert!((noisy.tolerance - z * noise).abs() < EXACT);
+    assert_eq!(noisy.verdict, ClassVerdict::Class(GrowthClass::Linear));
+}
+
+#[test]
+fn c_is_ambiguous_when_noise_hides_the_class() {
+    // Seeds this far apart put n and n log n both within tolerance.
+    let fit = c(&seeded_sweep(|n| 1000 * n, 0.15));
+    assert!(fit.tolerance > fit.separation / 2.0, "{fit:?}");
+    match &fit.verdict {
+        ClassVerdict::Ambiguous(classes) => {
+            assert!(classes.contains(&GrowthClass::Linear), "{classes:?}");
+            assert!(classes.len() >= 2, "{classes:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn c_refuses_incomplete_windows_and_short_ones() {
+    let sweep = Sweep::new(
+        DEFAULT_SIZES[..6]
+            .iter()
+            .map(|&n| SizeObservation::completed(n, vec![n]))
+            .chain([SizeObservation::timed_out(1024)])
+            .collect(),
+    )
+    .expect("valid");
+    assert_eq!(
+        ClassSelect::default().fit(&sweep),
+        Err(GrowthError::IncompleteWindow {
+            timed_out: vec![1024],
+            errored: vec![]
+        })
+    );
+    let short = Sweep::from_fn(&[16, 32, 64, 128], |n| n).expect("valid");
+    assert_eq!(
+        ClassSelect::default().fit(&short),
+        Err(GrowthError::TooFewPoints {
+            points: 2,
+            needed: ClassSelect::MIN_POINTS
+        })
+    );
+    let seed_zero = Sweep::new(
+        DEFAULT_SIZES
+            .iter()
+            .map(|&n| SizeObservation::completed(n, vec![0, n, n]))
+            .collect(),
+    )
+    .expect("valid");
+    assert_eq!(
+        ClassSelect::default().fit(&seed_zero),
+        Err(GrowthError::ZeroSteps { n: 128 })
+    );
+}
+
+#[test]
+fn c_through_the_trait() {
+    let est: &dyn GrowthEstimator = &ClassSelect::default();
+    assert_eq!(est.name(), "C:class-select");
+    let fit = est.estimate(&default_sweep(|n| n * n)).expect("fits");
+    assert_eq!(fit.alpha(), None);
+    match fit {
+        GrowthFit::Class(f) => assert_eq!(f.class(), Some(GrowthClass::Quadratic)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        LogLogSlope::default()
+            .estimate(&default_sweep(|n| n))
+            .expect("fits")
+            .alpha()
+            .map(f64::round),
+        Some(1.0)
+    );
+}
+
+proptest! {
+    /// Whatever the step counts: every float is finite; a named class is
+    /// within tolerance and is the only class that is; an ambiguous verdict
+    /// lists exactly the classes within tolerance; and while the tolerance
+    /// is below half the separation, no verdict is ambiguous.
+    #[test]
+    fn c_verdict_laws(
+        steps in prop::collection::vec(prop::collection::vec(1u64..1_000_000, 1..6), 7)
+    ) {
+        let seeds = steps[0].len();
+        let sweep = Sweep::new(
+            DEFAULT_SIZES
+                .iter()
+                .zip(&steps)
+                .map(|(&n, s)| SizeObservation::completed(n, s.iter().copied().cycle().take(seeds).collect()))
+                .collect(),
+        ).expect("valid");
+        let fit = c(&sweep);
+        prop_assert!(fit.tolerance.is_finite() && fit.separation.is_finite());
+        prop_assert!(fit.candidates.iter().all(|k| k.misfit.is_finite() && k.ln_c.is_finite()));
+        let within: Vec<GrowthClass> = fit
+            .candidates
+            .iter()
+            .filter(|k| k.misfit <= fit.tolerance)
+            .map(|k| k.class)
+            .collect();
+        match &fit.verdict {
+            ClassVerdict::Class(k) => prop_assert_eq!(&within, &vec![*k]),
+            ClassVerdict::Ambiguous(ks) => {
+                prop_assert_eq!(&within, ks);
+                prop_assert!(fit.tolerance >= fit.separation / 2.0);
+            }
+            ClassVerdict::NoFit => prop_assert!(within.is_empty()),
+        }
     }
 }

@@ -294,7 +294,7 @@ fn example_fuel_bounds_a_runaway_candidate() {
 // Fuel plans and sweeps
 
 fn alpha(fit: &GrowthFit) -> f64 {
-    fit.alpha()
+    fit.alpha().expect("an exponent")
 }
 
 #[test]
