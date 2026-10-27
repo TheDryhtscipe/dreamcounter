@@ -153,6 +153,8 @@ name = "dc-surface"
 version = "0.1.0"
 dependencies = [
  "dc-core",
+ "dc-eval",
+ "dc-stitch",
  "proptest",
 ]
 

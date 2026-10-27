@@ -1,0 +1,104 @@
+-- The dc prelude (spec section 10, decision D7).
+--
+-- Every definition is written on top of the combinators, so its step cost is the
+-- honest cost of the definition. Each is the obvious efficient one: linear in
+-- the list it walks, and linear in the count for take, drop and nth. The exact
+-- step count of each, as a formula in the input sizes, is pinned by the tests in
+-- crates/dc-surface/tests/prelude.rs. Change a definition only together with
+-- its formula there.
+--
+-- `length` is a primitive (cost 1), so it is not defined here.
+
+let min_int = -9223372036854775808
+
+let max_int = 9223372036854775807
+
+let max a b = if a <= b then b else a
+
+let min a b = if a <= b then a else b
+
+let map f xs = foldr (fun x acc -> f x :: acc) [] xs
+
+let filter p xs = foldr (fun x acc -> if p x then x :: acc else acc) [] xs
+
+-- `cons` is passed to foldr directly: one step per element for the iteration
+-- and one for the cons.
+let append xs ys = foldr (::) ys xs
+
+let reverse xs = foldl (fun acc x -> x :: acc) [] xs
+
+let concat xss = foldr append [] xss
+
+let sum xs = foldl (+) 0 xs
+
+-- range lo hi = [lo; lo + 1; ...; hi - 1], empty when hi <= lo. The loop runs
+-- i = 0, 1, ... and conses from the top element down. The guard keeps `hi - 1`
+-- and `hi - lo` from overflowing for an empty range. A range of more than
+-- max_int elements raises Overflow.
+let range lo hi =
+  if hi <= lo then []
+  else
+    let top = hi - 1 in
+    loop (hi - lo) [] (fun i acc -> (top - i) :: acc)
+
+-- take and drop stop after k elements, so their cost is linear in
+-- min(k, length xs). The depth fuel `length xs + 1` always suffices.
+let take k xs =
+  bfix (length xs + 1)
+    (fun self k ys ->
+      if k <= 0 then []
+      else
+        match ys with
+        | [] -> []
+        | y :: t -> y :: self (k - 1) t)
+    k xs
+
+let drop k xs =
+  bfix (length xs + 1)
+    (fun self k ys ->
+      if k <= 0 then ys
+      else
+        match ys with
+        | [] -> ys
+        | _ :: t -> self (k - 1) t)
+    k xs
+
+let split_at k xs = (take k xs, drop k xs)
+
+-- zip stops at the end of the shorter list.
+let zip xs ys =
+  bfix (length xs + 1)
+    (fun self a b ->
+      match a with
+      | [] -> []
+      | x :: at ->
+        match b with
+        | [] -> []
+        | y :: bt -> (x, y) :: self at bt)
+    xs ys
+
+-- nth xs i is the element at index i (from 0). An index out of range raises
+-- IndexOutOfBounds, through array_get on an empty array.
+let nth xs i =
+  if i < 0 then array_get (array_of_list []) i
+  else
+    match drop i xs with
+    | [] -> array_get (array_of_list []) i
+    | x :: _ -> x
+
+-- any and all stop at the first element that decides the answer.
+let any p xs =
+  bfix (length xs + 1)
+    (fun self ys ->
+      match ys with
+      | [] -> false
+      | y :: t -> p y || self t)
+    xs
+
+let all p xs =
+  bfix (length xs + 1)
+    (fun self ys ->
+      match ys with
+      | [] -> true
+      | y :: t -> p y && self t)
+    xs
