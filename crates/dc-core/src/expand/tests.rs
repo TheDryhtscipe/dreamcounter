@@ -86,6 +86,18 @@ fn arguments_are_shifted_under_binders_of_the_body() {
 }
 
 #[test]
+fn nested_open_arguments_keep_the_shift_of_their_own_binder() {
+    // The inner argument is renamed by a renaming with breakpoints at 0 and 1, and
+    // its child `$0` is free only to depth 1: cutting the renaming there must keep
+    // the breakpoint at 0.
+    check(
+        &[("(lam (lam $1))", 1)],
+        "(lam (lib_0 (lam (lib_0 (add $0 $1)))))",
+        "(lam (lam (lam (lam (add $1 $3)))))",
+    );
+}
+
+#[test]
 fn duplicated_and_lazy_parameters_are_substituted_not_shared() {
     // #0 + #0.
     check(
@@ -398,13 +410,15 @@ fn gen_term() -> impl Strategy<Value = Gen> {
 
 /// Terms with library references and uses with any number of arguments.
 fn gen_term_with_libs() -> impl Strategy<Value = Gen> {
-    // Mostly variables, so that arguments are open and parameters are used.
+    // Mostly low variables, so that arguments are open, parameters are used and
+    // nested uses build renamings with several breakpoints.
     let leaf = prop_oneof![
-        4 => (0u32..4).prop_map(Gen::Var),
+        6 => (0u32..3).prop_map(Gen::Var),
+        1 => (3u32..5).prop_map(Gen::Var),
         3 => gen_leaf(),
         1 => any::<u8>().prop_map(Gen::Lib),
     ];
-    leaf.prop_recursive(6, 48, 4, |inner| {
+    leaf.prop_recursive(10, 96, 4, |inner| {
         let inner = inner.boxed();
         prop_oneof![
             3 => gen_node(inner.clone()),
@@ -810,12 +824,56 @@ fn a_shared_subterm_is_expanded_once_under_different_renamings() {
     let tasks = ex.memo.len();
     assert_eq!(got, naive_expand(&mut a, &libs, prog));
     // Each renaming of the argument costs a few tasks; its closed and self-bound
-    // parts are expanded once.
+    // parts are expanded once. Without sharing it would be about `m * size`.
     let (m, size) = (m as usize, size as usize);
     assert!(
-        tasks <= 10 * m + 4 * size,
+        tasks <= 10 * m + 6 * size,
         "{tasks} tasks for {m} renamings of an argument of size {size}"
     );
+}
+
+/// `λ. and p1 (and p2 (... (and pn ())))` where `pi` is `head 1 2 ... i`: one long
+/// application spine whose every prefix is used separately.
+fn shared_spine_prefixes(a: &mut Arena, head: TermId, n: i64) -> TermId {
+    let mut prefixes = vec![];
+    let mut p = head;
+    for i in 1..=n {
+        let arg = a.int(i);
+        p = a.app(p, arg);
+        prefixes.push(p);
+    }
+    let mut t = a.unit();
+    for &p in prefixes.iter().rev() {
+        t = a.and(p, t);
+    }
+    a.lam(t)
+}
+
+#[test]
+fn shared_prefixes_of_a_spine_are_planned_in_linear_work() {
+    // Small enough for the recursive reference, large enough that quadratic work
+    // (about n^2 / 2 subtasks) is far above the bound.
+    let n = 500;
+    let mut a = Arena::new();
+    // λ#0. λ. #0 + $0, applied to every prefix of a long spine: its first use is
+    // over-saturated by all the later arguments.
+    let libs = defs(&mut a, &[("(lam (lam (add $1 $0)))", 1)]);
+    let v0 = a.var(0);
+    let lib = a.lib(LibId(0));
+    for head in [v0, lib] {
+        let prog = shared_spine_prefixes(&mut a, head, n);
+        let mut ex = Expander::new(&mut a, &libs).expect("libraries");
+        let got = ex
+            .run(&mut a, Task::Expand(prog, IDENTITY), None)
+            .expect("expand");
+        assert_eq!(got, naive_expand(&mut a, &libs, prog));
+        let n = n as usize;
+        assert!(
+            ex.planned <= 10 * n,
+            "{} subtasks planned for {n} prefixes",
+            ex.planned
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -900,7 +958,7 @@ fn naive_expand(a: &mut Arena, libs: &[LibDef], t: TermId) -> TermId {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1024))]
+    #![proptest_config(ProptestConfig::with_cases(4096))]
 
     #[test]
     fn expansion_agrees_with_naive_substitution(
@@ -929,5 +987,106 @@ proptest! {
             sexpr::print(&a, prog)
         );
         prop_assert_eq!(got, want);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Renamings against a reference model: a renaming as a plain list of
+// (position, increase) breakpoints.
+// ---------------------------------------------------------------------------
+
+/// Breakpoints as strictly increasing positions with positive increases, from a
+/// list of (gap, delta) with gap 0 allowed only first.
+fn breakpoints(raw: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut at = 0;
+    raw.iter()
+        .enumerate()
+        .map(|(i, &(gap, delta))| {
+            at += if i == 0 { gap } else { gap + 1 };
+            (at, delta + 1)
+        })
+        .collect()
+}
+
+/// Interns the renaming with these breakpoints.
+fn interned(rs: &mut Renamings, points: &[(u32, u32)]) -> RenId {
+    let mut r = IDENTITY;
+    for (i, &(at, delta)) in points.iter().enumerate().rev() {
+        let prev = if i == 0 { 0 } else { points[i - 1].0 };
+        r = rs.cons(at - prev, delta, r);
+    }
+    r
+}
+
+fn reference_apply(points: &[(u32, u32)], j: u32) -> u32 {
+    j + points
+        .iter()
+        .filter(|&&(at, _)| at <= j)
+        .map(|&(_, d)| d)
+        .sum::<u32>()
+}
+
+#[test]
+fn restrict_keeps_breakpoints_below_the_depth_only() {
+    let mut rs = Renamings::new();
+    // Breakpoints at 0 and 2: cutting at 1 keeps the one at 0.
+    let r = interned(&mut rs, &[(0, 1), (2, 1)]);
+    let want = interned(&mut rs, &[(0, 1)]);
+    assert_eq!(rs.restrict(r, 1), want);
+    let cut = rs.restrict(r, 1);
+    assert_eq!(rs.apply(cut, 0), 1);
+    // Breakpoints at 1 and 3: cutting at 3 keeps only the one at 1, so a term free
+    // to depth 3 gets the same renaming as under a single breakpoint at 1.
+    let r = interned(&mut rs, &[(1, 2), (3, 1)]);
+    let want = interned(&mut rs, &[(1, 2)]);
+    assert_eq!(rs.restrict(r, 3), want);
+    assert_eq!(rs.restrict(r, 4), r);
+    assert_eq!(rs.restrict(r, 1), IDENTITY);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// `restrict` keeps exactly the breakpoints below the depth, so equal tasks get
+    /// equal renamings, and `lift` and `after_shift` agree with the model.
+    #[test]
+    fn renamings_agree_with_a_breakpoint_list(
+        raw in proptest::collection::vec((0u32..3, 0u32..3), 0..6),
+        others in proptest::collection::vec(
+            proptest::collection::vec((0u32..3, 0u32..3), 0..6),
+            0..4,
+        ),
+        depths in proptest::collection::vec(0u32..14, 1..6),
+        by in 0u32..3,
+    ) {
+        let mut rs = Renamings::new();
+        // Other renamings first, so that cells and memo entries are shared.
+        for o in &others {
+            let pts = breakpoints(o);
+            let r = interned(&mut rs, &pts);
+            for &d in &depths {
+                rs.restrict(r, d);
+            }
+        }
+        let pts = breakpoints(&raw);
+        let r = interned(&mut rs, &pts);
+        for &d in &depths {
+            let kept: Vec<(u32, u32)> = pts.iter().copied().filter(|&(at, _)| at < d).collect();
+            let want = interned(&mut rs, &kept);
+            prop_assert_eq!(rs.restrict(r, d), want, "depth {} of {:?}", d, pts);
+        }
+        for j in 0..14 {
+            prop_assert_eq!(rs.apply(r, j), reference_apply(&pts, j));
+        }
+        let lifted: Vec<(u32, u32)> = pts.iter().map(|&(at, d)| (at + 1, d)).collect();
+        prop_assert_eq!(rs.lift(r), interned(&mut rs, &lifted));
+        let mut shifted = pts.clone();
+        if by > 0 {
+            match shifted.first_mut() {
+                Some((0, d)) => *d += by,
+                _ => shifted.insert(0, (0, by)),
+            }
+        }
+        prop_assert_eq!(rs.after_shift(r, by), interned(&mut rs, &shifted));
     }
 }

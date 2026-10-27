@@ -31,13 +31,18 @@
 //!
 //! A renaming is a hash-consed list of the indices where its shift grows, each
 //! stored relative to the one before. Moving it under a binder or under a use site
-//! builds one list cell, so a chain of nested uses with open arguments, binders in
-//! the arguments included, costs time and memory linear in its length. Renaming a
-//! variable `$j` walks the breakpoints at or below `j`, of which there are at most
-//! `j + 1`.
-//! Cutting a renaming down costs one step per breakpoint kept and is memoised. Every
-//! traversal uses an explicit stack, so the depth of a term is limited only by
-//! memory.
+//! builds one list cell, so the renamings for a chain of nested uses with open
+//! arguments, binders in the arguments included, take memory linear in its length.
+//! Renaming a variable `$j` walks the breakpoints at or below `j`, of which there are
+//! at most `j + 1`. Cutting a renaming down costs one step per breakpoint kept and is
+//! memoised for each renaming and depth. Time is therefore linear in the input times
+//! the number of breakpoints a variable or a cut walks: a variable deep inside many
+//! nested open uses that refers to all their binders makes it quadratic.
+//!
+//! An application is expanded one argument at a time, except that a library use
+//! takes its arguments up to the library's arity together, so prefixes of a long
+//! application spine are shared. Every traversal uses an explicit stack, so the
+//! depth of a term is limited only by memory.
 
 use std::fmt;
 
@@ -131,8 +136,9 @@ pub fn expand(arena: &mut Arena, libs: &[LibDef], root: TermId) -> Result<TermId
 /// An expander belongs to the arena it was built with: its library bodies and memo
 /// tables hold ids in that arena. Use it only with that arena.
 ///
-/// Between programs it keeps only the expanded library bodies and a table of free
-/// depths with one entry per arena node, which grows as the arena does. The tables
+/// Between programs it keeps only the expanded library bodies and two tables with
+/// one entry per arena node, free depths and application heads, which grow as the
+/// arena does. The tables
 /// for one program are dropped when its expansion ends, so they are not shared
 /// between programs.
 #[derive(Debug)]
@@ -146,6 +152,10 @@ pub struct Expander {
     sites: Vec<Site>,
     renamings: Renamings,
     free: FreeDepth,
+    heads: SpineHeads,
+    /// The number of subtasks planned, a measure of the work done.
+    #[cfg(test)]
+    planned: usize,
 }
 
 impl Expander {
@@ -159,6 +169,9 @@ impl Expander {
             sites: Vec::new(),
             renamings: Renamings::new(),
             free: FreeDepth::default(),
+            heads: SpineHeads::default(),
+            #[cfg(test)]
+            planned: 0,
         };
         for (i, def) in libs.iter().enumerate() {
             let lib = LibId(u32::try_from(i).expect("more than 2^32 libraries"));
@@ -230,6 +243,10 @@ impl Expander {
                             self.memo.insert(task, t);
                         }
                         Plan::Build(shape, kids) => {
+                            #[cfg(test)]
+                            {
+                                self.planned += kids.len();
+                            }
                             let pending: Vec<Task> = kids
                                 .iter()
                                 .copied()
@@ -308,17 +325,29 @@ impl Expander {
                 Plan::Build(Shape::Rebuild(node), kids)
             }
             Term::App(..) | Term::Lib(_) => {
-                let (head, args) = spine(arena, t);
-                match arena.get(head) {
-                    Term::Lib(l) => self.plan_use(arena, l, &args, r, preparing)?,
-                    _ => {
-                        let mut kids = Vec::with_capacity(args.len() + 1);
-                        kids.push(self.expand_task(arena, head, r));
-                        for &a in &args {
-                            kids.push(self.expand_task(arena, a, r));
-                        }
-                        Plan::Build(Shape::Spine, kids)
+                // A library use takes the spine only up to the library's arity: an
+                // over-saturated use is the saturated one applied to the rest, one
+                // argument at a time. So no spine walked is longer than an arity, and
+                // each prefix of a long spine is its own memoised task.
+                let (head, n) = self.heads.get(arena, t);
+                let lib = match arena.get(head) {
+                    Term::Lib(l) => self
+                        .bodies
+                        .get(l.0 as usize)
+                        .is_none_or(|&(arity, _)| n <= arity)
+                        .then_some(l),
+                    _ => None,
+                };
+                match (lib, node) {
+                    (Some(l), _) => {
+                        let (_, args) = spine(arena, t);
+                        self.plan_use(arena, l, &args, r, preparing)?
                     }
+                    (None, Term::App(f, x)) => Plan::Build(
+                        Shape::Rebuild(node),
+                        vec![self.expand_task(arena, f, r), self.expand_task(arena, x, r)],
+                    ),
+                    (None, other) => unreachable!("a library is its own head: {other:?}"),
                 }
             }
         })
@@ -430,7 +459,6 @@ fn spine(arena: &Arena, t: TermId) -> (TermId, Vec<TermId>) {
 fn build(arena: &mut Arena, shape: Shape, kids: &[TermId]) -> TermId {
     match shape {
         Shape::Same => kids[0],
-        Shape::Spine => arena.apps(kids[0], &kids[1..]),
         Shape::Use { eta } => {
             let mut t = arena.apps(kids[0], &kids[1..]);
             for _ in 0..eta {
@@ -468,8 +496,6 @@ enum Task {
 enum Shape {
     /// The node with its children replaced by the results, in order.
     Rebuild(Term),
-    /// The first result applied to the rest.
-    Spine,
     /// A library use: the instantiated body applied to the extra arguments, under
     /// `eta` lambdas.
     Use { eta: u32 },
@@ -669,6 +695,41 @@ impl Renamings {
             self.restricted.insert((id, left), acc);
         }
         acc
+    }
+}
+
+/// A memo of the head of each application spine and its number of arguments.
+#[derive(Debug, Default)]
+struct SpineHeads {
+    memo: Vec<Option<(TermId, u32)>>,
+}
+
+impl SpineHeads {
+    /// The head of `t`'s spine and how many arguments it is applied to. Each node's
+    /// answer is computed once, so this costs amortised constant time.
+    fn get(&mut self, arena: &Arena, t: TermId) -> (TermId, u32) {
+        if self.memo.len() < arena.len() {
+            self.memo.resize(arena.len(), None);
+        }
+        let mut path = vec![];
+        let mut cur = t;
+        let (head, mut n) = loop {
+            if let Some(known) = self.memo[cur.index()] {
+                break known;
+            }
+            match arena.get(cur) {
+                Term::App(f, _) => {
+                    path.push(cur);
+                    cur = f;
+                }
+                _ => break (cur, 0),
+            }
+        };
+        for &p in path.iter().rev() {
+            n = n.checked_add(1).expect("more than 2^32 arguments");
+            self.memo[p.index()] = Some((head, n));
+        }
+        (head, n)
     }
 }
 
