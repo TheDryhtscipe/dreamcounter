@@ -828,6 +828,493 @@ fn shared_type_structure_is_walked_once() {
     );
 }
 
+/// A checker whose term walk panics after `steps` steps, so a test of how much
+/// work inference does fails fast, without a timer or a thread left running.
+fn bounded(steps: u64) -> TypeChecker {
+    let mut tc = TypeChecker::new();
+    tc.step_limit = Some(steps);
+    tc
+}
+
+/// `(if c t t)` nested `n` deep around `leaf`: a DAG of `n` nodes that is a tree of
+/// `2^n` nodes. Every level's two branches are the same `TermId`.
+fn shared_ifs(a: &mut Arena, n: usize, c: TermId, leaf: TermId) -> TermId {
+    let mut t = leaf;
+    for _ in 0..n {
+        t = a.if_(c, t, t);
+    }
+    t
+}
+
+#[test]
+fn shared_subterms_are_inferred_once() {
+    // Walking the term as a tree takes 2^30 steps at n = 30; the budget is linear.
+    const N: usize = 30;
+    const STEPS: u64 = 100 * N as u64;
+    // Closed.
+    let mut a = Arena::new();
+    let c = a.bool(true);
+    let one = a.int(1);
+    let t = shared_ifs(&mut a, N, c, one);
+    assert_eq!(bounded(STEPS).infer(&a, t, NO_LIBS), Ok(sch("Int")));
+    assert_eq!(bounded(STEPS).check(&a, t, NO_LIBS, &sch("Int")), Ok(()));
+    assert!(bounded(STEPS).check(&a, t, NO_LIBS, &sch("Bool")).is_err());
+    // Open: the shared subterms use the lambda's variable.
+    let v = a.var(0);
+    let body = shared_ifs(&mut a, N, v, v);
+    let f = a.lam(body);
+    let want = sch("Bool -> Bool");
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), Ok(want.clone()));
+    assert_eq!(bounded(STEPS).check(&a, f, NO_LIBS, &want), Ok(()));
+    // Under a let, so the shared subterms see a polymorphic binding.
+    let id = a.lam(v);
+    let inner = a.app(v, one);
+    let body = shared_ifs(&mut a, N, c, inner);
+    let l = a.let_(id, body);
+    assert_eq!(bounded(STEPS).infer(&a, l, NO_LIBS), Ok(sch("Int")));
+}
+
+/// `t' = (pair (fst t) (lam (snd t)))` nested `n` deep around `(pair $0 $0)`, under
+/// a lambda: the two uses of `t` see different binders for `$0`.
+fn pairs_across_scopes(a: &mut Arena, n: usize) -> TermId {
+    let v = a.var(0);
+    let (pair, fst, snd) = (a.prim(Prim::Pair), a.prim(Prim::Fst), a.prim(Prim::Snd));
+    let mut t = a.apps(pair, &[v, v]);
+    for _ in 0..n {
+        let l = a.app(fst, t);
+        let r = a.app(snd, t);
+        let r = a.lam(r);
+        t = a.apps(pair, &[l, r]);
+    }
+    a.lam(t)
+}
+
+#[test]
+fn open_shared_subterms_are_reused_across_scopes() {
+    // Each level uses the open subterm below it twice, in two different scopes, so
+    // the tree has 2^n nodes. Keying the reuse on the scope alone never hits.
+    const N: usize = 40;
+    const STEPS: u64 = 100 * N as u64;
+    let mut a = Arena::new();
+    let v = a.var(0);
+    // t' = (let t t): in the scope of the let, and under the let's binder.
+    let mut t = v;
+    for _ in 0..N {
+        t = a.let_(t, t);
+    }
+    let f = a.lam(t);
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), Ok(sch("a -> a")));
+    // t' = ((lam t) t): under a new lambda binder, and outside it.
+    let mut t = v;
+    for _ in 0..N {
+        let l = a.lam(t);
+        t = a.app(l, t);
+    }
+    let f = a.lam(t);
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), Ok(sch("a -> a")));
+    let want = sch("Int -> Int");
+    assert_eq!(bounded(STEPS).check(&a, f, NO_LIBS, &want), Ok(()));
+    // t' = (if true t (let (lam $0) t)) around ($0 1), under (let (lam $0) ...): the
+    // uses see different polymorphic bindings of the same type.
+    let (yes, one) = (a.bool(true), a.int(1));
+    let id = a.lam(v);
+    let mut t = a.app(v, one);
+    for _ in 0..N {
+        let l = a.let_(id, t);
+        t = a.if_(yes, t, l);
+    }
+    let f = a.let_(id, t);
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), Ok(sch("Int")));
+    // Uses at different types, compared with the tree walk at a size it can do.
+    let small = pairs_across_scopes(&mut a, 8);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, small, NO_LIBS);
+    assert!(want.is_ok(), "{want:?}");
+    assert_eq!(bounded(STEPS).infer(&a, small, NO_LIBS), want);
+    let big = pairs_across_scopes(&mut a, N);
+    let got = bounded(STEPS).infer(&a, big, NO_LIBS);
+    assert!(got.is_ok(), "{got:?}");
+}
+
+#[test]
+fn shared_spine_prefixes_do_not_hide_shared_arguments() {
+    // t' = (if (lt $0 0) (add t 1) (add t 2)): the two applications share the
+    // prefix `(add t)`, which the walk never infers on its own, so `t` must be
+    // reused as an argument of both spines.
+    const N: usize = 30;
+    const STEPS: u64 = 100 * N as u64;
+    let mut a = Arena::new();
+    let v = a.var(0);
+    let (zero, one, two) = (a.int(0), a.int(1), a.int(2));
+    let (add, lt) = (a.prim(Prim::Add), a.prim(Prim::Lt));
+    let cond = a.apps(lt, &[v, zero]);
+    let mut t = v;
+    for _ in 0..N {
+        let l = a.apps(add, &[t, one]);
+        let r = a.apps(add, &[t, two]);
+        t = a.if_(cond, l, r);
+    }
+    let f = a.lam(t);
+    let want = sch("Int -> Int");
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), Ok(want.clone()));
+    assert_eq!(bounded(STEPS).check(&a, f, NO_LIBS, &want), Ok(()));
+    // The prefix is a whole argument of `fst`: ((pair t) 1) and ((pair t) 2).
+    let yes = a.bool(true);
+    let (pair, fst) = (a.prim(Prim::Pair), a.prim(Prim::Fst));
+    let mut t = v;
+    for _ in 0..N {
+        let l = a.apps(pair, &[t, one]);
+        let l = a.app(fst, l);
+        let r = a.apps(pair, &[t, two]);
+        let r = a.app(fst, r);
+        t = a.if_(yes, l, r);
+    }
+    let f = a.lam(t);
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), Ok(sch("a -> a")));
+}
+
+#[test]
+fn shared_subterms_far_from_their_binders_are_reused_across_scopes() {
+    // As in `open_shared_subterms_are_reused_across_scopes`, but the variable is
+    // bound more than 64 binders out, as a reference to an early definition in a
+    // long chain of lets is.
+    const N: usize = 30;
+    const STEPS: u64 = 400 * N as u64;
+    const OUTER: u32 = 70;
+    let mut a = Arena::new();
+    let v = a.var(OUTER - 1);
+    let wrap = |a: &mut Arena, mut t: TermId| {
+        for _ in 0..OUTER {
+            t = a.lam(t);
+        }
+        t
+    };
+    let mut t = v;
+    for _ in 0..N {
+        t = a.let_(t, t);
+    }
+    let f = wrap(&mut a, t);
+    let got = bounded(STEPS).infer(&a, f, NO_LIBS);
+    assert!(got.is_ok(), "{got:?}");
+    let v = a.var(OUTER - 1);
+    let mut t = v;
+    for _ in 0..N {
+        let l = a.lam(t);
+        t = a.app(l, t);
+    }
+    let f = wrap(&mut a, t);
+    let got = bounded(STEPS).infer(&a, f, NO_LIBS);
+    assert!(got.is_ok(), "{got:?}");
+}
+
+#[test]
+fn errors_inside_shared_subterms_are_located_as_in_the_tree() {
+    // A duplicate of an ill-typed subterm does not change where the error is
+    // reported: it names the variable and its argument position, as it would
+    // without the duplicate.
+    let e = expect_err("(lam (if $0 (add $0 1) (add $0 1)))");
+    assert_eq!(e.term_text, "$0", "{e}");
+    assert!(e.context.contains("argument 1 of `add`"), "{e}");
+    let cases = [
+        ("(lam (if $0 (add $0 1) (add $0 1)))", None),
+        (
+            "(lam (lam (pair (add $0 1) (pair (cons $1 (cons $0 nil)) \
+             (cons $1 (cons $0 nil))))))",
+            Some("a -> a"),
+        ),
+        (
+            "(lam (lam (pair (add $0 1) (pair (cons $1 (cons $0 nil)) \
+             (cons $1 (cons $0 nil))))))",
+            Some("a -> b -> (Int, (List a, List a))"),
+        ),
+        (
+            "(lam (pair (fst $0) (and (fst $0) (add (fst $0) 1))))",
+            None,
+        ),
+    ];
+    for (src, expected) in cases {
+        let mut a = Arena::new();
+        let id = parse_term(&mut a, src);
+        let mut memo = TypeChecker::new();
+        let mut tree = TypeChecker::new();
+        tree.tree_walk = true;
+        let (got, want) = match expected {
+            None => (
+                memo.infer(&a, id, NO_LIBS).map(|_| ()),
+                tree.infer(&a, id, NO_LIBS).map(|_| ()),
+            ),
+            Some(s) => (
+                memo.check(&a, id, NO_LIBS, &sch(s)),
+                tree.check(&a, id, NO_LIBS, &sch(s)),
+            ),
+        };
+        assert!(want.is_err(), "{src}");
+        assert_eq!(got, want, "{src}");
+    }
+}
+
+/// `(lam (pair t (let true t)))` with `t` = `(if true u u)` nested `n` deep around
+/// `u` = `(add $0 1)`: the second `t` sees `$0` bound to a Bool.
+fn clash_under_let(a: &mut Arena, n: usize) -> TermId {
+    let (v, one, yes) = (a.var(0), a.int(1), a.bool(true));
+    let (add, pair) = (a.prim(Prim::Add), a.prim(Prim::Pair));
+    let leaf = a.apps(add, &[v, one]);
+    let t = shared_ifs(a, n, yes, leaf);
+    let l = a.let_(yes, t);
+    let body = a.apps(pair, &[t, l]);
+    a.lam(body)
+}
+
+#[test]
+fn errors_in_large_shared_terms_are_located_as_in_the_tree() {
+    // At n = 18 the tree walk takes millions of steps; locating the error must
+    // still name the subterm the tree walk names, in a polynomial number of steps.
+    const N: usize = 18;
+    const STEPS: u64 = 100 * (N * N) as u64;
+    let mut a = Arena::new();
+    let f = clash_under_let(&mut a, N);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, f, NO_LIBS);
+    let e = want.clone().expect_err("ill typed");
+    assert!(e.context.contains("argument 1 of `add`"), "{e}");
+    assert_eq!(TypeChecker::new().infer(&a, f, NO_LIBS), want);
+    assert_eq!(bounded(STEPS).infer(&a, f, NO_LIBS), want);
+    let s = sch("Int -> (Int, Int)");
+    let want = tree.check(&a, f, NO_LIBS, &s);
+    assert!(want.is_err());
+    assert_eq!(bounded(STEPS).check(&a, f, NO_LIBS, &s), want);
+}
+
+/// `t_n`, with `t_(k+1) = (if true t_k t_k)` and `t_0 = (add true 1)` if `open` is
+/// false, else `lam x. t_n` with `t_0 = (add x true)`: a leaf that is ill typed on
+/// its own, shared down a chain.
+fn ill_typed_leaf_chain(a: &mut Arena, n: usize, open: bool) -> TermId {
+    let (add, yes, one) = (a.prim(Prim::Add), a.bool(true), a.int(1));
+    let mut t = if open {
+        let v0 = a.var(0);
+        a.apps(add, &[v0, yes])
+    } else {
+        a.apps(add, &[yes, one])
+    };
+    for _ in 0..n {
+        t = a.if_(yes, t, t);
+    }
+    if open {
+        a.lam(t)
+    } else {
+        t
+    }
+}
+
+#[test]
+fn ill_typed_shared_leaves_are_located_in_polynomial_steps() {
+    // Each use of a subterm whose fresh inference failed is walked in place at
+    // once, not tried again from a checkpoint: otherwise every level doubles the
+    // work of locating the error.
+    for open in [false, true] {
+        let mut a = Arena::new();
+        let small = ill_typed_leaf_chain(&mut a, 10, open);
+        let mut tree = TypeChecker::new();
+        tree.tree_walk = true;
+        let want = tree.infer(&a, small, NO_LIBS);
+        assert!(want.is_err());
+        assert_eq!(TypeChecker::new().infer(&a, small, NO_LIBS), want);
+
+        const N: usize = 40;
+        const STEPS: u64 = 100 * (N * N) as u64;
+        let big = ill_typed_leaf_chain(&mut a, N, open);
+        let e = bounded(STEPS)
+            .infer(&a, big, NO_LIBS)
+            .expect_err("ill typed");
+        assert_eq!(e.context, want.clone().unwrap_err().context, "open {open}");
+        let s = if open { sch("Int -> Int") } else { sch("Int") };
+        let e = bounded(STEPS)
+            .check(&a, big, NO_LIBS, &s)
+            .expect_err("ill typed");
+        let want = tree.check(&a, small, NO_LIBS, &s).unwrap_err();
+        assert_eq!(e.context, want.context, "open {open}");
+    }
+}
+
+#[test]
+fn only_failed_fresh_inference_marks_a_key_failed() {
+    // `(add $0 1)` infers afresh as `Int -> Int`; only fitting it to `$0 : Bool`
+    // fails, which depends on the binder, so the key must not be marked failed.
+    let mut a = Arena::new();
+    let (add, one, v0) = (a.prim(Prim::Add), a.int(1), a.var(0));
+    let t = a.apps(add, &[v0, one]);
+    let body = a.if_(v0, t, t);
+    let f = a.lam(body);
+    let mut tc = TypeChecker::new();
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    assert_eq!(tc.infer(&a, f, NO_LIBS), tree.infer(&a, f, NO_LIBS));
+    assert_eq!(tc.failed_keys(), 0);
+}
+
+/// `lam x. let (lam (pair x $0)) in t_n`, with `t_0 = ($0 1)` and `t_(k+1) =
+/// (if true t_k (let (lam (pair (fst ($1 0)) $0)) t_k))`: every level binds a new
+/// polymorphic helper whose type has the free variable `x`.
+fn helpers_over_a_lambda_variable(a: &mut Arena, n: usize) -> TermId {
+    let (v0, v1, zero, one, yes) = (a.var(0), a.var(1), a.int(0), a.int(1), a.bool(true));
+    let (pair, fst) = (a.prim(Prim::Pair), a.prim(Prim::Fst));
+    let b0 = a.apps(pair, &[v1, v0]);
+    let b0 = a.lam(b0);
+    let prev = a.app(v1, zero);
+    let x = a.app(fst, prev);
+    let b = a.apps(pair, &[x, v0]);
+    let b = a.lam(b);
+    let mut t = a.app(v0, one);
+    for _ in 0..n {
+        let l = a.let_(b, t);
+        t = a.if_(yes, t, l);
+    }
+    let body = a.let_(b0, t);
+    a.lam(body)
+}
+
+#[test]
+fn shared_subterms_under_new_helpers_with_free_type_variables_are_reused() {
+    const N: usize = 30;
+    const STEPS: u64 = 100 * N as u64;
+    let mut a = Arena::new();
+    let small = helpers_over_a_lambda_variable(&mut a, 6);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, small, NO_LIBS);
+    assert_eq!(want, Ok(sch("a -> (a, Int)")));
+    assert_eq!(bounded(STEPS).infer(&a, small, NO_LIBS), want);
+    let big = helpers_over_a_lambda_variable(&mut a, N);
+    assert_eq!(bounded(STEPS).infer(&a, big, NO_LIBS), want);
+}
+
+#[test]
+fn shared_subterms_with_many_free_variables_agree_with_the_tree() {
+    // More free variables than the memo records one by one: the scope is all the
+    // bindings out to the outermost one used.
+    const VARS: u32 = 70;
+    let mut a = Arena::new();
+    let mut t = a.int(1);
+    let pair = a.prim(Prim::Pair);
+    for i in 0..VARS {
+        let v = a.var(i);
+        t = a.apps(pair, &[v, t]);
+    }
+    // In one scope twice, and in a scope one binder further in.
+    let l = a.lam(t);
+    let both = a.apps(pair, &[t, t]);
+    let mut f = a.apps(pair, &[both, l]);
+    for _ in 0..VARS {
+        f = a.lam(f);
+    }
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, f, NO_LIBS);
+    assert!(want.is_ok(), "{want:?}");
+    assert_eq!(bounded(10_000).infer(&a, f, NO_LIBS), want);
+}
+
+#[test]
+fn shared_subterms_stay_polymorphic_and_constrain_their_scope() {
+    // The two `(lam $0)` are one TermId, used at Int and at Bool.
+    assert_infers(
+        "((lam (lam (pair ($1 1) ($0 true)))) (lam $0) (lam $0))",
+        "(Int, Bool)",
+    );
+    // An open shared subterm: `(snd (pair $0 nil))` is one TermId, in the same scope,
+    // used as a List Int and as a List Bool.
+    assert_infers(
+        "(lam ((lam (lam (pair $1 $0))) (cons 1 (snd (pair $0 nil))) \
+         (cons true (snd (pair $0 nil)))))",
+        "a -> (List Int, List Bool)",
+    );
+    // A shared subterm still constrains the variables it uses, at each use.
+    assert_infers("(lam (pair (add $0 1) (add $0 1)))", "Int -> (Int, Int)");
+    assert_infers("(lam (pair (fst $0) (fst $0)))", "(a, b) -> (a, a)");
+    let e = expect_err("(lam (pair (fst $0) (and (fst $0) (add (fst $0) 1))))");
+    assert!(matches!(*e.kind, TypeErrorKind::Mismatch { .. }), "{e}");
+    // The same subterm under different scopes is not confused.
+    assert_infers(
+        "(lam (pair (fst $0) (lam (fst $0))))",
+        "(a, b) -> (a, (c, d) -> c)",
+    );
+}
+
+/// Random terms with many shared subterms: the same subterm twice in one form,
+/// under the same binders or in different scopes.
+fn arb_shared_src() -> impl Strategy<Value = String> {
+    let leaf = prop_oneof![
+        (0u32..3).prop_map(|i| format!("${i}")),
+        (-1i64..2).prop_map(|n| n.to_string()),
+        Just("true".to_string()),
+        Just("nil".to_string()),
+        proptest::sample::select(Prim::ALL).prop_map(|p| p.name().to_string()),
+    ];
+    leaf.prop_recursive(6, 64, 3, |inner| {
+        prop_oneof![
+            3 => inner.clone().prop_map(|b| format!("(lam {b})")),
+            3 => (inner.clone(), inner.clone()).prop_map(|(f, a)| format!("({f} {a})")),
+            1 => (inner.clone(), inner.clone()).prop_map(|(x, b)| format!("(let {x} {b})")),
+            2 => (inner.clone(), inner.clone()).prop_map(|(c, t)| format!("(if {c} {t} {t})")),
+            2 => inner.clone().prop_map(|t| format!("((lam (lam (pair $1 $0))) {t} {t})")),
+            1 => inner.clone().prop_map(|t| format!("(pair {t} (lam {t}))")),
+            1 => inner.clone().prop_map(|t| format!("((lam {t}) {t})")),
+            1 => inner.clone().prop_map(|t| format!("(if true {t} (let (lam $0) {t}))")),
+            // A helper whose type has the free variable of the lambda around it.
+            1 => inner.clone().prop_map(|t| {
+                format!("(lam (if true {t} (let (lam (pair $1 $0)) {t})))")
+            }),
+            1 => (inner.clone(), inner.clone()).prop_map(|(t, u)| format!("(let {t} ({u} {t}))")),
+            // Two spines sharing the prefix `({f} {t})`.
+            1 => (inner.clone(), inner).prop_map(|(f, t)| {
+                format!("(if true ({f} {t} 1) ({f} {t} true))")
+            }),
+        ]
+    })
+}
+
+#[test]
+fn reusing_shared_subterms_agrees_with_walking_the_tree() {
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(4000));
+    let (typed, untyped) = (std::cell::Cell::new(0u32), std::cell::Cell::new(0u32));
+    runner
+        .run(&arb_shared_src(), |src| {
+            let mut a = Arena::new();
+            let id = sexpr::parse(&mut a, &src).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let mut memo = TypeChecker::new();
+            let mut tree = TypeChecker::new();
+            tree.tree_walk = true;
+            let got = memo.infer(&a, id, NO_LIBS);
+            let want = tree.infer(&a, id, NO_LIBS);
+            // Errors too: an error is located by walking the tree again.
+            prop_assert_eq!(&got, &want, "{}", src);
+            if let Ok(s) = &want {
+                typed.set(typed.get() + 1);
+                prop_assert!(memo.check(&a, id, NO_LIBS, s).is_ok(), "{}", src);
+                // Checking against a less general type agrees too.
+                for t in ["Int", "Bool -> Bool", "List Int"] {
+                    let s = sch(t);
+                    prop_assert_eq!(
+                        memo.check(&a, id, NO_LIBS, &s),
+                        tree.check(&a, id, NO_LIBS, &s),
+                        "{} against {}",
+                        src,
+                        t
+                    );
+                }
+            } else {
+                untyped.set(untyped.get() + 1);
+            }
+            Ok(())
+        })
+        .unwrap();
+    // Both outcomes must be exercised for the comparison to mean anything.
+    assert!(typed.get() > 400, "only {} well typed", typed.get());
+    assert!(untyped.get() > 400, "only {} ill typed", untyped.get());
+}
+
 // ---------------------------------------------------------------- check locates errors
 
 #[test]

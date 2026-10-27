@@ -14,57 +14,99 @@
 //! [`print`] always flattens application spines, so `parse(print(t)) == t` for every
 //! term `t`.
 
-use std::fmt::{self, Write};
+use std::fmt::{self, Write as _};
 
 use crate::prim::Prim;
 use crate::term::{Arena, LibId, Term, TermId};
 
 /// Prints `id` in core syntax.
+///
+/// It walks with an explicit stack, so any depth of term prints without risk of
+/// a stack overflow. Shared subterms are printed at each use, so the text can be
+/// exponentially longer than the number of distinct nodes; use
+/// [`print_bounded`] for a bounded cost.
 pub fn print(arena: &Arena, id: TermId) -> String {
     let mut out = String::new();
-    write_term(arena, id, &mut out).expect("writing to a String cannot fail");
+    print_bounded(arena, id, usize::MAX, &mut out);
     out
 }
 
-fn write_term(arena: &Arena, id: TermId, out: &mut String) -> fmt::Result {
-    match arena.get(id) {
-        Term::Var(i) => write!(out, "${i}"),
-        Term::Int(n) => write!(out, "{n}"),
-        Term::Bool(b) => write!(out, "{b}"),
-        Term::Unit => out.write_str("unit"),
-        Term::Prim(p) => out.write_str(p.name()),
-        Term::Lib(LibId(l)) => write!(out, "lib_{l}"),
-        Term::Lam(b) => write_form(arena, "lam", &[b], out),
-        Term::Let(x, b) => write_form(arena, "let", &[x, b], out),
-        Term::If(c, t, e) => write_form(arena, "if", &[c, t, e], out),
-        Term::And(x, y) => write_form(arena, "and", &[x, y], out),
-        Term::Or(x, y) => write_form(arena, "or", &[x, y], out),
-        Term::App(..) => {
-            let mut spine = vec![];
-            let mut head = id;
-            while let Term::App(f, a) = arena.get(head) {
-                spine.push(a);
-                head = f;
+/// Appends `id` in core syntax to `out`, stopping as soon as `out` is longer than
+/// `limit` bytes. Each application visited pushes its whole spine first, and up
+/// to about `limit` nodes are visited, so the cost is bounded by about `limit`
+/// times the length of the longest atom or application spine, not by the size of
+/// the term. Returns whether the whole term was written.
+pub fn print_bounded(arena: &Arena, id: TermId, limit: usize, out: &mut String) -> bool {
+    enum Item {
+        Term(TermId),
+        Text(&'static str),
+    }
+    let mut todo = vec![Item::Term(id)];
+    while let Some(item) = todo.pop() {
+        if out.len() > limit {
+            return false;
+        }
+        let t = match item {
+            Item::Text(s) => {
+                out.push_str(s);
+                continue;
             }
-            out.write_char('(')?;
-            write_term(arena, head, out)?;
-            for &a in spine.iter().rev() {
-                out.write_char(' ')?;
-                write_term(arena, a, out)?;
+            Item::Term(t) => t,
+        };
+        let (keyword, children): (&str, &[TermId]) = match arena.get(t) {
+            Term::Var(i) => {
+                let _ = write!(out, "${i}");
+                continue;
             }
-            out.write_char(')')
+            Term::Int(n) => {
+                let _ = write!(out, "{n}");
+                continue;
+            }
+            Term::Bool(b) => {
+                let _ = write!(out, "{b}");
+                continue;
+            }
+            Term::Unit => {
+                out.push_str("unit");
+                continue;
+            }
+            Term::Prim(p) => {
+                out.push_str(p.name());
+                continue;
+            }
+            Term::Lib(LibId(l)) => {
+                let _ = write!(out, "lib_{l}");
+                continue;
+            }
+            Term::Lam(b) => ("lam", &[b]),
+            Term::Let(x, b) => ("let", &[x, b]),
+            Term::If(c, th, e) => ("if", &[c, th, e]),
+            Term::And(x, y) => ("and", &[x, y]),
+            Term::Or(x, y) => ("or", &[x, y]),
+            Term::App(..) => {
+                // The spine is flattened: `(f a b)`, not `((f a) b)`. Arguments are
+                // met last first, which is the order to push them.
+                out.push('(');
+                todo.push(Item::Text(")"));
+                let mut head = t;
+                while let Term::App(f, a) = arena.get(head) {
+                    todo.push(Item::Term(a));
+                    todo.push(Item::Text(" "));
+                    head = f;
+                }
+                todo.push(Item::Term(head));
+                continue;
+            }
+        };
+        out.push('(');
+        out.push_str(keyword);
+        todo.push(Item::Text(")"));
+        for &c in children.iter().rev() {
+            todo.push(Item::Term(c));
+            todo.push(Item::Text(" "));
         }
     }
-}
-
-fn write_form(arena: &Arena, keyword: &str, args: &[TermId], out: &mut String) -> fmt::Result {
-    out.write_char('(')?;
-    out.write_str(keyword)?;
-    for &a in args {
-        out.write_char(' ')?;
-        write_term(arena, a, out)?;
-    }
-    out.write_char(')')
+    true
 }
 
 /// A parse error, with the byte offset where it was found.
@@ -160,8 +202,26 @@ struct Parser<'a, 't> {
     end: usize,
 }
 
-impl Parser<'_, '_> {
-    fn next(&mut self) -> Result<Token<'_>, ParseError> {
+/// An open form waiting for more subterms: the parser's explicit stack, in place of
+/// recursion on the host stack.
+enum Open<'a> {
+    /// `(kw ...` with the arguments read so far; `kw` takes `arity` of them.
+    Form {
+        keyword: &'a str,
+        arity: usize,
+        args: Vec<TermId>,
+        head_offset: usize,
+    },
+    /// `(head args ...`; `head` is `None` until it has been read.
+    App {
+        head: Option<TermId>,
+        args: Vec<TermId>,
+        head_offset: usize,
+    },
+}
+
+impl<'a> Parser<'a, '_> {
+    fn next(&mut self) -> Result<Token<'a>, ParseError> {
         let tok = self.tokens.get(self.pos).copied().ok_or(ParseError {
             offset: self.end,
             message: "unexpected end of input".into(),
@@ -180,71 +240,127 @@ impl Parser<'_, '_> {
         )
     }
 
-    fn term(&mut self, arena: &mut Arena) -> Result<TermId, ParseError> {
-        let tok = self.next()?;
-        match tok.tok {
-            Tok::Close => Err(ParseError {
-                offset: tok.offset,
-                message: "unexpected ')'".into(),
+    fn arity_error(keyword: &str, arity: usize, head_offset: usize) -> ParseError {
+        ParseError {
+            offset: head_offset,
+            message: format!("'{keyword}' takes {arity} argument(s)"),
+        }
+    }
+
+    /// Consumes the `)` that closes a form.
+    fn close(&mut self) -> Result<(), ParseError> {
+        match self.next()?.tok {
+            Tok::Close => Ok(()),
+            _ => Err(ParseError {
+                offset: self.tokens[self.pos - 1].offset,
+                message: "expected ')'".into(),
             }),
-            Tok::Atom(a) => atom(arena, a, tok.offset),
-            Tok::Open => {
-                let head_offset = self.tokens.get(self.pos).map_or(self.end, |t| t.offset);
-                let keyword = match self.tokens.get(self.pos) {
-                    Some(Token {
-                        tok: Tok::Atom(a), ..
-                    }) => keyword_arity(a).map(|n| (*a, n)),
-                    _ => None,
-                };
-                let id = if let Some((kw, n)) = keyword {
-                    self.pos += 1;
-                    let mut args = Vec::with_capacity(n);
-                    for _ in 0..n {
+        }
+    }
+
+    /// Reads one term. Open forms are kept on an explicit stack, so the nesting
+    /// depth is limited by memory, not by the host stack.
+    fn term(&mut self, arena: &mut Arena) -> Result<TermId, ParseError> {
+        let mut stack: Vec<Open<'a>> = vec![];
+        loop {
+            // Read the start of a subterm: an atom is done at once, `(` opens a form.
+            let tok = self.next()?;
+            let mut done = match tok.tok {
+                Tok::Close => {
+                    return Err(ParseError {
+                        offset: tok.offset,
+                        message: "unexpected ')'".into(),
+                    })
+                }
+                Tok::Atom(a) => atom(arena, a, tok.offset)?,
+                Tok::Open => {
+                    let head_offset = self.tokens.get(self.pos).map_or(self.end, |t| t.offset);
+                    let keyword = match self.tokens.get(self.pos) {
+                        Some(Token {
+                            tok: Tok::Atom(a), ..
+                        }) => keyword_arity(a).map(|n| (*a, n)),
+                        _ => None,
+                    };
+                    if let Some((keyword, arity)) = keyword {
+                        self.pos += 1;
+                        if self.peek_close() {
+                            return Err(Self::arity_error(keyword, arity, head_offset));
+                        }
+                        stack.push(Open::Form {
+                            keyword,
+                            arity,
+                            args: Vec::with_capacity(arity),
+                            head_offset,
+                        });
+                    } else {
                         if self.peek_close() {
                             return Err(ParseError {
                                 offset: head_offset,
-                                message: format!("'{kw}' takes {n} argument(s)"),
+                                message: "empty application '()'".into(),
                             });
                         }
-                        args.push(self.term(arena)?);
-                    }
-                    match kw {
-                        "lam" => arena.lam(args[0]),
-                        "let" => arena.let_(args[0], args[1]),
-                        "if" => arena.if_(args[0], args[1], args[2]),
-                        "and" => arena.and(args[0], args[1]),
-                        _ => arena.or(args[0], args[1]),
-                    }
-                } else {
-                    if self.peek_close() {
-                        return Err(ParseError {
-                            offset: head_offset,
-                            message: "empty application '()'".into(),
+                        stack.push(Open::App {
+                            head: None,
+                            args: vec![],
+                            head_offset,
                         });
                     }
-                    let head = self.term(arena)?;
-                    let mut args = vec![];
-                    while !self.peek_close() {
-                        if self.pos >= self.tokens.len() {
+                    continue;
+                }
+            };
+            // Hand the finished subterm to the innermost open form; close every form
+            // that it completes.
+            loop {
+                let Some(open) = stack.last_mut() else {
+                    return Ok(done);
+                };
+                match open {
+                    Open::Form {
+                        keyword,
+                        arity,
+                        args,
+                        head_offset,
+                    } => {
+                        args.push(done);
+                        if args.len() < *arity {
+                            if self.peek_close() {
+                                return Err(Self::arity_error(keyword, *arity, *head_offset));
+                            }
                             break;
                         }
-                        args.push(self.term(arena)?);
+                        done = match *keyword {
+                            "lam" => arena.lam(args[0]),
+                            "let" => arena.let_(args[0], args[1]),
+                            "if" => arena.if_(args[0], args[1], args[2]),
+                            "and" => arena.and(args[0], args[1]),
+                            _ => arena.or(args[0], args[1]),
+                        };
                     }
-                    if args.is_empty() {
-                        return Err(ParseError {
-                            offset: head_offset,
-                            message: "application needs at least one argument".into(),
-                        });
+                    Open::App {
+                        head,
+                        args,
+                        head_offset,
+                    } => {
+                        if head.is_none() {
+                            *head = Some(done);
+                        } else {
+                            args.push(done);
+                        }
+                        if !self.peek_close() && self.pos < self.tokens.len() {
+                            break;
+                        }
+                        if args.is_empty() {
+                            return Err(ParseError {
+                                offset: *head_offset,
+                                message: "application needs at least one argument".into(),
+                            });
+                        }
+                        let f = head.expect("the head is read before any argument");
+                        done = arena.apps(f, args);
                     }
-                    arena.apps(head, &args)
-                };
-                match self.next()?.tok {
-                    Tok::Close => Ok(id),
-                    _ => Err(ParseError {
-                        offset: self.tokens[self.pos - 1].offset,
-                        message: "expected ')'".into(),
-                    }),
                 }
+                self.close()?;
+                stack.pop();
             }
         }
     }
@@ -348,6 +464,74 @@ mod tests {
             let e = parse(&mut a, src).expect_err(src);
             assert!(e.message.contains(expect), "{src:?}: got {e}");
         }
+    }
+
+    /// Far deeper than a recursive walk survives on a test thread's stack.
+    const DEEP: usize = 100_000;
+
+    #[test]
+    fn deep_lambdas_print_and_parse_without_host_recursion() {
+        let mut a = Arena::new();
+        let mut t = a.var(0);
+        for _ in 0..DEEP {
+            t = a.lam(t);
+        }
+        let text = print(&a, t);
+        assert_eq!(text.len(), DEEP * "(lam )".len() + "$0".len());
+        assert!(text.starts_with("(lam (lam "));
+        assert_eq!(parse(&mut a, &text), Ok(t));
+        let mut fresh = Arena::new();
+        let back = parse(&mut fresh, &text).unwrap();
+        assert_eq!(fresh.len(), a.len());
+        assert_eq!(print(&fresh, back), text);
+    }
+
+    #[test]
+    fn deep_arguments_heads_and_forms_print_and_parse() {
+        let mut a = Arena::new();
+        let f = a.prim(Prim::Not);
+        let one = a.int(1);
+        let t0 = a.bool(true);
+        // Nested in argument position, in head position and in each form slot.
+        let mut arg = t0;
+        let mut head = f;
+        let mut forms = one;
+        for i in 0..DEEP {
+            arg = a.app(f, arg);
+            head = if i % 2 == 0 {
+                a.app(head, one)
+            } else {
+                a.lam(head)
+            };
+            let c = a.bool(i % 3 == 0);
+            forms = match i % 5 {
+                0 => a.if_(c, forms, one),
+                1 => a.let_(one, forms),
+                2 => a.and(c, forms),
+                3 => a.or(forms, c),
+                _ => a.app(forms, one),
+            };
+        }
+        for t in [arg, head, forms] {
+            let text = print(&a, t);
+            assert_eq!(parse(&mut a, &text), Ok(t));
+        }
+    }
+
+    #[test]
+    fn deep_malformed_input_is_an_error() {
+        let open = "(not ".repeat(DEEP);
+        let mut a = Arena::new();
+        let e = parse(&mut a, &open).unwrap_err();
+        assert!(e.message.contains("at least one argument"), "{e}");
+        let e = parse(&mut a, &format!("{open}(lam")).unwrap_err();
+        assert!(e.message.contains("unexpected end of input"), "{e}");
+        let unbalanced = format!("{open}true{}", ")".repeat(DEEP + 1));
+        let e = parse(&mut a, &unbalanced).unwrap_err();
+        assert!(e.message.contains("unexpected input after term"), "{e}");
+        let short = format!("{open}true{}", ")".repeat(DEEP - 1));
+        let e = parse(&mut a, &short).unwrap_err();
+        assert!(e.message.contains("unexpected end of input"), "{e}");
     }
 
     fn arb_term(arena: std::rc::Rc<std::cell::RefCell<Arena>>) -> impl Strategy<Value = TermId> {

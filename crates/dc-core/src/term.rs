@@ -173,29 +173,46 @@ impl Arena {
 
     /// The number of binders a context must supply for `id` to be closed: one more
     /// than the largest free de Bruijn index, or 0 for a closed term.
+    ///
+    /// It walks with an explicit stack and visits each distinct node once, so its
+    /// cost is linear in the number of distinct nodes under `id`, however deep or
+    /// shared they are.
     pub fn free_depth(&self, id: TermId) -> u32 {
         let mut memo = FxHashMap::default();
-        self.free_depth_memo(id, &mut memo)
+        self.free_depths(id, &mut memo);
+        memo[&id]
     }
 
-    fn free_depth_memo(&self, id: TermId, memo: &mut FxHashMap<TermId, u32>) -> u32 {
-        if let Some(&d) = memo.get(&id) {
-            return d;
+    /// Records in `memo` the [`free_depth`](Arena::free_depth) of `id` and of every
+    /// node under it that `memo` does not already hold.
+    pub(crate) fn free_depths(&self, id: TermId, memo: &mut FxHashMap<TermId, u32>) {
+        // A node is pushed with `false` to be expanded, and again with `true` to be
+        // computed once its children are done.
+        let mut stack = vec![(id, false)];
+        while let Some((t, children_done)) = stack.pop() {
+            if memo.contains_key(&t) {
+                continue;
+            }
+            let node = self.get(t);
+            if !children_done {
+                stack.push((t, true));
+                stack.extend(
+                    children(&node)
+                        .into_iter()
+                        .filter(|c| !memo.contains_key(c))
+                        .map(|c| (c, false)),
+                );
+                continue;
+            }
+            let d = |c: TermId| memo[&c];
+            let depth = match node {
+                Term::Var(i) => i.saturating_add(1),
+                Term::Lam(b) => d(b).saturating_sub(1),
+                Term::Let(x, b) => d(x).max(d(b).saturating_sub(1)),
+                t => children(&t).into_iter().map(d).max().unwrap_or(0),
+            };
+            memo.insert(t, depth);
         }
-        let d = match self.get(id) {
-            Term::Var(i) => i + 1,
-            Term::Lam(b) => self.free_depth_memo(b, memo).saturating_sub(1),
-            Term::Let(x, b) => self
-                .free_depth_memo(x, memo)
-                .max(self.free_depth_memo(b, memo).saturating_sub(1)),
-            t => children(&t)
-                .into_iter()
-                .map(|c| self.free_depth_memo(c, memo))
-                .max()
-                .unwrap_or(0),
-        };
-        memo.insert(id, d);
-        d
     }
 
     /// Whether `id` has no free variables.
@@ -267,6 +284,47 @@ mod tests {
         assert!(a.is_closed(let_ok));
         let let_free = a.let_(v0, v0);
         assert_eq!(a.free_depth(let_free), 1);
+    }
+
+    #[test]
+    fn free_depth_of_deep_terms_needs_no_host_recursion() {
+        const DEEP: u32 = 100_000;
+        let mut a = Arena::new();
+        // $DEEP under DEEP lambdas: free, with depth 1 left over.
+        let mut t = a.var(DEEP);
+        for _ in 0..DEEP {
+            t = a.lam(t);
+        }
+        assert_eq!(a.free_depth(t), 1);
+        assert!(!a.is_closed(t));
+        let closed = a.lam(t);
+        assert!(a.is_closed(closed));
+        // Deep through every kind of node, closed by lets.
+        let mut u = a.var(0);
+        let one = a.int(1);
+        for i in 0..DEEP {
+            u = match i % 4 {
+                0 => a.let_(one, u),
+                1 => a.app(u, one),
+                2 => a.if_(one, one, u),
+                _ => a.and(u, one),
+            };
+        }
+        assert_eq!(a.free_depth(u), 0);
+    }
+
+    #[test]
+    fn free_depth_visits_shared_subterms_once() {
+        // A DAG of about 100 nodes that is a tree of 2^100 nodes.
+        let mut a = Arena::new();
+        let c = a.var(3);
+        let mut t = a.var(0);
+        for _ in 0..100 {
+            t = a.if_(c, t, t);
+        }
+        let start = std::time::Instant::now();
+        assert_eq!(a.free_depth(t), 4);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

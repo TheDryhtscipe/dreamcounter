@@ -11,8 +11,32 @@
 //! result with the input term. If the sugared text does not compile back to the
 //! same term, it prints again without sugar (only `fun`, `let`, application,
 //! `if`, `&&`, `||` and infix operators), which always round-trips.
+//!
+//! # Limits
+//!
+//! The printer recurses on the host stack, once or a few times per level of the
+//! core term, and a stack overflow aborts the process. So it first measures, with
+//! an explicit stack, how deep the term nests, and refuses a term deeper than
+//! [`MAX_PRETTY_DEPTH`] with a [`PrettyError::TooDeep`] error. Every node counts
+//! one level, including each application in a spine `f a b c`. The limit is five
+//! times what the front end accepts ([`crate::MAX_DEPTH`]), so it also covers a
+//! closed program wrapped in one `let` per definition it uses, for up to about 400
+//! definitions. The printer stays recursive because its sugar recognition and
+//! name scoping read much more plainly that way, and a deeper term could not be
+//! read back by the front end anyway.
+//!
+//! A term deeper than [`INLINE_DEPTH`] is printed on a thread of its own with a
+//! [`PRINT_STACK`] stack, so how much stack the caller has left does not matter.
+//! A term within the depth limit needs at most about 2 MiB of stack in a debug
+//! build.
+//!
+//! Terms are DAGs, and the printer writes a shared subterm out at every use, so
+//! `(if c t t)` nested `n` deep prints `2^n` subterms. So the printer also refuses
+//! a term with more than [`MAX_PRETTY_NODES`] nodes written out as a tree, with a
+//! [`PrettyError::TooLarge`] error.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use dc_core::term::children;
 use dc_core::{sexpr, Arena, LibId, Prim, Term, TermId};
@@ -34,15 +58,69 @@ const P_ATOM: u8 = 9;
 /// A name pushed for a binder the printed text never mentions.
 const HIDDEN: &str = "%hidden";
 
+/// The deepest core term [`pretty`] prints; see the module documentation.
+pub const MAX_PRETTY_DEPTH: usize = 500;
+
+/// The most nodes a core term [`pretty`] prints may have, written out as a tree.
+pub const MAX_PRETTY_NODES: usize = 100_000;
+
+/// The deepest term printed on the caller's thread. In a debug build, 256 KiB of
+/// stack left is enough to print any term this deep, and to start the printing
+/// thread for a deeper one.
+pub const INLINE_DEPTH: usize = 16;
+
+/// The stack size of the thread a deeper term is printed on: eight times what
+/// the deepest term needs in a debug build.
+pub const PRINT_STACK: usize = 16 << 20;
+
+/// Why [`pretty`] refused a term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrettyError {
+    /// The term nests more deeply than [`MAX_PRETTY_DEPTH`].
+    TooDeep,
+    /// The term has more than [`MAX_PRETTY_NODES`] nodes written out as a tree.
+    TooLarge,
+}
+
+impl fmt::Display for PrettyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PrettyError::TooDeep => write!(
+                f,
+                "the term nests more than {MAX_PRETTY_DEPTH} levels deep, too deep to \
+                 print as surface syntax"
+            ),
+            PrettyError::TooLarge => write!(
+                f,
+                "the term has more than {MAX_PRETTY_NODES} nodes written out, too many \
+                 to print as surface syntax"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PrettyError {}
+
 /// Prints `id` as surface syntax. Library references print as `lib_name(l)`.
 /// Free variables (when `id` is open) print as `free0`, `free1`, ... with `free0`
 /// the innermost.
-pub fn pretty(arena: &Arena, id: TermId, lib_name: impl Fn(LibId) -> String) -> String {
-    let sugared = Printer::new(arena, &lib_name, true).top(id);
-    if round_trips(arena, id, &sugared, &lib_name) {
-        return sugared;
-    }
-    Printer::new(arena, &lib_name, false).top(id)
+///
+/// Fails if `id` nests more than [`MAX_PRETTY_DEPTH`] levels deep or has more
+/// than [`MAX_PRETTY_NODES`] nodes written out. Panics if a term deeper than
+/// [`INLINE_DEPTH`] comes and the system cannot start a thread to print it on.
+pub fn pretty(
+    arena: &Arena,
+    id: TermId,
+    lib_name: impl Fn(LibId) -> String + Sync,
+) -> Result<String, PrettyError> {
+    let height = measure(arena, id)?;
+    Ok(on_enough_stack(height, || {
+        let sugared = Printer::new(arena, &lib_name, true).top(id);
+        if round_trips(arena, id, &sugared, &lib_name) {
+            return sugared;
+        }
+        Printer::new(arena, &lib_name, false).top(id)
+    }))
 }
 
 /// Prints without checking the result. With `sugar` false only `fun`, `let`,
@@ -53,31 +131,97 @@ pub fn pretty(arena: &Arena, id: TermId, lib_name: impl Fn(LibId) -> String) -> 
 pub fn pretty_unchecked(
     arena: &Arena,
     id: TermId,
-    lib_name: impl Fn(LibId) -> String,
+    lib_name: impl Fn(LibId) -> String + Sync,
     sugar: bool,
-) -> String {
-    Printer::new(arena, &lib_name, sugar).top(id)
+) -> Result<String, PrettyError> {
+    let height = measure(arena, id)?;
+    Ok(on_enough_stack(height, || {
+        Printer::new(arena, &lib_name, sugar).top(id)
+    }))
 }
 
-fn libs_in(arena: &Arena, id: TermId, out: &mut HashSet<LibId>, seen: &mut HashSet<TermId>) {
-    if !seen.insert(id) {
-        return;
+/// Runs `print` for a term `height` levels deep: on this thread if the term is
+/// at most [`INLINE_DEPTH`] deep, else on a new thread with a [`PRINT_STACK`]
+/// stack.
+fn on_enough_stack(height: usize, print: impl FnOnce() -> String + Send) -> String {
+    if height <= INLINE_DEPTH {
+        return print();
     }
-    let t = arena.get(id);
-    if let Term::Lib(l) = t {
-        out.insert(l);
+    std::thread::scope(|scope| {
+        let printer = std::thread::Builder::new()
+            .name("dc-pretty".into())
+            .stack_size(PRINT_STACK)
+            .spawn_scoped(scope, print)
+            .expect("the system starts a thread to print a deep term on");
+        printer
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// The height of `id`: the most levels from it down to a leaf. Fails if that is
+/// more than [`MAX_PRETTY_DEPTH`], or if `id` has more than [`MAX_PRETTY_NODES`]
+/// nodes written out as a tree. It walks with an explicit stack and visits each
+/// distinct node once.
+fn measure(arena: &Arena, id: TermId) -> Result<usize, PrettyError> {
+    // The height and tree size of each finished node.
+    let mut done: HashMap<TermId, (usize, usize)> = HashMap::new();
+    let mut stack = vec![(id, 1usize, false)];
+    while let Some((t, depth, children_done)) = stack.pop() {
+        if depth > MAX_PRETTY_DEPTH {
+            return Err(PrettyError::TooDeep);
+        }
+        if let Some(&(h, _)) = done.get(&t) {
+            // Done already, reached again by another path.
+            if depth + h - 1 > MAX_PRETTY_DEPTH {
+                return Err(PrettyError::TooDeep);
+            }
+            continue;
+        }
+        let cs = children(&arena.get(t));
+        if children_done {
+            let h = 1 + cs.iter().map(|c| done[c].0).max().unwrap_or(0);
+            let size = cs.iter().fold(1usize, |n, c| n.saturating_add(done[c].1));
+            if size > MAX_PRETTY_NODES {
+                return Err(PrettyError::TooLarge);
+            }
+            done.insert(t, (h, size));
+            continue;
+        }
+        stack.push((t, depth, true));
+        for c in cs {
+            match done.get(&c) {
+                Some(&(h, _)) if depth + h > MAX_PRETTY_DEPTH => return Err(PrettyError::TooDeep),
+                Some(_) => {}
+                None => stack.push((c, depth + 1, false)),
+            }
+        }
     }
-    for c in children(&t) {
-        libs_in(arena, c, out, seen);
+    Ok(done[&id].0)
+}
+
+/// The library abstractions `id` refers to.
+fn libs_in(arena: &Arena, id: TermId) -> HashSet<LibId> {
+    let mut out = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![id];
+    while let Some(t) = stack.pop() {
+        if !seen.insert(t) {
+            continue;
+        }
+        let node = arena.get(t);
+        if let Term::Lib(l) = node {
+            out.insert(l);
+        }
+        stack.extend(children(&node));
     }
+    out
 }
 
 fn round_trips(arena: &Arena, id: TermId, text: &str, lib_name: &impl Fn(LibId) -> String) -> bool {
     let mut scratch = Arena::new();
     let mut env = TopLevel::new();
-    let mut libs = HashSet::new();
-    libs_in(arena, id, &mut libs, &mut HashSet::new());
-    for l in libs {
+    for l in libs_in(arena, id) {
         let t = scratch.lib(l);
         if env.define_inline(&scratch, &lib_name(l), t).is_err() {
             return false;
@@ -174,9 +318,10 @@ impl<'a, F: Fn(LibId) -> String> Printer<'a, F> {
     }
 
     fn top(&mut self, id: TermId) -> String {
-        let mut libs = HashSet::new();
-        libs_in(self.arena, id, &mut libs, &mut HashSet::new());
-        self.reserved = libs.into_iter().map(|l| (self.lib_name)(l)).collect();
+        self.reserved = libs_in(self.arena, id)
+            .into_iter()
+            .map(|l| (self.lib_name)(l))
+            .collect();
         self.go(id, P_OPEN)
     }
 
