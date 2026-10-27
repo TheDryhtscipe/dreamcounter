@@ -22,3 +22,6 @@ __pycache__/
 
 # DOCA runtime log
 /.doca/doca.log
+
+# Claude Code harness worktrees
+/.claude/worktrees/
