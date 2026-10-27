@@ -1,0 +1,17 @@
+index-dir: /home/thedryhtscipe/.cache/doca/index
+default-path: /home/thedryhtscipe/dev/dreamcounter/docs
+recursive: true
+embedding-model: BAAI/bge-large-en-v1.5
+embedding-cache-dir: /home/thedryhtscipe/.cache/doca/models
+default-top-k: 10
+search-threshold: null
+index-patterns:
+- '*.md'
+- '*.txt'
+- '*.rst'
+- '*.py'
+json: false
+verbose: false
+surreal-url: surrealkv:///home/thedryhtscipe/dev/dreamcounter/.doca/surreal.db
+surreal-ns: doca
+surreal-db: docs

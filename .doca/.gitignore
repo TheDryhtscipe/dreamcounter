@@ -1,0 +1,7 @@
+# DOCA database files (not tracked)
+doca.db
+surreal.db
+*.db
+
+# Search indexes
+index/

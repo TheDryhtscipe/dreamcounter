@@ -1,0 +1,24 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python (scripts, analysis)
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local harness files
+/CLAUDE.md
+/CLAUDE.local.md
+/.orc/
+/.claude/settings.local.json
+
+# Experiment outputs (results are recorded in DOCA)
+/runs/
+/logs/
+
+# DOCA runtime log
+/.doca/doca.log
