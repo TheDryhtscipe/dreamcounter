@@ -2,7 +2,9 @@
 
 dreamcounter is a research project in DreamCoder-style library learning. It aims at algorithmic primitives, such as divide and conquer, sliding windows, memoised recursion, and monotone stacks, rather than domain helpers. Given it is aimed at research within mathematics explicitly using LLMs, it is also coded in partnership with Claude.
 
-The research bet is this. An objective that rewards an abstraction for reducing the computational cost growth of solutions, not only their description length, will separate algorithmic ideas from shorthand.
+The research bet is this: an objective that rewards an abstraction for reducing the computational cost growth of solutions, not only their description length, will separate algorithmic ideas from shorthand.
+
+Proper documentation will follow soon.
 
 ## Status
 
