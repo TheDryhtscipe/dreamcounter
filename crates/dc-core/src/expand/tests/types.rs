@@ -7,6 +7,13 @@
 //! occurrence (see `a_duplicated_polymorphic_argument_generalises_the_expansion`).
 //! The property test checks that direction for every case and counts how often the
 //! types are equal.
+//!
+//! The converse does not hold either way round: the expansion can be strictly more
+//! general, and a program whose expansion types may not type at all once
+//! refactored (see
+//! `a_parameter_used_at_two_types_can_make_the_refactored_program_untypable`). So
+//! type preservation is one-way: if the refactored program types, its type is an
+//! instance of the expansion's.
 
 use std::cell::Cell;
 
@@ -145,6 +152,39 @@ fn a_duplicated_polymorphic_argument_generalises_the_expansion() {
     let e = parse(&mut a, "(pair nil nil)");
     let no_libs: &[Scheme] = &[];
     assert_eq!(check_type(&a, e, no_libs, &refactored), Ok(()));
+}
+
+#[test]
+fn a_parameter_used_at_two_types_can_make_the_refactored_program_untypable() {
+    // The other half of the gap above: the expansion types, the refactored program
+    // does not. `let id = λx. x in (λp. (fst p 1, snd p true)) (id, id)` types,
+    // because each `id` in the pair is instantiated afresh and the components get
+    // different types. With λ#0. (#0, #0) the pair is `(a -> a, a -> a)` for one
+    // `a`, which the lambda-bound `p` cannot use at both Int and Bool.
+    let mut a = Arena::new();
+    let libs = defs(&mut a, &[("(lam (pair $0 $0))", 1)]);
+    let schemes = lib_schemes(&a, &libs);
+    let refactored = parse(
+        &mut a,
+        "(let (lam $0) ((lam (pair ((fst $0) 1) ((snd $0) true))) (lib_0 $0)))",
+    );
+    let original = parse(
+        &mut a,
+        "(let (lam $0) ((lam (pair ((fst $0) 1) ((snd $0) true))) (pair $0 $0)))",
+    );
+    let expanded = expand(&mut a, &libs, refactored).expect("expand");
+    assert_eq!(expanded, original);
+    let no_libs: &[Scheme] = &[];
+    assert_eq!(
+        infer(&a, expanded, no_libs).map(|s| s.to_string()),
+        Ok("(Int, Bool)".to_string())
+    );
+    assert!(infer(&a, refactored, &schemes).is_err());
+    // A body that uses its parameter at two types does not type at all, so such
+    // an abstraction has no scheme to give a program.
+    let mut a = Arena::new();
+    let body = parse(&mut a, "(lam (pair ($0 1) ($0 true)))");
+    assert!(infer(&a, body, no_libs).is_err());
 }
 
 /// Rewrites the library use at preorder position `pos` of `rewritten`, `L a0 ...
