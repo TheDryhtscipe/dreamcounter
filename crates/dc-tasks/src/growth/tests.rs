@@ -942,16 +942,79 @@ fn c_widens_its_tolerance_to_the_seed_noise() {
 }
 
 #[test]
-fn c_is_ambiguous_when_noise_hides_the_class() {
-    // Seeds this far apart put n and n log n both within tolerance.
+fn c_refuses_when_noise_hides_the_class() {
+    // Seeds this far apart put the tolerance above half the separation.
     let fit = c(&seeded_sweep(|n| 1000 * n, 0.15));
-    assert!(fit.tolerance > fit.separation / 2.0, "{fit:?}");
-    match &fit.verdict {
-        ClassVerdict::Ambiguous(classes) => {
-            assert!(classes.contains(&GrowthClass::Linear), "{classes:?}");
-            assert!(classes.len() >= 2, "{classes:?}");
-        }
-        other => panic!("{other:?}"),
+    assert!(fit.tolerance >= fit.separation / 2.0, "{fit:?}");
+    assert_eq!(fit.verdict, ClassVerdict::TooNoisy);
+}
+
+#[test]
+fn c_never_names_a_class_for_noisy_growth_between_classes() {
+    // n^1.5 lies between n log n and n²; with seeds 13 % apart the widened
+    // tolerance has n log n just inside it and n² just outside (review of
+    // db440d). C must refuse.
+    let f = |n: u64| ((n as f64).powf(1.5) * 1000.0) as u64;
+    let fit = c(&seeded_sweep(f, 0.13));
+    assert!(
+        fit.candidates[GrowthClass::NLogN as usize].misfit <= fit.tolerance,
+        "the test needs a class within the widened tolerance: {fit:?}"
+    );
+    assert_eq!(fit.verdict, ClassVerdict::TooNoisy, "{fit:?}");
+}
+
+#[test]
+fn c_noise_ignores_single_seed_sizes_but_not_the_others() {
+    // As in the noisy linear sweep, but n = 1024 has one seed: the other
+    // sizes still show the spread, so C still refuses.
+    let mut obs = seeded_sweep(|n| 1000 * n, 0.15).observations().to_vec();
+    obs[6] = SizeObservation::completed(1024, vec![1000 * 1024]);
+    let fit = c(&Sweep::new(obs).expect("valid"));
+    assert!(fit.noise.expect("other sizes have seeds") > 0.0);
+    assert_eq!(fit.verdict, ClassVerdict::TooNoisy, "{fit:?}");
+}
+
+#[test]
+fn c_rejects_parameters_out_of_range() {
+    let sweep = default_sweep(|n| n);
+    for (est, name) in [
+        (
+            ClassSelect {
+                misfit_fraction: 0.5,
+                ..ClassSelect::default()
+            },
+            "misfit_fraction",
+        ),
+        (
+            ClassSelect {
+                misfit_fraction: -0.1,
+                ..ClassSelect::default()
+            },
+            "misfit_fraction",
+        ),
+        (
+            ClassSelect {
+                misfit_fraction: f64::NAN,
+                ..ClassSelect::default()
+            },
+            "misfit_fraction",
+        ),
+        (
+            ClassSelect {
+                noise_z: -1.0,
+                ..ClassSelect::default()
+            },
+            "noise_z",
+        ),
+        (
+            ClassSelect {
+                noise_z: f64::INFINITY,
+                ..ClassSelect::default()
+            },
+            "noise_z",
+        ),
+    ] {
+        assert_eq!(est.fit(&sweep), Err(GrowthError::BadParameter { name }));
     }
 }
 
@@ -1014,10 +1077,11 @@ fn c_through_the_trait() {
 }
 
 proptest! {
-    /// Whatever the step counts: every float is finite; a named class is
-    /// within tolerance and is the only class that is; an ambiguous verdict
-    /// lists exactly the classes within tolerance; and while the tolerance
-    /// is below half the separation, no verdict is ambiguous.
+    /// Whatever the step counts: every float is finite; the misfits and the
+    /// separation match a recomputation from the medians; C names a class or
+    /// says `NoFit` only while the tolerance is below half the separation; a
+    /// named class is the only class within tolerance; and `TooNoisy` comes
+    /// exactly when the tolerance reaches half the separation.
     #[test]
     fn c_verdict_laws(
         steps in prop::collection::vec(prop::collection::vec(1u64..1_000_000, 1..6), 7)
@@ -1033,6 +1097,28 @@ proptest! {
         let fit = c(&sweep);
         prop_assert!(fit.tolerance.is_finite() && fit.separation.is_finite());
         prop_assert!(fit.candidates.iter().all(|k| k.misfit.is_finite() && k.ln_c.is_finite()));
+        // Recompute the misfits and the separation from the medians here.
+        let window = [128u64, 256, 512, 1024];
+        let meds: Vec<f64> = sweep.medians()[3..].iter().map(|&(_, m)| (m as f64).ln()).collect();
+        let half_range = |d: &[f64]| {
+            let hi = d.iter().copied().fold(f64::MIN, f64::max);
+            let lo = d.iter().copied().fold(f64::MAX, f64::min);
+            (hi - lo) / 2.0
+        };
+        let lnf: Vec<Vec<f64>> = GrowthClass::ALL
+            .iter()
+            .map(|k| window.iter().map(|&n| k.ln_f(n)).collect())
+            .collect();
+        let mut sep = f64::INFINITY;
+        for i in 0..7 {
+            let d: Vec<f64> = meds.iter().zip(&lnf[i]).map(|(y, f)| y - f).collect();
+            prop_assert!((fit.candidates[i].misfit - half_range(&d)).abs() < 1e-9);
+            for j in i + 1..7 {
+                let d: Vec<f64> = lnf[i].iter().zip(&lnf[j]).map(|(a, b)| a - b).collect();
+                sep = sep.min(half_range(&d));
+            }
+        }
+        prop_assert!((fit.separation - sep).abs() < 1e-9);
         let within: Vec<GrowthClass> = fit
             .candidates
             .iter()
@@ -1040,12 +1126,15 @@ proptest! {
             .map(|k| k.class)
             .collect();
         match &fit.verdict {
-            ClassVerdict::Class(k) => prop_assert_eq!(&within, &vec![*k]),
-            ClassVerdict::Ambiguous(ks) => {
-                prop_assert_eq!(&within, ks);
-                prop_assert!(fit.tolerance >= fit.separation / 2.0);
+            ClassVerdict::Class(k) => {
+                prop_assert!(fit.tolerance < sep / 2.0);
+                prop_assert_eq!(&within, &vec![*k]);
             }
-            ClassVerdict::NoFit => prop_assert!(within.is_empty()),
+            ClassVerdict::TooNoisy => prop_assert!(fit.tolerance >= sep / 2.0),
+            ClassVerdict::NoFit => {
+                prop_assert!(fit.tolerance < sep / 2.0);
+                prop_assert!(within.is_empty());
+            }
         }
     }
 }

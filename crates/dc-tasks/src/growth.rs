@@ -48,19 +48,30 @@
 //! has `½ range(ln f − ln g) ≤ 2τ`. The *separation* of the window is the
 //! smallest `½ range(ln f − ln g)` over all pairs of classes; over the
 //! default window it is `½ ln(ln 1024 / ln 128) ≈ 0.178`, for `n` against
-//! `n log n` (and `1` against `log n`). That is fifty times B's `γ` margin.
+//! `n log n` (and `1` against `log n`).
 //!
 //! The *tolerance* `τ` is the larger of a floor, [`ClassSelect::misfit_fraction`]
-//! (default ¼) times the separation, which absorbs lower-order terms such as
-//! the `+ 4n` in `n log n + 4n`, and [`ClassSelect::noise_z`] (default 3)
+//! (default ¼) times the separation, which absorbs small lower-order terms
+//! such as the `+ 2n` in `n log₂ n + 2n` (but not `+ 4n`, a `NoFit`), and [`ClassSelect::noise_z`] (default 3)
 //! times the seed noise: the largest standard error of a size's median `ln`
 //! step count, `√(π/2) · s / √k` for `k` seeds with sample standard deviation
 //! `s` of their `ln` steps (the large-sample standard error of a median). A
-//! class is named only if it is the one class with misfit at most `τ`; if none
-//! is, the verdict is [`ClassVerdict::NoFit`] (`n^1.5`, `n² log n`), and if
-//! several are, [`ClassVerdict::Ambiguous`]. While `τ` is below half the
-//! separation, which the default floor guarantees for exact step counts, at
-//! most one class can be within `τ`, so only seed noise can make C ambiguous.
+//! class is named only if it is the one class with misfit at most `τ`; if
+//! none is, the verdict is [`ClassVerdict::NoFit`] (`n^1.5`, `n² log n`).
+//! Half the separation bounds `τ`: below it at most one class can be within
+//! `τ`, but at or above it a series between two classes can sit just inside
+//! one and just outside the other, so C then refuses with
+//! [`ClassVerdict::TooNoisy`] whatever the misfits. Noise can therefore only
+//! make C refuse, never make it name a class.
+//!
+//! # What a verdict means
+//!
+//! A named class says that over the window every median step count is
+//! within a factor `e^τ` of `c · f(n)`. It is a statement about the window,
+//! not a proof of asymptotic growth. Growth close to a class is named as
+//! that class: `n^1.2` as `n log n`, `n^1.04` as `n`, and `n log n + 30n`
+//! (a large lower-order term) as `n` over `128..1024`, where `ln n` varies by
+//! only a factor 1.43. Telling such cases apart needs larger sizes.
 //!
 //! # Conventions
 //!
@@ -291,6 +302,11 @@ pub enum GrowthError {
     /// is (to rounding) a linear function of `ln n`, so every `γ` fits
     /// equally well.
     GammaUnidentifiable,
+    /// An estimator parameter is out of its documented range.
+    BadParameter {
+        /// The parameter's field name.
+        name: &'static str,
+    },
 }
 
 impl fmt::Display for GrowthError {
@@ -318,6 +334,9 @@ impl fmt::Display for GrowthError {
             }
             GrowthError::DegenerateSizes => write!(f, "sizes in the fit window do not vary"),
             GrowthError::NonFinite => write!(f, "fit produced a non-finite value"),
+            GrowthError::BadParameter { name } => {
+                write!(f, "estimator parameter {name} is out of range")
+            }
             GrowthError::GammaUnidentifiable => {
                 write!(
                     f,
@@ -673,9 +692,10 @@ pub struct ClassCandidate {
 pub enum ClassVerdict {
     /// Exactly one class is within tolerance.
     Class(GrowthClass),
-    /// Several classes are within tolerance, in order of growth. Only seed
-    /// noise above half the separation can cause this.
-    Ambiguous(Vec<GrowthClass>),
+    /// The seed noise puts the tolerance at or above half the separation, so
+    /// several classes could fit and C does not choose. Raised before the
+    /// misfits are looked at.
+    TooNoisy,
     /// No class is within tolerance: the growth lies between classes (such as
     /// `n^1.5`) or outside them.
     NoFit,
@@ -694,8 +714,9 @@ pub struct ClassFit {
     /// window: how far apart the closest classes are.
     pub separation: f64,
     /// The largest standard error of a median `ln` step count over the
-    /// window, estimated from the seeds. `None` if some size in the window has
-    /// a single seed, so the noise is unknown and only the floor applies.
+    /// window, estimated from the sizes with at least two seeds. `None` if
+    /// every size in the window has a single seed, so the noise is unknown
+    /// and only the floor applies.
     pub noise: Option<f64>,
     /// The sizes fitted.
     pub window: FitWindow,
@@ -717,7 +738,7 @@ impl ClassFit {
     pub fn class(&self) -> Option<GrowthClass> {
         match self.verdict {
             ClassVerdict::Class(c) => Some(c),
-            ClassVerdict::Ambiguous(_) | ClassVerdict::NoFit => None,
+            ClassVerdict::TooNoisy | ClassVerdict::NoFit => None,
         }
     }
 }
@@ -728,11 +749,12 @@ impl ClassFit {
 pub struct ClassSelect {
     /// The sizes to fit over.
     pub window: Window,
-    /// The tolerance floor as a fraction of the separation. Below ½ the
-    /// classes are exclusive for exact step counts; the default ¼ leaves half
-    /// of that margin for lower-order terms.
+    /// The tolerance floor as a fraction of the separation, in `[0, ½)`. Below
+    /// ½ the classes are exclusive for exact step counts; the default ¼ leaves
+    /// half of that margin for lower-order terms.
     pub misfit_fraction: f64,
-    /// How many standard errors of seed noise the tolerance allows.
+    /// How many standard errors of seed noise the tolerance allows; finite
+    /// and `≥ 0`.
     pub noise_z: f64,
 }
 
@@ -757,8 +779,17 @@ impl ClassSelect {
     ///
     /// See [`GrowthError`]. Besides the medians, every seed's step count in
     /// the window must be positive ([`GrowthError::ZeroSteps`]), since the
-    /// noise is estimated from their logarithms.
+    /// noise is estimated from their logarithms. [`GrowthError::BadParameter`]
+    /// if `misfit_fraction` or `noise_z` is out of range.
     pub fn fit(&self, sweep: &Sweep) -> Result<ClassFit, GrowthError> {
+        if !(0.0..0.5).contains(&self.misfit_fraction) {
+            return Err(GrowthError::BadParameter {
+                name: "misfit_fraction",
+            });
+        }
+        if !(self.noise_z.is_finite() && self.noise_z >= 0.0) {
+            return Err(GrowthError::BadParameter { name: "noise_z" });
+        }
         let (points, window) = window_points(sweep, self.window, Self::MIN_POINTS, 2)?;
         let ln_steps: Vec<f64> = points.iter().map(|&(_, s)| ln_u64(s)).collect();
         let ln_fs: Vec<Vec<f64>> = GrowthClass::ALL
@@ -785,15 +816,14 @@ impl ClassSelect {
         let noise = seed_noise(sweep, window.n_min)?;
         let tolerance =
             (self.misfit_fraction * separation).max(self.noise_z * noise.unwrap_or(0.0));
-        let within: Vec<GrowthClass> = candidates
-            .iter()
-            .filter(|c: &&ClassCandidate| c.misfit <= tolerance)
-            .map(|c| c.class)
-            .collect();
-        let verdict = match within.as_slice() {
-            [] => ClassVerdict::NoFit,
-            [one] => ClassVerdict::Class(*one),
-            _ => ClassVerdict::Ambiguous(within),
+        // Exclusivity: with τ < separation / 2 at most one class is within τ.
+        let verdict = if tolerance >= separation / 2.0 {
+            ClassVerdict::TooNoisy
+        } else {
+            match candidates.iter().find(|c| c.misfit <= tolerance) {
+                Some(c) => ClassVerdict::Class(c.class),
+                None => ClassVerdict::NoFit,
+            }
         };
         let finite = [tolerance, separation, noise.unwrap_or(0.0)]
             .iter()
@@ -836,11 +866,12 @@ fn min_max(v: &[f64]) -> (f64, f64) {
 }
 
 /// The largest standard error of a median `ln` step count over the completed
-/// sizes from `n_min` up: `√(π/2) · s / √k` for `k` seeds whose `ln` steps
-/// have sample standard deviation `s`. `None` if some such size has one seed.
+/// sizes from `n_min` up: `√(π/2) · s / √k` for `k ≥ 2` seeds whose `ln`
+/// steps have sample standard deviation `s`. Sizes with one seed say nothing
+/// about the noise and are skipped; `None` if every size has one seed.
 /// The caller has already checked that those sizes completed.
 fn seed_noise(sweep: &Sweep, n_min: u64) -> Result<Option<f64>, GrowthError> {
-    let mut noise = Some(0.0f64);
+    let mut noise: Option<f64> = None;
     for o in sweep.observations().iter().filter(|o| o.n >= n_min) {
         let SizeOutcome::Completed { steps } = &o.outcome else {
             continue;
@@ -849,7 +880,6 @@ fn seed_noise(sweep: &Sweep, n_min: u64) -> Result<Option<f64>, GrowthError> {
             return Err(GrowthError::ZeroSteps { n: o.n });
         }
         if steps.len() < 2 {
-            noise = None;
             continue;
         }
         let ys: Vec<f64> = steps.iter().map(|&s| ln_u64(s)).collect();
@@ -857,7 +887,7 @@ fn seed_noise(sweep: &Sweep, n_min: u64) -> Result<Option<f64>, GrowthError> {
         let mean = ys.iter().sum::<f64>() / k;
         let var = ys.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / (k - 1.0);
         let se = (std::f64::consts::FRAC_PI_2 * var / k).sqrt();
-        noise = noise.map(|m| m.max(se));
+        noise = Some(noise.map_or(se, |m| m.max(se)));
     }
     Ok(noise)
 }

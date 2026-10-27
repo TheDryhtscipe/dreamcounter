@@ -30,7 +30,8 @@
 //! the gaps between classes, not from the runs.
 //!
 //! Estimator C names the class itself, and must name the right one on the
-//! medians. On each seed alone it may refuse (with one seed the noise is
+//! medians, except that on a short sweep it may refuse as too noisy
+//! (insertion sort up to 512). On each seed alone it may refuse (with one seed the noise is
 //! unknown, so only its tolerance floor applies, and insertion sort's
 //! seeds vary by about 12 % in steps), but it must never name another
 //! class.
@@ -498,7 +499,7 @@ fn check_c_per_seed(sweep: &Sweep, expected: Class) -> Result<usize, String> {
                     expected.c_class()
                 ))
             }
-            ClassVerdict::Ambiguous(_) | ClassVerdict::NoFit => refused += 1,
+            ClassVerdict::TooNoisy | ClassVerdict::NoFit => refused += 1,
         }
     }
     Ok(refused)
@@ -647,7 +648,21 @@ fn check_window(a: &LogLogFit, sizes: &[u64]) {
     );
 }
 
-fn check_polynomial<F: TaskFamily>(family: &F, reference: &str, entry: &str, class: Class) {
+/// Whether estimator C must name the class on the medians, or may instead
+/// refuse because the seeds are too noisy for the sweep.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum COnMedians {
+    Names,
+    NamesOrTooNoisy,
+}
+
+fn check_polynomial<F: TaskFamily>(
+    family: &F,
+    reference: &str,
+    entry: &str,
+    class: Class,
+    c_medians: COnMedians,
+) {
     let r = run(family, reference, entry);
     check_window(&r.a, &family.sizes());
     let c = check_a(r.a.alpha, &family.sizes(), class).unwrap_or_else(|e| panic!("{entry}: {e}"));
@@ -656,7 +671,9 @@ fn check_polynomial<F: TaskFamily>(family: &F, reference: &str, entry: &str, cla
         c.ideal, c.distance, c.gap
     );
     check_b(&r.b, class).unwrap_or_else(|e| panic!("{entry}: {e}"));
-    check_c(&r.c, class).unwrap_or_else(|e| panic!("{entry}: {e}"));
+    if !(c_medians == COnMedians::NamesOrTooNoisy && r.c.verdict == ClassVerdict::TooNoisy) {
+        check_c(&r.c, class).unwrap_or_else(|e| panic!("{entry}: {e}"));
+    }
     check_c_per_seed(&r.sweep, class).unwrap_or_else(|e| panic!("{entry}: {e}"));
     let drift = slope_drift(&r.sweep);
     assert!(drift.abs() < POLY_MAX_DRIFT, "{entry}: drift {drift}");
@@ -667,19 +684,34 @@ fn check_polynomial<F: TaskFamily>(family: &F, reference: &str, entry: &str, cla
 
 #[test]
 fn sum_is_linear() {
-    check_polynomial(&RefSum, "sum_ref", "sum_ref", Class::Linear);
+    check_polynomial(
+        &RefSum,
+        "sum_ref",
+        "sum_ref",
+        Class::Linear,
+        COnMedians::Names,
+    );
 }
 
 #[test]
 fn merge_sort_is_n_log_n() {
-    check_polynomial(&REF_SORT, "msort", "msort", Class::NLogN);
+    check_polynomial(&REF_SORT, "msort", "msort", Class::NLogN, COnMedians::Names);
 }
 
 #[test]
 fn insertion_sort_is_quadratic() {
     // Measured under merge sort's fuel plan, as a candidate for the family
-    // would be: ten times merge sort's steps is still enough up to 512.
-    check_polynomial(&REF_SORT, "msort", "isort", Class::Quadratic);
+    // would be: ten times merge sort's steps is still enough up to 512. On this
+    // short sweep the seeds' spread (about 12 %) puts C's tolerance above half
+    // the separation, so C may refuse; on the default sweep it must name n²
+    // (class_select_holds_on_every_seed_of_the_default_sweep).
+    check_polynomial(
+        &REF_SORT,
+        "msort",
+        "isort",
+        Class::Quadratic,
+        COnMedians::NamesOrTooNoisy,
+    );
 }
 
 /// Estimator C over the default sweep `16, ..., 1024`, on the medians and on
