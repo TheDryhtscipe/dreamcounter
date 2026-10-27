@@ -9,7 +9,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+rustc-hash.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
