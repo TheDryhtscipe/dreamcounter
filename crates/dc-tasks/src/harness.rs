@@ -43,6 +43,7 @@
 //! library abstractions, and the evaluator refuses unexpanded ones.
 
 use std::fmt;
+use std::panic::{self, AssertUnwindSafe};
 
 use dc_core::{types, Arena, Scheme, TermId, TypeError};
 use dc_eval::{apply, ErrorKind, Outcome, Value};
@@ -202,6 +203,19 @@ pub enum FamilyDefect {
         /// The output the oracle gives.
         oracle: Box<Value>,
     },
+    /// The oracle panicked on an example's inputs.
+    OraclePanicked {
+        /// The example's position in [`TaskFamily::examples`].
+        index: usize,
+        /// The panic message, or a placeholder if it was not a string.
+        message: String,
+    },
+    /// The generator gave the same input for two different seeds at every
+    /// size, so the seeds of a sweep would all measure one input.
+    IgnoresSeed {
+        /// The two seeds compared.
+        seeds: (u64, u64),
+    },
     /// Two calls of the generator with the same `(n, seed)` gave different
     /// inputs.
     NotDeterministic {
@@ -224,8 +238,10 @@ pub enum FamilyDefect {
 /// Checks a family's definition before anything is run on it: its sizes are
 /// strictly increasing and positive, the upper half of them holds at least
 /// [`PowerLogGrid::MIN_POINTS`] sizes, it has examples and each agrees with
-/// the oracle, and its generator gives the same input twice for every size
-/// and seed `0..config.seeds`. [`FuelPlan::from_reference`] calls it.
+/// the oracle (an oracle that panics on an example is a defect, not a panic
+/// here), its generator gives the same input twice for every size and seed
+/// `0..config.seeds`, and seeds 0 and 1 give different inputs at some size.
+/// [`FuelPlan::from_reference`] calls it.
 ///
 /// # Errors
 ///
@@ -252,7 +268,20 @@ pub fn validate_family<F: TaskFamily + ?Sized>(
         return Err(FamilyDefect::NoExamples);
     }
     for (index, e) in examples.iter().enumerate() {
-        let oracle = family.oracle(&e.inputs);
+        // `AssertUnwindSafe`: on a panic the family is reported as defective
+        // and nothing it holds is used again here.
+        let oracle = match panic::catch_unwind(AssertUnwindSafe(|| family.oracle(&e.inputs))) {
+            Ok(v) => v,
+            Err(payload) => {
+                // `panic!` payloads are a `&str` or a `String`.
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                return Err(FamilyDefect::OraclePanicked { index, message });
+            }
+        };
         if oracle != e.output {
             return Err(FamilyDefect::ExampleDisagrees {
                 index,
@@ -267,6 +296,13 @@ pub fn validate_family<F: TaskFamily + ?Sized>(
                 return Err(FamilyDefect::NotDeterministic { n, seed });
             }
         }
+    }
+    let seeds = (0, 1);
+    if sizes
+        .iter()
+        .all(|&n| generate_input(family, n, seeds.0) == generate_input(family, n, seeds.1))
+    {
+        return Err(FamilyDefect::IgnoresSeed { seeds });
     }
     Ok(())
 }
@@ -455,6 +491,12 @@ impl FuelPlan {
     /// every output is checked against the oracle: a reference that fails is
     /// a broken family. A reference that runs out of the global cap at a size
     /// is not a failure; that size gets the cap as its fuel.
+    ///
+    /// The family check assumes the default fit: [`Window::UpperHalf`](crate::growth::Window::UpperHalf) and
+    /// estimator B's [`PowerLogGrid::MIN_POINTS`] (3). So a family with three
+    /// or four sizes is refused here even if the caller will fit it with
+    /// estimator A or with [`Window::All`](crate::growth::Window::All), where
+    /// fewer points would do.
     ///
     /// # Errors
     ///

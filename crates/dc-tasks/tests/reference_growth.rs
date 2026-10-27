@@ -12,13 +12,19 @@
 //! # How the checks are set
 //!
 //! Neither estimator names a class (spec §9's class selector, estimator C, is
-//! not built), so the tests classify the fitted slope themselves. Estimator A
-//! is applied to the exact series `n`, `n log n`, `n²` and `2ⁿ` on the
-//! family's own sweep; that gives each class's *ideal* slope there. A program
-//! is put in the class whose ideal slope is nearest its fitted slope. On top
-//! of that, the fitted slope must be within a quarter of the gap from its
-//! class's ideal slope to the nearest other class's, so a program that only
-//! just lands on the right side fails. Estimator B must choose `γ = 1` for
+//! not built), so the tests classify the fitted slope themselves. Each class's
+//! *ideal* slope is the least-squares slope of `ln f(n)` on `ln n` over the
+//! upper half of the family's sweep, worked out in this file without the
+//! estimator: 1 for `n`, 2 for `n²`, and an ordinary least-squares sum for
+//! `n ln n` and `2ⁿ`, whose log-log slopes depend on the window. Estimator A
+//! itself is not used to set its targets, so a distorted A cannot move them.
+//! A program is put in the class whose ideal slope is nearest its fitted
+//! slope. On top of that, the fitted slope must be within a quarter of the
+//! gap from its class's ideal slope to the nearest other class's, so a
+//! program that only just lands on the right side fails. That tolerance has
+//! to absorb finite-size effects in real programs, so it cannot see a small
+//! distortion of A; the meta-test catches that by requiring A to give the
+//! closed-form slope on each exact series to within [`A_EXACT_TOLERANCE`]. Estimator B must choose `γ = 1` for
 //! `n log n` and `γ = 0` for `n` and `n²`, with `α` within
 //! [`B_ALPHA_TOLERANCE`] of the class's exponent. The tolerances follow from
 //! the gaps between classes, not from the runs.
@@ -296,14 +302,47 @@ impl Class {
         }
     }
 
-    /// Estimator A's slope for the exact series of the class on `sizes`.
+    /// The least-squares slope of `ln f(n)` on `ln n` for the class's `f`,
+    /// over the window estimator A fits by default (the upper half of
+    /// `sizes`). Closed form for `n` and `n²`; for `n ln n` and `2ⁿ` the
+    /// slope depends on the window, so it is the ordinary least-squares slope
+    /// of the exact `ln f(n)` computed here. Nothing here calls an estimator.
     fn ideal_slope(self, sizes: &[u64]) -> f64 {
-        let sweep = Sweep::from_fn(sizes, |n| self.steps(n)).expect("valid sizes");
-        LogLogSlope::default()
-            .fit(&sweep)
-            .expect("an exact series fits")
-            .alpha
+        let window = upper_half(sizes);
+        let xs: Vec<f64> = window.iter().map(|&n| (n as f64).ln()).collect();
+        match self {
+            Class::Linear => 1.0,
+            Class::Quadratic => 2.0,
+            Class::NLogN => {
+                let ys: Vec<f64> = xs.iter().map(|&x| x + x.ln()).collect();
+                ols_slope(&xs, &ys)
+            }
+            Class::Exponential => {
+                let ys: Vec<f64> = window
+                    .iter()
+                    .map(|&n| n as f64 * std::f64::consts::LN_2)
+                    .collect();
+                ols_slope(&xs, &ys)
+            }
+        }
     }
+}
+
+/// The last `⌈k/2⌉` of the `k` sizes: the window of spec §9 that estimator A
+/// fits by default, restated here so that the targets do not depend on
+/// `growth.rs`.
+fn upper_half(sizes: &[u64]) -> &[u64] {
+    &sizes[sizes.len() / 2..]
+}
+
+/// The ordinary least-squares slope of `ys` on `xs`.
+fn ols_slope(xs: &[f64], ys: &[f64]) -> f64 {
+    let k = xs.len() as f64;
+    let mx = xs.iter().sum::<f64>() / k;
+    let my = ys.iter().sum::<f64>() / k;
+    let sxy: f64 = xs.iter().zip(ys).map(|(x, y)| (x - mx) * (y - my)).sum();
+    let sxx: f64 = xs.iter().map(|x| (x - mx) * (x - mx)).sum();
+    sxy / sxx
 }
 
 /// How estimator A's slope classifies on a sweep.
@@ -342,6 +381,12 @@ fn classify(alpha: f64, sizes: &[u64]) -> Classified {
 /// of the gap to the nearest other class. A quarter leaves half of the
 /// classifying margin unused.
 const A_GAP_FRACTION: f64 = 0.25;
+
+/// How far estimator A's slope on an exact class series may be from the
+/// closed-form slope. The series are rounded to integers at a scale of at
+/// least 1000, so the rounding moves `ln steps` by under `10⁻³`; the
+/// tolerance only has to absorb that and floating-point error.
+const A_EXACT_TOLERANCE: f64 = 1e-3;
 
 /// How far estimator B's `α` may be from the class's exponent. The `n log n`
 /// and `n` ideals differ by 1 in `γ`, not in `α`, and `n` and `n²` by 1 in
@@ -532,8 +577,20 @@ fn run<F: TaskFamily>(family: &F, reference: &str, entry: &str) -> Run {
     Run { sweep, a, b }
 }
 
+/// The ideal slopes are taken over [`upper_half`]; estimator A must have
+/// fitted that same window for the comparison to mean anything.
+fn check_window(a: &LogLogFit, sizes: &[u64]) {
+    let w = upper_half(sizes);
+    assert_eq!(
+        (a.window.n_min, a.window.n_max),
+        (w[0], w[w.len() - 1]),
+        "estimator A fitted a different window"
+    );
+}
+
 fn check_polynomial<F: TaskFamily>(family: &F, reference: &str, entry: &str, class: Class) {
     let r = run(family, reference, entry);
+    check_window(&r.a, &family.sizes());
     let c = check_a(r.a.alpha, &family.sizes(), class).unwrap_or_else(|e| panic!("{entry}: {e}"));
     println!(
         "RESULT {entry}: A ideal {:.4} distance {:.4} gap {:.4}",
@@ -597,6 +654,7 @@ fn subset_enumeration_is_exponential() {
     let family = ZeroSubsets;
     let r = run(&family, "zero_subsets", "zero_subsets");
     let sizes = family.sizes();
+    check_window(&r.a, &sizes);
     let c = check_a(r.a.alpha, &sizes, Class::Exponential).unwrap_or_else(|e| panic!("{e}"));
     println!(
         "RESULT zero_subsets: A ideal {:.4} distance {:.4} gap {:.4}",
@@ -633,15 +691,28 @@ impl GrowthEstimator for AlwaysLinear {
 }
 
 /// The checks above must fail for an estimator that cannot tell classes
-/// apart, and for each class pass only for that class.
+/// apart, and for each class pass only for that class. Each class's exact
+/// series is fitted on a sweep it fits in a `u64`: the sort sizes for the
+/// polynomial classes, the subset sizes for `2ⁿ`.
 #[test]
 fn the_checks_reject_a_wrong_estimator_and_a_wrong_class() {
-    let sizes = REF_SORT.sizes();
     for &class in &CLASSES {
+        let sizes = match class {
+            Class::Exponential => ZeroSubsets.sizes(),
+            _ => REF_SORT.sizes(),
+        };
         let sweep = Sweep::from_fn(&sizes, |n| class.steps(n)).expect("valid sizes");
         let real = LogLogSlope::default().estimate(&sweep).expect("a fit");
         let stub = AlwaysLinear.estimate(&sweep).expect("a fit");
         assert!(check_a(real.alpha(), &sizes, class).is_ok(), "{class:?}");
+        // On an exact series, A must give the closed-form slope itself, not
+        // merely land in the right class: this is what catches a distorted A.
+        let ideal = class.ideal_slope(&sizes);
+        assert!(
+            (real.alpha() - ideal).abs() < A_EXACT_TOLERANCE,
+            "{class:?}: A gives {} on the exact series, closed form {ideal}",
+            real.alpha()
+        );
         for &other in CLASSES.iter().filter(|&&o| o != class) {
             assert!(
                 check_a(real.alpha(), &sizes, other).is_err(),
@@ -659,6 +730,7 @@ fn the_checks_reject_a_wrong_estimator_and_a_wrong_class() {
         }
     }
     // B's γ check: an exact n log n series is not taken for n or n².
+    let sizes = REF_SORT.sizes();
     let sweep = Sweep::from_fn(&sizes, |n| Class::NLogN.steps(n)).expect("valid sizes");
     let b = PowerLogGrid::default().fit(&sweep).expect("a fit");
     assert!(check_b(&b, Class::Linear).is_err());

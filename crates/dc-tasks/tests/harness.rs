@@ -682,6 +682,10 @@ struct BrokenSum {
     /// Generate from a counter shared between calls instead of the rng.
     impure: bool,
     counter: std::cell::Cell<i64>,
+    /// Generate from seed 0 whatever the seed asked for.
+    seedless: bool,
+    /// Make the oracle panic on a list of length 3.
+    panicky_oracle: bool,
 }
 
 impl TaskFamily for BrokenSum {
@@ -703,10 +707,16 @@ impl TaskFamily for BrokenSum {
             self.counter.set(k);
             return vec![Value::int_list(&vec![k; n as usize])];
         }
+        if self.seedless {
+            return ListSum.generate(n, &mut TaskRng::new(n, 0));
+        }
         let m = if self.short { n.saturating_sub(1) } else { n };
         ListSum.generate(m, rng)
     }
     fn oracle(&self, inputs: &[Value]) -> Value {
+        if self.panicky_oracle && ints_of(&inputs[0]).len() == 3 {
+            panic!("oracle cannot sum three");
+        }
         ListSum.oracle(inputs)
     }
     fn sizes(&self) -> Vec<u64> {
@@ -789,6 +799,34 @@ fn validation_rejects_a_generator_that_does_not_repeat() {
     assert_eq!(
         validate_family(&f, &config()),
         Err(FamilyDefect::NotDeterministic { n: 16, seed: 0 })
+    );
+}
+
+#[test]
+fn validation_reports_an_oracle_that_panics_on_an_example() {
+    let f = BrokenSum {
+        panicky_oracle: true,
+        ..BrokenSum::default()
+    };
+    // ListSum's example 1 is [1, 2, 3].
+    assert_eq!(
+        validate_family(&f, &config()),
+        Err(FamilyDefect::OraclePanicked {
+            index: 1,
+            message: "oracle cannot sum three".to_string(),
+        })
+    );
+}
+
+#[test]
+fn validation_rejects_a_generator_that_ignores_its_seed() {
+    let f = BrokenSum {
+        seedless: true,
+        ..BrokenSum::default()
+    };
+    assert_eq!(
+        validate_family(&f, &config()),
+        Err(FamilyDefect::IgnoresSeed { seeds: (0, 1) })
     );
 }
 
