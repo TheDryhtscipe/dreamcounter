@@ -1,8 +1,11 @@
 //! The CEK machine (spec §4, decision D6).
 //!
-//! The control is either a term to evaluate in an environment or a value to return
-//! to the topmost continuation frame. Continuations live in an explicit `Vec`, so a
-//! dc program can recurse as deep as memory allows without touching the Rust stack.
+//! The control is a term to evaluate in an environment, a value to return to the
+//! topmost continuation frame, or a function value to apply to an argument.
+//! Continuations live in an explicit `Vec`, and [`Machine::apply`] never calls
+//! itself: a primitive or a recursive `self` that applies a function hands the
+//! application back to the loop as a control. So a dc program can recurse as deep
+//! as memory allows without touching the Rust stack.
 //! Every step is charged through [`crate::cost`], in one place ([`Machine::charge`]),
 //! which is also where the global fuel is checked.
 
@@ -13,7 +16,9 @@ use std::rc::Rc;
 use dc_core::{Arena, LibId, Prim, Term, TermId};
 
 use crate::cost;
-use crate::value::{structural_eq, Env, EqResult, Fun, List, MemoKey, MemoTable, Tree, Value};
+use crate::value::{
+    structural_eq, Env, EqResult, Fun, KeyBuild, List, MemoKey, MemoTable, Tree, Value,
+};
 
 /// The result of one evaluation (spec §4). The `u64` is the number of steps taken.
 #[derive(Clone, Debug)]
@@ -117,6 +122,16 @@ pub fn apply(arena: &Arena, program: TermId, inputs: &[Value], fuel: u64) -> Out
 enum Control {
     Eval(TermId, Env),
     Return(Value),
+    /// Apply the function value to the argument. Primitives, combinators and the
+    /// `self` of `bfix` and `memorec` return this instead of applying directly,
+    /// so a chain of such applications runs in the machine loop, not on the
+    /// Rust stack.
+    Apply(Value, Value),
+}
+
+/// Applies `f` to `x` from the machine loop.
+fn call(f: &Value, x: Value) -> Step {
+    Ok(Control::Apply(f.clone(), x))
 }
 
 enum Halt {
@@ -225,6 +240,7 @@ impl<'a> Machine<'a> {
                     None => return Outcome::Value(v, self.steps),
                     Some(frame) => self.resume(frame, v),
                 },
+                Control::Apply(f, x) => self.apply(&f, x),
             };
             control = match next {
                 Ok(c) => c,
@@ -243,6 +259,11 @@ impl<'a> Machine<'a> {
         } else {
             Ok(())
         }
+    }
+
+    /// The steps that can still be charged without a timeout.
+    fn fuel_left(&self) -> u64 {
+        self.fuel.saturating_sub(self.steps)
     }
 
     fn eval_term(&mut self, t: TermId, env: Env) -> Step {
@@ -356,7 +377,7 @@ impl<'a> Machine<'a> {
                         out.push(p.0.clone());
                         let next = p.1.clone();
                         self.stack.push(Frame::Unfold { g: g.clone(), out });
-                        self.apply(&g, next)
+                        call(&g, next)
                     }
                     _ => Err(bad(Prim::Unfold)),
                 },
@@ -444,11 +465,14 @@ impl<'a> Machine<'a> {
             (Prim::Le, [V::Int(a), V::Int(b)]) => self.constant(V::Bool(a <= b)),
             (Prim::Not, [V::Bool(b)]) => self.constant(V::Bool(!b)),
             (Prim::Eq, [a, b]) => {
-                let (result, nodes) = structural_eq(a, b);
+                // Comparing more pairs than the fuel left can only time out, so the
+                // comparison stops one pair above it.
+                let (result, nodes) = structural_eq(a, b, self.fuel_left());
                 self.charge(cost::eq(nodes))?;
                 match result {
                     EqResult::Data(same) => ret(V::Bool(same)),
                     EqResult::Function => Err(error(ErrorKind::EqOnFunction)),
+                    EqResult::OverLimit => Err(Halt::Timeout),
                 }
             }
             (Prim::Pair, [a, b]) => self.constant(V::pair(a.clone(), b.clone())),
@@ -465,28 +489,28 @@ impl<'a> Machine<'a> {
             (Prim::OptionCase, [V::Option(o), on_none, on_some]) => {
                 self.charge(cost::PRIM)?;
                 match o {
-                    None => self.apply(on_none, V::Unit),
-                    Some(x) => self.apply(on_some, (**x).clone()),
+                    None => call(on_none, V::Unit),
+                    Some(x) => call(on_some, (**x).clone()),
                 }
             }
             (Prim::ListCase, [V::List(xs), on_nil, on_cons]) => {
                 self.charge(cost::PRIM)?;
                 match &xs.0 {
-                    None => self.apply(on_nil, V::Unit),
+                    None => call(on_nil, V::Unit),
                     Some(cell) => {
                         self.stack.push(Frame::ApplyTo(V::List(cell.tail.clone())));
-                        self.apply(on_cons, cell.head.clone())
+                        call(on_cons, cell.head.clone())
                     }
                 }
             }
             (Prim::TreeCase, [V::Tree(t), on_leaf, on_node]) => {
                 self.charge(cost::PRIM)?;
                 match &t.0 {
-                    None => self.apply(on_leaf, V::Unit),
+                    None => call(on_leaf, V::Unit),
                     Some(node) => {
                         self.stack.push(Frame::ApplyTo(V::Tree(node.right.clone())));
                         self.stack.push(Frame::ApplyTo(node.value.clone()));
-                        self.apply(on_node, V::Tree(node.left.clone()))
+                        call(on_node, V::Tree(node.left.clone()))
                     }
                 }
             }
@@ -530,7 +554,7 @@ impl<'a> Machine<'a> {
                     g: g.clone(),
                     out: Vec::new(),
                 });
-                self.apply(g, s.clone())
+                call(g, s.clone())
             }
             (Prim::Bfix, [V::Int(n), f, x]) => self.bfix_call(*n, f, x.clone()),
             (Prim::Memorec, [V::Int(n), f, x]) => {
@@ -571,7 +595,7 @@ impl<'a> Machine<'a> {
                     rest: cell.tail.clone(),
                 });
                 self.stack.push(Frame::ApplyTo(cell.head.clone()));
-                self.apply(&f, acc)
+                call(&f, acc)
             }
         }
     }
@@ -586,7 +610,7 @@ impl<'a> Machine<'a> {
                     elems,
                 });
                 self.stack.push(Frame::ApplyTo(acc));
-                self.apply(&f, x)
+                call(&f, x)
             }
         }
     }
@@ -602,7 +626,7 @@ impl<'a> Machine<'a> {
             n,
         });
         self.stack.push(Frame::ApplyTo(acc));
-        self.apply(&f, Value::Int(i))
+        call(&f, Value::Int(i))
     }
 
     fn tabulate_next(&mut self, f: Value, i: i64, n: i64, out: imbl::Vector<Value>) -> Step {
@@ -616,7 +640,7 @@ impl<'a> Machine<'a> {
             n,
             out,
         });
-        self.apply(&f, Value::Int(i))
+        call(&f, Value::Int(i))
     }
 
     /// Folds a tree in post-order: left subtree, right subtree, then
@@ -652,7 +676,7 @@ impl<'a> Machine<'a> {
                     });
                     self.stack.push(Frame::ApplyTo(right));
                     self.stack.push(Frame::ApplyTo(x));
-                    return self.apply(&g, left);
+                    return call(&g, left);
                 }
             }
         }
@@ -673,13 +697,31 @@ impl<'a> Machine<'a> {
             f: f.clone(),
         }));
         self.stack.push(Frame::ApplyTo(x));
-        self.apply(f, this)
+        call(f, this)
     }
 
     /// One memo call on `x`: a hit returns the stored result, a miss evaluates
     /// `f self x` and stores the result.
     fn memo_call(&mut self, table: &Rc<RefCell<MemoTable>>, f: &Value, x: Value) -> Step {
-        let key = MemoKey::from_value(&x).ok_or(error(ErrorKind::InvalidMemoKey))?;
+        // A key of k nodes is charged 1 + k, so a key with more nodes than the fuel
+        // left is never built: the call can only time out, unless it is a miss with
+        // no misses left, which raises FuelExhausted without charging.
+        let key = match MemoKey::build_within(&x, self.fuel_left()) {
+            KeyBuild::Key(key) => key,
+            KeyBuild::Invalid => return Err(error(ErrorKind::InvalidMemoKey)),
+            KeyBuild::OverLimit => {
+                let size = MemoKey::size_of(&x).ok_or(error(ErrorKind::InvalidMemoKey))?;
+                let t = table.borrow();
+                let hit = || t.entries.keys().any(|k| k.size() == size && k.matches(&x));
+                if t.misses_left <= 0 && !hit() {
+                    return Err(error(ErrorKind::FuelExhausted));
+                }
+                drop(t);
+                self.charge(cost::memo_call(size))?;
+                // Not reached: the charge is above the fuel left.
+                MemoKey::from_value(&x).ok_or(error(ErrorKind::InvalidMemoKey))?
+            }
+        };
         let size = key.size();
         let hit = table.borrow().entries.get(&key).cloned();
         if let Some(v) = hit {
@@ -703,7 +745,7 @@ impl<'a> Machine<'a> {
             table: Rc::downgrade(table),
             f: f.clone(),
         }));
-        self.apply(f, this)
+        call(f, this)
     }
 }
 

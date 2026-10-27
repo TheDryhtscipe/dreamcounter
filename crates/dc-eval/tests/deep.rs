@@ -5,7 +5,7 @@
 mod common;
 
 use common::*;
-use dc_eval::{List, Outcome, Tree, Value};
+use dc_eval::{ErrorKind, List, Outcome, Tree, Value};
 
 const N: i64 = 100_000;
 
@@ -154,5 +154,52 @@ fn formatting_deep_values() {
         assert!(t
             .to_string()
             .contains("Node (Node (Leaf, 0, Leaf), 1, Leaf)"));
+    });
+}
+
+#[test]
+fn self_calls_through_saturated_primitives_use_no_host_stack() {
+    // Ill-typed functionals whose saturation applies `self` directly: each `self`
+    // call goes through a case primitive or a combinator, never through a closure.
+    on_small_stack(|| {
+        // some 1, then per level: bfix call 1 + option_case 1.
+        assert_error(
+            "(bfix 100000 (option_case (some 0) (lam 0)) 0)",
+            ErrorKind::FuelExhausted,
+            200_001,
+        );
+        // some 1, then per level: miss 2 + option_case 1.
+        assert_error(
+            "(memorec 100000 (option_case (some 0) (lam 0)) 0)",
+            ErrorKind::FuelExhausted,
+            300_001,
+        );
+        // Per level: bfix call 1 + loop iteration 1.
+        assert_error(
+            "(bfix 100000 (loop 1 0) 0)",
+            ErrorKind::FuelExhausted,
+            200_000,
+        );
+        // nil 1 + cons 1, then per level: bfix call 1 + list_case 1.
+        assert_error(
+            "(bfix 100000 (list_case (cons 0 nil) (lam 0)) 0)",
+            ErrorKind::FuelExhausted,
+            200_002,
+        );
+        // Per level: bfix call 1 + tabulate element 1.
+        assert_error(
+            "(bfix 100000 (array_tabulate 1) 0)",
+            ErrorKind::FuelExhausted,
+            200_000,
+        );
+        // Only the global fuel bounds this one.
+        assert!(matches!(
+            run_fuel(
+                "(bfix 1000000000 (option_case (some 0) (lam 0)) 0)",
+                &[],
+                100_000
+            ),
+            Outcome::Timeout(100_001)
+        ));
     });
 }

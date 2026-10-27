@@ -116,6 +116,48 @@ fn timeout_is_the_first_count_above_the_fuel() {
     ));
 }
 
+/// Runs `src` with `fuel` on another thread and fails if it takes more than
+/// `secs` seconds, so host work that the fuel does not bound shows up as a failure.
+fn run_fuel_within(src: &'static str, fuel: u64, secs: u64) -> String {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_fuel(src, &[], fuel).to_string());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs))
+        .unwrap_or_else(|_| panic!("{src} with fuel {fuel} ran longer than {secs} s"))
+}
+
+#[test]
+fn eq_on_a_shared_structure_stops_at_the_fuel() {
+    // A tree with 2^64 - 1 nodes, built in 257 steps by sharing each subtree:
+    // leaf 1 + 64 × (1 + β 2 + node 1). eq counts every node of both sides, so it
+    // goes over the fuel; the comparison stops at the first node above it.
+    let p = "(let (loop 64 leaf (lam (lam (node $0 0 $0)))) (eq $0 $0))";
+    assert_eq!(run_fuel_within(p, 10_000, 20), "Timeout(10001)");
+    // The same with pairs: 64 × (1 + β 2 + pair 1).
+    let q = "(let (loop 64 0 (lam (lam (pair $0 $0)))) (eq $0 $0))";
+    assert_eq!(run_fuel_within(q, 10_000, 20), "Timeout(10001)");
+}
+
+#[test]
+fn memo_key_on_a_shared_structure_is_sized_before_it_is_built() {
+    // A key of 2^41 - 1 nodes built in 40 × (1 + β 2 + pair 1) = 160 steps. The
+    // call is charged 1 + key size, so the timeout count is 160 + 2^41.
+    let p = "(memorec 1 (lam (lam 0)) (loop 40 0 (lam (lam (pair $0 $0)))))";
+    assert_eq!(
+        run_fuel_within(p, 10_000, 20),
+        format!("Timeout({})", 160 + (1u64 << 41))
+    );
+    // An invalid key is found without charging, whatever its size: here the
+    // function comes after the 2^41 - 1 valid nodes. pair 1 more.
+    let q = "(memorec 1 (lam (lam 0)) (pair (loop 40 0 (lam (lam (pair $0 $0)))) (lam 0)))";
+    assert_eq!(run_fuel_within(q, 10_000, 20), "Error(InvalidMemoKey, 161)");
+    // A miss with no misses left is not charged, so it raises FuelExhausted
+    // however large the key.
+    let r = "(memorec 0 (lam (lam 0)) (loop 40 0 (lam (lam (pair $0 $0)))))";
+    assert_eq!(run_fuel_within(r, 10_000, 20), "Error(FuelExhausted, 160)");
+}
+
 #[test]
 fn unfold_without_end_times_out() {
     // Each iteration: β 1 + pair 1 + some 1 + produced element 1 = 4.

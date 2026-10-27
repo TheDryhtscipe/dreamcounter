@@ -112,12 +112,36 @@ pub enum KeyAtom {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MemoKey(Vec<KeyAtom>);
 
+/// The result of [`MemoKey::build_within`].
+pub(crate) enum KeyBuild {
+    /// The key, of at most the limit's size.
+    Key(MemoKey),
+    /// The value is not a valid key.
+    Invalid,
+    /// The key has more nodes than the limit; nothing was kept.
+    OverLimit,
+}
+
 impl MemoKey {
     /// Converts a value to a key. Returns `None` for a value that is not a valid key.
     pub fn from_value(v: &Value) -> Option<MemoKey> {
+        match MemoKey::build_within(v, u64::MAX) {
+            KeyBuild::Key(k) => Some(k),
+            KeyBuild::Invalid | KeyBuild::OverLimit => None,
+        }
+    }
+
+    /// Converts a value to a key of at most `limit` nodes. Stops as soon as the
+    /// key is invalid or has more than `limit` nodes, so the work done is bounded
+    /// by `limit` even for a key whose pairs share components (2^n nodes from n
+    /// distinct pairs).
+    pub(crate) fn build_within(v: &Value, limit: u64) -> KeyBuild {
         let mut atoms = Vec::new();
         let mut work = vec![v];
         while let Some(v) = work.pop() {
+            if atoms.len() as u64 >= limit {
+                return KeyBuild::OverLimit;
+            }
             match v {
                 Value::Int(n) => atoms.push(KeyAtom::Int(*n)),
                 Value::Bool(b) => atoms.push(KeyAtom::Bool(*b)),
@@ -127,10 +151,67 @@ impl MemoKey {
                     work.push(&p.1);
                     work.push(&p.0);
                 }
+                _ => return KeyBuild::Invalid,
+            }
+        }
+        KeyBuild::Key(MemoKey(atoms))
+    }
+
+    /// The key size of `v` in value nodes (saturating), or `None` if `v` is not a
+    /// valid key. Each distinct pair is measured once, so the work is linear in the
+    /// number of distinct pairs, not in the size, which sharing can make
+    /// exponentially larger.
+    pub(crate) fn size_of(v: &Value) -> Option<u64> {
+        let mut sizes: FxHashMap<*const (Value, Value), u64> = FxHashMap::default();
+        // `(value, children measured)`; `results` holds the measured sizes.
+        let mut work: Vec<(&Value, bool)> = vec![(v, false)];
+        let mut results: Vec<u64> = Vec::new();
+        while let Some((v, measured)) = work.pop() {
+            match v {
+                Value::Int(_) | Value::Bool(_) | Value::Unit => results.push(1),
+                Value::Pair(p) => {
+                    let ptr = Rc::as_ptr(p);
+                    if measured {
+                        let b = results.pop()?;
+                        let a = results.pop()?;
+                        let s = a.saturating_add(b).saturating_add(1);
+                        sizes.insert(ptr, s);
+                        results.push(s);
+                    } else if let Some(&s) = sizes.get(&ptr) {
+                        results.push(s);
+                    } else {
+                        work.push((v, true));
+                        work.push((&p.1, false));
+                        work.push((&p.0, false));
+                    }
+                }
                 _ => return None,
             }
         }
-        Some(MemoKey(atoms))
+        results.pop()
+    }
+
+    /// Whether `v` converts to this key. The work is bounded by this key's size.
+    pub(crate) fn matches(&self, v: &Value) -> bool {
+        let mut atoms = self.0.iter();
+        let mut work = vec![v];
+        while let Some(v) = work.pop() {
+            let same = match (atoms.next(), v) {
+                (Some(KeyAtom::Int(m)), Value::Int(n)) => m == n,
+                (Some(KeyAtom::Bool(m)), Value::Bool(n)) => m == n,
+                (Some(KeyAtom::Unit), Value::Unit) => true,
+                (Some(KeyAtom::Pair), Value::Pair(p)) => {
+                    work.push(&p.1);
+                    work.push(&p.0);
+                    true
+                }
+                _ => false,
+            };
+            if !same {
+                return false;
+            }
+        }
+        atoms.next().is_none()
     }
 
     /// The key size in value nodes, as the cost model counts it.
@@ -355,13 +436,13 @@ fn detach_children(v: &mut Value, out: &mut Vec<Value>) {
         Value::Array(a) => defer_array_drop(mem::take(a)),
         Value::Pair(rc) => {
             if let Some(p) = Rc::get_mut(rc) {
-                out.push(mem::replace(&mut p.0, Value::Unit));
-                out.push(mem::replace(&mut p.1, Value::Unit));
+                take_child(&mut p.0, out);
+                take_child(&mut p.1, out);
             }
         }
         Value::Option(Some(rc)) => {
             if let Some(x) = Rc::get_mut(rc) {
-                out.push(mem::replace(x, Value::Unit));
+                take_child(x, out);
             }
         }
         Value::List(l) => {
@@ -396,6 +477,17 @@ fn detach_children(v: &mut Value, out: &mut Vec<Value>) {
                 }
             }
         }
+    }
+}
+
+/// Moves `child` onto `out` unless it is a scalar, which drops without work. So a
+/// pair or option emptied by an earlier detach adds nothing to the work list.
+fn take_child(child: &mut Value, out: &mut Vec<Value>) {
+    if !matches!(
+        child,
+        Value::Int(_) | Value::Bool(_) | Value::Unit | Value::Option(None)
+    ) {
+        out.push(mem::replace(child, Value::Unit));
     }
 }
 
@@ -437,9 +529,23 @@ fn defer_array_drop(a: imbl::Vector<Value>) {
 /// already doing so. Dropping an array drops its elements, which may queue more
 /// arrays; the loop picks those up instead of recursing.
 fn drain_array_drops() {
+    drain_queue(drop);
+}
+
+/// Empties `ARRAY_DROPS`, passing each array to `drop_one`.
+fn drain_queue(mut drop_one: impl FnMut(imbl::Vector<Value>)) {
+    /// Clears `DRAINING` when the drain ends, also if a drop unwinds, so a later
+    /// drop on this thread empties the queue again.
+    struct Draining;
+    impl Drop for Draining {
+        fn drop(&mut self) {
+            let _ = DRAINING.try_with(|d| d.set(false));
+        }
+    }
     let Ok(false) = DRAINING.try_with(|d| d.replace(true)) else {
         return;
     };
+    let _draining = Draining;
     loop {
         // The borrow ends before the array drops, so nested drops can queue more.
         let next = ARRAY_DROPS
@@ -447,15 +553,21 @@ fn drain_array_drops() {
             .ok()
             .flatten();
         match next {
-            Some(a) => drop(a),
+            Some(a) => drop_one(a),
             None => break,
         }
     }
-    let _ = DRAINING.try_with(|d| d.set(false));
 }
 
 impl Drop for Value {
     fn drop(&mut self) {
+        // A value with no children owns nothing to detach and queues no array.
+        if matches!(
+            self,
+            Value::Int(_) | Value::Bool(_) | Value::Unit | Value::Option(None)
+        ) {
+            return;
+        }
         let mut work = Vec::new();
         detach_children(self, &mut work);
         while let Some(mut v) = work.pop() {
@@ -527,17 +639,21 @@ pub(crate) enum EqResult {
     Data(bool),
     /// A function value was reached.
     Function,
+    /// More than the limit of node pairs were compared; the count is the limit + 1.
+    OverLimit,
 }
 
 /// Structural equality of data values, as `eq` computes it, with the number of
 /// value-node pairs compared. The comparison runs left to right in pre-order and
 /// stops at the first difference or at the first function value; the pair that
-/// stopped it is counted.
+/// stopped it is counted. It also stops once it has compared more than `limit`
+/// pairs, so the work is bounded by `limit` even when sharing makes the values
+/// exponentially larger than the memory they use.
 ///
 /// Nodes: every scalar, pair, option, array, list cell (including the final `nil`)
 /// and tree node (including each `leaf`) is one node. A list or tree value is not a
 /// node of its own apart from its cells.
-pub(crate) fn structural_eq(a: &Value, b: &Value) -> (EqResult, u64) {
+pub(crate) fn structural_eq(a: &Value, b: &Value, limit: u64) -> (EqResult, u64) {
     enum Work<'a> {
         Value(&'a Value, &'a Value),
         List(&'a List, &'a List),
@@ -611,6 +727,9 @@ pub(crate) fn structural_eq(a: &Value, b: &Value) -> (EqResult, u64) {
                 }
             }
         };
+        if nodes > limit {
+            return (EqResult::OverLimit, nodes);
+        }
         if !same {
             return (EqResult::Data(false), nodes);
         }
@@ -740,6 +859,32 @@ impl fmt::Display for Value {
 /// to themselves.
 impl PartialEq for Value {
     fn eq(&self, other: &Value) -> bool {
-        matches!(structural_eq(self, other).0, EqResult::Data(true))
+        matches!(structural_eq(self, other, u64::MAX).0, EqResult::Data(true))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn queued() -> usize {
+        ARRAY_DROPS.with(|q| q.borrow().len())
+    }
+
+    #[test]
+    fn a_panic_while_draining_does_not_stop_later_drains() {
+        std::thread::spawn(|| {
+            defer_array_drop(imbl::vector![Value::Int(1)]);
+            defer_array_drop(imbl::vector![Value::Int(2)]);
+            let r = std::panic::catch_unwind(|| drain_queue(|_| panic!("drop failed")));
+            assert!(r.is_err());
+            assert!(!DRAINING.with(Cell::get), "the flag is cleared on unwind");
+            assert_eq!(queued(), 1);
+            // The next outermost drop empties what the failed one left.
+            drop(Value::some(Value::Int(0)));
+            assert_eq!(queued(), 0);
+        })
+        .join()
+        .expect("test thread");
     }
 }

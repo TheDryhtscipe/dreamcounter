@@ -64,10 +64,22 @@
 //! - **Timeout steps.** The machine stops with `Timeout(s)` at the first charge that
 //!   takes the count `s` above the fuel. So `s > fuel`, and `s = fuel + 1` when that
 //!   charge is a single step. A program that finishes in `s` steps finishes at every
-//!   fuel `≥ s` with the same outcome (spec §7, invariant 3).
+//!   fuel `≥ s` with the same outcome (spec §7, invariant 3). An `eq` that would
+//!   compare more node pairs than the fuel left stops counting one pair above it,
+//!   so it times out with `s = fuel + 1`: sharing can make a value exponentially
+//!   larger than the steps that built it, and the full count is not computed. A
+//!   `memorec` key larger than the fuel left is sized without being built, so its
+//!   timeout count is exact.
 //! - **Applying a program to inputs.** [`crate::apply`] evaluates the program term
 //!   (free for a `lam`) and applies it to each input in turn. Each application of a
 //!   closure is one β step; a primitive program is charged as a primitive.
+//! - **`tree_fold` charges internal nodes only.** The spec says "1 per node". A
+//!   `leaf` makes no call of `f`, so it is charged 0, and `tree_fold z f leaf` costs
+//!   only the `leaf` literal. `eq` does count each `leaf` as a node. To be confirmed
+//!   with the spec owner.
+//! - **`mod i64::MIN -1` overflows.** Its mathematical result, 0, is representable,
+//!   but the checked remainder fails, so it raises `Overflow` like `div i64::MIN -1`.
+//!   To be confirmed with the spec owner.
 
 /// One β-reduction: applying a closure to one argument.
 pub const BETA: u64 = 1;
@@ -103,7 +115,7 @@ pub fn array_convert(n: u64) -> u64 {
 
 /// A `memorec` call with a key of `key_size` value nodes, hit or miss.
 pub fn memo_call(key_size: u64) -> u64 {
-    1 + key_size
+    key_size.saturating_add(1)
 }
 
 #[cfg(test)]
