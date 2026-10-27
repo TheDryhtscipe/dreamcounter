@@ -4,11 +4,15 @@
 //! arrays are persistent vectors whose updates take O(log n). Lists cache their
 //! length in every cons cell, so `length` is O(1) (spec §5).
 //!
-//! Long lists and deep trees are freed iteratively (see the `Drop` impls), so
-//! dropping a list of a million elements cannot overflow the Rust stack.
+//! Nothing here recurses on the host stack over the value structure. Dropping a
+//! value frees its uniquely owned parts with an explicit work list (see the `Drop`
+//! impls), so dropping a list of a million elements, a deeply nested option or a
+//! long chain of closures cannot overflow the Rust stack. Structural equality is
+//! iterative too. Only `Display`/`Debug`, which exist for test output, recurse.
 
 use std::cell::RefCell;
 use std::fmt;
+use std::mem;
 use std::rc::Rc;
 
 use dc_core::{Prim, TermId};
@@ -54,7 +58,8 @@ pub enum Fun {
         /// The arguments received so far, in order.
         args: Vec<Value>,
     },
-    /// The recursive argument `self` passed by `bfix`: `bfix fuel f`.
+    /// The recursive argument `self` passed by `bfix`. Calling it with `x` is
+    /// `bfix fuel f x`.
     BfixSelf {
         /// Remaining depth fuel for the next call.
         fuel: i64,
@@ -79,34 +84,51 @@ pub struct MemoTable {
     pub misses_left: i64,
 }
 
-/// A memo-table key: `Int`, `Bool`, `Unit` or pairs of those (spec §6).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum MemoKey {
-    /// An integer key.
+/// One atom of a [`MemoKey`]'s pre-order encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyAtom {
+    /// An integer.
     Int(i64),
-    /// A boolean key.
+    /// A boolean.
     Bool(bool),
-    /// The unit key.
+    /// The unit value.
     Unit,
-    /// A pair key.
-    Pair(Box<MemoKey>, Box<MemoKey>),
+    /// A pair; its two components follow in pre-order.
+    Pair,
 }
 
+/// A memo-table key: `Int`, `Bool`, `Unit` or pairs of those (spec §6).
+///
+/// Stored as the pre-order sequence of its value nodes. Every atom has a fixed
+/// arity, so the encoding is injective, and the key size of the cost model is the
+/// length of the sequence.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MemoKey(Vec<KeyAtom>);
+
 impl MemoKey {
-    /// Converts a value to a key, with its size in value nodes. Returns `None` for a
-    /// value that is not a valid key.
-    pub fn from_value(v: &Value) -> Option<(MemoKey, u64)> {
-        match v {
-            Value::Int(n) => Some((MemoKey::Int(*n), 1)),
-            Value::Bool(b) => Some((MemoKey::Bool(*b), 1)),
-            Value::Unit => Some((MemoKey::Unit, 1)),
-            Value::Pair(p) => {
-                let (a, sa) = MemoKey::from_value(&p.0)?;
-                let (b, sb) = MemoKey::from_value(&p.1)?;
-                Some((MemoKey::Pair(Box::new(a), Box::new(b)), 1 + sa + sb))
+    /// Converts a value to a key. Returns `None` for a value that is not a valid key.
+    pub fn from_value(v: &Value) -> Option<MemoKey> {
+        let mut atoms = Vec::new();
+        let mut work = vec![v];
+        while let Some(v) = work.pop() {
+            match v {
+                Value::Int(n) => atoms.push(KeyAtom::Int(*n)),
+                Value::Bool(b) => atoms.push(KeyAtom::Bool(*b)),
+                Value::Unit => atoms.push(KeyAtom::Unit),
+                Value::Pair(p) => {
+                    atoms.push(KeyAtom::Pair);
+                    work.push(&p.1);
+                    work.push(&p.0);
+                }
+                _ => return None,
             }
-            _ => None,
         }
+        Some(MemoKey(atoms))
+    }
+
+    /// The key size in value nodes, as the cost model counts it.
+    pub fn size(&self) -> u64 {
+        self.0.len() as u64
     }
 }
 
@@ -129,7 +151,10 @@ impl Env {
 
     /// This environment with `value` bound at index 0.
     pub fn push(&self, value: Value) -> Env {
-        Env(Some(Rc::new(EnvNode { value, next: self.clone() })))
+        Env(Some(Rc::new(EnvNode {
+            value,
+            next: self.clone(),
+        })))
     }
 
     /// The value at de Bruijn index `i`, if bound.
@@ -140,6 +165,18 @@ impl Env {
             i -= 1;
         }
         Some(&node.value)
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        let mut next = self.0.take();
+        while let Some(rc) = next {
+            match Rc::try_unwrap(rc) {
+                Ok(mut node) => next = node.next.0.take(),
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -190,7 +227,10 @@ impl List {
         I: IntoIterator<Item = Value>,
         I::IntoIter: DoubleEndedIterator,
     {
-        items.into_iter().rev().fold(List::nil(), |tail, v| List::cons(v, tail))
+        items
+            .into_iter()
+            .rev()
+            .fold(List::nil(), |tail, v| List::cons(v, tail))
     }
 }
 
@@ -244,6 +284,20 @@ impl Tree {
     pub fn node(left: Tree, value: Value, right: Tree) -> Tree {
         Tree(Some(Rc::new(TreeNode { left, value, right })))
     }
+
+    /// The number of internal nodes. Iterative, so safe on degenerate trees.
+    pub fn size(&self) -> u64 {
+        let mut n = 0;
+        let mut work = vec![self];
+        while let Some(t) = work.pop() {
+            if let Some(node) = &t.0 {
+                n += 1;
+                work.push(&node.left);
+                work.push(&node.right);
+            }
+        }
+        n
+    }
 }
 
 impl Drop for Tree {
@@ -254,6 +308,90 @@ impl Drop for Tree {
                 stack.extend(node.left.0.take());
                 stack.extend(node.right.0.take());
             }
+        }
+    }
+}
+
+/// Moves the uniquely owned children of `v` onto `out`, leaving `v` with nothing
+/// that a recursive drop would descend into. Shared children are left alone: dropping
+/// them only decrements a count.
+fn detach_children(v: &mut Value, out: &mut Vec<Value>) {
+    match v {
+        Value::Int(_) | Value::Bool(_) | Value::Unit | Value::Option(None) => {}
+        // Array elements are dropped by `imbl` one at a time, and each element's own
+        // drop is iterative, so arrays only nest as deep as the program nests them.
+        Value::Array(_) => {}
+        Value::Pair(rc) => {
+            if let Some(p) = Rc::get_mut(rc) {
+                out.push(mem::replace(&mut p.0, Value::Unit));
+                out.push(mem::replace(&mut p.1, Value::Unit));
+            }
+        }
+        Value::Option(Some(rc)) => {
+            if let Some(x) = Rc::get_mut(rc) {
+                out.push(mem::replace(x, Value::Unit));
+            }
+        }
+        Value::List(l) => {
+            let mut next = l.0.take();
+            while let Some(rc) = next {
+                match Rc::try_unwrap(rc) {
+                    Ok(mut cell) => {
+                        out.push(mem::replace(&mut cell.head, Value::Unit));
+                        next = cell.tail.0.take();
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        Value::Tree(t) => {
+            let mut stack: Vec<Rc<TreeNode>> = t.0.take().into_iter().collect();
+            while let Some(rc) = stack.pop() {
+                if let Ok(mut node) = Rc::try_unwrap(rc) {
+                    out.push(mem::replace(&mut node.value, Value::Unit));
+                    stack.extend(node.left.0.take());
+                    stack.extend(node.right.0.take());
+                }
+            }
+        }
+        Value::Fun(rc) => {
+            if let Some(f) = Rc::get_mut(rc) {
+                match f {
+                    Fun::Closure { env, .. } => detach_env(env, out),
+                    Fun::Partial { args, .. } => out.append(args),
+                    Fun::BfixSelf { f, .. } => out.push(mem::replace(f, Value::Unit)),
+                    Fun::MemoSelf { table, f } => {
+                        out.push(mem::replace(f, Value::Unit));
+                        if let Some(cell) = Rc::get_mut(table) {
+                            out.extend(cell.get_mut().entries.drain().map(|(_, v)| v));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn detach_env(env: &mut Env, out: &mut Vec<Value>) {
+    let mut next = env.0.take();
+    while let Some(rc) = next {
+        match Rc::try_unwrap(rc) {
+            Ok(mut node) => {
+                out.push(mem::replace(&mut node.value, Value::Unit));
+                next = node.next.0.take();
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+impl Drop for Value {
+    fn drop(&mut self) {
+        let mut work = Vec::new();
+        detach_children(self, &mut work);
+        while let Some(mut v) = work.pop() {
+            detach_children(&mut v, &mut work);
+            // `v` now owns nothing unique, so its own drop does not recurse.
         }
     }
 }
@@ -293,16 +431,43 @@ impl Value {
         Value::Array(items.into_iter().collect())
     }
 
+    /// A tree value.
+    pub fn tree(t: Tree) -> Value {
+        Value::Tree(t)
+    }
+
     /// Whether this is a function value.
     pub fn is_fun(&self) -> bool {
         matches!(self, Value::Fun(_))
     }
+
+    /// The integer, if this is one.
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+/// The result of comparing two values with `eq`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EqResult {
+    /// The values are equal (`true`) or differ (`false`).
+    Data(bool),
+    /// A function value was reached.
+    Function,
 }
 
 /// Structural equality of data values, as `eq` computes it, with the number of
-/// value-node pairs compared. Returns `Err(())` if a function value is reached.
-/// The comparison stops at the first difference.
-pub(crate) fn structural_eq(a: &Value, b: &Value) -> (Result<bool, ()>, u64) {
+/// value-node pairs compared. The comparison runs left to right in pre-order and
+/// stops at the first difference or at the first function value; the pair that
+/// stopped it is counted.
+///
+/// Nodes: every scalar, pair, option, array, list cell (including the final `nil`)
+/// and tree node (including each `leaf`) is one node. A list or tree value is not a
+/// node of its own apart from its cells.
+pub(crate) fn structural_eq(a: &Value, b: &Value) -> (EqResult, u64) {
     enum Work<'a> {
         Value(&'a Value, &'a Value),
         List(&'a List, &'a List),
@@ -311,71 +476,76 @@ pub(crate) fn structural_eq(a: &Value, b: &Value) -> (Result<bool, ()>, u64) {
     let mut work = vec![Work::Value(a, b)];
     let mut nodes = 0u64;
     while let Some(item) = work.pop() {
-        nodes += 1;
         let same = match item {
-            Work::List(l, m) => match (&l.0, &m.0) {
-                (None, None) => true,
-                (Some(c), Some(d)) => {
-                    work.push(Work::List(&c.tail, &d.tail));
-                    work.push(Work::Value(&c.head, &d.head));
-                    true
-                }
-                _ => false,
-            },
-            Work::Tree(s, t) => match (&s.0, &t.0) {
-                (None, None) => true,
-                (Some(m), Some(n)) => {
-                    work.push(Work::Tree(&m.right, &n.right));
-                    work.push(Work::Value(&m.value, &n.value));
-                    work.push(Work::Tree(&m.left, &n.left));
-                    true
-                }
-                _ => false,
-            },
-            Work::Value(x, y) => match (x, y) {
-                (Value::Fun(_), _) | (_, Value::Fun(_)) => return (Err(()), nodes),
-                (Value::Int(m), Value::Int(n)) => m == n,
-                (Value::Bool(m), Value::Bool(n)) => m == n,
-                (Value::Unit, Value::Unit) => true,
-                (Value::Pair(p), Value::Pair(q)) => {
-                    work.push(Work::Value(&p.1, &q.1));
-                    work.push(Work::Value(&p.0, &q.0));
-                    true
-                }
-                (Value::Option(None), Value::Option(None)) => true,
-                (Value::Option(Some(p)), Value::Option(Some(q))) => {
-                    work.push(Work::Value(p, q));
-                    true
-                }
-                (Value::List(l), Value::List(m)) => {
-                    // The list itself is not a node: its cells are.
-                    nodes -= 1;
-                    work.push(Work::List(l, m));
-                    true
-                }
-                (Value::Tree(s), Value::Tree(t)) => {
-                    nodes -= 1;
-                    work.push(Work::Tree(s, t));
-                    true
-                }
-                (Value::Array(u), Value::Array(v)) => {
-                    if u.len() == v.len() {
-                        for (p, q) in u.iter().zip(v.iter()).rev() {
-                            work.push(Work::Value(p, q));
-                        }
+            Work::List(l, m) => {
+                nodes += 1;
+                match (&l.0, &m.0) {
+                    (None, None) => true,
+                    (Some(c), Some(d)) => {
+                        work.push(Work::List(&c.tail, &d.tail));
+                        work.push(Work::Value(&c.head, &d.head));
                         true
-                    } else {
-                        false
                     }
+                    _ => false,
                 }
-                _ => false,
-            },
+            }
+            Work::Tree(s, t) => {
+                nodes += 1;
+                match (&s.0, &t.0) {
+                    (None, None) => true,
+                    (Some(m), Some(n)) => {
+                        work.push(Work::Tree(&m.right, &n.right));
+                        work.push(Work::Value(&m.value, &n.value));
+                        work.push(Work::Tree(&m.left, &n.left));
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            Work::Value(Value::List(l), Value::List(m)) => {
+                work.push(Work::List(l, m));
+                true
+            }
+            Work::Value(Value::Tree(s), Value::Tree(t)) => {
+                work.push(Work::Tree(s, t));
+                true
+            }
+            Work::Value(x, y) => {
+                nodes += 1;
+                match (x, y) {
+                    (Value::Fun(_), _) | (_, Value::Fun(_)) => return (EqResult::Function, nodes),
+                    (Value::Int(m), Value::Int(n)) => m == n,
+                    (Value::Bool(m), Value::Bool(n)) => m == n,
+                    (Value::Unit, Value::Unit) => true,
+                    (Value::Pair(p), Value::Pair(q)) => {
+                        work.push(Work::Value(&p.1, &q.1));
+                        work.push(Work::Value(&p.0, &q.0));
+                        true
+                    }
+                    (Value::Option(None), Value::Option(None)) => true,
+                    (Value::Option(Some(p)), Value::Option(Some(q))) => {
+                        work.push(Work::Value(p, q));
+                        true
+                    }
+                    (Value::Array(u), Value::Array(v)) => {
+                        if u.len() == v.len() {
+                            for (p, q) in u.iter().zip(v.iter()).rev() {
+                                work.push(Work::Value(p, q));
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                }
+            }
         };
         if !same {
-            return (Ok(false), nodes);
+            return (EqResult::Data(false), nodes);
         }
     }
-    (Ok(true), nodes)
+    (EqResult::Data(true), nodes)
 }
 
 impl fmt::Debug for Value {
@@ -387,6 +557,23 @@ impl fmt::Debug for Value {
 impl fmt::Debug for List {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl fmt::Debug for Cons {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cons")
+            .field("head", &self.head)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for TreeNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TreeNode")
+            .field("value", &self.value)
+            .finish_non_exhaustive()
     }
 }
 
@@ -444,6 +631,6 @@ impl fmt::Display for Value {
 /// to themselves.
 impl PartialEq for Value {
     fn eq(&self, other: &Value) -> bool {
-        matches!(structural_eq(self, other).0, Ok(true))
+        matches!(structural_eq(self, other).0, EqResult::Data(true))
     }
 }
