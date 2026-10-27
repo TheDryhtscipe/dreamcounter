@@ -1138,6 +1138,22 @@ fn ill_typed_shared_leaves_are_located_in_polynomial_steps() {
     }
 }
 
+#[test]
+fn only_failed_fresh_inference_marks_a_key_failed() {
+    // `(add $0 1)` infers afresh as `Int -> Int`; only fitting it to `$0 : Bool`
+    // fails, which depends on the binder, so the key must not be marked failed.
+    let mut a = Arena::new();
+    let (add, one, v0) = (a.prim(Prim::Add), a.int(1), a.var(0));
+    let t = a.apps(add, &[v0, one]);
+    let body = a.if_(v0, t, t);
+    let f = a.lam(body);
+    let mut tc = TypeChecker::new();
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    assert_eq!(tc.infer(&a, f, NO_LIBS), tree.infer(&a, f, NO_LIBS));
+    assert_eq!(tc.failed_keys(), 0);
+}
+
 /// `lam x. let (lam (pair x $0)) in t_n`, with `t_0 = ($0 1)` and `t_(k+1) =
 /// (if true t_k (let (lam (pair (fst ($1 0)) $0)) t_k))`: every level binds a new
 /// polymorphic helper whose type has the free variable `x`.

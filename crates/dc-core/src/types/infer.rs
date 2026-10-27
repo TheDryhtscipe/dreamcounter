@@ -1474,6 +1474,12 @@ impl TypeChecker {
         Ok(Step::EvalShared(id))
     }
 
+    /// How many keys the last call marked as failed.
+    #[cfg(test)]
+    pub(super) fn failed_keys(&self) -> usize {
+        self.failed.len()
+    }
+
     /// Whether no binding in `scope` has a type with free variables: then
     /// inferring a subterm for it uses only nodes it makes itself.
     fn scope_closed(&self, scope: &Scope) -> bool {
@@ -1822,14 +1828,18 @@ impl TypeChecker {
                 let kept = self.fun(&params, t);
                 self.generalize(kept);
                 let t = self.instantiate(kept);
-                let indices = self.free_vars[&key.0].indices();
-                let t = self.apply_scope(arena, key.0, &key.1, &indices, t)?;
+                let (id, scope) = key.clone();
                 let kept = if self.checkpoints.is_empty() {
                     kept
                 } else {
                     self.keep_past_checkpoints(&key, kept)
                 };
+                // Kept before the scope is applied: a key in the memo is one
+                // whose fresh inference worked, which is how a failed use tells
+                // a failed fresh inference from a binder that does not fit.
                 self.memo.insert(key, kept);
+                let indices = self.free_vars[&id].indices();
+                let t = self.apply_scope(arena, id, &scope, &indices, t)?;
                 Step::Return(t)
             }
             Frame::Tried => {
