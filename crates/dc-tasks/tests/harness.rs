@@ -3,11 +3,13 @@
 //! written in core syntax without the prelude.
 
 use dc_core::{sexpr, Arena, Scheme, TermId};
-use dc_eval::Value;
-use dc_tasks::growth::{GrowthError, GrowthFit, LogLogSlope, SizeOutcome, DEFAULT_SIZES};
+use dc_eval::{apply, Outcome, Value};
+use dc_tasks::growth::{
+    median_steps, GrowthError, GrowthFit, LogLogSlope, SizeOutcome, Sweep, DEFAULT_SIZES,
+};
 use dc_tasks::harness::{
     check_examples, check_generated, measure, run_sweep, CheckFailure, FuelPlan, HarnessConfig,
-    Measurement, RunFailure, SizeRun,
+    Measurement, RunFailure, SizeRun, SweepError,
 };
 use dc_tasks::rng::TaskRng;
 use dc_tasks::task::{generate_input, Example, Inputs, TaskFamily};
@@ -94,8 +96,40 @@ impl TaskFamily for ListReverse {
     }
 }
 
+/// The sum of the negative elements. A reference that adds only negative
+/// elements takes more steps on inputs with more of them, so its step counts
+/// differ between seeds at the same size.
+struct ListNegSum;
+
+impl TaskFamily for ListNegSum {
+    fn name(&self) -> &str {
+        "list-neg-sum"
+    }
+    fn signature(&self) -> Scheme {
+        "List Int -> Int".parse().unwrap()
+    }
+    fn description(&self) -> &str {
+        "Return the sum of the negative integers in a list."
+    }
+    fn examples(&self) -> Vec<Example> {
+        vec![
+            Example::new(vec![Value::int_list(&[])], Value::Int(0)),
+            Example::new(vec![Value::int_list(&[1, -2, 3, -4])], Value::Int(-6)),
+        ]
+    }
+    fn generate(&self, n: u64, rng: &mut TaskRng) -> Inputs {
+        vec![random_ints(n, rng)]
+    }
+    fn oracle(&self, inputs: &[Value]) -> Value {
+        Value::Int(ints_of(&inputs[0]).iter().filter(|&&x| x < 0).sum())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Programs
+
+/// `foldl (\acc x -> if x < 0 then acc + x else acc) 0`.
+const NEG_SUM: &str = "(lam (foldl (lam (lam (if (lt $0 0) (add $1 $0) $1))) 0 $0))";
 
 /// `foldl (\acc x -> acc + x) 0`.
 const SUM: &str = "(lam (foldl (lam (lam (add $1 $0))) 0 $0))";
@@ -134,6 +168,22 @@ fn default_config_follows_the_spec() {
     let c = HarnessConfig::default();
     assert_eq!((c.seeds, c.fuel_multiplier), (5, 10));
     assert_eq!(ListSum.sizes(), DEFAULT_SIZES.to_vec());
+}
+
+#[test]
+fn default_global_cap_keeps_a_runaway_run_under_a_gigabyte() {
+    // A non-terminating `unfold` candidate allocates about 16 bytes per step
+    // (measured in release: 159 MB peak RSS at 10M steps). Every run the
+    // harness makes is capped by `max_fuel`, so the default cap bounds the
+    // memory one looping candidate can take on a shared machine.
+    const BYTES_PER_RUNAWAY_STEP: u64 = 16;
+    let c = HarnessConfig::default();
+    assert!(
+        c.max_fuel * BYTES_PER_RUNAWAY_STEP <= 1 << 30,
+        "max_fuel = {}",
+        c.max_fuel
+    );
+    assert!(c.example_fuel <= c.max_fuel);
 }
 
 #[test]
@@ -284,7 +334,7 @@ fn quadratic_program_has_slope_near_two() {
     let mut arena = Arena::new();
     let rev2 = parse(&mut arena, REV_QUADRATIC);
     let c = config();
-    let plan = FuelPlan::uniform(&DEFAULT_SIZES, c.max_fuel);
+    let plan = FuelPlan::uniform(&ListReverse, c.max_fuel, &c);
     let passed = check_examples(&ListReverse, &arena, rev2, &c).unwrap();
     let report = run_sweep(&ListReverse, &arena, &passed, &plan, &c).unwrap();
     let fit = LogLogSlope::default().fit(&report.sweep).unwrap();
@@ -432,4 +482,164 @@ fn measure_runs_the_whole_pipeline_and_gates_on_examples() {
         measure(&ListSum, &arena, counts, &plan, &est, &c).unwrap(),
         Measurement::Rejected(CheckFailure::Example { index: 1, .. })
     ));
+}
+
+/// Sums correctly, except that it returns 0 for lists of 4 to 99 elements:
+/// right on every example, wrong at n = 16, 32 and 64, which lie below the
+/// default fit window, and right at every size inside it.
+const SUM_WRONG_BELOW_WINDOW: &str = "(lam (if (lt 3 (length $0)) \
+     (if (lt (length $0) 100) 0 (foldl (lam (lam (add $1 $0))) 0 $0)) \
+     (foldl (lam (lam (add $1 $0))) 0 $0)))";
+
+#[test]
+fn measure_rejects_wrong_outputs_even_below_the_fit_window() {
+    let mut arena = Arena::new();
+    let sum = parse(&mut arena, SUM);
+    let wrong = parse(&mut arena, SUM_WRONG_BELOW_WINDOW);
+    let c = config();
+    let plan = FuelPlan::from_reference(&ListSum, &arena, sum, &c).unwrap();
+    let est = LogLogSlope::default();
+    match measure(&ListSum, &arena, wrong, &plan, &est, &c).unwrap() {
+        Measurement::Incorrect {
+            report,
+            n: 16,
+            seed: 0,
+            failure: RunFailure::WrongOutput { actual, .. },
+        } => {
+            assert_eq!(*actual, Value::Int(0));
+            // The whole sweep is still recorded.
+            assert_eq!(report.records.len(), DEFAULT_SIZES.len());
+            let errored: Vec<u64> = report
+                .sweep
+                .observations()
+                .iter()
+                .filter(|o| o.outcome == SizeOutcome::Errored)
+                .map(|o| o.n)
+                .collect();
+            assert_eq!(errored, vec![16, 32, 64]);
+        }
+        other => panic!("expected Incorrect at n = 16, seed 0; got {other:?}"),
+    }
+}
+
+#[test]
+fn measure_still_fits_when_only_timeouts_occur() {
+    // A timeout is recorded, not a failure (spec §9): the quadratic reverse
+    // under a linear reference times out at large sizes and is Measured, with
+    // the estimator refusing over its incomplete window.
+    let mut arena = Arena::new();
+    let rev = parse(&mut arena, REV);
+    let rev2 = parse(&mut arena, REV_QUADRATIC);
+    let c = config();
+    let plan = FuelPlan::from_reference(&ListReverse, &arena, rev, &c).unwrap();
+    let est = LogLogSlope::default();
+    match measure(&ListReverse, &arena, rev2, &plan, &est, &c).unwrap() {
+        Measurement::Measured { fit, .. } => {
+            assert!(matches!(fit, Err(GrowthError::IncompleteWindow { .. })))
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn sweep_refuses_a_token_or_plan_from_another_family_or_seed_count() {
+    let mut arena = Arena::new();
+    let sum = parse(&mut arena, SUM);
+    let neg = parse(&mut arena, NEG_SUM);
+    let c = config();
+    let sum_plan = FuelPlan::from_reference(&ListSum, &arena, sum, &c).unwrap();
+    let neg_plan = FuelPlan::from_reference(&ListNegSum, &arena, neg, &c).unwrap();
+    let sum_passed = check_examples(&ListSum, &arena, sum, &c).unwrap();
+    let neg_passed = check_examples(&ListNegSum, &arena, neg, &c).unwrap();
+    let wrong_family = SweepError::WrongFamily {
+        expected: "list-neg-sum".to_string(),
+        found: "list-sum".to_string(),
+    };
+    // Examples passed for list-sum, swept as list-neg-sum.
+    assert_eq!(
+        run_sweep(&ListNegSum, &arena, &sum_passed, &neg_plan, &c),
+        Err(wrong_family.clone())
+    );
+    // A plan made for list-sum, used for list-neg-sum.
+    assert_eq!(
+        run_sweep(&ListNegSum, &arena, &neg_passed, &sum_plan, &c),
+        Err(wrong_family.clone())
+    );
+    let est = LogLogSlope::default();
+    assert_eq!(
+        measure(&ListNegSum, &arena, neg, &sum_plan, &est, &c),
+        Err(wrong_family)
+    );
+    // A plan made with 5 seeds, swept with 3.
+    let three = HarnessConfig { seeds: 3, ..c };
+    assert_eq!(
+        run_sweep(&ListNegSum, &arena, &neg_passed, &neg_plan, &three),
+        Err(SweepError::SeedsMismatch { plan: 5, config: 3 })
+    );
+    assert!(run_sweep(&ListNegSum, &arena, &neg_passed, &neg_plan, &c).is_ok());
+}
+
+/// The exact steps of `program` on each seed's input at size `n`, run
+/// directly on the evaluator rather than through the harness.
+fn direct_steps<F: TaskFamily>(family: &F, arena: &Arena, program: TermId, n: u64) -> Vec<u64> {
+    (0..5)
+        .map(|seed| {
+            let inputs = generate_input(family, n, seed);
+            match apply(arena, program, &inputs, u64::MAX) {
+                Outcome::Value(v, steps) => {
+                    assert_eq!(v, family.oracle(&inputs));
+                    steps
+                }
+                other => panic!("n = {n}, seed = {seed}: {other:?}"),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn sweep_runs_every_seed_and_fuel_covers_the_slowest_reference_run() {
+    let mut arena = Arena::new();
+    let neg = parse(&mut arena, NEG_SUM);
+    let c = config();
+    let plan = FuelPlan::from_reference(&ListNegSum, &arena, neg, &c).unwrap();
+    let passed = check_examples(&ListNegSum, &arena, neg, &c).unwrap();
+    let report = run_sweep(&ListNegSum, &arena, &passed, &plan, &c).unwrap();
+    let mut medians = Vec::new();
+    for ((r, o), s) in report
+        .records
+        .iter()
+        .zip(report.sweep.observations())
+        .zip(plan.sizes())
+    {
+        let expected = direct_steps(&ListNegSum, &arena, neg, r.n);
+        let min = *expected.iter().min().unwrap();
+        let max = *expected.iter().max().unwrap();
+        // The family must make the seeds differ, or this test proves nothing.
+        assert!(min < max, "n = {}: steps {expected:?} do not vary", r.n);
+        assert_eq!(
+            r.run,
+            SizeRun::Completed {
+                steps: expected.clone()
+            }
+        );
+        assert_eq!(
+            o.outcome,
+            SizeOutcome::Completed {
+                steps: expected.clone()
+            }
+        );
+        assert_eq!(s.reference_steps, Some(max), "n = {}", r.n);
+        assert_eq!(s.fuel, 10 * max, "n = {}", r.n);
+        medians.push((r.n, median_steps(&expected).unwrap()));
+    }
+    assert_eq!(report.sweep.medians(), medians);
+    let from_medians = Sweep::from_fn(&DEFAULT_SIZES, |n| {
+        medians.iter().find(|&&(m, _)| m == n).unwrap().1
+    })
+    .unwrap();
+    let est = LogLogSlope::default();
+    assert_eq!(
+        est.fit(&report.sweep).unwrap(),
+        est.fit(&from_medians).unwrap()
+    );
 }

@@ -21,7 +21,13 @@
 //!    recorded for that size and the sweep goes on to the next size. Nothing
 //!    is dropped: a timeout is a result, not a failure of the sweep.
 //! 4. The resulting [`Sweep`] feeds a [`GrowthEstimator`]; [`measure`] does
-//!    steps 1, 3 and 4 in one call.
+//!    steps 1, 3 and 4 in one call. A wrong output or runtime error at any
+//!    size, inside the fit window or below it, makes the candidate
+//!    [`Measurement::Incorrect`] with no fit: only a timeout is not a failure.
+//!
+//! The [`ExamplesPassed`] token and the [`FuelPlan`] carry the family's name,
+//! and the plan its number of seeds; [`run_sweep`] refuses them for another
+//! family or seed count.
 //!
 //! [`check_generated`] checks a program against the oracle on generated
 //! inputs without measuring it, to test families and reference solutions.
@@ -31,6 +37,8 @@
 //!
 //! Candidates must be closed and fully expanded: the type check uses no
 //! library abstractions, and the evaluator refuses unexpanded ones.
+
+use std::fmt;
 
 use dc_core::{types, Arena, Scheme, TermId, TypeError};
 use dc_eval::{apply, ErrorKind, Outcome, Value};
@@ -43,7 +51,14 @@ pub const DEFAULT_SEEDS: u64 = 5;
 /// Per-size fuel as a multiple of the reference solution's steps (spec §9).
 pub const DEFAULT_FUEL_MULTIPLIER: u64 = 10;
 /// The default global cap on fuel for one run.
-pub const DEFAULT_MAX_FUEL: u64 = 1_000_000_000;
+///
+/// The evaluator has no memory bound, so fuel is the only bound on memory: a
+/// non-terminating `unfold` allocates about 16 bytes per step, so this cap
+/// holds one runaway candidate to about 800 MB. A family whose reference
+/// needs more than a tenth of this at its largest sizes gets less than ten
+/// times the reference's steps there; such families declare smaller sweeps,
+/// or a caller raises the cap on a machine that has the memory.
+pub const DEFAULT_MAX_FUEL: u64 = 50_000_000;
 /// The default fuel for one example run. Examples are small; this stops a
 /// non-terminating candidate (`unfold` can loop) early.
 pub const DEFAULT_EXAMPLE_FUEL: u64 = 10_000_000;
@@ -149,17 +164,71 @@ pub fn run_on(
     }
 }
 
-/// Proof that a program passed its family's type check and examples. Only
-/// [`check_examples`] makes one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Proof that a program passed a family's type check and examples. Only
+/// [`check_examples`] makes one, and it names the family, so
+/// [`run_sweep`] refuses it for any other family.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExamplesPassed {
     program: TermId,
+    family: String,
 }
 
 impl ExamplesPassed {
     /// The program that passed.
     pub fn program(&self) -> TermId {
         self.program
+    }
+
+    /// The [`TaskFamily::name`] of the family whose examples it passed.
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+}
+
+/// Why [`run_sweep`] or [`measure`] could not run a sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SweepError {
+    /// The [`ExamplesPassed`] token or the [`FuelPlan`] was made for another
+    /// family.
+    WrongFamily {
+        /// The name of the family being swept.
+        expected: String,
+        /// The family the token or plan was made for.
+        found: String,
+    },
+    /// The plan was made with a different number of seeds than the config
+    /// the sweep runs with, so its fuel does not cover the same inputs.
+    SeedsMismatch {
+        /// The seeds the plan was made with.
+        plan: u64,
+        /// The seeds in the config.
+        config: u64,
+    },
+    /// The plan's sizes do not form a valid [`Sweep`].
+    Growth(GrowthError),
+}
+
+impl fmt::Display for SweepError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SweepError::WrongFamily { expected, found } => write!(
+                f,
+                "sweeping family {expected:?} with a token or plan made for {found:?}"
+            ),
+            SweepError::SeedsMismatch { plan, config } => write!(
+                f,
+                "the plan was made with {plan} seed(s) but the config has {config}"
+            ),
+            SweepError::Growth(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SweepError {}
+
+impl From<GrowthError> for SweepError {
+    fn from(e: GrowthError) -> Self {
+        SweepError::Growth(e)
     }
 }
 
@@ -183,7 +252,10 @@ pub fn check_examples<F: TaskFamily + ?Sized>(
         run_on(arena, program, &example.inputs, &example.output, fuel)
             .map_err(|failure| CheckFailure::Example { index, failure })?;
     }
-    Ok(ExamplesPassed { program })
+    Ok(ExamplesPassed {
+        program,
+        family: family.name().to_string(),
+    })
 }
 
 /// Runs `program` on seeds `0..config.seeds` at each of `sizes` with
@@ -235,9 +307,11 @@ pub struct SizeFuel {
     pub reference_steps: Option<u64>,
 }
 
-/// The per-size fuel of a sweep.
+/// The per-size fuel of a sweep, for one family and one number of seeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuelPlan {
+    family: String,
+    seeds: u64,
     sizes: Vec<SizeFuel>,
 }
 
@@ -283,15 +357,28 @@ impl FuelPlan {
                 reference_steps: most,
             });
         }
-        Ok(FuelPlan { sizes })
+        Ok(FuelPlan {
+            family: family.name().to_string(),
+            seeds: config.seeds,
+            sizes,
+        })
     }
 
-    /// The same fuel at every size, with no reference.
-    pub fn uniform(sizes: &[u64], fuel: u64) -> FuelPlan {
+    /// The same fuel, capped by [`HarnessConfig::max_fuel`], at every one of
+    /// the family's sizes, with no reference.
+    pub fn uniform<F: TaskFamily + ?Sized>(
+        family: &F,
+        fuel: u64,
+        config: &HarnessConfig,
+    ) -> FuelPlan {
+        let fuel = fuel.min(config.max_fuel);
         FuelPlan {
-            sizes: sizes
-                .iter()
-                .map(|&n| SizeFuel {
+            family: family.name().to_string(),
+            seeds: config.seeds,
+            sizes: family
+                .sizes()
+                .into_iter()
+                .map(|n| SizeFuel {
                     n,
                     fuel,
                     reference_steps: None,
@@ -303,6 +390,16 @@ impl FuelPlan {
     /// The sizes and their fuel, in the family's order.
     pub fn sizes(&self) -> &[SizeFuel] {
         &self.sizes
+    }
+
+    /// The [`TaskFamily::name`] of the family the plan was made for.
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    /// The number of seeds the plan was made with.
+    pub fn seeds(&self) -> u64 {
+        self.seeds
     }
 }
 
@@ -347,19 +444,52 @@ pub struct SweepReport {
     pub sweep: Sweep,
 }
 
+impl SweepReport {
+    /// The smallest size at which a run failed for a reason other than a
+    /// timeout (a wrong output or a runtime error), with the seed and the
+    /// failure. `None` if every size completed correctly or timed out.
+    pub fn first_incorrect(&self) -> Option<(u64, u64, &RunFailure)> {
+        self.records.iter().find_map(|r| match &r.run {
+            SizeRun::Failed {
+                failure: RunFailure::Timeout { .. },
+                ..
+            }
+            | SizeRun::Completed { .. } => None,
+            SizeRun::Failed { seed, failure } => Some((r.n, *seed, failure)),
+        })
+    }
+}
+
 /// Runs the growth sweep for a program that has passed its examples.
 ///
 /// # Errors
 ///
-/// [`GrowthError`] if the plan's sizes do not form a valid [`Sweep`] (zero
-/// or repeated sizes) or `config.seeds` is 0.
+/// [`SweepError::WrongFamily`] if `passed` or `plan` was made for another
+/// family, and [`SweepError::SeedsMismatch`] if `plan` was made with another
+/// number of seeds; both are checked before anything runs.
+/// [`SweepError::Growth`] if the plan's sizes do not form a valid [`Sweep`]
+/// (zero or repeated sizes) or `config.seeds` is 0.
 pub fn run_sweep<F: TaskFamily + ?Sized>(
     family: &F,
     arena: &Arena,
     passed: &ExamplesPassed,
     plan: &FuelPlan,
     config: &HarnessConfig,
-) -> Result<SweepReport, GrowthError> {
+) -> Result<SweepReport, SweepError> {
+    for found in [passed.family(), plan.family()] {
+        if found != family.name() {
+            return Err(SweepError::WrongFamily {
+                expected: family.name().to_string(),
+                found: found.to_string(),
+            });
+        }
+    }
+    if plan.seeds != config.seeds {
+        return Err(SweepError::SeedsMismatch {
+            plan: plan.seeds,
+            config: config.seeds,
+        });
+    }
     let mut records = Vec::with_capacity(plan.sizes.len());
     let mut observations = Vec::with_capacity(plan.sizes.len());
     for &SizeFuel { n, fuel, .. } in &plan.sizes {
@@ -404,8 +534,23 @@ fn run_size<F: TaskFamily + ?Sized>(
 pub enum Measurement {
     /// The program failed its type check or examples; no sweep was run.
     Rejected(CheckFailure),
+    /// The program passed its examples but gave a wrong output or a runtime
+    /// error on a generated input during the sweep, at any size, inside the
+    /// fit window or not. It is incorrect, so it gets no fit. Only a timeout
+    /// is not a failure (spec §9). The full sweep is kept for the record.
+    Incorrect {
+        /// The sweep.
+        report: SweepReport,
+        /// The smallest size with a failure other than a timeout.
+        n: u64,
+        /// The seed that failed there.
+        seed: u64,
+        /// What went wrong.
+        failure: RunFailure,
+    },
     /// The sweep and the estimator's fit (which can refuse, for example when
-    /// sizes in its window timed out).
+    /// sizes in its window timed out). Every size completed with the right
+    /// outputs or timed out.
     Measured {
         /// The sweep.
         report: SweepReport,
@@ -427,12 +572,21 @@ pub fn measure<F: TaskFamily + ?Sized>(
     plan: &FuelPlan,
     estimator: &dyn GrowthEstimator,
     config: &HarnessConfig,
-) -> Result<Measurement, GrowthError> {
+) -> Result<Measurement, SweepError> {
     let passed = match check_examples(family, arena, program, config) {
         Ok(passed) => passed,
         Err(failure) => return Ok(Measurement::Rejected(failure)),
     };
     let report = run_sweep(family, arena, &passed, plan, config)?;
+    if let Some((n, seed, failure)) = report.first_incorrect() {
+        let failure = failure.clone();
+        return Ok(Measurement::Incorrect {
+            report,
+            n,
+            seed,
+            failure,
+        });
+    }
     let fit = estimator.estimate(&report.sweep);
     Ok(Measurement::Measured { report, fit })
 }
