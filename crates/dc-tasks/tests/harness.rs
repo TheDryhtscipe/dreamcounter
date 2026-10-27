@@ -8,8 +8,9 @@ use dc_tasks::growth::{
     median_steps, GrowthError, GrowthFit, LogLogSlope, SizeOutcome, Sweep, DEFAULT_SIZES,
 };
 use dc_tasks::harness::{
-    check_examples, check_generated, measure, run_sweep, CheckFailure, FuelPlan, HarnessConfig,
-    Measurement, RunFailure, SizeRun, SweepError,
+    check_examples, check_generated, check_input_sizes, measure, run_sweep, validate_family,
+    CheckFailure, FamilyDefect, FuelPlan, HarnessConfig, Measurement, RunFailure, SizeRun,
+    SweepError,
 };
 use dc_tasks::rng::TaskRng;
 use dc_tasks::task::{generate_input, Example, Inputs, TaskFamily};
@@ -641,5 +642,222 @@ fn sweep_runs_every_seed_and_fuel_covers_the_slowest_reference_run() {
     assert_eq!(
         est.fit(&report.sweep).unwrap(),
         est.fit(&from_medians).unwrap()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Family validation
+
+/// The length of a family's single list input.
+fn list_len(inputs: &[Value]) -> u64 {
+    match inputs {
+        [Value::List(l)] => l.len(),
+        other => panic!("expected one list input, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_families_here_are_valid() {
+    let c = config();
+    let families: [&dyn TaskFamily; 3] = [&ListSum, &ListReverse, &ListNegSum];
+    for f in families {
+        assert_eq!(validate_family(f, &c), Ok(()), "{}", f.name());
+        assert_eq!(
+            check_input_sizes(f, c.seeds, list_len),
+            Ok(()),
+            "{}",
+            f.name()
+        );
+    }
+}
+
+/// [`ListSum`] with one part of its definition replaced, to check that each
+/// defect is caught.
+#[derive(Default)]
+struct BrokenSum {
+    sizes: Option<Vec<u64>>,
+    examples: Option<Vec<Example>>,
+    /// Generate one element fewer than asked.
+    short: bool,
+    /// Generate from a counter shared between calls instead of the rng.
+    impure: bool,
+    counter: std::cell::Cell<i64>,
+    /// Generate from seed 0 whatever the seed asked for.
+    seedless: bool,
+    /// Make the oracle panic on a list of length 3.
+    panicky_oracle: bool,
+}
+
+impl TaskFamily for BrokenSum {
+    fn name(&self) -> &str {
+        "broken-sum"
+    }
+    fn signature(&self) -> Scheme {
+        ListSum.signature()
+    }
+    fn description(&self) -> &str {
+        ListSum.description()
+    }
+    fn examples(&self) -> Vec<Example> {
+        self.examples.clone().unwrap_or_else(|| ListSum.examples())
+    }
+    fn generate(&self, n: u64, rng: &mut TaskRng) -> Inputs {
+        if self.impure {
+            let k = self.counter.get() + 1;
+            self.counter.set(k);
+            return vec![Value::int_list(&vec![k; n as usize])];
+        }
+        if self.seedless {
+            return ListSum.generate(n, &mut TaskRng::new(n, 0));
+        }
+        let m = if self.short { n.saturating_sub(1) } else { n };
+        ListSum.generate(m, rng)
+    }
+    fn oracle(&self, inputs: &[Value]) -> Value {
+        if self.panicky_oracle && ints_of(&inputs[0]).len() == 3 {
+            panic!("oracle cannot sum three");
+        }
+        ListSum.oracle(inputs)
+    }
+    fn sizes(&self) -> Vec<u64> {
+        self.sizes.clone().unwrap_or_else(|| ListSum.sizes())
+    }
+}
+
+#[test]
+fn validation_rejects_bad_sizes() {
+    let c = config();
+    for sizes in [
+        vec![16, 64, 32, 128, 256],
+        vec![0, 16, 32, 64, 128],
+        vec![16, 32, 32, 64, 128],
+    ] {
+        let f = BrokenSum {
+            sizes: Some(sizes.clone()),
+            ..BrokenSum::default()
+        };
+        assert_eq!(
+            validate_family(&f, &c),
+            Err(FamilyDefect::BadSizes { sizes })
+        );
+    }
+}
+
+#[test]
+fn validation_rejects_a_sweep_too_short_to_fit() {
+    // Four sizes: the upper half is two, and estimator B needs three.
+    let f = BrokenSum {
+        sizes: Some(vec![16, 32, 64, 128]),
+        ..BrokenSum::default()
+    };
+    assert_eq!(
+        validate_family(&f, &config()),
+        Err(FamilyDefect::WindowTooSmall {
+            points: 2,
+            needed: 3
+        })
+    );
+    // Five sizes: the upper half is three.
+    let f = BrokenSum {
+        sizes: Some(vec![16, 32, 64, 128, 256]),
+        ..BrokenSum::default()
+    };
+    assert_eq!(validate_family(&f, &config()), Ok(()));
+}
+
+#[test]
+fn validation_rejects_missing_or_wrong_examples() {
+    let c = config();
+    let none = BrokenSum {
+        examples: Some(vec![]),
+        ..BrokenSum::default()
+    };
+    assert_eq!(validate_family(&none, &c), Err(FamilyDefect::NoExamples));
+    let wrong = BrokenSum {
+        examples: Some(vec![
+            Example::new(vec![Value::int_list(&[1, 2])], Value::Int(3)),
+            Example::new(vec![Value::int_list(&[1, 2, 3])], Value::Int(7)),
+        ]),
+        ..BrokenSum::default()
+    };
+    assert_eq!(
+        validate_family(&wrong, &c),
+        Err(FamilyDefect::ExampleDisagrees {
+            index: 1,
+            stated: Box::new(Value::Int(7)),
+            oracle: Box::new(Value::Int(6)),
+        })
+    );
+}
+
+#[test]
+fn validation_rejects_a_generator_that_does_not_repeat() {
+    let f = BrokenSum {
+        impure: true,
+        ..BrokenSum::default()
+    };
+    assert_eq!(
+        validate_family(&f, &config()),
+        Err(FamilyDefect::NotDeterministic { n: 16, seed: 0 })
+    );
+}
+
+#[test]
+fn validation_reports_an_oracle_that_panics_on_an_example() {
+    let f = BrokenSum {
+        panicky_oracle: true,
+        ..BrokenSum::default()
+    };
+    // ListSum's example 1 is [1, 2, 3].
+    assert_eq!(
+        validate_family(&f, &config()),
+        Err(FamilyDefect::OraclePanicked {
+            index: 1,
+            message: "oracle cannot sum three".to_string(),
+        })
+    );
+}
+
+#[test]
+fn validation_rejects_a_generator_that_ignores_its_seed() {
+    let f = BrokenSum {
+        seedless: true,
+        ..BrokenSum::default()
+    };
+    assert_eq!(
+        validate_family(&f, &config()),
+        Err(FamilyDefect::IgnoresSeed { seeds: (0, 1) })
+    );
+}
+
+#[test]
+fn input_size_check_rejects_inputs_of_the_wrong_size() {
+    let f = BrokenSum {
+        short: true,
+        ..BrokenSum::default()
+    };
+    // The definition is otherwise valid; only the measured size is wrong.
+    assert_eq!(validate_family(&f, &config()), Ok(()));
+    assert_eq!(
+        check_input_sizes(&f, 5, list_len),
+        Err(FamilyDefect::WrongInputSize {
+            n: 16,
+            seed: 0,
+            actual: 15
+        })
+    );
+}
+
+#[test]
+fn a_fuel_plan_refuses_a_defective_family() {
+    let mut arena = Arena::new();
+    let sum = parse(&mut arena, SUM);
+    let f = BrokenSum {
+        examples: Some(vec![]),
+        ..BrokenSum::default()
+    };
+    assert_eq!(
+        FuelPlan::from_reference(&f, &arena, sum, &config()),
+        Err(CheckFailure::Family(FamilyDefect::NoExamples))
     );
 }
