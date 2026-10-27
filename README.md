@@ -6,7 +6,7 @@ The research bet is this. An objective that rewards an abstraction for reducing 
 
 ## Status
 
-Phase 1 (literature and language specification) is drafted. Three open questions block phase 2. There is no code yet.
+Phase 1 (literature and language specification) is done apart from citation checks. Phase 2 (the core language) has started.
 
 ## Phases
 
@@ -16,6 +16,10 @@ Phase 1 (literature and language specification) is drafted. Three open questions
 4. Baseline loop modelled on LILO: LLM proposals and Stitch compression.
 5. Cost-aware library objective, compared with pure description length.
 6. Structural abstraction with e-graphs.
+
+## Building
+
+The code is a Cargo workspace under `crates/`. To run the same checks as CI (format, lint and tests), run `scripts/gate.sh`.
 
 ## Documentation
 
