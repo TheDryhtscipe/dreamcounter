@@ -62,9 +62,12 @@
 //!   the evaluation ends, and an escaped `self` keeps working with its own table and
 //!   remaining misses. Tables are never shared between `memorec` calls or between
 //!   evaluations. Each `self` holds only a weak reference, so a `self` stored in its
-//!   own table cannot keep it alive after the evaluation. A table that no `self` and
-//!   no pending call can reach is released during the evaluation; that changes no
-//!   step count. DECISION (coordinator, review of PR 7): this replaces the earlier
+//!   own table cannot keep it alive after the evaluation. A table with no live
+//!   `self` and no pending call is released during the evaluation; that changes no
+//!   step count. A table whose own entries hold a `self` of it (a curried `memorec`
+//!   result, or `pair self ..`) counts as live and is kept until the evaluation
+//!   ends, even when the program can no longer reach it, so such tables cost memory
+//!   in proportion to steps (bead dreamcounter-fc8e0a). DECISION (coordinator, review of PR 7): this replaces the earlier
 //!   reading, under which an escaped `self` raised `MemoSelfEscaped`.
 //! - **A `self` from an earlier evaluation.** A value returned by one evaluation
 //!   can hold a `memorec` `self` whose table was dropped when that evaluation

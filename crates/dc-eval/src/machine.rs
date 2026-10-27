@@ -710,8 +710,9 @@ impl<'a> Machine<'a> {
     ///
     /// A table that no `self` and no frame refers to can never be read again, so
     /// releasing it changes nothing a program can observe. Such tables are
-    /// released whenever the count doubles, so a loop of short `memorec` calls
-    /// holds only the tables still reachable, at amortised O(1) work per table.
+    /// released whenever the count doubles, at amortised O(1) work per table. A
+    /// `self` stored in its own table's entries counts as a reference, so a loop
+    /// of curried `memorec` calls keeps every table until the evaluation ends.
     fn adopt_table(&mut self, table: Rc<RefCell<MemoTable>>) {
         if self.memo_tables.len() >= self.memo_prune_at {
             // Strong references: this vector, plus any `MemoStore` frame. Weak
