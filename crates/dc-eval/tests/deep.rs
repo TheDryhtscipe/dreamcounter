@@ -144,9 +144,13 @@ fn formatting_deep_values() {
         assert!(s.ends_with(&format!("None{}, 400001)", ")".repeat(100_000))));
         let v = o.value().expect("value");
         assert_eq!(
-            format!("{v:?}").len(),
+            format!("{v}").len(),
             "Some ()".len() * 100_000 + "None".len()
         );
+        // `Debug` stops after `DEBUG_NODES` values and elides the rest.
+        let d = format!("{v:?}");
+        assert!(d.len() < 10 * dc_eval::DEBUG_NODES as usize, "{d}");
+        assert!(d.contains("Some (...)"), "{d}");
         // Nested arrays and a deep tree format too.
         let a = run("(loop 100000 unit (lam (lam (array_of_list (cons $0 nil)))))");
         assert!(a.to_string().contains("[|[|[|()|]|]|]"));

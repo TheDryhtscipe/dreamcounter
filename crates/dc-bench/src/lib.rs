@@ -262,6 +262,11 @@ pub struct Compiled {
 /// At most this many characters of a value appear in an error.
 const SHOWN: usize = 200;
 
+/// At most this many values and tree nodes of a value are formatted for an
+/// error, so a value with shared parts is not written out in full. Each takes at
+/// least one character, so the first [`SHOWN`] characters are all formatted.
+const SHOWN_NODES: u64 = SHOWN as u64;
+
 fn shown(v: &impl fmt::Display) -> String {
     let s = v.to_string();
     match s.char_indices().nth(SHOWN) {
@@ -283,12 +288,12 @@ impl Compiled {
             Outcome::Value(v, steps) if v == inst.expected => Ok(steps),
             Outcome::Value(v, _) => Err(BenchError::WrongResult {
                 program: self.program.name,
-                got: shown(&v),
-                expected: shown(&inst.expected),
+                got: shown(&v.display_within(SHOWN_NODES)),
+                expected: shown(&inst.expected.display_within(SHOWN_NODES)),
             }),
             other => Err(BenchError::NotAValue {
                 program: self.program.name,
-                outcome: shown(&other),
+                outcome: shown(&other.display_within(SHOWN_NODES)),
             }),
         }
     }
