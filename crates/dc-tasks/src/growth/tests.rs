@@ -516,8 +516,8 @@ fn estimators_are_swappable_behind_the_trait() {
         .collect();
     assert!(matches!(fits[0], GrowthFit::LogLog(_)));
     assert!(matches!(fits[1], GrowthFit::PowerLog(_)));
-    assert!((fits[0].alpha() - a(&sweep).alpha).abs() < EXACT);
-    assert!((fits[1].alpha() - 1.0).abs() < EXACT);
+    assert!((fits[0].alpha().expect("A has an exponent") - a(&sweep).alpha).abs() < EXACT);
+    assert!((fits[1].alpha().expect("B has an exponent") - 1.0).abs() < EXACT);
     assert_eq!(fits[0].window(), fits[1].window());
     assert_ne!(ests[0].name(), ests[1].name());
 }
@@ -786,5 +786,805 @@ proptest! {
         let mut rss = fit.candidates.map(|c| c.rss);
         rss.sort_by(f64::total_cmp);
         prop_assert!((fit.rss_margin() - (rss[1] - rss[0])).abs() < 1e-12);
+    }
+}
+
+// ------------------------------------------------------------- estimator C
+
+/// Estimator C with the given noise model and the other defaults.
+fn c_with(noise_model: NoiseModel) -> ClassSelect {
+    ClassSelect {
+        noise_model,
+        ..ClassSelect::default()
+    }
+}
+
+/// C on an exact series, such as one from [`Sweep::from_fn`] (one seed per
+/// size): [`NoiseModel::Exact`].
+fn c(sweep: &Sweep) -> ClassFit {
+    c_with(NoiseModel::Exact).fit(sweep).expect("C fits")
+}
+
+/// C with the defaults, which estimate the noise from the seeds.
+fn c_seeded(sweep: &Sweep) -> ClassFit {
+    ClassSelect::default().fit(sweep).expect("C fits")
+}
+
+/// The default tolerance.
+fn default_tolerance() -> f64 {
+    ClassSelect::default().tolerance
+}
+
+/// A class and an exact step series of it.
+type ClassCase = (GrowthClass, fn(u64) -> u64);
+
+/// Sizes on which `2ⁿ` fits in a `u64`.
+const EXP_SIZES: [u64; 6] = [10, 20, 30, 40, 50, 60];
+
+#[test]
+fn c_names_the_class_of_each_exact_series() {
+    let cases: [ClassCase; 6] = [
+        (GrowthClass::Constant, |_| 7),
+        (GrowthClass::Log, |n| 1000 * log2(n)),
+        (GrowthClass::Linear, |n| 3 * n),
+        (GrowthClass::NLogN, |n| n * log2(n)),
+        (GrowthClass::Quadratic, |n| n * n),
+        (GrowthClass::Cubic, |n| n * n * n),
+    ];
+    for (class, f) in cases {
+        let fit = c(&default_sweep(f));
+        assert_eq!(fit.verdict, ClassVerdict::Class(class), "{class:?}");
+        assert_eq!(fit.best().class, class);
+        assert!(
+            fit.best().misfit < EXACT,
+            "{class:?}: {}",
+            fit.best().misfit
+        );
+    }
+    let exp = Sweep::from_fn(&EXP_SIZES, |n| 1 << n).expect("valid");
+    assert_eq!(
+        c(&exp).verdict,
+        ClassVerdict::Class(GrowthClass::Exponential)
+    );
+}
+
+/// Exact `1000 · n^a` on the default sweep.
+fn power_law(a: f64) -> Sweep {
+    default_sweep(move |n| (1000.0 * (n as f64).powf(a)).round() as u64)
+}
+
+#[test]
+fn c_refuses_powers_near_a_class() {
+    // Each is within a few per cent of n, n log n or n² over part of the
+    // sweep, but no class with a bounded lower-order term follows it over
+    // all of 16..1024.
+    for a in [0.9, 0.95, 1.1, 1.14, 1.2, 1.3, 1.9, 2.1] {
+        let fit = c(&power_law(a));
+        assert_eq!(fit.verdict, ClassVerdict::NoFit, "n^{a}: {fit:?}");
+    }
+}
+
+#[test]
+fn c_names_classes_with_a_lower_order_term() {
+    for (class, f) in [
+        (GrowthClass::Linear, (|n| 3 * n + 5) as fn(u64) -> u64),
+        (GrowthClass::NLogN, |n| n * log2(n) + 2 * n),
+        // In natural logarithms this is n ln n + 4 ln 2 · n, a lower-order
+        // term as large as the main term at n = 16 (ρ = 1).
+        (GrowthClass::NLogN, |n| n * log2(n) + 4 * n),
+        (GrowthClass::Quadratic, |n| n * n / 4 + 3 * n),
+        (GrowthClass::Cubic, |n| n * n * n + 7 * n * n),
+    ] {
+        let fit = c(&default_sweep(f));
+        assert_eq!(fit.verdict, ClassVerdict::Class(class), "{fit:?}");
+        let k = fit.candidates[class as usize];
+        assert!(k.misfit < 1e-3, "{k:?}");
+    }
+    // Without the lower-order term the same series is refused: the term is
+    // what names it.
+    let one_term = ClassSelect {
+        lower_order_ratio: 0.0,
+        ..c_with(NoiseModel::Exact)
+    };
+    let fit = one_term
+        .fit(&default_sweep(|n| n * log2(n) + 4 * n))
+        .expect("fits");
+    assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
+    assert!(fit.candidates.iter().all(|k| k.r == 0.0), "{fit:?}");
+}
+
+#[test]
+fn c_lower_order_term_is_bounded_by_the_main_term() {
+    // n log2 n + 8n: the term is twice the main term at n = 16, beyond ρ = 1.
+    let sweep = default_sweep(|n| n * log2(n) + 8 * n);
+    let fit = c(&sweep);
+    assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
+    // r sits at its upper bound ρ q, q = min f/g = ln 16.
+    let k = fit.candidates[GrowthClass::NLogN as usize];
+    assert!((k.r - 16f64.ln()).abs() < EXACT, "{k:?}");
+    // With ρ = 2 it is named.
+    let wide = ClassSelect {
+        lower_order_ratio: 2.0,
+        ..c_with(NoiseModel::Exact)
+    };
+    let fit = wide.fit(&sweep).expect("fits");
+    assert_eq!(
+        fit.verdict,
+        ClassVerdict::Class(GrowthClass::NLogN),
+        "{fit:?}"
+    );
+    // A negative term is bounded by half the main term: n² − 0.9 n·16 at
+    // n = 16 is a tenth of n², beyond the bound.
+    let sweep = default_sweep(|n| n * n - 9 * n * 16 / 10);
+    let fit = c(&sweep);
+    let k = fit.candidates[GrowthClass::Quadratic as usize];
+    assert!((k.r + 8.0).abs() < EXACT, "{k:?}");
+    assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
+}
+
+/// Sizes of the `zero-subsets` reference family.
+const SUBSET_SIZES: [u64; 6] = [4, 6, 8, 10, 12, 14];
+
+#[test]
+fn c_tells_2_to_the_n_from_its_lower_order_term() {
+    // The lower-order term of 2ⁿ is n, which covers recurrences
+    // T(n) = 2 T(n − 1) + p(n) with p of degree 0 or 1. Over 4..14 a
+    // polynomial term can be as large as 2ⁿ itself, so larger terms, and
+    // growth near 2ⁿ, are refused.
+    let fit = |f: fn(u64) -> u64| c(&Sweep::from_fn(&SUBSET_SIZES, f).expect("valid"));
+    let exp = |b: f64| move |n: u64| (1000.0 * b.powi(n as i32)).round() as u64;
+    for (f, verdict) in [
+        (
+            (|n| 21 * (1 << n) - 8) as fn(u64) -> u64,
+            ClassVerdict::Class(GrowthClass::Exponential),
+        ),
+        (
+            |n| 1000 * ((1 << n) - n - 2),
+            ClassVerdict::Class(GrowthClass::Exponential),
+        ),
+        (
+            |n| 1000 * n * n * n,
+            ClassVerdict::Class(GrowthClass::Cubic),
+        ),
+        // n³ is 4 times 2ⁿ at n = 4: with n³ as the term this would be named.
+        (|n| (1000 << n) + 50 * n * n * n, ClassVerdict::NoFit),
+        (|n| n * (1000 << n), ClassVerdict::NoFit),
+        (|n| 1000 * n.pow(4), ClassVerdict::NoFit),
+        (|n| 1000 * n.pow(5), ClassVerdict::NoFit),
+    ] {
+        let got = fit(f);
+        assert_eq!(got.verdict, verdict, "{got:?}");
+    }
+    for b in [1.9, 2.1, 3.0] {
+        let got = c(&Sweep::from_fn(&SUBSET_SIZES, exp(b)).expect("valid"));
+        assert_eq!(got.verdict, ClassVerdict::NoFit, "{b}^n: {got:?}");
+    }
+}
+
+#[test]
+fn c_refuses_growth_outside_its_classes() {
+    // n^1.5 and n² log n lie between classes; neither is within tolerance of
+    // any class, so C says so rather than naming the nearest.
+    for f in [
+        (|n| ((n as f64).powf(1.5) * 1000.0) as u64) as fn(u64) -> u64,
+        |n| n * n * log2(n),
+    ] {
+        let fit = c(&default_sweep(f));
+        assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
+        assert!(fit.best().misfit > fit.tolerance);
+    }
+}
+
+/// `2⁸, 2¹⁰, …, 2²⁰`.
+const WIDE_SIZES: [u64; 7] = [1 << 8, 1 << 10, 1 << 12, 1 << 14, 1 << 16, 1 << 18, 1 << 20];
+
+/// Exact `100 · n^a` over `2⁸, 2¹⁰, …, 2²⁰`.
+fn wide_power_law(a: f64) -> Sweep {
+    Sweep::from_fn(&WIDE_SIZES, |n| ((n as f64).powf(a) * 100.0).round() as u64).expect("valid")
+}
+
+#[test]
+fn c_on_a_wide_window() {
+    // A wider window tells near-classes apart better, and the lower-order
+    // term still absorbs n log2 n + 2n, which is 25 % above n log2 n at
+    // n = 2⁸.
+    for (a, verdict) in [
+        (1.0, ClassVerdict::Class(GrowthClass::Linear)),
+        (1.05, ClassVerdict::NoFit),
+        (1.1, ClassVerdict::NoFit),
+        (2.0, ClassVerdict::Class(GrowthClass::Quadratic)),
+    ] {
+        let fit = c(&wide_power_law(a));
+        assert_eq!(fit.verdict, verdict, "n^{a}: {fit:?}");
+    }
+    let plus_2n = Sweep::from_fn(&WIDE_SIZES, |n| n * log2(n) + 2 * n).expect("valid");
+    assert_eq!(c(&plus_2n).verdict, ClassVerdict::Class(GrowthClass::NLogN));
+}
+
+#[test]
+fn c_misfit_is_the_half_range_and_ln_c_the_midpoint() {
+    // With no lower-order term, against class n: ln(3n + 5) − ln n =
+    // ln(3 + 5/n), which falls with n.
+    let one_term = ClassSelect {
+        lower_order_ratio: 0.0,
+        ..c_with(NoiseModel::Exact)
+    };
+    let fit = one_term.fit(&default_sweep(|n| 3 * n + 5)).expect("fits");
+    let lin = fit.candidates[GrowthClass::Linear as usize];
+    assert_eq!(lin.class, GrowthClass::Linear);
+    assert_eq!(lin.r, 0.0);
+    let (hi, lo) = ((3.0 + 5.0 / 16.0f64).ln(), (3.0 + 5.0 / 1024.0f64).ln());
+    assert!((lin.misfit - (hi - lo) / 2.0).abs() < EXACT, "{lin:?}");
+    assert!((lin.ln_c - (hi + lo) / 2.0).abs() < EXACT, "{lin:?}");
+
+    // With it, 3n + 5 = 3 (n + 5/3) exactly: r = 5/3, c = 3.
+    let fit = c(&default_sweep(|n| 3 * n + 5));
+    let lin = fit.candidates[GrowthClass::Linear as usize];
+    assert!((lin.r - 5.0 / 3.0).abs() < 1e-9, "{lin:?}");
+    assert!((lin.ln_c - 3f64.ln()).abs() < 1e-9, "{lin:?}");
+    assert!(lin.misfit < 1e-12, "{lin:?}");
+}
+
+#[test]
+fn c_tolerance_and_margin_on_an_exact_series() {
+    let fit = c(&default_sweep(|n| 3 * n));
+    assert_eq!(fit.noise, Some(0.0), "exact: noise 0");
+    assert_eq!(fit.noise_margin, 0.0);
+    assert_eq!(fit.tolerance, 0.01);
+    assert_eq!(
+        (fit.window.n_min, fit.window.n_max, fit.window.points),
+        (16, 1024, 7),
+        "C fits the whole sweep by default"
+    );
+}
+
+#[test]
+fn c_refuses_one_seed_per_size_unless_told_the_noise() {
+    let sweep = default_sweep(|n| n * n);
+    let fit = c_seeded(&sweep);
+    assert_eq!(fit.noise, None, "one seed per size: noise unknown");
+    assert_eq!(fit.noise_margin, 0.0);
+    assert_eq!(fit.verdict, ClassVerdict::NoiseUnknown);
+    assert_eq!(fit.class(), None);
+
+    // The same series, declared exact or with a known small noise, is named.
+    let exact = c(&sweep);
+    assert_eq!(exact.candidates, fit.candidates);
+    assert_eq!(exact.verdict, ClassVerdict::Class(GrowthClass::Quadratic));
+    let known = c_with(NoiseModel::Known(0.01)).fit(&sweep).expect("fits");
+    assert_eq!(known.noise, Some(0.01));
+    assert!((known.noise_margin - 0.03).abs() < EXACT, "{known:?}");
+    assert_eq!(known.verdict, ClassVerdict::Class(GrowthClass::Quadratic));
+
+    // A known noise large enough to bring n log n within reach of exact n
+    // refuses.
+    let lin = default_sweep(|n| 3 * n);
+    let loud = c_with(NoiseModel::Known(0.1)).fit(&lin).expect("fits");
+    assert!(
+        loud.candidates[GrowthClass::NLogN as usize].misfit <= loud.tolerance + loud.noise_margin
+    );
+    assert_eq!(loud.verdict, ClassVerdict::TooNoisy, "{loud:?}");
+}
+
+/// A default sweep with five seeds per size: `base(n)` scaled by
+/// `1 + δ · {−2, −1, 0, 1, 2}`.
+fn seeded_sweep(base: impl Fn(u64) -> u64, delta: f64) -> Sweep {
+    Sweep::new(
+        DEFAULT_SIZES
+            .iter()
+            .map(|&n| {
+                let b = base(n) as f64;
+                let steps = [-2.0, -1.0, 0.0, 1.0, 2.0]
+                    .iter()
+                    .map(|k| (b * (1.0 + delta * k)).round() as u64)
+                    .collect();
+                SizeObservation::completed(n, steps)
+            })
+            .collect(),
+    )
+    .expect("valid")
+}
+
+/// The noise C should report for [`seeded_sweep`]: the largest, over the
+/// sweep, of `√(π/2) · sd / √5`, the standard error of a median of five,
+/// with `sd` the sample standard deviation of the seeds' `ln` steps.
+fn seeded_noise(base: impl Fn(u64) -> u64, delta: f64) -> f64 {
+    DEFAULT_SIZES
+        .iter()
+        .map(|&n| {
+            let b = base(n) as f64;
+            let ys: Vec<f64> = [-2.0, -1.0, 0.0, 1.0, 2.0]
+                .iter()
+                .map(|k| ((b * (1.0 + delta * k)).round()).ln())
+                .collect();
+            let m = ys.iter().sum::<f64>() / 5.0;
+            let var = ys.iter().map(|y| (y - m) * (y - m)).sum::<f64>() / 4.0;
+            (std::f64::consts::FRAC_PI_2 * var / 5.0).sqrt()
+        })
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn c_seed_noise_sets_the_noise_margin_not_the_tolerance() {
+    let delta = 0.03;
+    let fit = c_seeded(&seeded_sweep(|n| 1000 * n, delta));
+    let noise = seeded_noise(|n| 1000 * n, delta);
+    assert!((fit.noise.expect("five seeds") - noise).abs() < EXACT);
+    let z = ClassSelect::default().noise_z;
+    assert!(
+        z * noise > default_tolerance(),
+        "the test needs a noise margin above the tolerance"
+    );
+    assert!(
+        (fit.tolerance - default_tolerance()).abs() < EXACT,
+        "{fit:?}"
+    );
+    assert!((fit.noise_margin - z * noise).abs() < EXACT, "{fit:?}");
+    // n log n, 0.28 from exact n, is beyond τ + m.
+    assert!(fit.candidates[GrowthClass::NLogN as usize].misfit > fit.tolerance + fit.noise_margin);
+    assert_eq!(fit.verdict, ClassVerdict::Class(GrowthClass::Linear));
+}
+
+#[test]
+fn c_refuses_when_noise_brings_another_class_within_reach() {
+    // The medians are exactly linear (the middle seed is the base), but
+    // seeds this far apart put n log n within τ + m.
+    let sweep = seeded_sweep(|n| 1000 * n, 0.15);
+    let fit = c_seeded(&sweep);
+    assert!(fit.candidates[GrowthClass::Linear as usize].misfit <= fit.tolerance);
+    assert!(
+        fit.candidates[GrowthClass::NLogN as usize].misfit <= fit.tolerance + fit.noise_margin,
+        "{fit:?}"
+    );
+    assert_eq!(fit.verdict, ClassVerdict::TooNoisy);
+    assert_eq!(
+        c(&sweep).verdict,
+        ClassVerdict::Class(GrowthClass::Linear),
+        "the same medians, declared exact"
+    );
+}
+
+#[test]
+fn c_never_names_a_class_for_noisy_growth_between_classes() {
+    // n^1.5 lies between n log n and n²: outside τ of both (n log n at
+    // 0.376), but with seeds 15 % apart n log n is within τ + m. C refuses.
+    let f = |n: u64| ((n as f64).powf(1.5) * 1000.0) as u64;
+    let sweep = seeded_sweep(f, 0.15);
+    let fit = c_seeded(&sweep);
+    let nlogn = fit.candidates[GrowthClass::NLogN as usize].misfit;
+    assert!(nlogn > fit.tolerance, "{fit:?}");
+    assert!(nlogn <= fit.tolerance + fit.noise_margin, "{fit:?}");
+    assert_eq!(fit.verdict, ClassVerdict::TooNoisy, "{fit:?}");
+    assert_eq!(c(&sweep).verdict, ClassVerdict::NoFit);
+}
+
+#[test]
+fn c_seed_noise_does_not_name_growth_between_n_and_n_log_n() {
+    // Review 2 of PR 19, HIGH 1: when seed noise widened the tolerance,
+    // 1000 · n^1.1 and 1000 · n ln ln n with five seeds 3 % apart were named
+    // n log n (misfits 0.0744 and 0.0765 against a widened tolerance of
+    // 0.0799), though their exact medians are NoFit.
+    let cases: [fn(u64) -> u64; 2] = [
+        |n| (1000.0 * (n as f64).powf(1.1)) as u64,
+        |n| (1000.0 * n as f64 * (n as f64).ln().ln()) as u64,
+    ];
+    for f in cases {
+        let exact = c(&default_sweep(f));
+        assert_eq!(exact.verdict, ClassVerdict::NoFit, "{exact:?}");
+        for delta in [0.0, 0.02, 0.03, 0.04] {
+            let fit = c_seeded(&seeded_sweep(f, delta));
+            assert!(
+                matches!(fit.verdict, ClassVerdict::TooNoisy | ClassVerdict::NoFit),
+                "delta {delta}: {fit:?}"
+            );
+            assert!(fit.candidates[GrowthClass::NLogN as usize].misfit > fit.tolerance);
+        }
+    }
+}
+
+/// A default sweep of three seeds per size around medians `1000 · n`, each
+/// moved by `±offset` in `ln`, alternately up and down: the seeds' `ln`
+/// steps are the median's and the median's `± spread`.
+fn offset_linear_sweep(offset: f64, spread: f64) -> Sweep {
+    Sweep::new(
+        DEFAULT_SIZES
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                let ln_median = (1000.0 * n as f64).ln() + sign * offset;
+                let steps = [-spread, 0.0, spread]
+                    .iter()
+                    .map(|s| (ln_median + s).exp().round() as u64)
+                    .collect();
+                SizeObservation::completed(n, steps)
+            })
+            .collect(),
+    )
+    .expect("valid")
+}
+
+#[test]
+fn c_names_a_class_only_if_its_true_misfit_is_within_tau_minus_m() {
+    // Review 3 of PR 19, MEDIUM: the module comment said C names a class
+    // whose true medians are within τ of it whenever each median is off by
+    // at most m. An offset of m can raise the misfit to τ + m, so C names
+    // the class only if the true misfit is at most τ − m. Here the true
+    // medians are exactly 1000 · n (misfit 0), each is off by 0.015 < m,
+    // and the misfit 0.015 is above τ: C refuses.
+    let fit = c_seeded(&offset_linear_sweep(0.015, 0.01));
+    let linear = fit.candidates[GrowthClass::Linear as usize].misfit;
+    assert!((linear - 0.015).abs() < 1e-3, "{fit:?}");
+    assert!(0.015 <= fit.noise_margin, "each median is off by at most m");
+    assert!(linear > fit.tolerance, "{fit:?}");
+    assert_eq!(fit.verdict, ClassVerdict::TooNoisy, "{fit:?}");
+
+    // With the noise margin m below τ, an offset of at most m names the
+    // class: the true misfit 0 is within τ − m, and the next class is far
+    // beyond τ + 2m.
+    let fit = c_seeded(&offset_linear_sweep(0.004, 0.002));
+    assert!(0.004 <= fit.noise_margin, "{fit:?}");
+    assert!(fit.noise_margin <= fit.tolerance, "{fit:?}");
+    assert_eq!(
+        fit.verdict,
+        ClassVerdict::Class(GrowthClass::Linear),
+        "{fit:?}"
+    );
+}
+
+#[test]
+fn c_noise_ignores_single_seed_sizes_but_not_the_others() {
+    // As in the noisy linear sweep, but n = 1024 has one seed: the other
+    // sizes still show the spread, so C still refuses.
+    let mut obs = seeded_sweep(|n| 1000 * n, 0.15).observations().to_vec();
+    obs[6] = SizeObservation::completed(1024, vec![1000 * 1024]);
+    let fit = c_seeded(&Sweep::new(obs).expect("valid"));
+    assert!(fit.noise.expect("other sizes have seeds") > 0.0);
+    assert_eq!(fit.verdict, ClassVerdict::TooNoisy, "{fit:?}");
+}
+
+#[test]
+fn c_rejects_parameters_out_of_range() {
+    let sweep = default_sweep(|n| n);
+    let mut cases = vec![
+        (
+            ClassSelect {
+                tolerance: -0.01,
+                ..ClassSelect::default()
+            },
+            "tolerance",
+        ),
+        (
+            ClassSelect {
+                tolerance: f64::NAN,
+                ..ClassSelect::default()
+            },
+            "tolerance",
+        ),
+        (
+            ClassSelect {
+                tolerance: f64::INFINITY,
+                ..ClassSelect::default()
+            },
+            "tolerance",
+        ),
+        (
+            ClassSelect {
+                lower_order_ratio: -0.01,
+                ..ClassSelect::default()
+            },
+            "lower_order_ratio",
+        ),
+        (
+            ClassSelect {
+                lower_order_ratio: f64::NAN,
+                ..ClassSelect::default()
+            },
+            "lower_order_ratio",
+        ),
+        (
+            ClassSelect {
+                lower_order_ratio: f64::INFINITY,
+                ..ClassSelect::default()
+            },
+            "lower_order_ratio",
+        ),
+        (
+            ClassSelect {
+                noise_z: -1.0,
+                ..ClassSelect::default()
+            },
+            "noise_z",
+        ),
+        (
+            ClassSelect {
+                noise_z: f64::INFINITY,
+                ..ClassSelect::default()
+            },
+            "noise_z",
+        ),
+    ];
+    for v in [-0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        cases.push((c_with(NoiseModel::Known(v)), "noise_model"));
+    }
+    for (est, name) in cases {
+        assert_eq!(est.fit(&sweep), Err(GrowthError::BadParameter { name }));
+    }
+    assert!(c_with(NoiseModel::Known(0.0)).fit(&sweep).is_ok());
+}
+
+#[test]
+fn c_refuses_incomplete_windows_and_short_ones() {
+    let sweep = Sweep::new(
+        DEFAULT_SIZES[..6]
+            .iter()
+            .map(|&n| SizeObservation::completed(n, vec![n]))
+            .chain([SizeObservation::timed_out(1024)])
+            .collect(),
+    )
+    .expect("valid");
+    assert_eq!(
+        ClassSelect::default().fit(&sweep),
+        Err(GrowthError::IncompleteWindow {
+            timed_out: vec![1024],
+            errored: vec![]
+        })
+    );
+    let short = Sweep::from_fn(&[16, 32, 64], |n| n).expect("valid");
+    assert_eq!(
+        ClassSelect::default().fit(&short),
+        Err(GrowthError::TooFewPoints {
+            points: 3,
+            needed: ClassSelect::MIN_POINTS
+        })
+    );
+    let seed_zero = Sweep::new(
+        DEFAULT_SIZES
+            .iter()
+            .map(|&n| SizeObservation::completed(n, vec![0, n, n]))
+            .collect(),
+    )
+    .expect("valid");
+    for model in [NoiseModel::FromSeeds, NoiseModel::Exact] {
+        assert_eq!(
+            c_with(model).fit(&seed_zero),
+            Err(GrowthError::ZeroSteps { n: 16 })
+        );
+    }
+}
+
+#[test]
+fn c_through_the_trait() {
+    let est: &dyn GrowthEstimator = &c_with(NoiseModel::Exact);
+    assert_eq!(est.name(), "C:class-select");
+    let fit = est.estimate(&default_sweep(|n| n * n)).expect("fits");
+    assert_eq!(fit.alpha(), None);
+    match fit {
+        GrowthFit::Class(f) => assert_eq!(f.class(), Some(GrowthClass::Quadratic)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        LogLogSlope::default()
+            .estimate(&default_sweep(|n| n))
+            .expect("fits")
+            .alpha()
+            .map(f64::round),
+        Some(1.0)
+    );
+}
+
+/// The smallest half range of [`two_term_residuals`] over `n_grid + 1`
+/// evenly spaced `r` from `lo` to `hi`, by brute force.
+fn scan_half_range(base: &[f64], h: &[f64], lo: f64, hi: f64, n_grid: u32) -> f64 {
+    (0..=n_grid)
+        .map(|i| {
+            let r = lo + (hi - lo) * f64::from(i) / f64::from(n_grid);
+            let d: Vec<f64> = base
+                .iter()
+                .zip(h)
+                .map(|(b, h)| b - (1.0 + r * h).ln())
+                .collect();
+            let hi = d.iter().copied().fold(f64::MIN, f64::max);
+            let lo = d.iter().copied().fold(f64::MAX, f64::min);
+            (hi - lo) / 2.0
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Checks a fitted `r` against a brute-force scan of
+/// `[−min(½, ρ) / max h, ρ / max h]`:
+/// `r` is in the interval, and no `r` of the scan does better than it by
+/// more than rounding. With `N` grid steps, the nearest grid point is within
+/// `1.5 / (N max h)` of `r`, where each residual moves by at most
+/// `2 max h` per unit of `r` (since `1 + r h ≥ ½`), so the scan's best is
+/// within `3 / N` above the true minimum.
+fn check_against_scan(base: &[f64], h: &[f64], ratio: f64, r: f64) -> Result<(), TestCaseError> {
+    const N: u32 = 3000;
+    let h_max = h.iter().copied().fold(0.0, f64::max);
+    let d: Vec<f64> = base
+        .iter()
+        .zip(h)
+        .map(|(b, h)| b - (1.0 + r * h).ln())
+        .collect();
+    let got = midpoint_and_half_range(&d).1;
+    if h_max == 0.0 || h.iter().all(|&v| v == h[0]) {
+        prop_assert_eq!(r, 0.0);
+        return Ok(());
+    }
+    let (lo, hi) = (-ratio.min(0.5) / h_max, ratio / h_max);
+    prop_assert!(r >= lo && r <= hi, "r {} outside [{}, {}]", r, lo, hi);
+    let scan = scan_half_range(base, h, lo, hi, N);
+    prop_assert!(got <= scan + 1e-12, "fit {} worse than scan {}", got, scan);
+    prop_assert!(
+        scan <= got + 3.0 / f64::from(N) + 1e-12,
+        "scan {} vs fit {}",
+        scan,
+        got
+    );
+    Ok(())
+}
+
+proptest! {
+    /// The `r` fit agrees with a brute-force scan, for any residuals,
+    /// any positive `h` (some possibly equal) and any `ρ`.
+    #[test]
+    fn c_r_fit_matches_a_brute_force_scan(
+        points in prop::collection::vec((-3.0f64..3.0, 0.001f64..10.0), 4..8),
+        equal_h in any::<bool>(),
+        ratio in 0.0f64..4.0,
+    ) {
+        let base: Vec<f64> = points.iter().map(|p| p.0).collect();
+        let h: Vec<f64> = points.iter().map(|p| if equal_h { points[0].1 } else { p.1 }).collect();
+        let r = minimax_r(&base, &h, ratio);
+        check_against_scan(&base, &h, ratio, r)?;
+    }
+
+    /// Whatever the step counts: every float is finite; each class's `r`
+    /// agrees with a brute-force scan and its misfit and `ln c` with a
+    /// recomputation from the medians at that `r`; the noise matches a
+    /// recomputation from the seeds; the tolerance is the default; the noise
+    /// margin is `noise_z` times the noise; and the verdict follows the rule
+    /// in the module comment, recomputed here from the misfits.
+    #[test]
+    fn c_verdict_laws(
+        steps in prop::collection::vec(prop::collection::vec(1u64..1_000_000, 1..6), 7)
+    ) {
+        let seeds = steps[0].len();
+        let per_size: Vec<Vec<u64>> = steps
+            .iter()
+            .map(|s| s.iter().copied().cycle().take(seeds).collect())
+            .collect();
+        let sweep = Sweep::new(
+            DEFAULT_SIZES
+                .iter()
+                .zip(&per_size)
+                .map(|(&n, s)| SizeObservation::completed(n, s.clone()))
+                .collect(),
+        ).expect("valid");
+        let fit = c_seeded(&sweep);
+        prop_assert!(fit.noise_margin.is_finite());
+        prop_assert!(fit
+            .candidates
+            .iter()
+            .all(|k| k.misfit.is_finite() && k.ln_c.is_finite() && k.r.is_finite()));
+        // Recompute each class's residuals from the medians here.
+        let meds: Vec<f64> = sweep.medians().iter().map(|&(_, m)| (m as f64).ln()).collect();
+        let defaults = ClassSelect::default();
+        for (i, class) in GrowthClass::ALL.iter().enumerate() {
+            let k = fit.candidates[i];
+            prop_assert_eq!(k.class, *class);
+            let base: Vec<f64> = meds
+                .iter()
+                .zip(DEFAULT_SIZES)
+                .map(|(y, n)| y - class.ln_f(n))
+                .collect();
+            let h: Vec<f64> = DEFAULT_SIZES
+                .iter()
+                .map(|&n| match class.lower_order_term() {
+                    Some(g) => (g.ln_f(n) - class.ln_f(n)).exp(),
+                    None => 0.0,
+                })
+                .collect();
+            check_against_scan(&base, &h, defaults.lower_order_ratio, k.r)?;
+            let d: Vec<f64> = base.iter().zip(&h).map(|(b, h)| b - (1.0 + k.r * h).ln()).collect();
+            let hi = d.iter().copied().fold(f64::MIN, f64::max);
+            let lo = d.iter().copied().fold(f64::MAX, f64::min);
+            prop_assert!((k.misfit - (hi - lo) / 2.0).abs() < 1e-9);
+            prop_assert!((k.ln_c - (hi + lo) / 2.0).abs() < 1e-9);
+        }
+        // Recompute the noise: the largest standard error of a median over
+        // the window, from the seeds' ln steps.
+        let noise = (seeds >= 2).then(|| {
+            per_size
+                .iter()
+                .map(|s| {
+                    let ys: Vec<f64> = s.iter().map(|&v| (v as f64).ln()).collect();
+                    let k = ys.len() as f64;
+                    let m = ys.iter().sum::<f64>() / k;
+                    let var = ys.iter().map(|y| (y - m) * (y - m)).sum::<f64>() / (k - 1.0);
+                    (std::f64::consts::FRAC_PI_2 * var / k).sqrt()
+                })
+                .fold(0.0, f64::max)
+        });
+        match (fit.noise, noise) {
+            (None, None) => {}
+            (Some(got), Some(want)) => prop_assert!((got - want).abs() < 1e-9),
+            (got, want) => prop_assert!(false, "noise {got:?}, expected {want:?}"),
+        }
+        prop_assert_eq!(fit.tolerance, defaults.tolerance);
+        prop_assert!(
+            (fit.noise_margin - defaults.noise_z * noise.unwrap_or(0.0)).abs() < 1e-9
+        );
+        let within = |limit: f64| -> Vec<GrowthClass> {
+            fit.candidates.iter().filter(|k| k.misfit <= limit).map(|k| k.class).collect()
+        };
+        let named = within(fit.tolerance);
+        let near = within(fit.tolerance + fit.noise_margin);
+        let expected = match noise {
+            None => ClassVerdict::NoiseUnknown,
+            Some(_) if named.len() == 1 && near.len() == 1 => ClassVerdict::Class(named[0]),
+            Some(_) if !near.is_empty() => ClassVerdict::TooNoisy,
+            Some(_) => ClassVerdict::NoFit,
+        };
+        prop_assert_eq!(&fit.verdict, &expected);
+    }
+
+    /// With the medians fixed, noise only refuses: the verdict with any
+    /// noise margin is the verdict for exact step counts or `TooNoisy`, a
+    /// zero margin gives the exact verdict, and more noise refuses whenever
+    /// less does. The series are near or between classes, `n^α (ln n)^γ`,
+    /// with multiplicative seed jitter.
+    #[test]
+    fn c_noise_only_refuses(
+        alpha in 0.0f64..3.2,
+        gamma in -1.0f64..2.0,
+        seeds in 1usize..6,
+        jitter in prop::collection::vec(-1.0f64..1.0, 35),
+        spread in 0.0f64..0.15,
+        v in 0.0f64..0.06,
+        z in 0.0f64..6.0,
+    ) {
+        let sweep = Sweep::new(
+            DEFAULT_SIZES
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| {
+                    let ln_n = (n as f64).ln();
+                    let base = 1000.0 * (alpha * ln_n + gamma * ln_n.ln()).exp();
+                    let steps = (0..seeds)
+                        .map(|j| (base * (spread * jitter[i * 5 + j]).exp()).round().max(1.0) as u64)
+                        .collect();
+                    SizeObservation::completed(n, steps)
+                })
+                .collect(),
+        ).expect("valid");
+        let exact = c_with(NoiseModel::Exact).fit(&sweep).expect("fits");
+        let refuses_or_agrees = |verdict: &ClassVerdict| {
+            *verdict == exact.verdict || *verdict == ClassVerdict::TooNoisy
+        };
+        let with = |noise_z: f64, noise_model: NoiseModel| {
+            ClassSelect { noise_z, noise_model, ..ClassSelect::default() }
+                .fit(&sweep)
+                .expect("fits")
+        };
+
+        let from_seeds = with(z, NoiseModel::FromSeeds);
+        let silent = with(0.0, NoiseModel::FromSeeds);
+        if from_seeds.noise.is_some() {
+            prop_assert!(refuses_or_agrees(&from_seeds.verdict), "{from_seeds:?} vs {exact:?}");
+            prop_assert_eq!(&silent.verdict, &exact.verdict);
+        } else {
+            prop_assert_eq!(&from_seeds.verdict, &ClassVerdict::NoiseUnknown);
+            prop_assert_eq!(&silent.verdict, &ClassVerdict::NoiseUnknown);
+        }
+
+        let known = with(z, NoiseModel::Known(v));
+        prop_assert!(refuses_or_agrees(&known.verdict), "{known:?} vs {exact:?}");
+        prop_assert_eq!(&with(0.0, NoiseModel::Known(v)).verdict, &exact.verdict);
+        let louder = with(z, NoiseModel::Known(2.0 * v));
+        prop_assert!(refuses_or_agrees(&louder.verdict), "{louder:?} vs {exact:?}");
+        if known.verdict == ClassVerdict::TooNoisy {
+            prop_assert_eq!(&louder.verdict, &ClassVerdict::TooNoisy);
+        }
     }
 }
