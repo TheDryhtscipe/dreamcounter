@@ -401,6 +401,6 @@ proptest! {
         let expanded = expand(&mut a, &[lib], refactored).expect("expand");
         let want = apply(&a, prog, inputs, UNLIMITED).to_string();
         let got = apply(&a, expanded, inputs, UNLIMITED).to_string();
-        prop_assert_eq!(got, want, "{}", sexpr::print(&a, refactored));
+        prop_assert_eq!(got, want, "{}", sexpr::print(&a, refactored).unwrap());
     }
 }

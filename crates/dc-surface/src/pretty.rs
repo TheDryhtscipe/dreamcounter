@@ -64,6 +64,9 @@ pub const MAX_PRETTY_DEPTH: usize = 500;
 /// The most nodes a core term [`pretty`] prints may have, written out as a tree.
 pub const MAX_PRETTY_NODES: usize = 100_000;
 
+// `pretty` checks its output with `sexpr::print`, which must take any term it prints.
+const _: () = assert!(MAX_PRETTY_NODES <= sexpr::MAX_PRINT_NODES);
+
 /// The deepest term printed on the caller's thread. In a debug build, 256 KiB of
 /// stack left is enough to print any term this deep, and to start the printing
 /// thread for a deeper one.
@@ -244,11 +247,14 @@ fn round_trips(arena: &Arena, id: TermId, text: &str, lib_name: &impl Fn(LibId) 
     for _ in 0..depth {
         expected.push_str("(lam ");
     }
-    expected.push_str(&sexpr::print(arena, id));
+    // `pretty` measured `id` first, so it is within MAX_PRETTY_NODES, which is
+    // within what `sexpr::print` takes.
+    expected.push_str(&sexpr::print(arena, id).expect("a measured term is within the print limit"));
     for _ in 0..depth {
         expected.push(')');
     }
-    sexpr::print(&scratch, back) == expected
+    // A term too large to print is larger than `id`, so it is not the same term.
+    sexpr::print(&scratch, back).is_ok_and(|text| text == expected)
 }
 
 fn infix(p: Prim) -> Option<(&'static str, u8, u8, u8)> {

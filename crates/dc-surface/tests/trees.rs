@@ -43,7 +43,7 @@ fn close(name: &str) -> (Arena, TermId) {
 
 fn core(name: &str) -> String {
     let (arena, id) = close(name);
-    sexpr::print(&arena, id)
+    sexpr::print(&arena, id).unwrap()
 }
 
 fn type_of(name: &str) -> Scheme {
@@ -165,7 +165,7 @@ fn tree_programs_round_trip_through_stitch() {
         let (mut arena, id) = close(name);
         let text = dc_stitch::encode(&arena, id, &names).unwrap_or_else(|e| panic!("{e}"));
         for tok in ["tree_case", "tree_fold", "node", "leaf"] {
-            if sexpr::print(&arena, id).contains(tok) {
+            if sexpr::print(&arena, id).unwrap().contains(tok) {
                 assert!(text.contains(tok), "{name}: {tok} missing from {text}");
             }
         }
