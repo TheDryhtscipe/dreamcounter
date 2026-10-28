@@ -10,11 +10,23 @@
 //!
 //! Variables get [`TyVar`] numbers in order of first appearance. Schemes are
 //! normalised, so any variable names may be used.
+//!
+//! **Bounded depth.** Type text may come from outside (task signatures, library
+//! schemes read from files), and most walks over [`Type`] (drop, print, compare,
+//! import into the checker) recurse on the host stack. So text is an error, not a
+//! stack overflow, when the parsed type would be deeper than [`MAX_TYPE_DEPTH`] (the
+//! bound on types the checker builds, counted the same way: a leaf is one level) or
+//! when its brackets plus the root would nest deeper than that. The bounds differ
+//! because brackets with no constructor, as in `((Int))`, deepen the text but not the
+//! type, while a flat tuple `(a, b, c, ...)` deepens the type (pairs nest to the
+//! right) but not the text. Text printed from a type within the bound parses back.
+//! The parser itself keeps an explicit stack and does not recurse: at the bound, a
+//! recursive descent needs megabytes of stack in a debug build.
 
 use std::fmt;
 use std::str::FromStr;
 
-use super::{Scheme, TyVar, Type};
+use super::{Scheme, TyVar, Type, MAX_TYPE_DEPTH};
 
 /// A type or scheme parse error, with the byte offset where it was found.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +105,45 @@ struct Parser<'a> {
     names: Vec<&'a str>,
 }
 
+/// A part of a type that [`Parser::ty`] has begun and that waits for more input.
+/// Each `start` is the byte offset where the part's text begins.
+enum Frame {
+    /// A constructor, waiting for its argument `atom`.
+    Ctor {
+        ctor: fn(Type) -> Type,
+        start: usize,
+    },
+    /// `lhs ->`, waiting for the result `type`; `depth` is the depth of `lhs`.
+    Arrow {
+        lhs: Type,
+        depth: usize,
+        start: usize,
+    },
+    /// `(` and the items so far with their depths, waiting for the next item.
+    Tuple {
+        items: Vec<(Type, usize)>,
+        start: usize,
+    },
+}
+
+/// The "too deep" error at `offset`.
+fn too_deep<T>(offset: usize) -> Result<T, TypeParseError> {
+    Err(TypeParseError {
+        offset,
+        message: format!("type nested deeper than {MAX_TYPE_DEPTH} levels"),
+    })
+}
+
+/// The depth of a constructor over children at most `depth` deep, if that is within
+/// [`MAX_TYPE_DEPTH`]; `offset` is where the constructor's text starts.
+fn above(depth: usize, offset: usize) -> Result<usize, TypeParseError> {
+    if depth >= MAX_TYPE_DEPTH {
+        too_deep(offset)
+    } else {
+        Ok(depth + 1)
+    }
+}
+
 impl<'a> Parser<'a> {
     fn peek(&self) -> Option<Tok<'a>> {
         self.toks.get(self.pos).map(|t| t.0)
@@ -129,73 +180,111 @@ impl<'a> Parser<'a> {
         TyVar(u32::try_from(i).expect("fewer than 2^32 type variables"))
     }
 
+    /// Parses a `type` with an explicit stack of [`Frame`]s, so the host stack does
+    /// not grow with the nesting of the text. Every type is built with its depth
+    /// known, so none deeper than [`MAX_TYPE_DEPTH`] is ever built (or dropped).
     fn ty(&mut self) -> Result<Type, TypeParseError> {
-        let a = self.app()?;
-        if self.peek() == Some(Tok::Arrow) {
-            self.pos += 1;
-            let b = self.ty()?;
-            Ok(Type::arrow(a, b))
-        } else {
-            Ok(a)
-        }
-    }
-
-    fn app(&mut self) -> Result<Type, TypeParseError> {
-        let ctor: Option<fn(Type) -> Type> = match self.peek() {
-            Some(Tok::Ident("List")) => Some(Type::list),
-            Some(Tok::Ident("Option")) => Some(Type::option),
-            Some(Tok::Ident("Array")) => Some(Type::array),
-            Some(Tok::Ident("Tree")) => Some(Type::tree),
-            _ => None,
-        };
-        match ctor {
-            Some(c) => {
+        let mut frames: Vec<Frame> = vec![];
+        // Brackets open, plus one for the root: the nesting of the grammar.
+        let mut nesting = 1;
+        'ty: loop {
+            // A `type` starts here; first its `app`, then its `atom`.
+            let start = self.offset();
+            let ctor: Option<fn(Type) -> Type> = match self.peek() {
+                Some(Tok::Ident("List")) => Some(Type::list),
+                Some(Tok::Ident("Option")) => Some(Type::option),
+                Some(Tok::Ident("Array")) => Some(Type::array),
+                Some(Tok::Ident("Tree")) => Some(Type::tree),
+                _ => None,
+            };
+            if let Some(ctor) = ctor {
                 self.pos += 1;
-                Ok(c(self.atom()?))
+                frames.push(Frame::Ctor { ctor, start });
             }
-            None => self.atom(),
-        }
-    }
-
-    fn atom(&mut self) -> Result<Type, TypeParseError> {
-        match self.peek() {
-            Some(Tok::Ident("Int")) => {
-                self.pos += 1;
-                Ok(Type::Int)
-            }
-            Some(Tok::Ident("Bool")) => {
-                self.pos += 1;
-                Ok(Type::Bool)
-            }
-            Some(Tok::Ident("Unit")) => {
-                self.pos += 1;
-                Ok(Type::Unit)
-            }
-            Some(Tok::Ident(name)) if name.starts_with(|c: char| c.is_ascii_lowercase()) => {
-                self.pos += 1;
-                Ok(Type::Var(self.var(name)))
-            }
-            Some(Tok::Ident(name)) => self.err(format!(
-                "unknown type '{name}' (types are Int, Bool, Unit, List, Option, Array, Tree; \
-                 variables are lower case)"
-            )),
-            Some(Tok::Open) => {
-                self.pos += 1;
-                let first = self.ty()?;
-                let mut items = vec![first];
-                while self.peek() == Some(Tok::Comma) {
+            let leaf = match self.peek() {
+                Some(Tok::Ident("Int")) => Type::Int,
+                Some(Tok::Ident("Bool")) => Type::Bool,
+                Some(Tok::Ident("Unit")) => Type::Unit,
+                Some(Tok::Ident(name)) if name.starts_with(|c: char| c.is_ascii_lowercase()) => {
+                    Type::Var(self.var(name))
+                }
+                Some(Tok::Ident(name)) => {
+                    return self.err(format!(
+                        "unknown type '{name}' (types are Int, Bool, Unit, List, Option, \
+                         Array, Tree; variables are lower case)"
+                    ))
+                }
+                Some(Tok::Open) => {
+                    if nesting >= MAX_TYPE_DEPTH {
+                        return too_deep(self.offset());
+                    }
+                    nesting += 1;
+                    frames.push(Frame::Tuple {
+                        items: vec![],
+                        start: self.offset(),
+                    });
                     self.pos += 1;
-                    items.push(self.ty()?);
+                    continue 'ty;
+                }
+                Some(_) => return self.err("expected a type"),
+                None => return self.err("unexpected end of input"),
+            };
+            let leaf_start = self.offset();
+            self.pos += 1;
+            // `t` is a complete `atom` of depth `d` whose text starts at `s`. Close
+            // the frames it completes, until one needs more input.
+            let (mut t, mut d, mut s) = (leaf, 1, leaf_start);
+            loop {
+                if let Some(&Frame::Ctor { ctor, start }) = frames.last() {
+                    frames.pop();
+                    d = above(d, start)?;
+                    t = ctor(t);
+                    s = start;
+                }
+                // `t` is a complete `app`.
+                if self.peek() == Some(Tok::Arrow) {
+                    self.pos += 1;
+                    frames.push(Frame::Arrow {
+                        lhs: t,
+                        depth: d,
+                        start: s,
+                    });
+                    continue 'ty;
+                }
+                // `t` is a complete `type`: it is the result of any arrows waiting.
+                while let Some(Frame::Arrow { .. }) = frames.last() {
+                    let Some(Frame::Arrow { lhs, depth, start }) = frames.pop() else {
+                        unreachable!("the last frame is an arrow");
+                    };
+                    d = above(depth.max(d), start)?;
+                    t = Type::arrow(lhs, t);
+                }
+                let (mut items, start) = match frames.pop() {
+                    None => return Ok(t),
+                    Some(Frame::Tuple { items, start }) => (items, start),
+                    Some(Frame::Ctor { .. } | Frame::Arrow { .. }) => {
+                        unreachable!("a constructor waits for an atom, and arrows are closed")
+                    }
+                };
+                items.push((t, d));
+                if self.peek() == Some(Tok::Comma) {
+                    self.pos += 1;
+                    frames.push(Frame::Tuple { items, start });
+                    continue 'ty;
                 }
                 self.expect(Tok::Close, "')'")?;
-                let last = items.pop().expect("at least one item");
-                Ok(items
-                    .into_iter()
-                    .rev()
-                    .fold(last, |acc, t| Type::pair(t, acc)))
+                nesting -= 1;
+                // Pairs nest to the right. Check the depth before building any of
+                // them, so a long tuple never becomes a pair chain too deep to drop.
+                let (mut acc, mut depth) = items.pop().expect("at least one item");
+                for &(_, item) in items.iter().rev() {
+                    depth = above(item.max(depth), start)?;
+                }
+                for (item, _) in items.into_iter().rev() {
+                    acc = Type::pair(item, acc);
+                }
+                (t, d, s) = (acc, depth, start);
             }
-            Some(_) => self.err("expected a type"),
-            None => self.err("unexpected end of input"),
         }
     }
 
@@ -246,7 +335,8 @@ fn parser(src: &str) -> Result<Parser<'_>, TypeParseError> {
 impl FromStr for Type {
     type Err = TypeParseError;
 
-    /// Parses a type. Variables are numbered in order of first appearance.
+    /// Parses a type. Variables are numbered in order of first appearance. Text
+    /// nested deeper than [`MAX_TYPE_DEPTH`] is an error.
     fn from_str(src: &str) -> Result<Type, TypeParseError> {
         let mut p = parser(src)?;
         let t = p.ty()?;
@@ -258,7 +348,8 @@ impl FromStr for Type {
 impl FromStr for Scheme {
     type Err = TypeParseError;
 
-    /// Parses a scheme such as `Key a => a -> List a`.
+    /// Parses a scheme such as `Key a => a -> List a`. Text nested deeper than
+    /// [`MAX_TYPE_DEPTH`] is an error.
     fn from_str(src: &str) -> Result<Scheme, TypeParseError> {
         let mut p = parser(src)?;
         let keys = p.keys()?;
