@@ -1182,6 +1182,56 @@ fn c_seed_noise_does_not_name_growth_between_n_and_n_log_n() {
     }
 }
 
+/// A default sweep of three seeds per size around medians `1000 · n`, each
+/// moved by `±offset` in `ln`, alternately up and down: the seeds' `ln`
+/// steps are the median's and the median's `± spread`.
+fn offset_linear_sweep(offset: f64, spread: f64) -> Sweep {
+    Sweep::new(
+        DEFAULT_SIZES
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                let ln_median = (1000.0 * n as f64).ln() + sign * offset;
+                let steps = [-spread, 0.0, spread]
+                    .iter()
+                    .map(|s| (ln_median + s).exp().round() as u64)
+                    .collect();
+                SizeObservation::completed(n, steps)
+            })
+            .collect(),
+    )
+    .expect("valid")
+}
+
+#[test]
+fn c_names_a_class_only_if_its_true_misfit_is_within_tau_minus_m() {
+    // Review 3 of PR 19, MEDIUM: the module comment said C names a class
+    // whose true medians are within τ of it whenever each median is off by
+    // at most m. An offset of m can raise the misfit to τ + m, so C names
+    // the class only if the true misfit is at most τ − m. Here the true
+    // medians are exactly 1000 · n (misfit 0), each is off by 0.015 < m,
+    // and the misfit 0.015 is above τ: C refuses.
+    let fit = c_seeded(&offset_linear_sweep(0.015, 0.01));
+    let linear = fit.candidates[GrowthClass::Linear as usize].misfit;
+    assert!((linear - 0.015).abs() < 1e-3, "{fit:?}");
+    assert!(0.015 <= fit.noise_margin, "each median is off by at most m");
+    assert!(linear > fit.tolerance, "{fit:?}");
+    assert_eq!(fit.verdict, ClassVerdict::TooNoisy, "{fit:?}");
+
+    // With the noise margin m below τ, an offset of at most m names the
+    // class: the true misfit 0 is within τ − m, and the next class is far
+    // beyond τ + 2m.
+    let fit = c_seeded(&offset_linear_sweep(0.004, 0.002));
+    assert!(0.004 <= fit.noise_margin, "{fit:?}");
+    assert!(fit.noise_margin <= fit.tolerance, "{fit:?}");
+    assert_eq!(
+        fit.verdict,
+        ClassVerdict::Class(GrowthClass::Linear),
+        "{fit:?}"
+    );
+}
+
 #[test]
 fn c_noise_ignores_single_seed_sizes_but_not_the_others() {
     // As in the noisy linear sweep, but n = 1024 has one seed: the other

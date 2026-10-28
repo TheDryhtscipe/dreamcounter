@@ -704,25 +704,48 @@ fn check_window(a: &LogLogFit, sizes: &[u64]) {
     );
 }
 
-/// Whether estimator C must name the class on the medians, or may instead
-/// refuse because the seeds are too noisy for the sweep.
+/// What estimator C must do on the medians.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum COnMedians {
+    /// Name the class.
     Names,
+    /// Name the class, or refuse because the seeds are too noisy.
     NamesOrTooNoisy,
+    /// Refuse as too noisy because the class's misfit is above the default
+    /// tolerance but within the noise margin of it.
+    TooNoisy,
 }
 
-/// Checks estimator C on the medians: it names `expected`, or, if
-/// `on_medians` allows it, refuses as too noisy.
+/// Checks estimator C on the medians, as `on_medians` requires.
 fn check_c_on_medians(
     fit: &ClassFit,
     expected: Class,
     on_medians: COnMedians,
 ) -> Result<(), String> {
-    if on_medians == COnMedians::NamesOrTooNoisy && fit.verdict == ClassVerdict::TooNoisy {
-        Ok(())
-    } else {
-        check_c(fit, expected)
+    match on_medians {
+        COnMedians::Names => check_c(fit, expected),
+        COnMedians::NamesOrTooNoisy if fit.verdict == ClassVerdict::TooNoisy => Ok(()),
+        COnMedians::NamesOrTooNoisy => check_c(fit, expected),
+        COnMedians::TooNoisy => {
+            let misfit = fit.candidates[expected.c_class() as usize].misfit;
+            let tolerance = ClassSelect::default().tolerance;
+            if fit.verdict == ClassVerdict::TooNoisy
+                && misfit > tolerance
+                && misfit <= tolerance + fit.noise_margin
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "C: {:?} ({} misfit {misfit:.4}, tolerance {:.4}, noise margin {:.4}), \
+                     expected TooNoisy with the misfit above the tolerance {tolerance} \
+                     and within the noise margin of it",
+                    fit.verdict,
+                    expected.c_class(),
+                    fit.tolerance,
+                    fit.noise_margin
+                ))
+            }
+        }
     }
 }
 
@@ -771,14 +794,15 @@ fn merge_sort_is_n_log_n() {
 fn insertion_sort_is_quadratic() {
     // Measured under merge sort's fuel plan, as a candidate for the family
     // would be: ten times merge sort's steps is still enough up to 512. The
-    // seeds' spread (about 12 %) leaves the medians outside C's tolerance of
-    // n², so C may refuse them as too noisy, but must not name another class.
+    // seeds' spread (about 12 %) leaves the medians about 0.04 from n², above
+    // C's tolerance of 0.01 but within the noise margin, so C refuses them as
+    // too noisy.
     check_polynomial(
         &REF_SORT,
         "msort",
         "isort",
         Class::Quadratic,
-        COnMedians::NamesOrTooNoisy,
+        COnMedians::TooNoisy,
     );
 }
 

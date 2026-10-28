@@ -72,9 +72,21 @@
 //! is [`ClassVerdict::TooNoisy`]; if none is, it is [`ClassVerdict::NoFit`]
 //! (`n^1.5`, `n² log n`). With the medians fixed, raising the noise can
 //! therefore only turn a verdict into `TooNoisy`, never name a class or
-//! change which class is named. If the true medians are within `τ` of a
-//! class and nothing else is within `τ + 2m` of them, C names that class as
-//! long as each median is off by at most `m`.
+//! change which class is named.
+//!
+//! Moving each median by at most `m` in `ln` moves every misfit by at most
+//! `m`. So if each median is off by at most `m`, C names a class whose true
+//! medians are within `τ − m` of it and more than `τ + 2m` from every other
+//! class. That needs `m < τ`. A class within `τ` of the true medians but not
+//! within `τ − m` can be refused: exact `1000 · n` with each median moved by
+//! 0.015, alternately up and down, and three seeds 0.01 apart in `ln` at each
+//! size (`m ≈ 0.022`) has misfit 0.015 against `n` and is `TooNoisy`.
+//!
+//! In practice this makes C refuse often under seed noise. With five seeds
+//! per size whose `ln` steps vary with standard deviation `σ` about exact
+//! `n`, `n log n` or `n²`, C named the class in about 95 % of 3000 random
+//! sweeps at `σ = 0.01`, about 30 % at `σ = 0.02` and under 1 % at
+//! `σ = 0.05`, and refused the rest as `TooNoisy`.
 //!
 //! With one seed per size the seeds say nothing about the noise. Then, under
 //! the default [`NoiseModel::FromSeeds`], C refuses with
@@ -92,7 +104,10 @@
 //! proof of asymptotic growth. Over the default sweep `16..1024`, exact
 //! `n^a` is named `n` for `a` from 0.99 to 1.01, `n²` from 1.99 to 2.01 and
 //! `n³` from 2.99 to 3.01, and never `n log n`: the closest, `n^1.135`, has
-//! misfit 0.019 against it, about twice `τ`.
+//! misfit 0.019 against it, about twice `τ`. These bands are for exact
+//! series. Under seed noise a power near a class is occasionally named that
+//! class: with two to five seeds per size and `σ` from 0.01 to 0.02,
+//! `n^1.135` was named `n log n` in up to 12 of 3000 random sweeps.
 //!
 //! The tolerance is below the noise of programs whose step counts vary much
 //! with their inputs. Insertion sort's seeds vary by about 12 % in steps,
