@@ -2364,13 +2364,18 @@ impl TypeChecker {
                 self.level -= 1;
                 let kept = self.fun(&params, t);
                 self.generalize(kept);
-                let t = self.instantiate(kept);
                 let (id, scope) = key.clone();
                 let kept = if self.checkpoints.is_empty() {
                     kept
                 } else {
                     self.keep_past_checkpoints(&key, kept)
                 };
+                // Instantiated from the kept type as it goes into the memo, so
+                // this use and later reuses get the same closed nodes. If this
+                // use got the type before it was copied by `freeze`, a term
+                // over two uses would hold two distinct copies of one type,
+                // and freezing that would double the store at each level.
+                let t = self.instantiate(kept);
                 // Kept before the scope is applied: a key in the memo is one
                 // whose fresh inference worked, which is how a failed use tells
                 // a failed fresh inference from a binder that does not fit.
