@@ -452,6 +452,24 @@ enum Slot {
 /// A shared subterm and what its type depends on.
 type MemoKey = (TermId, Scope);
 
+/// A binding of a scope in a failure pattern (see [`TypeChecker::pattern`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Bound {
+    Mono,
+    /// A polymorphic binding whose type has no free variables, by its
+    /// [`Canon`] id.
+    Closed(u32),
+    /// A polymorphic binding whose type has free variables: its [`Canon`] id,
+    /// which fixes its shape and quantified variables, and the [`Canon`] ids
+    /// of what its free variables, in order of first occurrence, resolve to
+    /// now, written with [`Canon::Open`] variables.
+    Open(u32, Box<[u32]>),
+}
+
+/// The types a use of a shared subterm is inferred with, in a form that
+/// means the same in every state of the store.
+type Pattern = Vec<Bound>;
+
 /// A shared subterm being inferred for the memo.
 #[derive(Debug)]
 struct Pending {
@@ -517,6 +535,8 @@ pub struct TypeChecker {
     canon_closed: Vec<bool>,
     /// The [`Canon`] node of each id.
     canon_nodes: Vec<Canon>,
+    /// For each [`Canon`] id, whether that type has a quantified variable.
+    canon_bound: Vec<bool>,
     /// Walks every term as a tree, without reusing shared subterms: the
     /// reference the tests compare the memoised walk with.
     pub(super) tree_walk: bool,
@@ -536,7 +556,10 @@ pub struct TypeChecker {
     /// being tried, the [`TypeChecker::pattern`]s of the scopes it failed in.
     /// A use whose pattern is an instance of one of them fails too, so it is
     /// walked in place at once (see [`TypeChecker::note_failure`]).
-    failed: FxHashMap<TermId, Vec<Scope>>,
+    failed: FxHashMap<TermId, Vec<Pattern>>,
+    /// The free variables of each [`Canon`] id of a polymorphic binding met
+    /// by [`TypeChecker::pattern`], in order of first occurrence.
+    class_free: FxHashMap<u32, Box<[Ty]>>,
     /// Steps taken by the term walk of the current call.
     steps: u64,
     /// Units of work done by the current call (see [`DEFAULT_WORK_BUDGET`]).
@@ -825,6 +848,7 @@ impl TypeChecker {
         release_map(&mut self.memo);
         release_map(&mut self.canon);
         release_map(&mut self.failed);
+        release_map(&mut self.class_free);
         release_set(&mut self.seen_pairs);
         release_map(&mut self.inst);
     }
@@ -840,6 +864,7 @@ impl TypeChecker {
         release_vec(&mut self.pending);
         release_vec(&mut self.canon_closed);
         release_vec(&mut self.canon_nodes);
+        release_vec(&mut self.canon_bound);
         release_vec(&mut self.checkpoints);
         release_vec(&mut self.trail);
         release_vec(&mut self.memo_log);
@@ -854,6 +879,7 @@ impl TypeChecker {
                 + self.pending.capacity()
                 + self.canon_closed.capacity()
                 + self.canon_nodes.capacity()
+                + self.canon_bound.capacity()
                 + self.checkpoints.capacity()
                 + self.trail.capacity()
                 + self.memo_log.capacity(),
@@ -873,11 +899,13 @@ impl TypeChecker {
         empty_map(&mut self.canon);
         self.canon_closed.clear();
         self.canon_nodes.clear();
+        self.canon_bound.clear();
         self.steps = 0;
         self.checkpoints.clear();
         self.trail.clear();
         self.memo_log.clear();
         empty_map(&mut self.failed);
+        empty_map(&mut self.class_free);
     }
 
     /// Pushes a binding for a new innermost variable.
@@ -957,8 +985,17 @@ impl TypeChecker {
                         (h.arity() < 1 || closed(a)) && (h.arity() < 2 || closed(b))
                     }
                 };
+                let bound = match canon {
+                    Canon::Var { .. } => true,
+                    Canon::Free(_) | Canon::Open { .. } => false,
+                    Canon::Con(h, a, b) => {
+                        let bound = |c: u32| self.canon_bound[c as usize];
+                        (h.arity() >= 1 && bound(a)) || (h.arity() >= 2 && bound(b))
+                    }
+                };
                 self.canon_closed.push(closed);
                 self.canon_nodes.push(canon);
+                self.canon_bound.push(bound);
             }
             ids.insert(r, id);
         }
@@ -2112,26 +2149,70 @@ impl TypeChecker {
     }
 
     /// The failure pattern of a use with `scope` (for the de Bruijn
-    /// `indices`) in the current state: a [`Slot`] for each binding, where
-    /// a polymorphic one whose type has free variables is replaced by the
-    /// [`Canon`] id of that type now, with its unbound variables that are
-    /// not quantified numbered across the whole scope ([`Canon::Open`]).
-    /// Rigid variables keep their node, which is made before the walk and
-    /// never changes. A unit is paid for each node met.
-    fn pattern(&mut self, scope: &Scope, indices: &[u32]) -> Scope {
-        let len = self.env.len();
+    /// `indices`) in the current state. A polymorphic binding whose type has
+    /// free variables is written as its [`Canon`] id with what those
+    /// variables resolve to now, as [`Canon`] ids whose unbound variables
+    /// that are not quantified are numbered across the whole scope
+    /// ([`Canon::Open`]). Rigid variables keep their node, which is made
+    /// before the walk and never changes. So the pattern costs time in what
+    /// the free variables have become, not in the size of the bindings'
+    /// types; a unit is paid for each node met.
+    fn pattern(&mut self, scope: &Scope, indices: &[u32]) -> Pattern {
         let mut open: FxHashMap<Ty, u32> = FxHashMap::default();
         let mut out = Vec::with_capacity(scope.len());
-        for (slot, &i) in scope.iter().zip(indices) {
+        for (slot, _) in scope.iter().zip(indices) {
             out.push(match *slot {
-                Slot::Poly(c) if !self.canon_closed[c as usize] => {
-                    let ty = self.env[len - 1 - i as usize].ty;
-                    Slot::Poly(self.canonical(ty, Some(&mut open)))
+                Slot::Mono => Bound::Mono,
+                Slot::Poly(c) if self.canon_closed[c as usize] => Bound::Closed(c),
+                Slot::Poly(c) => {
+                    let free = self.free_of_class(c);
+                    let now = free
+                        .iter()
+                        .map(|&t| self.canonical(t, Some(&mut open)))
+                        .collect();
+                    Bound::Open(c, now)
                 }
-                other => other,
             });
         }
         out
+    }
+
+    /// The free variables of the type with [`Canon`] id `c`, in order of
+    /// first occurrence, found once for each id; a unit is paid for each
+    /// node met.
+    fn free_of_class(&mut self, c: u32) -> Box<[Ty]> {
+        self.spent += 1;
+        count_probes(1);
+        if let Some(free) = self.class_free.get(&c) {
+            self.spent += free.len() as u64;
+            return free.clone();
+        }
+        let mut free = Vec::new();
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        let mut todo = vec![c];
+        while let Some(c) = todo.pop() {
+            self.spent += 1;
+            count_probes(1);
+            if !seen.insert(c) {
+                continue;
+            }
+            match self.canon_nodes[c as usize] {
+                Canon::Free(t) => free.push(t),
+                Canon::Con(h, a, b) => {
+                    if h.arity() >= 2 {
+                        todo.push(b);
+                    }
+                    if h.arity() >= 1 {
+                        todo.push(a);
+                    }
+                }
+                Canon::Var { .. } | Canon::Open { .. } => {}
+            }
+        }
+        let free: Box<[Ty]> = free.into();
+        count_probes(1);
+        self.class_free.insert(c, free.clone());
+        free
     }
 
     /// Whether a use of shared subterm `id` with `scope` (for the de Bruijn
@@ -2164,16 +2245,19 @@ impl TypeChecker {
     /// [`Canon::Open`] variables of `p` that sends `Key` variables to
     /// key-safe types. Each node of `p` is matched once, through a map to
     /// the node of `now` it stands for, and a unit is paid for each.
-    fn is_instance(&mut self, p: &Scope, now: &Scope) -> bool {
+    fn is_instance(&mut self, p: &Pattern, now: &Pattern) -> bool {
         if p.len() != now.len() {
             return false;
         }
         let mut image: FxHashMap<u32, u32> = FxHashMap::default();
         let mut todo = Vec::new();
         for (a, b) in p.iter().zip(now) {
-            match (*a, *b) {
-                (Slot::Mono, Slot::Mono) => {}
-                (Slot::Poly(x), Slot::Poly(y)) => todo.push((x, y)),
+            match (a, b) {
+                (Bound::Mono, Bound::Mono) => {}
+                (Bound::Closed(x), Bound::Closed(y)) if x == y => {}
+                (Bound::Open(c, xs), Bound::Open(d, ys)) if c == d && xs.len() == ys.len() => {
+                    todo.extend(xs.iter().copied().zip(ys.iter().copied()));
+                }
                 _ => return false,
             }
         }
@@ -2189,7 +2273,11 @@ impl TypeChecker {
             count_probes(1);
             image.insert(x, y);
             let matched = match (self.canon_nodes[x as usize], self.canon_nodes[y as usize]) {
-                (Canon::Open { key, .. }, _) => !key || self.key_safe(y),
+                // A variable stands for a type, never for a quantified
+                // variable of the current binding.
+                (Canon::Open { key, .. }, _) => {
+                    !self.canon_bound[y as usize] && (!key || self.key_safe(y))
+                }
                 (Canon::Con(h, a, b), Canon::Con(g, c, d)) if h == g => {
                     if h.arity() >= 2 {
                         todo.push((b, d));

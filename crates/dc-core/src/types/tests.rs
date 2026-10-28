@@ -1670,6 +1670,89 @@ fn refining_scope_failures_are_located_in_polynomial_steps_m() {
     assert_refining_failure_located(2, |n| 100 * n * n);
 }
 
+/// `lam x. (pair U U)`, with `U = (pair (let (lam $0) t_n) (let (lam x) t_n))`,
+/// `t_(k+1) = (if true t_k t_k)` and `t_0 = (pair (add ($0 1) 1) (if ($0
+/// true) 1 1))`: the chain is shared under two helpers, `a -> a`, under
+/// which it is well typed, and `a -> x`, under which it fails. A failure
+/// under the second says nothing about the first, whose type quantifies the
+/// variable that the second leaves free.
+fn chain_under_two_helpers(a: &mut Arena, n: usize) -> TermId {
+    let mut t = parse_term(a, "(pair (add ($0 1) 1) (if ($0 true) 1 1))");
+    let yes = a.bool(true);
+    for _ in 0..n {
+        t = a.if_(yes, t, t);
+    }
+    let (id, konst) = (parse_term(a, "(lam $0)"), parse_term(a, "(lam $1)"));
+    let (first, second) = (a.let_(id, t), a.let_(konst, t));
+    let pair = a.prim(Prim::Pair);
+    let u = a.apps(pair, &[first, second]);
+    let body = a.apps(pair, &[u, u]);
+    a.lam(body)
+}
+
+#[test]
+fn a_failure_under_one_helper_does_not_match_another() {
+    const N: usize = 40;
+    let mut a = Arena::new();
+    let small = chain_under_two_helpers(&mut a, 8);
+    let big = chain_under_two_helpers(&mut a, N);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let expected = sch("a -> b");
+    for t in [small, big] {
+        let want = tree.infer(&a, t, NO_LIBS);
+        assert!(want.is_err());
+        assert_eq!(bounded(100 * N as u64).infer(&a, t, NO_LIBS), want);
+        let want = tree.check(&a, t, NO_LIBS, &expected);
+        assert_eq!(
+            bounded(100 * N as u64).check(&a, t, NO_LIBS, &expected),
+            want
+        );
+    }
+}
+
+/// `lam x. let h = (lam (let (pair x x) (let (pair $0 $0) ... (pair $0
+/// arg)))) in t_n`, with `m` `let`s in the helper and `t_n` the chain of s2:
+/// a helper whose type is a DAG of `m` nodes over one free variable.
+fn chain_under_a_large_helper(a: &mut Arena, n: usize, m: usize) -> TermId {
+    let width = u32::try_from(m).expect("a small helper");
+    let mut src = format!("(pair $0 ${width})");
+    for k in (1..=m).rev() {
+        let bound = if k == 1 {
+            "(pair $1 $1)"
+        } else {
+            "(pair $0 $0)"
+        };
+        src = format!("(let {bound} {src})");
+    }
+    let helper = format!("(lam {src})");
+    chain_with_conds(a, n, 1, &helper, |_| "true".into(), S2_LEAF, None)
+}
+
+#[test]
+fn locating_under_a_large_helper_does_not_rewrite_its_type_at_every_use() {
+    // Each level walked in place looks up every level below it, so a lookup
+    // that wrote out the helper's whole type would cost n^2 m.
+    const N: usize = 60;
+    const M: usize = 200;
+    let mut a = Arena::new();
+    let small = chain_under_a_large_helper(&mut a, 6, 4);
+    let big = chain_under_a_large_helper(&mut a, N, M);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, small, NO_LIBS);
+    assert!(want.is_err());
+    assert_eq!(TypeChecker::new().infer(&a, small, NO_LIBS), want);
+    let mut tc = TypeChecker::with_work_budget(u64::MAX);
+    let want = tree.infer(&a, big, NO_LIBS);
+    assert_eq!(tc.infer(&a, big, NO_LIBS), want);
+    assert!(tc.spent() <= LARGE_HELPER_UNITS, "{} units", tc.spent());
+}
+
+/// About twice the units measured with patterns that cost what the free
+/// variables have become (526,527); writing out the whole helper took 4,581,403.
+const LARGE_HELPER_UNITS: u64 = 1_000_000;
+
 #[test]
 fn shared_subterms_with_many_free_variables_agree_with_the_tree() {
     // More free variables than the memo records one by one: the scope is all the
