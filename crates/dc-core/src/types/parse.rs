@@ -26,6 +26,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use rustc_hash::FxHashMap;
+
 use super::{Scheme, TyVar, Type, MAX_TYPE_DEPTH};
 
 /// A type or scheme parse error, with the byte offset where it was found.
@@ -102,7 +104,8 @@ struct Parser<'a> {
     toks: Vec<(Tok<'a>, usize)>,
     pos: usize,
     end: usize,
-    names: Vec<&'a str>,
+    /// Each variable name seen so far and its number, in order of first appearance.
+    names: FxHashMap<&'a str, u32>,
 }
 
 /// A part of a type that [`Parser::ty`] has begun and that waits for more input.
@@ -170,14 +173,10 @@ impl<'a> Parser<'a> {
     }
 
     fn var(&mut self, name: &'a str) -> TyVar {
-        let i = match self.names.iter().position(|&n| n == name) {
-            Some(i) => i,
-            None => {
-                self.names.push(name);
-                self.names.len() - 1
-            }
-        };
-        TyVar(u32::try_from(i).expect("fewer than 2^32 type variables"))
+        #[cfg(test)]
+        super::probes::add(1);
+        let next = u32::try_from(self.names.len()).expect("fewer than 2^32 type variables");
+        TyVar(*self.names.entry(name).or_insert(next))
     }
 
     /// Parses a `type` with an explicit stack of [`Frame`]s, so the host stack does
@@ -328,7 +327,7 @@ fn parser(src: &str) -> Result<Parser<'_>, TypeParseError> {
         toks: tokenize(src)?,
         pos: 0,
         end: src.len(),
-        names: vec![],
+        names: FxHashMap::default(),
     })
 }
 

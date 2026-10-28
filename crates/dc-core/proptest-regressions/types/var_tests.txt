@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 52ab2ac88969609467a62b9da2a84214fa37be205cf4b863aa15bd1ae69c89f9 # shrinks to t = List(Option(List(Pair(Var(TyVar(17)), Int)))), keys = [TyVar(17)]
+cc cea6a144554ddaec413ac74ef985b9919fa82812de9883fe0157f88454667932 # shrinks to t = Arrow(Array(Option(Tree(List(Var(TyVar(30)))))), Pair(Int, Pair(Int, Tree(Var(TyVar(30)))))), keys = []
+cc 1680ab5771117e416b0d12c73078f4b10ab8cb3bff56b3b5e3101afdbe47d70b # shrinks to t = Arrow(Arrow(Int, Array(List(Var(TyVar(8))))), Arrow(Pair(Var(TyVar(8)), Int), Int)), keys = []

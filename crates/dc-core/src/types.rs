@@ -23,7 +23,10 @@
 //!
 //! Inference lives in [`infer`], [`check`] and [`TypeChecker`].
 
+use std::collections::hash_map::Entry;
 use std::fmt;
+
+use rustc_hash::FxHashMap;
 
 mod error;
 mod infer;
@@ -129,25 +132,38 @@ impl Type {
     }
 
     /// The type variables in order of first occurrence, left to right, without
-    /// repeats.
+    /// repeats. It takes one hash-map lookup per variable occurrence, so time linear
+    /// in the size of the type for a well-spread hash.
     pub fn vars(&self) -> Vec<TyVar> {
-        let mut out = vec![];
-        self.collect_vars(&mut out);
-        out
+        self.numbered_vars().0
     }
 
-    fn collect_vars(&self, out: &mut Vec<TyVar>) {
+    /// The type variables in order of first occurrence, and each variable's position
+    /// in that order.
+    fn numbered_vars(&self) -> (Vec<TyVar>, FxHashMap<TyVar, u32>) {
+        let mut order = vec![];
+        let mut index = FxHashMap::default();
+        self.collect_vars(&mut order, &mut index);
+        (order, index)
+    }
+
+    fn collect_vars(&self, order: &mut Vec<TyVar>, index: &mut FxHashMap<TyVar, u32>) {
         match self {
             Type::Int | Type::Bool | Type::Unit => {}
             Type::Var(v) => {
-                if !out.contains(v) {
-                    out.push(*v);
+                #[cfg(test)]
+                probes::add(1);
+                if let Entry::Vacant(e) = index.entry(*v) {
+                    e.insert(u32::try_from(order.len()).expect("fewer than 2^32 type variables"));
+                    order.push(*v);
                 }
             }
-            Type::List(a) | Type::Option(a) | Type::Array(a) | Type::Tree(a) => a.collect_vars(out),
+            Type::List(a) | Type::Option(a) | Type::Array(a) | Type::Tree(a) => {
+                a.collect_vars(order, index)
+            }
             Type::Pair(a, b) | Type::Arrow(a, b) => {
-                a.collect_vars(out);
-                b.collect_vars(out);
+                a.collect_vars(order, index);
+                b.collect_vars(order, index);
             }
         }
     }
@@ -258,22 +274,20 @@ impl Scheme {
     }
 
     /// Quantifies every variable of `ty` and puts a `Key` constraint on each variable
-    /// in `keys`. Entries of `keys` that do not occur in `ty` are dropped.
+    /// in `keys`. Entries of `keys` that do not occur in `ty` are dropped. It takes one
+    /// hash-map lookup per variable occurrence and per key, plus a sort of the keys
+    /// that occur.
     pub fn with_keys(ty: Type, keys: &[TyVar]) -> Scheme {
-        let order = ty.vars();
+        let (_, index) = ty.numbered_vars();
         let rename = |v: TyVar| {
-            let i = order
-                .iter()
-                .position(|&w| w == v)
-                .expect("every variable of the type is in its own variable list");
-            TyVar(u32::try_from(i).expect("fewer than 2^32 type variables"))
+            #[cfg(test)]
+            probes::add(1);
+            index.get(&v).map(|&i| TyVar(i))
         };
-        let ty = ty.map_vars(&mut |v| rename(v));
-        let mut keys: Vec<TyVar> = keys
-            .iter()
-            .filter(|v| order.contains(v))
-            .map(|&v| rename(v))
-            .collect();
+        let ty = ty.map_vars(&mut |v| {
+            rename(v).expect("every variable of the type is in its own variable index")
+        });
+        let mut keys: Vec<TyVar> = keys.iter().filter_map(|&v| rename(v)).collect();
         keys.sort();
         keys.dedup();
         Scheme { ty, keys }
@@ -315,3 +329,27 @@ impl fmt::Display for Scheme {
         write!(f, "{}", self.ty)
     }
 }
+
+/// A count of the variable lookups made while collecting and numbering type
+/// variables, a measure of the work done that the tests check without a timer.
+#[cfg(test)]
+pub(crate) mod probes {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PROBES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Records `n` entries examined.
+    pub(crate) fn add(n: usize) {
+        PROBES.with(|p| p.set(p.get() + n as u64));
+    }
+
+    /// The entries examined on this thread since the last call.
+    pub(crate) fn take() -> u64 {
+        PROBES.with(|p| p.replace(0))
+    }
+}
+
+#[cfg(test)]
+mod var_tests;
