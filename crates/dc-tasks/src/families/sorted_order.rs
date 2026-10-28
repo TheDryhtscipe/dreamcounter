@@ -2,10 +2,20 @@
 //! a scan answers once the list is sorted.
 //!
 //! The input is a list of `n` integers in `[-10⁶, 10⁶]`; [`Variant::PairSums`]
-//! also takes a threshold `t` in that range. The size is `n`. Each element is
-//! drawn, with even odds, from the whole range or from a narrow one of about
-//! `n / 2` values (see [`narrow_bound`]), so every input has many equal
-//! values and a solution that mishandles ties fails the sweep. The variants:
+//! also takes a threshold `t`. The size is `n`. Ties matter differently to
+//! each variant, so inputs come in two kinds, with even odds:
+//!
+//! - tied: each element is drawn, with even odds, from the whole range or
+//!   from a narrow one of about `n / 2` values (see [`narrow_bound`]), so the
+//!   input has many equal values;
+//! - spread: elements are drawn from about `2 n²` values (see
+//!   [`spread_bound`]), so most inputs have none equal, but neighbours once
+//!   sorted are close, and the least gap is small and not 0.
+//!
+//! Half the time the threshold of [`Variant::PairSums`] is the sum of a
+//! random pair of elements, so some pair sums to exactly `t`; otherwise it is
+//! drawn from `[-10⁶, 10⁶]`. So a solution that mishandles ties, or gets
+//! only ties right, fails the sweep. The variants:
 //!
 //! | variant | answer |
 //! |---|---|
@@ -51,6 +61,13 @@ pub const VALUE_BOUND: i64 = 1_000_000;
 /// side of 0, so equal values are common.
 pub fn narrow_bound(n: u64) -> i64 {
     (n / 4).clamp(1, VALUE_BOUND as u64) as i64
+}
+
+/// Elements of a spread input of size `n` are drawn from
+/// `-spread_bound(n)..=spread_bound(n)`: about `2 n²` values, so two equal
+/// elements are unlikely but the least gap is small.
+pub fn spread_bound(n: u64) -> i64 {
+    n.saturating_mul(n).clamp(1, VALUE_BOUND as u64) as i64
 }
 
 /// A variant of the family.
@@ -261,6 +278,8 @@ impl TaskFamily for SortedOrder {
                 one(&[7], i64::MAX),
                 one(&[10, 3, 8], 2),
                 one(&[4, -2, 4], 0),
+                one(&[5, 1], 4),
+                one(&[1, 2, 10], 1),
             ],
             Variant::Distinct => vec![
                 one(&[], 0),
@@ -280,16 +299,28 @@ impl TaskFamily for SortedOrder {
     }
 
     fn generate(&self, n: u64, rng: &mut TaskRng) -> Inputs {
-        let narrow = narrow_bound(n);
-        let xs: Vec<i64> = (0..n)
-            .map(|_| {
-                let bound = if rng.bool() { narrow } else { VALUE_BOUND };
-                rng.int_in(-bound, bound)
-            })
-            .collect();
+        let xs: Vec<i64> = if rng.bool() {
+            let narrow = narrow_bound(n);
+            (0..n)
+                .map(|_| {
+                    let bound = if rng.bool() { narrow } else { VALUE_BOUND };
+                    rng.int_in(-bound, bound)
+                })
+                .collect()
+        } else {
+            let spread = spread_bound(n);
+            (0..n).map(|_| rng.int_in(-spread, spread)).collect()
+        };
         let mut inputs = vec![list(&xs)];
         if self.0 == Variant::PairSums {
-            inputs.push(Value::Int(rng.int_in(-VALUE_BOUND, VALUE_BOUND)));
+            let t = if xs.len() >= 2 && rng.bool() {
+                let i = rng.below(xs.len() as u64) as usize;
+                let j = (i + 1 + rng.below(xs.len() as u64 - 1) as usize) % xs.len();
+                xs[i] + xs[j]
+            } else {
+                rng.int_in(-VALUE_BOUND, VALUE_BOUND)
+            };
+            inputs.push(Value::Int(t));
         }
         inputs
     }
@@ -343,6 +374,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The generated inputs of `v` over the sweep, five seeds per size.
+    fn generated(v: Variant) -> Vec<Inputs> {
+        let f = SortedOrder(v);
+        SIZES
+            .iter()
+            .flat_map(|&n| (0..5).map(move |seed| (n, seed)))
+            .map(|(n, seed)| f.generate(n, &mut TaskRng::new(n, seed)))
+            .collect()
+    }
+
+    #[test]
+    fn generated_inputs_test_both_ties_and_gaps() {
+        // A sweep of only tied inputs answers 0 for the least gap almost
+        // every time, so it cannot tell a solution that finds equal values
+        // but gets gaps wrong from a right one; and the reverse for spread
+        // inputs. Both kinds must be common.
+        let gaps: Vec<i64> = generated(Variant::MinGap)
+            .iter()
+            .map(|i| min_gap(&ints_of(&i[0])))
+            .collect();
+        let zero = gaps.iter().filter(|&&g| g == 0).count();
+        let small = gaps.iter().filter(|&&g| 0 < g && g <= 64).count();
+        assert!(zero >= 6 && small >= 6, "least gaps {gaps:?}");
+        // The threshold is often an exact pair sum, where <= and < differ.
+        let exact = generated(Variant::PairSums)
+            .iter()
+            .filter(|i| {
+                let (xs, t) = (ints_of(&i[0]), int_of(&i[1]));
+                pair_sums(&xs, t) != pair_sums(&xs, t - 1)
+            })
+            .count();
+        assert!(exact >= 6, "{exact} of 30 thresholds are a pair sum");
     }
 
     proptest::proptest! {

@@ -153,8 +153,8 @@ fn check_variant(v: Variant) {
     let plan = FuelPlan::from_reference(&family, &arena, naive, &c)
         .expect("the naive reference is correct");
     println!("PLAN {}: {:?}", v.naive(), plan.sizes());
-    // The naive references' steps do not depend on the input (see SOURCE),
-    // so C has no noise to refuse them for.
+    // The naive references' steps barely depend on the input (see SOURCE),
+    // so C has little noise to refuse them for.
     let naive_named = check_class(
         &family,
         &mut arena,
