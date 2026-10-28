@@ -127,13 +127,15 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 /// out a unit a node.
 ///
 /// The budget is checked between steps of the term walk, between nodes of the
-/// search and between the arguments of a spine, so a call can overrun it by the
-/// rest of one step. That work is counted in full, and bounded: a unification
-/// visits no more nodes than the store holds (no more than the units already
-/// spent), a scope key has no more slots than there are bindings (no more than
-/// the steps taken), finding free variables visits no more nodes than the
-/// search has paid for, and an error writes out at most four types of at most
-/// [`MAX_TYPE_NODES`] nodes. So a call does at most about twice its budget, plus
+/// search, between the arguments of a spine and between the pairs of nodes a
+/// unification visits (types that share differently can make those as many as
+/// the product of their sizes), so a call can overrun it by the rest of one
+/// step. That work is counted in full, and bounded: a unification stops at the
+/// next pair, a check for occurrence or for a key type visits each node of the
+/// store once (no more than the units already spent), a scope key has no more
+/// slots than there are bindings (no more than the steps taken), finding free
+/// variables visits no more nodes than the search has paid for, and an error
+/// writes out at most four types of at most [`MAX_TYPE_NODES`] nodes. So a call does at most about twice its budget, plus
 /// a constant. The tests check that each unit stands for at most four reads of
 /// the term, the store or a scheme (a type node imported or a key looked up),
 /// on terms built to find work that is not charged. On those terms, one unit
@@ -256,6 +258,8 @@ enum UnifyError {
     Occurs(Ty, Ty),
     /// A non-key type where a `Key` type is required.
     Key(Ty),
+    /// The call ran out of work budget part way through.
+    OutOfWork,
 }
 
 /// A type written out as a [`Type`] would exceed [`MAX_TYPE_NODES`] or
@@ -1008,6 +1012,12 @@ impl TypeChecker {
         pairs.push((expected, found));
         let mut result = Ok(());
         while let Some((x, y)) = pairs.pop() {
+            // Shared structure can make the pairs visited as many as the
+            // product of the two types' sizes, so the budget is checked here.
+            if self.spent > self.budget.0 {
+                result = Err(UnifyError::OutOfWork);
+                break;
+            }
             let a = self.resolve(x);
             let b = self.resolve(y);
             if a == b {
@@ -2274,6 +2284,7 @@ impl TypeChecker {
                 let ty = self.export(t, &mut names)?;
                 TypeErrorKind::InfiniteType { var, ty }
             }
+            UnifyError::OutOfWork => too_much_work(self.budget.0),
             UnifyError::Key(t) => {
                 let found = self.export(t, &mut names)?;
                 if self.is_rigid(t) {

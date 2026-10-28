@@ -1991,6 +1991,84 @@ fn a_step_that_errors_past_the_budget_reports_too_much_work() {
     assert!(past > 0);
 }
 
+/// `c_k`, where `c_0 = base` and `c_{j+1} = (let c_j (pair $0 $0))`: a term
+/// whose type is a pair tree `k` deep with one store node per level.
+fn doubling(a: &mut Arena, base: TermId, k: usize) -> TermId {
+    let body = parse_term(a, "(pair $0 $0)");
+    let mut c = base;
+    for _ in 0..k {
+        c = a.let_(c, body);
+    }
+    c
+}
+
+/// A balanced tree of pairs `k` deep whose `2^k` leaves are `leaf(i)`.
+fn distinct_tree(a: &mut Arena, k: u32, leaf: &mut dyn FnMut(&mut Arena, i64) -> TermId) -> TermId {
+    fn go(
+        a: &mut Arena,
+        lo: i64,
+        hi: i64,
+        leaf: &mut dyn FnMut(&mut Arena, i64) -> TermId,
+    ) -> TermId {
+        if hi - lo == 1 {
+            leaf(a, lo)
+        } else {
+            let mid = lo + (hi - lo) / 2;
+            let l = go(a, lo, mid, leaf);
+            let r = go(a, mid, hi, leaf);
+            let pair = a.prim(Prim::Pair);
+            a.apps(pair, &[l, r])
+        }
+    }
+    go(a, 0, 1 << k, leaf)
+}
+
+/// `(if true A B)` where `A` is a tree `k` deep of distinct nodes whose leaves
+/// are distinct doublings `k` deep, and `B` is `k` doublings of a tree `k`
+/// deep of distinct nodes. Both types are the full pair tree `2k` deep over
+/// `Int`, but the sharing differs: below depth `k`, each of `A`'s `2^k` chains
+/// meets every node of `B`'s tree, so unifying them visits `4^k` pairs of
+/// store nodes, from types of about `k 2^k` nodes each. The `if` is bound by a
+/// `let` whose body is `0`, as its type is too large to write out. Type `Int`.
+fn crossed_sharing(a: &mut Arena, k: u32) -> TermId {
+    let depth = k as usize;
+    let left = distinct_tree(a, k, &mut |a, i| {
+        let base = a.int(i);
+        doubling(a, base, depth)
+    });
+    let tree = distinct_tree(a, k, &mut |a, i| a.int(i));
+    let right = doubling(a, tree, depth);
+    let t = a.bool(true);
+    let both = a.if_(t, left, right);
+    let zero = a.int(0);
+    a.let_(both, zero)
+}
+
+#[test]
+fn one_unification_is_bounded_by_the_budget() {
+    // A unification of two types that share differently visits pairs of
+    // nodes, as many as the product of their sizes. The budget must stop it
+    // there, not after it.
+    let mut a = Arena::new();
+    let t = crossed_sharing(&mut a, 9);
+    let mut tc = TypeChecker::new();
+    assert!(tc.infer(&a, t, NO_LIBS).is_ok());
+    let full = tc.spent();
+    let mut tried = 0;
+    for budget in (1_000..full).step_by((full / 40) as usize) {
+        let mut tc = TypeChecker::with_work_budget(budget);
+        let e = tc.infer(&a, t, NO_LIBS).unwrap_err();
+        assert_eq!(*e.kind, too_much_work(budget), "budget {budget}");
+        assert!(
+            tc.spent() <= 2 * budget + OVERRUN,
+            "{} units against a budget of {budget}",
+            tc.spent()
+        );
+        tried += 1;
+    }
+    assert!(tried >= 20);
+}
+
 #[test]
 fn running_out_in_the_first_walk_does_not_start_the_second() {
     // The second walk only names the clash the first one found; if the first
