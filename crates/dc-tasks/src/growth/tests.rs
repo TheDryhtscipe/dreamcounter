@@ -960,6 +960,9 @@ fn c_separation_tolerance_and_margin_on_an_exact_series() {
     assert_eq!(fit.noise, Some(0.0), "exact: noise 0");
     assert_eq!(fit.noise_margin, 0.0);
     assert!((fit.tolerance - default_tolerance()).abs() < EXACT);
+    // The cap binds on the default window: a quarter of the separation is
+    // 0.0446.
+    assert_eq!(fit.tolerance, 0.04);
     // The default tolerance keeps classes exclusive: no series can lie
     // within tolerance of two classes.
     assert!(fit.tolerance < fit.separation / 2.0);

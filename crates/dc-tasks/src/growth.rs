@@ -86,7 +86,7 @@
 //! within a factor `e^τ` of `c · f(n)`. It is a statement about the window,
 //! not a proof of asymptotic growth. Growth close to a class is named as
 //! that class. Over `128..1024`, where `ln n` varies by only a factor 1.43,
-//! exact `n^a` is named `n log n` for `a` from 1.134 to 1.208 and `n` for
+//! exact `n^a` is named `n log n` for `a` from 1.133 to 1.210 and `n` for
 //! `a` from 0.962 to 1.038; `n log n + 30n` (a large lower-order term) is
 //! named `n`. The tolerance cannot shrink enough to refuse these without
 //! refusing real `n log n` programs, whose lower-order terms give misfits
@@ -94,10 +94,12 @@
 //! over which `ln n` varies more: the cap keeps `τ` from growing with the
 //! separation, so over `2⁸ ..= 2²⁰` (a factor 2.5) no exact `n^a` is named
 //! `n log n`. The window must be wide in `ln n`, not only in `n`: over
-//! `2¹² ..= 2²⁰` (a factor 1.67), `n^a` for `a` from 1.08 to 1.104 still is.
+//! `2¹² ..= 2²⁰` (a factor 1.67), `n^a` for `a` from 1.078 to 1.105 still is.
 //! A wide window also refuses lower-order terms that are large at its
 //! small end: over `2⁸ ..= 2²⁰`, `n log₂ n + 2n` has misfit 0.064 and is a
-//! `NoFit`.
+//! `NoFit`. Real merge sort behaves like `n log₂ n + 1.4n`, so it is refused
+//! over windows from 64 up (`64..1024`, `64..16384`) that name it without
+//! the cap.
 //!
 //! # Conventions
 //!
@@ -798,9 +800,11 @@ pub enum NoiseModel {
 pub struct ClassSelect {
     /// The sizes to fit over.
     pub window: Window,
-    /// The tolerance floor as a fraction of the separation, in `[0, ½)`. Below
-    /// ½ the classes are exclusive for exact step counts; the default ¼ leaves
-    /// half of that margin for lower-order terms.
+    /// The tolerance floor as a fraction of the separation, in `[0, ½)`,
+    /// before [`ClassSelect::max_tolerance`] caps it. Below ½ the classes are
+    /// exclusive for exact step counts. On the default window the cap binds,
+    /// so the default ¼ matters only on windows whose separation is below
+    /// 0.16.
     pub misfit_fraction: f64,
     /// The most the tolerance floor can be, whatever the separation;
     /// `≥ 0`, and `f64::INFINITY` for no cap. The default 0.04 lets each
