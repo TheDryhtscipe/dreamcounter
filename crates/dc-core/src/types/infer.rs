@@ -42,8 +42,12 @@
 //! (see [`TypeChecker::run`]). That walk reuses shared subterms too, and goes
 //! into one only where its use fails. An error goes back to the outermost use
 //! being tried, so the walk goes back at most once for each level of nesting
-//! of shared uses, and costs about as much as the first walk for each time it
-//! goes back and once more. The work budget bounds both walks.
+//! of shared uses. Between two goings back it is a walk with reuse, like the
+//! first, except that a use walked in place sees the actual types of its
+//! monomorphic bindings, as the tree walk does, where the first walk saw
+//! fresh variables. So it usually costs about as much as the first walk for
+//! each time it goes back and once more, but a monomorphic binding with a
+//! large type can make it cost more. The work budget bounds both walks.
 //!
 //! **Work budget.** Reuse of shared subterms is keyed on the bindings they see,
 //! and a well-typed term can make exponentially many different sets of them, so
@@ -736,8 +740,12 @@ impl TypeChecker {
     /// goes back at most once for each level of nesting of shared uses, and no
     /// more often than there are shared subterms. Nothing walked in place is
     /// undone by a later error. Between two goings back the walk is a walk
-    /// with reuse, like the first, so the second walk costs about as much as
-    /// the first for each time it goes back and once more. Going back to the
+    /// with reuse, like the first, so the second walk usually costs about as
+    /// much as the first for each time it goes back and once more. A use
+    /// walked in place sees the actual types of its monomorphic bindings, as
+    /// the tree walk does, where the first walk saw fresh variables, so a
+    /// binding with a large type, generalised or instantiated again at each
+    /// level, can make it cost more. Going back to the
     /// innermost use instead would walk a use in place again under every try
     /// around it, which doubles the work at each level of a chain such as
     /// `(if c t t)` nested `n` deep.

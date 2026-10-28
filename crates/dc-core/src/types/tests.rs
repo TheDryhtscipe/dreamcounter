@@ -1381,7 +1381,14 @@ const CHAIN_DEPTH: usize = 40;
 /// the random terms below is about 1.6 times. A term whose second walk does
 /// more than the first for the same uses is outside this: copying kept types
 /// out of reach of checkpoints can double at each level
-/// (dreamcounter-715365), but none of the terms checked here does that.
+/// (dreamcounter-715365), but none of the terms checked here does that. So
+/// is a term whose walk in place meets a monomorphic binding with a large
+/// type: the first walk saw a fresh variable for it, and the walk in place
+/// sees the actual type, as the tree walk does. A chain rebinding a
+/// variable of type a pair tree 13 deep at each level costs over 50 times
+/// the first walk with 2 rollbacks. The random terms below keep types
+/// small; a generator that makes them large would trip this check for that
+/// reason, not because of a regression.
 const LOCATE_COST_FACTOR: u64 = 4;
 
 /// Units the second walk may spend past [`LOCATE_COST_FACTOR`], for small
