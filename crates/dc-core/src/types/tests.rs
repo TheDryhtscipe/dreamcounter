@@ -1313,7 +1313,13 @@ fn only_failed_fresh_inference_marks_a_key_failed() {
 /// (if true t_k (let (lam (pair (fst ($1 0)) $0)) t_k))`: every level binds a new
 /// polymorphic helper whose type has the free variable `x`.
 fn helpers_over_a_lambda_variable(a: &mut Arena, n: usize) -> TermId {
-    let (v0, v1, zero, one, yes) = (a.var(0), a.var(1), a.int(0), a.int(1), a.bool(true));
+    let leaf = parse_term(a, "($0 1)");
+    helpers_over_a_lambda_variable_from(a, n, leaf)
+}
+
+/// [`helpers_over_a_lambda_variable`] with `t_0 = leaf`.
+fn helpers_over_a_lambda_variable_from(a: &mut Arena, n: usize, leaf: TermId) -> TermId {
+    let (v0, v1, zero, yes) = (a.var(0), a.var(1), a.int(0), a.bool(true));
     let (pair, fst) = (a.prim(Prim::Pair), a.prim(Prim::Fst));
     let b0 = a.apps(pair, &[v1, v0]);
     let b0 = a.lam(b0);
@@ -1321,7 +1327,7 @@ fn helpers_over_a_lambda_variable(a: &mut Arena, n: usize) -> TermId {
     let x = a.app(fst, prev);
     let b = a.apps(pair, &[x, v0]);
     let b = a.lam(b);
-    let mut t = a.app(v0, one);
+    let mut t = leaf;
     for _ in 0..n {
         let l = a.let_(b, t);
         t = a.if_(yes, t, l);
@@ -1343,6 +1349,679 @@ fn shared_subterms_under_new_helpers_with_free_type_variables_are_reused() {
     assert_eq!(bounded(STEPS).infer(&a, small, NO_LIBS), want);
     let big = helpers_over_a_lambda_variable(&mut a, N);
     assert_eq!(bounded(STEPS).infer(&a, big, NO_LIBS), want);
+}
+
+// ---------------------------------------------------------------- locating errors in chains
+
+/// The leaf of s2: ill typed whatever the helper's free variable is.
+const S2_LEAF: &str = "(add (snd ($0 1)) true)";
+/// The leaf of s8, ill typed once the helper's free variable is `Int`, and the
+/// first part of the pair around its chain, which makes it `Int`.
+const S8_LEAF: &str = "(if (fst ($0 1)) true true)";
+const S8_FIRST: &str = "(add (fst ($0 1)) 1)";
+/// A condition that fixes the helper's free variable to `Int` again: once it
+/// is, unifying it with `Int` changes nothing.
+const FIX_X: &str = "(fst (pair true (add (fst ($0 1)) 1)))";
+
+/// The depth at which the chains below are located within a bound on steps.
+/// Walked as a tree, each is about `2^N` steps.
+const CHAIN_DEPTH: usize = 40;
+
+/// Builds the chain `build` at depth 8 and at [`CHAIN_DEPTH`], and checks
+/// that inferring each, and checking it against `expected(n)`, reports the
+/// error the tree walk reports, with no walk taking more than `steps(N)`
+/// steps. The tree walk of each chain fails in its leftmost leaf, so it is
+/// cheap at any depth, and is not bounded.
+fn assert_chain_located(
+    name: &str,
+    build: impl Fn(&mut Arena, usize) -> TermId,
+    expected: impl Fn(usize) -> Scheme,
+    steps: impl Fn(u64) -> u64,
+) {
+    let limit = steps(CHAIN_DEPTH as u64);
+    let mut a = Arena::new();
+    for n in [8, CHAIN_DEPTH] {
+        let t = build(&mut a, n);
+        let mut tree = TypeChecker::new();
+        tree.tree_walk = true;
+        let want = tree.infer(&a, t, NO_LIBS);
+        assert!(want.is_err(), "{name} at {n}");
+        assert_eq!(bounded(limit).infer(&a, t, NO_LIBS), want, "{name} at {n}");
+        let expected = expected(n);
+        let want = tree.check(&a, t, NO_LIBS, &expected);
+        assert!(want.is_err(), "{name} at {n} against {expected}");
+        assert_eq!(
+            bounded(limit).check(&a, t, NO_LIBS, &expected),
+            want,
+            "{name} at {n} against {expected}"
+        );
+    }
+}
+
+/// `lam x. let h = (lam (pair x $0)) in body`, where `body` is `t_n`, or
+/// `(pair first t_n)` if `first` is given, with `t_(k+1) = (if cond t_k t_k)`
+/// and `t_0 = leaf`, all read with `h` as `$0` and `x` as `$1`: every shared
+/// subterm uses the polymorphic helper `h`, whose type has the free variable
+/// `x`, so the scope of its key is open.
+fn chain_under_an_open_helper(
+    a: &mut Arena,
+    n: usize,
+    cond: &str,
+    leaf: &str,
+    first: Option<&str>,
+) -> TermId {
+    let cond = parse_term(a, cond);
+    let mut t = parse_term(a, leaf);
+    for _ in 0..n {
+        t = a.if_(cond, t, t);
+    }
+    if let Some(first) = first {
+        let (pair, first) = (a.prim(Prim::Pair), parse_term(a, first));
+        t = a.apps(pair, &[first, t]);
+    }
+    let h = parse_term(a, "(lam (pair $1 $0))");
+    let l = a.let_(h, t);
+    a.lam(l)
+}
+
+/// `lam x. lam z_1 ... lam z_n. let g_n = (lam (pair z_n $0)) in ... let g_1 =
+/// (lam (pair z_1 $0)) in let h = (lam (pair x $0)) in t_n`, with `t_0` the
+/// leaf of s2 and `t_k = (if (fst (pair true (add (fst (g_k 1)) 1))) t_(k-1)
+/// t_(k-1))`: each level fixes the free variable `z_k` of a helper of its
+/// own.
+fn chain_fixing_helpers_of_its_own(a: &mut Arena, n: usize) -> TermId {
+    let width = u32::try_from(n).expect("a small depth");
+    let mut t = parse_term(a, S2_LEAF);
+    for k in 1..=width {
+        // Under the `let`s, `h` is `$0` and `g_k` is `$k`.
+        let cond = parse_term(a, &format!("(fst (pair true (add (fst (${k} 1)) 1)))"));
+        t = a.if_(cond, t, t);
+    }
+    // Under the `let`s of `g_1 ... g_n` and the argument, `x` is `$(2n + 1)`.
+    let h = parse_term(a, &format!("(lam (pair ${} $0))", 2 * width + 1));
+    let mut body = a.let_(h, t);
+    for k in 1..=width {
+        // Under the `let`s of `g_(k+1) ... g_n` and the argument, `z_k` is
+        // `$(2n - 2k + 1)`.
+        let g = parse_term(a, &format!("(lam (pair ${} $0))", 2 * (width - k) + 1));
+        body = a.let_(g, body);
+    }
+    for _ in 0..=n {
+        body = a.lam(body);
+    }
+    body
+}
+
+/// The type the chains under one open helper are checked against.
+fn int_to_int_and_bool(_: usize) -> Scheme {
+    sch("Int -> (Int, Bool)")
+}
+
+#[test]
+fn open_scope_failures_are_located_in_polynomial_steps_s2() {
+    // Ill typed whatever the helper's free variable is.
+    assert_chain_located(
+        "s2",
+        |a, n| chain_under_an_open_helper(a, n, "true", S2_LEAF, None),
+        int_to_int_and_bool,
+        |n| 5 * n * n,
+    );
+}
+
+#[test]
+fn open_scope_failures_are_located_in_polynomial_steps_s7() {
+    // A new helper at every level.
+    assert_chain_located(
+        "s7",
+        |a, n| {
+            let leaf = parse_term(a, "(add ($0 1) 1)");
+            helpers_over_a_lambda_variable_from(a, n, leaf)
+        },
+        int_to_int_and_bool,
+        |n| 5 * n * n,
+    );
+}
+
+#[test]
+fn open_scope_failures_are_located_in_polynomial_steps_s8() {
+    // Ill typed only once the helper's free variable is `Int`.
+    assert_chain_located(
+        "s8",
+        |a, n| chain_under_an_open_helper(a, n, "true", S8_LEAF, Some(S8_FIRST)),
+        int_to_int_and_bool,
+        |n| 5 * n * n,
+    );
+}
+
+#[test]
+fn open_scope_failures_are_located_in_polynomial_steps_g3() {
+    // s8 with a use of the helper that fixes its free variable at every level.
+    assert_chain_located(
+        "g3",
+        |a, n| chain_under_an_open_helper(a, n, FIX_X, S8_LEAF, Some(S8_FIRST)),
+        int_to_int_and_bool,
+        |n| 5 * n * n,
+    );
+}
+
+#[test]
+fn open_scope_failures_are_located_in_polynomial_steps_g6() {
+    // s2 with a use of the helper that fixes its free variable at every level.
+    assert_chain_located(
+        "g6",
+        |a, n| chain_under_an_open_helper(a, n, FIX_X, S2_LEAF, None),
+        int_to_int_and_bool,
+        |n| 5 * n * n,
+    );
+}
+
+#[test]
+fn open_scope_failures_are_located_in_polynomial_steps_g9() {
+    // s2 with the free variable of a helper of its own fixed at every level.
+    assert_chain_located(
+        "g9",
+        chain_fixing_helpers_of_its_own,
+        |n| sch(&format!("{}Bool", "Int -> ".repeat(n + 1))),
+        |n| 30 * n * n,
+    );
+}
+
+/// `snd` applied `j` times to `e`.
+fn snds(j: usize, e: &str) -> String {
+    format!("{}{e}{}", "(snd ".repeat(j), ")".repeat(j))
+}
+
+/// `lam x_1 ... lam x_p. let h = helper in body`, where `body` is `t_n`, or
+/// `(pair first t_n)` if `first` is given, with `t_k = (if (cond (n - k + 1))
+/// t_(k-1) t_(k-1))` and `t_0 = leaf`: [`chain_under_an_open_helper`] with a
+/// condition of its own at each level, numbered from 1 at the top.
+fn chain_with_conds(
+    a: &mut Arena,
+    n: usize,
+    params: usize,
+    helper: &str,
+    cond: impl Fn(usize) -> String,
+    leaf: &str,
+    first: Option<&str>,
+) -> TermId {
+    let mut t = parse_term(a, leaf);
+    for k in 1..=n {
+        let c = parse_term(a, &cond(n - k + 1));
+        t = a.if_(c, t, t);
+    }
+    if let Some(first) = first {
+        let (pair, first) = (a.prim(Prim::Pair), parse_term(a, first));
+        t = a.apps(pair, &[first, t]);
+    }
+    let h = parse_term(a, helper);
+    let mut body = a.let_(h, t);
+    for _ in 0..params {
+        body = a.lam(body);
+    }
+    body
+}
+
+/// A condition that makes the part `snd^j` of the helper's free variable `x`
+/// a pair of one variable: each level refines a node of `x` that the level
+/// above made.
+fn deepening(j: usize) -> String {
+    let part = snds(j, "(fst ($1 1))");
+    format!("(fst (pair true (lam (if true {part} (pair $0 $0)))))")
+}
+
+/// A condition that unifies part `fst (snd^j x)` of the helper's free variable
+/// with the second parameter `y`, which is `Int`. Tried afresh, `y` is a
+/// fresh variable, so the part stays a variable; walked in place, it becomes
+/// `Int`.
+fn through_a_parameter(j: usize) -> String {
+    let part = snds(j, "(fst ($0 1))");
+    format!("(fst (pair true (if true $1 (fst {part}))))")
+}
+
+/// The type the chains whose levels refine the helper's free variable are
+/// checked against.
+fn to_itself_and_bool(_: usize) -> Scheme {
+    sch("a -> (a, Bool)")
+}
+
+#[test]
+fn refining_scope_failures_are_located_in_polynomial_steps_r2() {
+    // s2 with each level refining the helper's free variable further.
+    assert_chain_located(
+        "r2",
+        |a, n| chain_with_conds(a, n, 1, "(lam (pair $1 $0))", deepening, S2_LEAF, None),
+        to_itself_and_bool,
+        |n| 30 * n * n,
+    );
+}
+
+#[test]
+fn refining_scope_failures_are_located_in_polynomial_steps_r2s8() {
+    // s8 on the first part of the free variable, refining the second.
+    assert_chain_located(
+        "r2s8",
+        |a, n| {
+            chain_with_conds(
+                a,
+                n,
+                1,
+                "(lam (pair $1 $0))",
+                deepening,
+                "(if (fst (fst ($0 1))) true true)",
+                Some("(add (fst (fst ($0 1))) 1)"),
+            )
+        },
+        to_itself_and_bool,
+        |n| 30 * n * n,
+    );
+}
+
+#[test]
+fn refining_scope_failures_are_located_in_polynomial_steps_m() {
+    // s2 with each level fixing a part of the free variable only in place.
+    assert_chain_located(
+        "m",
+        |a, n| {
+            chain_with_conds(
+                a,
+                n,
+                2,
+                "(lam (pair $2 $0))",
+                through_a_parameter,
+                S2_LEAF,
+                Some("(add $1 1)"),
+            )
+        },
+        to_itself_and_bool,
+        |n| 30 * n * n,
+    );
+}
+
+/// `lam x. lam y. let h = (lam (pair x $0)) in body`, where `body` is `t_n`,
+/// or `(pair (add y 1) t_n)` if `fix_y`, with `t_0` the leaf of s2 and `t_k =
+/// (let z = z' in let g = (lam (pair (fst (g' 1)) $0)) in (if c_k t_(k-1)
+/// t_(k-1)))`, where `z'` and `g'` are the `z` and `g` of the level above
+/// (`y` and `h` at the top), and `c_k = (fst (pair true (if true z (fst
+/// (snd^k (fst (g 1)))))))`. Every `z` is `y` and every `g 1` is `(x, 1)`,
+/// so level `k` (counted from the leaf) unifies `y` with a part of `x` of its
+/// own, `fst (snd^k x)`. Tried afresh, a level's `z` is a fresh variable, so
+/// the parts it reaches are fixed only when it is walked in place.
+fn partition_chain(a: &mut Arena, n: usize, fix_y: bool) -> TermId {
+    let mut t = parse_term(a, S2_LEAF);
+    let z = a.var(1);
+    let g = parse_term(a, "(lam (pair (fst ($2 1)) $0))");
+    for k in 1..=n {
+        let part = snds(k, "(fst ($0 1))");
+        let c = parse_term(a, &format!("(fst (pair true (if true $1 (fst {part}))))"));
+        let body = a.if_(c, t, t);
+        let inner = a.let_(g, body);
+        t = a.let_(z, inner);
+    }
+    if fix_y {
+        let (pair, fix) = (a.prim(Prim::Pair), parse_term(a, "(add $1 1)"));
+        t = a.apps(pair, &[fix, t]);
+    }
+    let h = parse_term(a, "(lam (pair $2 $0))");
+    let body = a.let_(h, t);
+    let body = a.lam(body);
+    a.lam(body)
+}
+
+/// The type the chains with two parameters are checked against.
+fn of_two_parameters(_: usize) -> Scheme {
+    sch("a -> b -> c")
+}
+
+/// The type the chains with one parameter are checked against.
+fn of_one_parameter(_: usize) -> Scheme {
+    sch("a -> b")
+}
+
+#[test]
+fn chain_failures_are_located_in_polynomial_steps_partition() {
+    // Each level walked in place tries the levels below it afresh, and each
+    // fixes one more part of `x`, so a level costs more the deeper it is:
+    // about `n^3` units in all, against `n^2` steps.
+    assert_chain_located(
+        "partition",
+        |a, n| partition_chain(a, n, true),
+        of_two_parameters,
+        |n| 50 * n * n,
+    );
+}
+
+#[test]
+fn chain_failures_are_located_in_polynomial_steps_partition_without_fixing_y() {
+    assert_chain_located(
+        "partition without fixing y",
+        |a, n| partition_chain(a, n, false),
+        of_two_parameters,
+        |n| 50 * n * n,
+    );
+}
+
+/// `lam y. let h = (lam (pair y $0)) in t_n`, with `t_0` the leaf of s2 and
+/// `t_k = (let z = z' in let g = (lam (pair z $0)) in (if c_k t_(k-1)
+/// t_(k-1)))`, where `z'` and `g'` are the `z` and `g` of the level above
+/// (`y` and `h` at the top), and `c_k = (fst (pair true (pair (g' 1) (add
+/// (fst (snd^(n-k) z)) 1))))`: level `k` (counted from the leaf) makes a
+/// part of `y` of its own an `Int`, and uses the helper of the level above.
+fn parts_fixed_under_helpers_of_the_level_above(a: &mut Arena, n: usize) -> TermId {
+    let mut t = parse_term(a, S2_LEAF);
+    let y = a.var(1);
+    let helper = parse_term(a, "(lam (pair $1 $0))");
+    for k in 1..=n {
+        let part = snds(n - k, "$1");
+        let c = parse_term(
+            a,
+            &format!("(fst (pair true (pair ($2 1) (add (fst {part}) 1))))"),
+        );
+        let body = a.if_(c, t, t);
+        let inner = a.let_(helper, body);
+        t = a.let_(y, inner);
+    }
+    let body = a.let_(helper, t);
+    a.lam(body)
+}
+
+#[test]
+fn chain_failures_are_located_in_polynomial_steps_p2() {
+    assert_chain_located(
+        "p2",
+        parts_fixed_under_helpers_of_the_level_above,
+        of_one_parameter,
+        |n| 50 * n * n,
+    );
+}
+
+/// `lam x. let h = (lam (pair x $0)) in t_n`, with `t_0` the leaf of s2 and
+/// `t_k = (if (fst (pair true w_k)) t_(k-1) t_(k-1))`, where `w_k = (h (fst
+/// (h ... (fst (h i)))))` applies `h` `m + 1` times, with `i = k`, or `i = 1`
+/// if `same`, when every level has the one condition, itself shared.
+fn chain_with_wide_conditions(a: &mut Arena, n: usize, m: usize, same: bool) -> TermId {
+    let mut t = parse_term(a, S2_LEAF);
+    for k in 1..=n {
+        let i = if same { 1 } else { k };
+        let mut w = format!("($0 {i})");
+        for _ in 0..m {
+            w = format!("($0 (fst {w}))");
+        }
+        let c = parse_term(a, &format!("(fst (pair true {w}))"));
+        t = a.if_(c, t, t);
+    }
+    let h = parse_term(a, "(lam (pair $1 $0))");
+    let l = a.let_(h, t);
+    a.lam(l)
+}
+
+#[test]
+fn chain_failures_are_located_in_polynomial_steps_wide10() {
+    assert_chain_located(
+        "wide10",
+        |a, n| chain_with_wide_conditions(a, n, 10, false),
+        of_one_parameter,
+        |n| 100 * n * n,
+    );
+}
+
+#[test]
+fn chain_failures_are_located_in_polynomial_steps_wideshared200() {
+    assert_chain_located(
+        "wideshared200",
+        |a, n| chain_with_wide_conditions(a, n, 200, true),
+        of_one_parameter,
+        |n| 10 * n * n,
+    );
+}
+
+/// `lam z. let h = (lam (pair z $0)) in (pair (if z 1 1) (pair c_n c_n))`,
+/// with `c_0` the leaf of s2 and `c_k = (pair (add z 1) (pair c_(k-1)
+/// c_(k-1)))`. Walked in place, each level fails at once on `(add z 1)`, as
+/// `z` is `Bool`; tried afresh, `z` is a fresh variable, so the try goes all
+/// the way down to the leaf before it fails.
+fn failing_at_once_in_place(a: &mut Arena, n: usize) -> TermId {
+    let mut c = parse_term(a, S2_LEAF);
+    let pair = a.prim(Prim::Pair);
+    let bad = parse_term(a, "(add $1 1)");
+    for _ in 0..n {
+        let inner = a.apps(pair, &[c, c]);
+        c = a.apps(pair, &[bad, inner]);
+    }
+    let fix_z = parse_term(a, "(if $1 1 1)");
+    let inner = a.apps(pair, &[c, c]);
+    let body = a.apps(pair, &[fix_z, inner]);
+    let h = parse_term(a, "(lam (pair $1 $0))");
+    let l = a.let_(h, body);
+    a.lam(l)
+}
+
+#[test]
+fn chain_failures_are_located_in_linear_steps_fastfail() {
+    // A try that fails deep inside is not walked in place level by level:
+    // the error goes back to the outermost use being tried, which fails in
+    // place at once.
+    assert_chain_located(
+        "fastfail",
+        failing_at_once_in_place,
+        of_one_parameter,
+        |n| 20 * n,
+    );
+}
+
+/// `lam x. (pair U U)`, with `U = (pair (let first t_n) (let second t_n))`,
+/// `t_(k+1) = (if true t_k t_k)` and `t_0 = leaf`: a chain shared under two
+/// helpers, well typed under the first and ill typed under the second.
+fn chain_under_two_helpers_from(
+    a: &mut Arena,
+    n: usize,
+    leaf: &str,
+    first: &str,
+    second: &str,
+) -> TermId {
+    let mut t = parse_term(a, leaf);
+    let yes = a.bool(true);
+    for _ in 0..n {
+        t = a.if_(yes, t, t);
+    }
+    let (first, second) = (parse_term(a, first), parse_term(a, second));
+    let (first, second) = (a.let_(first, t), a.let_(second, t));
+    let pair = a.prim(Prim::Pair);
+    let u = a.apps(pair, &[first, second]);
+    let body = a.apps(pair, &[u, u]);
+    a.lam(body)
+}
+
+/// Builds [`chain_under_two_helpers_from`] at `n = 8` and at
+/// [`CHAIN_DEPTH`], and checks that inferring and checking both report the
+/// error at `leaves` (the leaf's failing part when inferring, then when
+/// checking, where `x` is rigid), as the tree walk does, within `8 N^2`
+/// steps. Walked as a tree, the big chain is `2^N`, so both chains are
+/// compared with the small one's tree walk: terms are shared in the arena,
+/// so the error is at the same leaf.
+fn assert_two_helpers_located(leaf: &str, first: &str, second: &str, leaves: [&str; 2]) {
+    let n = CHAIN_DEPTH as u64;
+    let limit = 8 * n * n;
+    let mut a = Arena::new();
+    let small = chain_under_two_helpers_from(&mut a, 8, leaf, first, second);
+    let big = chain_under_two_helpers_from(&mut a, CHAIN_DEPTH, leaf, first, second);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    // The type the term would have if the chain were well typed under both
+    // helpers, so that checking fails at a leaf too, not at the body.
+    let expected = sch("a -> (((Int, Int), (Int, Int)), ((Int, Int), (Int, Int)))");
+    let want_infer = tree.infer(&a, small, NO_LIBS);
+    let want_check = tree.check(&a, small, NO_LIBS, &expected);
+    let got = [want_infer.as_ref().err(), want_check.as_ref().err()];
+    for (e, leaf) in got.into_iter().zip(leaves) {
+        let e = e.expect("ill typed under the second helper");
+        assert_eq!(e.term_text, leaf, "{e}");
+    }
+    for t in [small, big] {
+        assert_eq!(bounded(limit).infer(&a, t, NO_LIBS), want_infer);
+        assert_eq!(bounded(limit).check(&a, t, NO_LIBS, &expected), want_check);
+    }
+}
+
+/// The helpers are `a -> a`, closed, and `a -> x`. Inferring, `x` becomes
+/// `Int` at `(add ($0 1) 1)`, so `($0 true)` fails; checking, `x` is rigid,
+/// so `($0 1)` does.
+#[test]
+fn a_failure_under_one_helper_is_located_in_polynomial_steps() {
+    assert_two_helpers_located(
+        "(pair (add ($0 1) 1) (if ($0 true) 1 1))",
+        "(lam $0)",
+        "(lam $1)",
+        ["($0 true)", "($0 1)"],
+    );
+}
+
+/// The helpers are `a -> (x, a)` and `a -> (a, x)`: both open, over the same
+/// free variable. Inferring, `x` becomes `Int` at the `add`, so the
+/// condition of `if` fails; checking, `x` is rigid, so the argument of `add`
+/// does.
+#[test]
+fn a_failure_under_one_of_two_open_helpers_is_located_in_polynomial_steps() {
+    assert_two_helpers_located(
+        "(pair (add (snd ($0 1)) 1) (if (snd ($0 true)) 1 1))",
+        "(lam (pair $1 $0))",
+        "(lam (pair $0 $1))",
+        ["(snd ($0 true))", "(snd ($0 1))"],
+    );
+}
+
+/// `lam x. lam y. (pair U U)`, with `U = (pair (let (lam (pair x $0)) (pair
+/// (add x 1) t_n)) (let (lam (pair y $0)) (pair (if y 1 1) t_n)))`, `t_(k+1) =
+/// (if true t_k t_k)` and `t_0 = (add (fst ($0 1)) 1)`. Both helpers are
+/// `a -> (v, a)`, of one shape, over a free variable that each `let` body
+/// then fixes: `x` to `Int`, under which the chain is well typed, and `y` to
+/// `Bool`, under which it is not.
+fn chain_under_helpers_of_one_shape(a: &mut Arena, n: usize) -> TermId {
+    let mut t = parse_term(a, "(add (fst ($0 1)) 1)");
+    let yes = a.bool(true);
+    for _ in 0..n {
+        t = a.if_(yes, t, t);
+    }
+    let pair = a.prim(Prim::Pair);
+    let mut branch = |helper: &str, fix: &str| {
+        let (helper, fix) = (parse_term(a, helper), parse_term(a, fix));
+        let body = a.apps(pair, &[fix, t]);
+        a.let_(helper, body)
+    };
+    let first = branch("(lam (pair $2 $0))", "(add $2 1)");
+    let second = branch("(lam (pair $1 $0))", "(if $1 1 1)");
+    let u = a.apps(pair, &[first, second]);
+    let body = a.apps(pair, &[u, u]);
+    let body = a.lam(body);
+    a.lam(body)
+}
+
+/// The chain is well typed under the helper over `x`, which is `Int`, and
+/// ill typed under the helper of the same shape over `y`, which is `Bool`.
+#[test]
+fn a_failure_under_one_of_two_helpers_of_one_shape_is_located_in_polynomial_steps() {
+    let n = CHAIN_DEPTH as u64;
+    let limit = 8 * n * n;
+    let mut a = Arena::new();
+    let small = chain_under_helpers_of_one_shape(&mut a, 8);
+    let big = chain_under_helpers_of_one_shape(&mut a, CHAIN_DEPTH);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    // Walked as a tree, the big chain is `2^N`; the error is at the same leaf
+    // of the small one, since terms are shared in the arena.
+    let want = tree.infer(&a, small, NO_LIBS);
+    let e = want
+        .as_ref()
+        .expect_err("ill typed under the helper over y");
+    assert_eq!(e.term_text, "(fst ($0 1))", "{e}");
+    for t in [small, big] {
+        assert_eq!(bounded(limit).infer(&a, t, NO_LIBS), want);
+    }
+}
+
+/// `lam y. let g_0 = (lam (pair y $0)) in S_n`, with `S_0 = leaf` and `S_k =
+/// (let z = y in let g = (lam (pair z $0)) in (if cond S_(k-1) S_(k-1)))`:
+/// each level binds a helper of its own over a monomorphic variable of its
+/// scope. `cond` sees the level's helper as `$0` and its parent's as `$2`.
+fn chain_making_helpers_over_mono(a: &mut Arena, n: usize, leaf: &str, cond: &str) -> TermId {
+    let mut t = parse_term(a, leaf);
+    let c = parse_term(a, cond);
+    let y = a.var(1);
+    let helper = parse_term(a, "(lam (pair $1 $0))");
+    for _ in 0..n {
+        let body = a.if_(c, t, t);
+        let inner = a.let_(helper, body);
+        t = a.let_(y, inner);
+    }
+    let body = a.let_(helper, t);
+    a.lam(body)
+}
+
+#[test]
+fn failures_under_helpers_made_inside_the_subterm_are_located_in_polynomial_steps() {
+    // Each condition uses the helper of the level above, so every key has an
+    // open scope.
+    assert_chain_located(
+        "helpers made over a monomorphic variable",
+        |a, n| chain_making_helpers_over_mono(a, n, S2_LEAF, "(fst (pair true ($2 1)))"),
+        of_one_parameter,
+        |n| 30 * n * n,
+    );
+}
+
+#[test]
+fn failures_with_closed_scopes_are_located_in_linear_steps() {
+    // Each condition uses the level's own helper, so a level's only free
+    // variable is the monomorphic `z` of the level above, and every key has a
+    // closed scope. Once the first try has failed, each key it was trying is
+    // walked in place at once, so no level is tried again.
+    assert_chain_located(
+        "mono-ill",
+        |a, n| chain_making_helpers_over_mono(a, n, S2_LEAF, "(fst (pair true ($0 1)))"),
+        of_one_parameter,
+        |n| 80 * n,
+    );
+}
+
+/// `lam x. let h = (lam (let (pair x x) (let (pair $0 $0) ... (pair $0
+/// arg)))) in t_n`, with `m` `let`s in the helper and `t_n` the chain of s2:
+/// a helper whose type is a DAG of `m` nodes over one free variable.
+fn chain_under_a_large_helper(a: &mut Arena, n: usize, m: usize) -> TermId {
+    let width = u32::try_from(m).expect("a small helper");
+    let mut src = format!("(pair $0 ${width})");
+    for k in (1..=m).rev() {
+        let bound = if k == 1 {
+            "(pair $1 $1)"
+        } else {
+            "(pair $0 $0)"
+        };
+        src = format!("(let {bound} {src})");
+    }
+    let helper = format!("(lam {src})");
+    chain_with_conds(a, n, 1, &helper, |_| "true".into(), S2_LEAF, None)
+}
+
+/// About twice the units measured at `n = 60` and `m = 200` (514,764).
+const LARGE_HELPER_UNITS: u64 = 1_000_000;
+
+#[test]
+fn locating_under_a_large_helper_does_not_rewrite_its_type_at_every_use() {
+    // Each level walked in place uses the helper again, so a use that wrote
+    // out the helper's whole type would cost n^2 m.
+    const N: usize = 60;
+    const M: usize = 200;
+    let mut a = Arena::new();
+    let small = chain_under_a_large_helper(&mut a, 6, 4);
+    let big = chain_under_a_large_helper(&mut a, N, M);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, small, NO_LIBS);
+    assert!(want.is_err());
+    assert_eq!(TypeChecker::new().infer(&a, small, NO_LIBS), want);
+    // Twice the bound, so a call that runs past the bound still ends.
+    let mut tc = TypeChecker::with_work_budget(2 * LARGE_HELPER_UNITS);
+    let got = tc.infer(&a, big, NO_LIBS);
+    assert!(tc.spent() <= LARGE_HELPER_UNITS, "{} units", tc.spent());
+    assert_eq!(got, tree.infer(&a, big, NO_LIBS));
 }
 
 #[test]
