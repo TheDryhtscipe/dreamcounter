@@ -25,6 +25,7 @@
 
 use std::collections::hash_map::Entry;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use rustc_hash::FxHashMap;
 
@@ -39,8 +40,26 @@ pub use infer::{check, infer, prim_scheme, LibEnv, TypeChecker, MAX_TYPE_DEPTH, 
 pub use parse::TypeParseError;
 
 /// A type variable. It prints as `a`, `b`, ..., `z`, `a1`, `b1`, ...
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Eq, PartialOrd, Ord)]
 pub struct TyVar(pub u32);
+
+/// Equality on the number. In test builds each comparison is counted in `probes`,
+/// so the tests can measure the work of a lookup whether it is a hash-map probe or a
+/// scan of a list.
+impl PartialEq for TyVar {
+    fn eq(&self, other: &TyVar) -> bool {
+        #[cfg(test)]
+        probes::add(1);
+        self.0 == other.0
+    }
+}
+
+/// Hashes the number, as a derived `Hash` would; it agrees with [`PartialEq`].
+impl Hash for TyVar {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
 
 impl fmt::Display for TyVar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -151,8 +170,6 @@ impl Type {
         match self {
             Type::Int | Type::Bool | Type::Unit => {}
             Type::Var(v) => {
-                #[cfg(test)]
-                probes::add(1);
                 if let Entry::Vacant(e) = index.entry(*v) {
                     e.insert(u32::try_from(order.len()).expect("fewer than 2^32 type variables"));
                     order.push(*v);
@@ -279,11 +296,7 @@ impl Scheme {
     /// that occur.
     pub fn with_keys(ty: Type, keys: &[TyVar]) -> Scheme {
         let (_, index) = ty.numbered_vars();
-        let rename = |v: TyVar| {
-            #[cfg(test)]
-            probes::add(1);
-            index.get(&v).map(|&i| TyVar(i))
-        };
+        let rename = |v: TyVar| index.get(&v).map(|&i| TyVar(i));
         let ty = ty.map_vars(&mut |v| {
             rename(v).expect("every variable of the type is in its own variable index")
         });
@@ -330,8 +343,14 @@ impl fmt::Display for Scheme {
     }
 }
 
-/// A count of the variable lookups made while collecting and numbering type
-/// variables, a measure of the work done that the tests check without a timer.
+/// A count of the equality comparisons made on type variables ([`TyVar`]) and on
+/// variable names in the type parser, a measure of lookup work that the tests check
+/// without a timer.
+///
+/// A hash-map lookup that finds its key makes about one comparison and a scan of a
+/// list makes one per element passed, so lookup work that grows faster than linear
+/// shows up in the count. Ordered comparisons (sorting, binary search) are not
+/// counted, and neither is work that compares the bare numbers or strings.
 #[cfg(test)]
 pub(crate) mod probes {
     use std::cell::Cell;
@@ -340,12 +359,12 @@ pub(crate) mod probes {
         static PROBES: Cell<u64> = const { Cell::new(0) };
     }
 
-    /// Records `n` entries examined.
+    /// Records `n` comparisons.
     pub(crate) fn add(n: usize) {
         PROBES.with(|p| p.set(p.get() + n as u64));
     }
 
-    /// The entries examined on this thread since the last call.
+    /// The comparisons made on this thread since the last call.
     pub(crate) fn take() -> u64 {
         PROBES.with(|p| p.replace(0))
     }

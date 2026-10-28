@@ -1,5 +1,10 @@
 //! Collecting and numbering type variables: the work grows linearly with the number
 //! of variables, and the results match a plain list-based reference.
+//!
+//! The work is the number of equality comparisons on type variables and on parsed
+//! variable names, which [`probes`] counts (see there for what it does not count).
+//! A lookup by scanning a list makes one comparison per element passed, so a scan in
+//! place of a hash map makes these counts grow quadratically.
 
 use proptest::prelude::*;
 
@@ -25,7 +30,7 @@ fn all_keyed_text(t: &Type) -> String {
     format!("{} => {t}", keys.join(", "))
 }
 
-/// The variable lookups made by `f`.
+/// The variable comparisons made by `f`.
 fn probes_of(f: impl FnOnce()) -> u64 {
     probes::take();
     f();
@@ -37,10 +42,10 @@ fn probes_of(f: impl FnOnce()) -> u64 {
 fn assert_linear(what: &str, n: u32, work: impl Fn(u32) -> u64) {
     let small = work(n);
     let large = work(4 * n);
-    assert!(small > 0, "{what}: no lookups counted at {n} variables");
+    assert!(small > 0, "{what}: no comparisons counted at {n} variables");
     assert!(
         large <= 5 * small,
-        "{what}: {small} lookups at {n} variables but {large} at {}; the work is not linear",
+        "{what}: {small} comparisons at {n} variables but {large} at {}; the work is not linear",
         4 * n
     );
 }
@@ -84,6 +89,19 @@ fn parsing_a_keyed_scheme_takes_linear_work_in_its_variables() {
         probes_of(|| {
             let s: Scheme = text.parse().expect("printed schemes parse");
             assert_eq!(s.keys().len(), n as usize);
+        })
+    });
+}
+
+#[test]
+fn checking_against_a_keyed_scheme_takes_linear_work_in_its_variables() {
+    assert_linear("check with a keyed library scheme", 1024, |n| {
+        let s = Scheme::with_keys(balanced_pairs(n), &balanced_pairs(n).vars());
+        let libs = [s.clone()];
+        let mut arena = crate::term::Arena::new();
+        let term = crate::sexpr::parse(&mut arena, "lib_0").expect("a library use parses");
+        probes_of(|| {
+            check(&arena, term, &libs[..], &s).expect("a library use has its own scheme");
         })
     });
 }

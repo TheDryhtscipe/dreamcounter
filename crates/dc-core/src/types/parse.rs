@@ -24,6 +24,7 @@
 //! recursive descent needs megabytes of stack in a debug build.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
 use rustc_hash::FxHashMap;
@@ -105,7 +106,26 @@ struct Parser<'a> {
     pos: usize,
     end: usize,
     /// Each variable name seen so far and its number, in order of first appearance.
-    names: FxHashMap<&'a str, u32>,
+    names: FxHashMap<Name<'a>, u32>,
+}
+
+/// A variable name as a key of [`Parser::names`]. In test builds each equality
+/// comparison is counted in `probes`, as for [`TyVar`].
+#[derive(Clone, Copy, Debug, Eq)]
+struct Name<'a>(&'a str);
+
+impl Hash for Name<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl PartialEq for Name<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        super::probes::add(1);
+        self.0 == other.0
+    }
 }
 
 /// A part of a type that [`Parser::ty`] has begun and that waits for more input.
@@ -173,10 +193,8 @@ impl<'a> Parser<'a> {
     }
 
     fn var(&mut self, name: &'a str) -> TyVar {
-        #[cfg(test)]
-        super::probes::add(1);
         let next = u32::try_from(self.names.len()).expect("fewer than 2^32 type variables");
-        TyVar(*self.names.entry(name).or_insert(next))
+        TyVar(*self.names.entry(Name(name)).or_insert(next))
     }
 
     /// Parses a `type` with an explicit stack of [`Frame`]s, so the host stack does

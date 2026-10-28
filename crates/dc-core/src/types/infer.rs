@@ -539,7 +539,8 @@ impl TypeChecker {
         let want = expected.map(|expected| {
             let mut rigid: FxHashMap<TyVar, Ty> = FxHashMap::default();
             for v in expected.vars() {
-                let key = expected.keys().contains(&v);
+                // Scheme keys are sorted.
+                let key = expected.keys().binary_search(&v).is_ok();
                 rigid.insert(v, self.push(Node::Rigid { key }));
             }
             let want = self.import(expected.ty(), &mut |_, v| rigid[&v]);
@@ -1049,7 +1050,8 @@ impl TypeChecker {
             *map.entry(v).or_insert_with(|| {
                 this.push(Node::Var {
                     level: this.level,
-                    key: s.keys().contains(&v),
+                    // Scheme keys are sorted.
+                    key: s.keys().binary_search(&v).is_ok(),
                 })
             })
         })
