@@ -2026,6 +2026,29 @@ fn the_search_and_free_variables_are_charged_at_any_budget() {
 }
 
 #[test]
+fn each_hash_table_probe_is_charged() {
+    // Hash-table probes miss the cache on large terms, so they cost more than
+    // the other reads and the time of a unit follows them. Within the slack of
+    // READS_PER_UNIT a pass could probe several times per unit unseen; this
+    // holds probes alone to one per unit.
+    let probes = || super::infer::PROBES.with(std::cell::Cell::get);
+    let mut a = Arena::new();
+    let mut shapes = adversarial_shapes(&mut a);
+    shapes.push(("open if nest", open_if_nest(&mut a, 20_000)));
+    shapes.push(("random if DAG", random_if_dag(&mut a, 20_000)));
+    for (name, t) in shapes {
+        let mut tc = TypeChecker::new();
+        let before = probes();
+        let _ = reads_and_units(&mut tc, &a, t);
+        let (probed, units) = (probes() - before, tc.spent());
+        assert!(
+            probed <= units + 1_000,
+            "{name}: {probed} probes for {units} units"
+        );
+    }
+}
+
+#[test]
 fn checking_against_a_large_key_scheme_is_charged() {
     // Each variable of the expected type and of a library's scheme is made
     // once per walk or use, and whether it has a `Key` constraint is looked
