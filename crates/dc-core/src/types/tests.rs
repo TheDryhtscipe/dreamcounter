@@ -1733,6 +1733,7 @@ fn reads() -> u64 {
     crate::term::GETS.with(std::cell::Cell::get)
         + super::infer::STORE_READS.with(std::cell::Cell::get)
         + super::infer::SCHEME_READS.with(std::cell::Cell::get)
+        + super::infer::TABLE_SLOTS.with(std::cell::Cell::get)
 }
 
 /// Infers `t` with `tc` against [`adversarial_libs`] and returns the reads it
@@ -2031,6 +2032,12 @@ fn distinct_tree(a: &mut Arena, k: u32, leaf: &mut dyn FnMut(&mut Arena, i64) ->
 /// store nodes, from types of about `k 2^k` nodes each. The `if` is bound by a
 /// `let` whose body is `0`, as its type is too large to write out. Type `Int`.
 fn crossed_sharing(a: &mut Arena, k: u32) -> TermId {
+    let zero = a.int(0);
+    crossed_sharing_then(a, k, zero)
+}
+
+/// [`crossed_sharing`] with `body` in place of `0` under the `let`.
+fn crossed_sharing_then(a: &mut Arena, k: u32, body: TermId) -> TermId {
     let depth = k as usize;
     let left = distinct_tree(a, k, &mut |a, i| {
         let base = a.int(i);
@@ -2040,8 +2047,39 @@ fn crossed_sharing(a: &mut Arena, k: u32) -> TermId {
     let right = doubling(a, tree, depth);
     let t = a.bool(true);
     let both = a.if_(t, left, right);
-    let zero = a.int(0);
-    a.let_(both, zero)
+    a.let_(both, body)
+}
+
+/// `(cons 1 (cons 1 ... nil))`, `m` deep: `m` small unifications of lists.
+fn cons_chain(a: &mut Arena, m: usize) -> TermId {
+    let cons = a.prim(Prim::Cons);
+    let one = a.int(1);
+    let mut c = a.prim(Prim::Nil);
+    for _ in 0..m {
+        c = a.apps(cons, &[one, c]);
+    }
+    c
+}
+
+#[test]
+fn a_large_unification_does_not_slow_later_ones() {
+    // Emptying a hash table costs time in its capacity, which a large
+    // unification raises. The unifications after it, in the same call or the
+    // next call on the same checker, must not pay for that each time.
+    let mut a = Arena::new();
+    let chain = cons_chain(&mut a, 20_000);
+    let t = crossed_sharing_then(&mut a, 9, chain);
+    let mut tc = TypeChecker::new();
+    let (reads, units) = reads_and_units(&mut tc, &a, t);
+    assert!(
+        reads <= READS_PER_UNIT * units + 1_000,
+        "in one call: {reads} reads for {units} units"
+    );
+    let (reads, units) = reads_and_units(&mut tc, &a, chain);
+    assert!(
+        reads <= READS_PER_UNIT * units + 1_000,
+        "in the next call: {reads} reads for {units} units"
+    );
 }
 
 #[test]

@@ -135,10 +135,14 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 /// store once (no more than the units already spent), a scope key has no more
 /// slots than there are bindings (no more than the steps taken), finding free
 /// variables visits no more nodes than the search has paid for, and an error
-/// writes out at most four types of at most [`MAX_TYPE_NODES`] nodes. So a call does at most about twice its budget, plus
-/// a constant. The tests check that each unit stands for at most four reads of
-/// the term, the store or a scheme (a type node imported or a key looked up),
-/// on terms built to find work that is not charged. On those terms, one unit
+/// writes out at most four types of at most [`MAX_TYPE_NODES`] nodes. So a
+/// call does at most about twice its budget, plus a constant. The hash tables
+/// the checker keeps between uses are emptied at a cost bounded by what they
+/// held, not by their capacity, so one large call or unification does not
+/// slow later ones. The tests check that each unit stands for at most four
+/// reads of the term, the store, a scheme (a type node imported or a key
+/// looked up) or a table slot visited while emptying, on terms built to find
+/// work that is not charged. On those terms, one unit
 /// takes 2 to 50 ns in a release build, most often 10 to 20 (October 2026), so
 /// a call that uses the whole default budget takes about 0.15 to 0.35 s.
 ///
@@ -166,6 +170,9 @@ thread_local! {
     /// Reads of library and expected schemes on this thread: one per type
     /// constructor or variable visited and one per key looked at.
     pub(super) static SCHEME_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Slots of hash tables kept between uses visited when they are emptied:
+    /// the capacity of a table cleared, or the entries of one dropped.
+    pub(super) static TABLE_SLOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Counts one read of a scheme, in tests.
@@ -752,17 +759,17 @@ impl TypeChecker {
         self.env.clear();
         self.frames.clear();
         self.spine.clear();
-        self.shared.clear();
-        self.free_vars.clear();
-        self.memo.clear();
+        empty_set(&mut self.shared);
+        empty_map(&mut self.free_vars);
+        empty_map(&mut self.memo);
         self.pending.clear();
-        self.canon.clear();
+        empty_map(&mut self.canon);
         self.canon_closed.clear();
         self.steps = 0;
         self.checkpoints.clear();
         self.trail.clear();
         self.memo_log.clear();
-        self.failed.clear();
+        empty_set(&mut self.failed);
     }
 
     /// Pushes a binding for a new innermost variable.
@@ -1008,7 +1015,7 @@ impl TypeChecker {
         let mut pairs = std::mem::take(&mut self.pairs);
         let mut seen = std::mem::take(&mut self.seen_pairs);
         pairs.clear();
-        seen.clear();
+        empty_set(&mut seen);
         pairs.push((expected, found));
         let mut result = Ok(());
         while let Some((x, y)) = pairs.pop() {
@@ -1170,7 +1177,7 @@ impl TypeChecker {
     /// shared structure stays shared.
     fn instantiate(&mut self, t: Ty) -> Ty {
         let mut map = std::mem::take(&mut self.inst);
-        map.clear();
+        empty_map(&mut map);
         let root = self.resolve(t);
         // A node is pushed with `true` to be expanded; a constructor is pushed again
         // with `false` to be rebuilt once its children are done. Entries are
@@ -2369,6 +2376,45 @@ fn free_vars(arena: &Arena, id: TermId, memo: &mut FxHashMap<TermId, FreeVars>) 
         memo.insert(t, fv);
     }
     spent
+}
+
+/// Empties a hash table kept between uses (see [`empty_set`]).
+fn empty_map<K, V, S: Default>(t: &mut HashMap<K, V, S>) {
+    if keep_table(t.len(), t.capacity()) {
+        t.clear();
+    } else {
+        *t = HashMap::default();
+    }
+}
+
+/// Empties a hash set kept between uses.
+fn empty_set<K, S: Default>(t: &mut std::collections::HashSet<K, S>) {
+    if keep_table(t.len(), t.capacity()) {
+        t.clear();
+    } else {
+        *t = std::collections::HashSet::default();
+    }
+}
+
+/// Whether to clear a table of `len` entries and `capacity` slots rather than
+/// replace it with an empty one. Clearing a table that holds anything visits
+/// every slot, and capacity never shrinks, so one large use would make every
+/// later small one slow. A table much larger than its contents is dropped
+/// instead, which visits only the entries. Either way, emptying costs at most
+/// a constant times the entries the table held, which were charged as they
+/// were added, plus a constant.
+fn keep_table(len: usize, capacity: usize) -> bool {
+    let keep = capacity <= 2 * len + 64;
+    #[cfg(test)]
+    {
+        let visited = match (keep, len) {
+            (_, 0) => 0,
+            (true, _) => capacity,
+            (false, _) => len,
+        };
+        TABLE_SLOTS.with(|c| c.set(c.get() + visited as u64));
+    }
+    keep
 }
 
 /// Whether `e` says that the call ran out of work budget.
