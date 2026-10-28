@@ -3305,3 +3305,197 @@ fn a_long_chain_of_links_keeps_the_error_located() {
     assert_eq!(e.term_text, "$0", "{e}");
     assert!(tc.spent() <= 300 * u64::from(n), "{} units", tc.spent());
 }
+
+// ---------------------------------------------------------------- random chains
+
+/// A xorshift generator, so that a fuzzed chain is fixed by its seed alone.
+struct XorShift(u64);
+
+impl XorShift {
+    fn from_seed(seed: u64) -> XorShift {
+        XorShift(0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+        let n = u64::try_from(xs.len()).expect("a short list");
+        xs[usize::try_from(self.below(n)).expect("an index")]
+    }
+}
+
+/// A part of what variable `$i` (one of the three innermost, past `shift`)
+/// stands for: itself, or a part of what it returns for `1` if it is a
+/// helper. `<K ... K>` and `<J ... J>` are `snd` applied as many times as
+/// the level's number, or the depth less it (see [`at_level`]).
+fn fuzz_part(r: &mut XorShift, shift: u64) -> String {
+    let i = r.below(3) + shift;
+    match r.below(10) {
+        0 => format!("${i}"),
+        1 => format!("(fst (${i} 1))"),
+        2 => format!("(snd (${i} 1))"),
+        3 => format!("(fst (fst (${i} 1)))"),
+        4 => format!("(snd (fst (${i} 1)))"),
+        5 => format!("(fst (snd (fst (${i} 1))))"),
+        6 => format!("(snd (snd (fst (${i} 1))))"),
+        7 => format!("(fst <K(fst (${i} 1))K>)"),
+        8 => format!("(fst <K${i}K>)"),
+        _ => format!("(fst <J(fst (${i} 1))J>)"),
+    }
+}
+
+/// An expression that unifies parts of what the innermost variables stand
+/// for with each other or with a type.
+fn fuzz_refine(r: &mut XorShift) -> String {
+    let (a, b) = (fuzz_part(r, 0), fuzz_part(r, 0));
+    match r.below(6) {
+        0 => format!("(add {a} 1)"),
+        1 => format!("(if {a} true true)"),
+        2 => format!("(if true {a} {b})"),
+        3 => format!("(pair {a} {b})"),
+        4 => format!("(if true {a} (fst {b}))"),
+        _ => format!("(lam (if true {a} (pair $0 $0)))"),
+    }
+}
+
+/// One level of a fuzzed chain: `(let b_1 ... (let b_m (if cond hole hole)))`.
+#[derive(Debug)]
+struct FuzzLevel {
+    binds: Vec<String>,
+    cond: String,
+}
+
+fn fuzz_level(r: &mut XorShift) -> FuzzLevel {
+    let binds = (0..r.below(3))
+        .map(|_| match r.below(3) {
+            0 => format!("${}", r.below(3)),
+            1 => format!("(lam (pair {} $0))", fuzz_part(r, 1)),
+            _ => format!("(lam (pair $0 {}))", fuzz_part(r, 1)),
+        })
+        .collect();
+    let cond = format!("(fst (pair true {}))", fuzz_refine(r));
+    FuzzLevel { binds, cond }
+}
+
+/// `s` at level `k` of a chain `n` deep: see [`fuzz_part`].
+fn at_level(s: &str, k: usize, n: usize) -> String {
+    s.replace("<K", &"(snd ".repeat(k))
+        .replace("K>", &")".repeat(k))
+        .replace("<J", &"(snd ".repeat(n - k))
+        .replace("J>", &")".repeat(n - k))
+}
+
+/// `lam x. lam y. let h = (lam (pair x $0)) in (pair fix t_n)`, with `t_0 =
+/// leaf` and `t_k` the level `level` at depth `k` around `t_(k-1)`.
+fn fuzz_chain(a: &mut Arena, level: &FuzzLevel, leaf: &str, fix: &str, n: usize) -> TermId {
+    let mut t = parse_term(a, leaf);
+    for k in 1..=n {
+        let c = parse_term(a, &at_level(&level.cond, k, n));
+        let mut body = a.if_(c, t, t);
+        for b in level.binds.iter().rev() {
+            let b = parse_term(a, &at_level(b, k, n));
+            body = a.let_(b, body);
+        }
+        t = body;
+    }
+    let (pair, fix) = (a.prim(Prim::Pair), parse_term(a, fix));
+    t = a.apps(pair, &[fix, t]);
+    let h = parse_term(a, "(lam (pair $2 $0))");
+    let body = a.let_(h, t);
+    let body = a.lam(body);
+    a.lam(body)
+}
+
+const FUZZ_LEAVES: &[&str] = &[
+    "(add (snd ($0 1)) true)",
+    "(if (fst ($0 1)) true true)",
+    "(add (fst (fst ($0 1))) true)",
+    "(if (snd (fst ($0 1))) true true)",
+    "(add $1 true)",
+];
+
+const FUZZ_FIXES: &[&str] = &["(add $1 1)", "1", "(add (fst $2) 1)", "(if $1 1 1)"];
+
+/// The seeds the fuzzer below tries unless `LOCATE_FUZZ_SEEDS` says.
+const FUZZ_SEEDS: u64 = 20_000;
+
+/// The most units one call of the fuzzer may spend.
+const FUZZ_BUDGET: u64 = 30_000_000;
+
+#[test]
+#[ignore = "slow; run in release with --ignored"]
+fn locating_errors_in_random_chains_goes_back_once_a_level() {
+    // Chains of random levels that bind helpers and mono variables and
+    // refine parts of what the parameters and helpers stand for, at a depth
+    // of their own at each level. For each ill-typed chain: at depth 4 the
+    // error is the tree walk's; at depths 6, 12 and 24 the second walk is
+    // within [`locate_cost`], and goes back at most once more for each level
+    // added. A level's condition can have shared subterms of its own, which
+    // can add a level of nesting of shared uses to the chain's, so the number
+    // of times is compared between depths, not with the depth.
+    let seeds = std::env::var("LOCATE_FUZZ_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(FUZZ_SEEDS);
+    let (mut ill, mut failures) = (0u64, Vec::new());
+    // The most the second walk cost per first walk, for each time it went
+    // back and once more.
+    let mut worst = 0.0f64;
+    for seed in 1..=seeds {
+        let mut r = XorShift::from_seed(seed);
+        let level = fuzz_level(&mut r);
+        let leaf = r.pick(FUZZ_LEAVES);
+        let fix = r.pick(FUZZ_FIXES);
+        let mut a = Arena::new();
+        let small = fuzz_chain(&mut a, &level, leaf, fix, 4);
+        let mut tree = TypeChecker::with_work_budget(u64::MAX);
+        tree.tree_walk = true;
+        let want = tree.infer(&a, small, NO_LIBS);
+        if want.is_ok() {
+            continue;
+        }
+        ill += 1;
+        let got = TypeChecker::with_work_budget(u64::MAX).infer(&a, small, NO_LIBS);
+        if got != want {
+            failures.push(format!("seed {seed}: error differs from the tree walk's"));
+        }
+        let mut last: Option<(usize, u64)> = None;
+        for n in [6, 12, 24] {
+            let t = fuzz_chain(&mut a, &level, leaf, fix, n);
+            let mut tc = TypeChecker::with_work_budget(FUZZ_BUDGET);
+            let _ = tc.infer(&a, t, NO_LIBS);
+            if let Err(e) = locate_cost(&tc) {
+                failures.push(format!("seed {seed} at {n}: {e}"));
+            }
+            let rollbacks = tc.rollbacks();
+            let (first, locate) = (tc.first_units(), tc.spent() - tc.first_units());
+            worst = worst.max(locate as f64 / ((rollbacks + 1) * first.max(1)) as f64);
+            if let Some((m, before)) = last {
+                if rollbacks > before + (n - m) as u64 {
+                    failures.push(format!(
+                        "seed {seed}: {before} rollbacks at {m}, {rollbacks} at {n}"
+                    ));
+                }
+            }
+            last = Some((n, rollbacks));
+        }
+    }
+    println!(
+        "{seeds} seeds, {ill} ill typed, {} failures, cost ratio at most {worst:.3}",
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "{:#?}",
+        &failures[..failures.len().min(20)]
+    );
+}
