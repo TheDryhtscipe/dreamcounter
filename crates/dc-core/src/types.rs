@@ -55,6 +55,14 @@ impl fmt::Display for TyVar {
 }
 
 /// A dc type (spec §2).
+///
+/// **Depth.** Dropping, cloning, comparing, hashing, printing and type-checking
+/// against a `Type` recurse on the host stack, one level per level of nesting. Types
+/// parsed from text and types the checker produces are at most [`MAX_TYPE_DEPTH`]
+/// deep, which these walks handle on an ordinary thread stack. A type built directly
+/// from the variants or constructors here has no such bound, so code building one
+/// from outside input must keep it within [`MAX_TYPE_DEPTH`] itself, or go through
+/// the text form.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     /// 64-bit signed integers.

@@ -120,6 +120,107 @@ fn parse_handles_precedence_and_tuples() {
     }
 }
 
+/// Runs `f` on a thread with a 256 KiB stack, so host recursion over deep type text
+/// overflows (and aborts the test binary) instead of passing by luck.
+fn on_small_stack<F: FnOnce() + Send + 'static>(f: F) {
+    on_stack(256 << 10, f);
+}
+
+/// Runs `f` on a thread with a stack of `bytes`.
+fn on_stack<F: FnOnce() + Send + 'static>(bytes: usize, f: F) {
+    std::thread::Builder::new()
+        .stack_size(bytes)
+        .spawn(f)
+        .expect("spawn test thread")
+        .join()
+        .expect("test thread panicked");
+}
+
+/// `n` copies of `prefix(`, then `inner`, then `n` closing brackets.
+fn wrapped(prefix: &str, n: usize, inner: &str) -> String {
+    format!("{}{inner}{}", format!("{prefix}(").repeat(n), ")".repeat(n))
+}
+
+/// `(Int, Int, ..., Int)` with `n` items: a pair chain `n` levels deep.
+fn tuple_of(n: usize) -> String {
+    format!("({})", vec!["Int"; n].join(", "))
+}
+
+/// Asserts that `src` is refused as too deep, both as a type and as a scheme.
+fn assert_too_deep(src: &str) {
+    let e = src.parse::<Type>().expect_err("deep type text parsed");
+    assert!(e.message.contains("deeper than"), "{e}");
+    let e = src.parse::<Scheme>().expect_err("deep scheme text parsed");
+    assert!(e.message.contains("deeper than"), "{e}");
+}
+
+#[test]
+fn deeply_bracketed_type_text_is_refused() {
+    // Brackets with no constructor add no depth to the type, only to the text.
+    on_small_stack(|| assert_too_deep(&wrapped("", 200_000, "Int")));
+}
+
+#[test]
+fn deeply_nested_constructor_text_is_refused() {
+    on_small_stack(|| assert_too_deep(&wrapped("List ", 100_000, "Int")));
+}
+
+#[test]
+fn long_arrow_chains_are_refused() {
+    // `->` nests to the right with no brackets, so each arrow is one level of type.
+    on_small_stack(|| assert_too_deep(&format!("{}Int", "Int -> ".repeat(200_000))));
+}
+
+#[test]
+fn long_tuples_are_refused() {
+    // A flat tuple has one bracket but nests to the right as pairs, so the type would
+    // be too deep to drop, print or check on a small stack.
+    on_small_stack(|| assert_too_deep(&tuple_of(100_000)));
+}
+
+#[test]
+fn deep_scheme_text_is_refused() {
+    on_small_stack(|| {
+        for body in [
+            wrapped("", 200_000, "a"),
+            wrapped("Option ", 100_000, "a"),
+            format!("{}a", "a -> ".repeat(200_000)),
+            tuple_of(100_000).replace("Int", "a"),
+        ] {
+            let e = format!("Key a => {body}")
+                .parse::<Scheme>()
+                .expect_err("deep scheme text parsed");
+            assert!(e.message.contains("deeper than"), "{e}");
+        }
+    });
+}
+
+#[test]
+fn type_text_at_the_depth_limit_parses() {
+    // The parser needs little stack at any depth, but printing a type at the limit
+    // recurses `MAX_TYPE_DEPTH` levels: about 400 KiB in a debug build.
+    on_stack(1 << 20, || {
+        let d = MAX_TYPE_DEPTH;
+        // Each form at exactly `MAX_TYPE_DEPTH` levels, then one level deeper. For
+        // bare brackets the levels are the text's: the root plus one per bracket.
+        type Form = fn(usize) -> String;
+        let forms: [(Form, usize); 4] = [
+            (|n| wrapped("List ", n, "Int"), d - 1),
+            (|n| format!("{}Int", "Int -> ".repeat(n)), d - 1),
+            (tuple_of, d),
+            (|n| wrapped("", n, "Int"), d - 1),
+        ];
+        for (form, n) in forms {
+            let src = form(n);
+            let t: Type = src.parse().unwrap_or_else(|e| panic!("at the limit: {e}"));
+            // An at-limit type prints as text that parses back to it.
+            assert_eq!(t.to_string().parse::<Type>(), Ok(t.clone()));
+            assert_eq!(src.parse::<Scheme>().map(|s| s.ty().clone()), Ok(t));
+            assert_too_deep(&form(n + 1));
+        }
+    });
+}
+
 #[test]
 fn schemes_compare_up_to_renaming() {
     assert_eq!(sch("x -> y -> x"), sch("a -> b -> a"));
