@@ -1535,6 +1535,141 @@ fn open_scope_failures_are_located_in_polynomial_steps_g9() {
     assert_open_scope_failure_located(5);
 }
 
+/// `snd` applied `j` times to `e`.
+fn snds(j: usize, e: &str) -> String {
+    format!("{}{e}{}", "(snd ".repeat(j), ")".repeat(j))
+}
+
+/// `lam x_1 ... lam x_p. let h = helper in body`, where `body` is `t_n`, or
+/// `(pair first t_n)` if `first` is given, with `t_k = (if (cond (n - k + 1))
+/// t_(k-1) t_(k-1))` and `t_0 = leaf`: [`chain_under_an_open_helper`] with a
+/// condition of its own at each level, numbered from 1 at the top.
+fn chain_with_conds(
+    a: &mut Arena,
+    n: usize,
+    params: usize,
+    helper: &str,
+    cond: impl Fn(usize) -> String,
+    leaf: &str,
+    first: Option<&str>,
+) -> TermId {
+    let mut t = parse_term(a, leaf);
+    for k in 1..=n {
+        let c = parse_term(a, &cond(n - k + 1));
+        t = a.if_(c, t, t);
+    }
+    if let Some(first) = first {
+        let (pair, first) = (a.prim(Prim::Pair), parse_term(a, first));
+        t = a.apps(pair, &[first, t]);
+    }
+    let h = parse_term(a, helper);
+    let mut body = a.let_(h, t);
+    for _ in 0..params {
+        body = a.lam(body);
+    }
+    body
+}
+
+/// A condition that makes the part `snd^j` of the helper's free variable `x`
+/// a pair of one variable: each level refines a node of `x` that the level
+/// above made.
+fn deepening(j: usize) -> String {
+    let part = snds(j, "(fst ($1 1))");
+    format!("(fst (pair true (lam (if true {part} (pair $0 $0)))))")
+}
+
+/// A condition that unifies part `fst (snd^j x)` of the helper's free variable
+/// with the second parameter `y`, which is `Int`. Tried afresh, `y` is a
+/// fresh variable, so the part stays a variable; walked in place, it becomes
+/// `Int`.
+fn through_a_parameter(j: usize) -> String {
+    let part = snds(j, "(fst ($0 1))");
+    format!("(fst (pair true (if true $1 (fst {part}))))")
+}
+
+/// Shapes whose keys have an open scope and whose levels refine the scope's
+/// free variable in a different way at each level, so no two levels see the
+/// same store. The conditions grow with the depth, so these are kept apart
+/// from [`open_scope_failures`], which the read judge runs at a large depth.
+fn refining_scope_failures(a: &mut Arena, n: usize) -> Vec<(&'static str, TermId)> {
+    vec![
+        (
+            "r2: s2 with each level refining the helper's free variable further",
+            chain_with_conds(a, n, 1, "(lam (pair $1 $0))", deepening, S2_LEAF, None),
+        ),
+        (
+            "r2s8: s8 on the first part of the free variable, refining the second",
+            chain_with_conds(
+                a,
+                n,
+                1,
+                "(lam (pair $1 $0))",
+                deepening,
+                "(if (fst (fst ($0 1))) true true)",
+                Some("(add (fst (fst ($0 1))) 1)"),
+            ),
+        ),
+        (
+            "m: s2 with each level fixing a part of the free variable only in place",
+            chain_with_conds(
+                a,
+                n,
+                2,
+                "(lam (pair $2 $0))",
+                through_a_parameter,
+                S2_LEAF,
+                Some("(add $1 1)"),
+            ),
+        ),
+    ]
+}
+
+/// Checks that the error of shape `which` of [`refining_scope_failures`] is
+/// the tree walk's, for inference and for checking against `a -> b -> c`
+/// (the shapes have at most two parameters), within `steps(N)` steps at
+/// depth `N`.
+fn assert_refining_failure_located(which: usize, steps: impl Fn(u64) -> u64) {
+    const SMALL: usize = 8;
+    const N: usize = 40;
+    let mut a = Arena::new();
+    let (name, small) = refining_scope_failures(&mut a, SMALL)[which];
+    let (_, big) = refining_scope_failures(&mut a, N)[which];
+    let steps = steps(N as u64);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, small, NO_LIBS);
+    assert!(want.is_err(), "{name}");
+    assert_eq!(TypeChecker::new().infer(&a, small, NO_LIBS), want, "{name}");
+    // The tree walk fails in the leftmost leaf, so it is cheap at any depth.
+    let want = tree.infer(&a, big, NO_LIBS);
+    assert_eq!(bounded(steps).infer(&a, big, NO_LIBS), want, "{name}");
+    let expected = sch("a -> (a, Bool)");
+    for t in [small, big] {
+        let want = tree.check(&a, t, NO_LIBS, &expected);
+        assert!(want.is_err(), "{name}");
+        assert_eq!(
+            bounded(steps).check(&a, t, NO_LIBS, &expected),
+            want,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn refining_scope_failures_are_located_in_polynomial_steps_r2() {
+    assert_refining_failure_located(0, |n| 100 * n * n);
+}
+
+#[test]
+fn refining_scope_failures_are_located_in_polynomial_steps_r2s8() {
+    assert_refining_failure_located(1, |n| 100 * n * n);
+}
+
+#[test]
+fn refining_scope_failures_are_located_in_polynomial_steps_m() {
+    assert_refining_failure_located(2, |n| 100 * n * n);
+}
+
 #[test]
 fn shared_subterms_with_many_free_variables_agree_with_the_tree() {
     // More free variables than the memo records one by one: the scope is all the
@@ -2196,6 +2331,7 @@ fn adversarial_shapes(a: &mut Arena) -> Vec<(&'static str, TermId)> {
     ]
     .into_iter()
     .chain(open_scope_failures(a, 2_000))
+    .chain(refining_scope_failures(a, 100))
     .collect()
 }
 

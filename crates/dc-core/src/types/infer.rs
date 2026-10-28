@@ -39,9 +39,12 @@
 //!
 //! An ill-typed term is walked a second time, so that its error is the one
 //! tree-walking HM reports, which names the subterm where the clash happens
-//! (see [`TypeChecker::run`]). That walk reuses shared subterms too, and goes
-//! into one only where its use fails, so its cost is polynomial, not
-//! exponential, in the size of the DAG.
+//! (see [`TypeChecker::run`]). That walk reuses shared subterms too, goes
+//! into one only where its use fails, and does not try again a use that is
+//! known to fail, so it does not double its work at each level of sharing.
+//! Like the first walk, it is bounded in general by the work budget, not by
+//! a polynomial in the size of the DAG: typability with `let` is
+//! DEXPTIME-complete, and a DAG is at least as compact as its `let` form.
 //!
 //! **Work budget.** Reuse of shared subterms is keyed on the bindings they see,
 //! and a well-typed term can make exponentially many different sets of them, so
@@ -327,6 +330,12 @@ enum Canon {
     /// An unbound variable that is not quantified, or a rigid one.
     Free(Ty),
     Con(Head, u32, u32),
+    /// An unbound variable that is not quantified, numbered in order of first
+    /// occurrence, in a failure pattern (see [`TypeChecker::pattern`]).
+    Open {
+        index: u32,
+        key: bool,
+    },
 }
 
 /// An expected type pushed into a subterm by [`TypeChecker::check`], with the
@@ -523,14 +532,11 @@ pub struct TypeChecker {
     trail: Vec<(Ty, Node)>,
     /// The memo keys added since the oldest checkpoint, in the order added.
     memo_log: Vec<MemoKey>,
-    /// The keys whose fresh inference failed while uses were being tried, and
-    /// would fail in the current state of the store too: their uses are
-    /// walked in place at once (see [`TypeChecker::shared_subterm`], and
-    /// [`TypeChecker::note_failure`] for why they would fail).
-    failed: FxHashSet<MemoKey>,
-    /// The keys with an open scope added to `failed` since the oldest
-    /// checkpoint, in the order added.
-    failed_log: Vec<LoggedFailure>,
+    /// For each shared subterm whose fresh inference failed while uses were
+    /// being tried, the [`TypeChecker::pattern`]s of the scopes it failed in.
+    /// A use whose pattern is an instance of one of them fails too, so it is
+    /// walked in place at once (see [`TypeChecker::note_failure`]).
+    failed: FxHashMap<TermId, Vec<Scope>>,
     /// Steps taken by the term walk of the current call.
     steps: u64,
     /// Units of work done by the current call (see [`DEFAULT_WORK_BUDGET`]).
@@ -567,9 +573,8 @@ struct Checkpoint {
     /// The shared subterm and the expected type of its position.
     id: TermId,
     want: Option<Want>,
-    /// The use's memo key, and whether its scope is closed.
+    /// The use's memo key.
     key: MemoKey,
-    closed: bool,
     nodes: usize,
     trail: usize,
     frames: usize,
@@ -577,21 +582,7 @@ struct Checkpoint {
     env: usize,
     pending: usize,
     memo_log: usize,
-    failed_log: usize,
     level: u32,
-}
-
-/// A key with an open scope in `failed`, with what
-/// [`TypeChecker::back_to`] needs to tell whether it still fails (see
-/// [`TypeChecker::note_failure`]).
-#[derive(Clone, Debug)]
-struct LoggedFailure {
-    key: MemoKey,
-    /// The length of the trail at a state the key fails in.
-    trail: usize,
-    /// The part of the store the key's slots reach, in that state, written
-    /// out by [`TypeChecker::slot_state`].
-    state: Vec<u32>,
 }
 
 /// Where a unification happens, for the error message.
@@ -738,14 +729,12 @@ impl TypeChecker {
     /// the same unifications as the tree walk, up to the one that fails, and
     /// reports the same error. An error unwinds to the innermost use being
     /// tried, so every use is walked in place at most once for each use being
-    /// tried around it. A use whose subterm, inferred afresh, fails is walked
-    /// in place at once from then on, for as long as the subterm is known to
-    /// fail in that scope (see [`TypeChecker::note_failure`]): always if no
-    /// binding in its scope has a type with free variables, else until the
-    /// walk goes back to a checkpoint made before it failed at which the
-    /// store nodes those types reach differ from what they were when it
-    /// failed. Without that, a chain of shared subterms over a leaf that is
-    /// ill typed takes time exponential in its length.
+    /// tried around it. Once a use's subterm, inferred afresh, has failed, a
+    /// later use of it is walked in place at once if the types of its scope
+    /// are an instance of the types it failed with: then it is known to fail
+    /// too, in any state of the store (see [`TypeChecker::note_failure`]).
+    /// Without that, a chain of shared subterms over a leaf that is ill typed
+    /// takes time exponential in its length.
     ///
     /// Both walks share the call's work budget. If the first runs out, that is
     /// the error. If only the second does, the first walk's error is returned:
@@ -835,7 +824,7 @@ impl TypeChecker {
         release_map(&mut self.free_vars);
         release_map(&mut self.memo);
         release_map(&mut self.canon);
-        release_set(&mut self.failed);
+        release_map(&mut self.failed);
         release_set(&mut self.seen_pairs);
         release_map(&mut self.inst);
     }
@@ -854,7 +843,6 @@ impl TypeChecker {
         release_vec(&mut self.checkpoints);
         release_vec(&mut self.trail);
         release_vec(&mut self.memo_log);
-        release_vec(&mut self.failed_log);
     }
 
     fn reset(&mut self) {
@@ -868,8 +856,7 @@ impl TypeChecker {
                 + self.canon_nodes.capacity()
                 + self.checkpoints.capacity()
                 + self.trail.capacity()
-                + self.memo_log.capacity()
-                + self.failed_log.capacity(),
+                + self.memo_log.capacity(),
         );
         self.nodes.clear();
         self.nodes.push(Node::Con(Head::Int, 0, 0));
@@ -890,18 +877,19 @@ impl TypeChecker {
         self.checkpoints.clear();
         self.trail.clear();
         self.memo_log.clear();
-        self.failed_log.clear();
-        empty_set(&mut self.failed);
+        empty_map(&mut self.failed);
     }
 
     /// Pushes a binding for a new innermost variable.
     fn bind_var(&mut self, ty: Ty, poly: bool) {
-        let class = poly.then(|| self.canonical(ty));
+        let class = poly.then(|| self.canonical(ty, None));
         self.env.push(Binding { ty, class });
     }
 
-    /// The [`Canon`] id of `t`.
-    fn canonical(&mut self, t: Ty) -> u32 {
+    /// The [`Canon`] id of `t`. With `open`, its unbound variables that are not
+    /// quantified are [`Canon::Open`], numbered through `open` (shared by the
+    /// types of one pattern), and a unit is paid for each node met.
+    fn canonical(&mut self, t: Ty, mut open: Option<&mut FxHashMap<Ty, u32>>) -> u32 {
         let mut ids: FxHashMap<Ty, u32> = FxHashMap::default();
         let mut vars = 0u32;
         // A constructor is pushed with `false` to be expanded, and again with `true`
@@ -911,6 +899,9 @@ impl TypeChecker {
         let mut stack = vec![(root, false)];
         while let Some((r, children_done)) = stack.pop() {
             count_probes(1);
+            if open.is_some() {
+                self.spent += 1;
+            }
             if ids.contains_key(&r) {
                 continue;
             }
@@ -923,6 +914,15 @@ impl TypeChecker {
                     vars += 1;
                     Canon::Var {
                         index: vars - 1,
+                        key,
+                    }
+                }
+                Node::Var { key, .. } if open.is_some() => {
+                    let open = open.as_deref_mut().expect("checked");
+                    count_probes(1);
+                    let next = u32::try_from(open.len()).expect("fewer than 2^32 variables");
+                    Canon::Open {
+                        index: *open.entry(r).or_insert(next),
                         key,
                     }
                 }
@@ -951,7 +951,7 @@ impl TypeChecker {
             if id == next {
                 let closed = match canon {
                     Canon::Var { .. } => true,
-                    Canon::Free(_) => false,
+                    Canon::Free(_) | Canon::Open { .. } => false,
                     Canon::Con(h, a, b) => {
                         let closed = |c: u32| self.canon_closed[c as usize];
                         (h.arity() < 1 || closed(a)) && (h.arity() < 2 || closed(b))
@@ -1875,7 +1875,7 @@ impl TypeChecker {
         if self.locate {
             self.spent += 1;
             count_probes(1);
-            if self.failed.contains(&key) {
+            if self.known_to_fail(id, &key.1, &indices) {
                 // Fresh inference would fail in this state, so this use fails
                 // too: trying it again would redo that work at every level of
                 // sharing.
@@ -1885,7 +1885,6 @@ impl TypeChecker {
                 id,
                 want,
                 key: key.clone(),
-                closed: self.scope_closed(&key.1),
                 nodes: self.nodes.len(),
                 trail: self.trail.len(),
                 frames: self.frames.len(),
@@ -1893,7 +1892,6 @@ impl TypeChecker {
                 env: self.env.len(),
                 pending: self.pending.len(),
                 memo_log: self.memo_log.len(),
-                failed_log: self.failed_log.len(),
                 level: self.level,
             });
         }
@@ -1963,7 +1961,6 @@ impl TypeChecker {
         if self.checkpoints.is_empty() {
             self.trail.clear();
             self.memo_log.clear();
-            self.failed_log.clear();
         }
     }
 
@@ -2052,172 +2049,191 @@ impl TypeChecker {
     /// afresh, and the checker has gone back to `cp`. The caller checks that:
     /// the key was not in the memo when the use failed (a key goes into the
     /// memo as soon as inference works, before the use is fitted to its
-    /// position). The key goes into `failed`, so that later uses of it are
-    /// walked in place at once.
+    /// position). The [`TypeChecker::pattern`] of its scope here goes into
+    /// `failed`, so that later uses whose pattern is an instance of it are
+    /// walked in place at once (see [`TypeChecker::known_to_fail`]).
     ///
     /// Which uses are walked in place changes the work done, not the error
     /// reported: a use walked in place is walked as the tree walk walks it
     /// (see [`TypeChecker::run`]). What the argument below ensures is that a
-    /// key in `failed` would fail if it were tried, so walking its uses in
-    /// place at once only skips work that would be undone. A key wrongly in
-    /// `failed` would have its uses walked as a tree, which takes time
-    /// exponential in the depth of sharing below it.
+    /// use found in `failed` would fail if it were tried, so walking it in
+    /// place at once only skips work that would be undone. A use wrongly
+    /// found there would be walked as a tree, which takes time exponential in
+    /// the depth of sharing below it.
     ///
-    /// Why a failed key fails later too. Inferring a subterm afresh does not
-    /// depend on the types of its monomorphic bindings, which are replaced by
-    /// fresh variables, nor on the memo, whose reuse agrees with the tree walk
-    /// (see [`TypeChecker::walk`]); its polymorphic bindings are given by the
-    /// key, each slot by a [`Canon`] fixed when the binding was made: a type
-    /// up to renaming of its quantified variables, whose free variables are
-    /// nodes of the store. The tree walk is Algorithm J, which unifies in any
-    /// order and is complete (Damas and Milner 1982), so inferring the subterm
-    /// fails in a state of the store exactly when no substitution for the
-    /// store's unbound variables (keeping rigid variables, and sending `Key`
-    /// variables to key types) types it under those bindings. Going forward,
-    /// the walk only refines the variables a slot names: it links them, lowers
-    /// their levels or flags them `Key`. It never generalises them: a use of
-    /// the key has a binding of that slot in scope, which has been in scope
-    /// since it was made, when the variable was not generalised (a slot made
-    /// later from the same type would quantify it). A substitution that works
-    /// in a refined state, composed with the refinement, works in the earlier
-    /// one. So a key that fails in a state fails in every state reached from
-    /// it going forward. A key with a closed scope names no node of the store,
-    /// so it fails in every state; it stays in `failed` until the end of the
-    /// walk.
+    /// Why a pattern that failed fails in every state of which it is an
+    /// instance. Inferring a subterm afresh does not depend on the types of
+    /// its monomorphic bindings, which are replaced by fresh variables, nor
+    /// on the memo, whose reuse agrees with the tree walk (see
+    /// [`TypeChecker::walk`]). It reads the store only through the types of
+    /// its polymorphic bindings and nodes it makes itself. The levels of
+    /// those types' unbound variables do not matter: they are at most the
+    /// use's level, so no `let` inside the subterm generalises them. The tree
+    /// walk is Algorithm J, which unifies in any order and is complete
+    /// (Damas and Milner 1982), so inference fails exactly when no
+    /// substitution for the unbound variables of those types, keeping rigid
+    /// variables and sending `Key` variables to key types, types the subterm
+    /// under them. That is a property of the pattern, which writes those
+    /// types out with their unbound variables numbered, and names no node
+    /// that can change: it means the same in every state of the store, and
+    /// going back to a checkpoint cannot make it untrue. If a pattern `P`
+    /// fails and the current pattern is `σ(P)`, where `σ` keeps rigid
+    /// variables and quantified structure and sends `Key` variables to
+    /// key-safe types, a substitution `S` that typed the subterm now would
+    /// make `S ∘ σ` type it under `P`. So the use fails now too.
     ///
-    /// Going back to a checkpoint undoes refinements, so a key with an open
-    /// scope is also logged with a state it fails in: the length of the trail
-    /// at `cp`, and the part of the store its slots reach there, written out
-    /// by [`TypeChecker::slot_state`]. The walk is in that state now.
-    /// [`TypeChecker::back_to`] some checkpoint `p` keeps the key if the
-    /// logged length is at most `p.trail`, or else if its slots reach the same
-    /// part of the store at `p` as they did when it was logged. It removes it
-    /// otherwise. Each logged key fails in the state at some moment `m` when
-    /// the trail had the logged length `t`, from which the walk has gone
-    /// forward, except back to checkpoints made after `m`; at first, `m` is
-    /// when `cp` was made. Going back to `p` keeps that true:
-    ///
-    /// - If `p` was made after `m`, its state was reached from `m`'s.
-    /// - Else `p.trail <= t`, as the trail does not shrink past a checkpoint
-    ///   still on the stack. If they are equal, every change since `p` to a
-    ///   node made before `p` had been undone by `m`, since each is on the
-    ///   trail past `p.trail` until undone. If the key's slots name only such
-    ///   nodes, they hold at `p` what they held at `m`, and the key fails at
-    ///   `p`, which becomes its `m`. If a slot names a node made after `p`,
-    ///   nothing the walk can reach refers to that node once it is back at
-    ///   `p`: links to it from nodes made before `p` are changes on the trail,
-    ///   the bindings, frames and memo entries made since are gone, and kept
-    ///   types frozen past checkpoints are copies whose only variables are
-    ///   quantified. A slot is made from a type the walk reaches, so no later
-    ///   binding has that slot, and the key is never looked up again.
-    /// - If `p.trail < t` but the slots reach, at `p`, the same nodes with the
-    ///   same contents as at `m`, inferring the subterm afresh at `p` meets
-    ///   the same types as at `m`, as it reads the store only through its
-    ///   bindings and nodes it makes itself. So the key fails at `p`, which
-    ///   becomes its `m`, and its logged length becomes `p.trail`. Changes
-    ///   that leave those nodes alone, such as fixing a variable of a binding
-    ///   the key does not depend on, no longer drop the key.
-    ///
-    /// Once no checkpoint is left, nothing can be undone, so the log is
-    /// cleared and its keys stay in `failed` until the end of the walk.
+    /// Why an instance, not only an equal pattern. Walking a failed use in
+    /// place makes the unifications its fresh inference made, with the
+    /// types actually bound in place of the fresh variables for its
+    /// monomorphic bindings, so every state it meets is an instance of the
+    /// state the failed inference met at the same point: an inner use that
+    /// failed there matches here. With equal patterns only, a part of a
+    /// helper's type that a monomorphic binding fixes in place, but leaves a
+    /// variable when tried afresh, makes a new pattern at every level, and
+    /// the walk is exponential again.
     fn note_failure(&mut self, cp: &Checkpoint) {
         self.spent += 1;
-        count_probes(1);
-        if !self.failed.insert(cp.key.clone()) {
+        let Some(fv) = self.free_vars.get(&cp.id) else {
+            unreachable!("a tried use has its free variables found");
+        };
+        let indices = fv.indices();
+        let pattern = self.pattern(&cp.key.1, &indices);
+        self.spent += 1 + pattern.len() as u64;
+        count_probes(2);
+        let known = self.failed.entry(cp.id).or_default();
+        if known.contains(&pattern) {
             return;
         }
+        known.push(pattern);
         #[cfg(test)]
         {
             self.failures_noted += 1;
         }
-        if !cp.closed && !self.checkpoints.is_empty() {
-            // Paid now: the unit of its removal, or of its drop when the log
-            // is cleared.
-            self.spent += 1;
-            let state = self.slot_state(&cp.key.1);
-            self.failed_log.push(LoggedFailure {
-                key: cp.key.clone(),
-                trail: cp.trail,
-                state,
-            });
-        }
     }
 
-    /// The part of the store the polymorphic slots of `scope` reach, written
-    /// out: the [`Canon`] of each slot names the unbound and rigid variables
-    /// of its type, and each is written out with what it now resolves to. A
-    /// node met again is written as a reference to its first appearance, so
-    /// the text is no longer than the nodes it reaches. Two texts are equal
-    /// only if the slots reach the same nodes, with the same contents up to
-    /// links. Links are followed without being compressed, so this changes
-    /// nothing. A unit is paid for each [`Canon`] node and each store node
-    /// read.
-    fn slot_state(&mut self, scope: &Scope) -> Vec<u32> {
-        const REF: u32 = 0;
-        const VAR: u32 = 1;
-        const RIGID: u32 = 2;
-        const CON: u32 = 3;
-        let mut free = Vec::new();
-        let mut seen_canon: FxHashSet<u32> = FxHashSet::default();
-        let mut stack: Vec<u32> = scope
-            .iter()
-            .filter_map(|slot| match *slot {
-                Slot::Poly(c) if !self.canon_closed[c as usize] => Some(c),
-                _ => None,
-            })
-            .collect();
-        while let Some(c) = stack.pop() {
-            self.spent += 1;
-            count_probes(1);
-            if !seen_canon.insert(c) {
-                continue;
-            }
-            match self.canon_nodes[c as usize] {
-                Canon::Var { .. } => {}
-                Canon::Free(t) => free.push(t),
-                Canon::Con(h, a, b) => {
-                    if h.arity() >= 2 && !self.canon_closed[b as usize] {
-                        stack.push(b);
-                    }
-                    if h.arity() >= 1 && !self.canon_closed[a as usize] {
-                        stack.push(a);
-                    }
+    /// The failure pattern of a use with `scope` (for the de Bruijn
+    /// `indices`) in the current state: a [`Slot`] for each binding, where
+    /// a polymorphic one whose type has free variables is replaced by the
+    /// [`Canon`] id of that type now, with its unbound variables that are
+    /// not quantified numbered across the whole scope ([`Canon::Open`]).
+    /// Rigid variables keep their node, which is made before the walk and
+    /// never changes. A unit is paid for each node met.
+    fn pattern(&mut self, scope: &Scope, indices: &[u32]) -> Scope {
+        let len = self.env.len();
+        let mut open: FxHashMap<Ty, u32> = FxHashMap::default();
+        let mut out = Vec::with_capacity(scope.len());
+        for (slot, &i) in scope.iter().zip(indices) {
+            out.push(match *slot {
+                Slot::Poly(c) if !self.canon_closed[c as usize] => {
+                    let ty = self.env[len - 1 - i as usize].ty;
+                    Slot::Poly(self.canonical(ty, Some(&mut open)))
                 }
-            }
-        }
-        let mut out = Vec::new();
-        let mut ids: FxHashMap<Ty, u32> = FxHashMap::default();
-        let mut todo: Vec<Ty> = free.into_iter().rev().collect();
-        while let Some(t) = todo.pop() {
-            let mut r = t;
-            self.spent += 1;
-            while let Node::Link(next) = self.node(r) {
-                self.spent += 1;
-                r = next;
-            }
-            count_probes(1);
-            if let Some(&i) = ids.get(&r) {
-                out.extend([REF, i]);
-                continue;
-            }
-            let next = u32::try_from(ids.len()).expect("fewer than 2^32 type nodes");
-            ids.insert(r, next);
-            match self.node(r) {
-                Node::Var { level, key, .. } => out.extend([VAR, r, level, u32::from(key)]),
-                Node::Rigid { key } => out.extend([RIGID, r, u32::from(key)]),
-                Node::Con(h, a, b) => {
-                    out.extend([CON, h as u32]);
-                    if h.arity() >= 2 {
-                        todo.push(b);
-                    }
-                    if h.arity() >= 1 {
-                        todo.push(a);
-                    }
-                }
-                Node::Link(_) => unreachable!("links were followed"),
-            }
+                other => other,
+            });
         }
         out
+    }
+
+    /// Whether a use of shared subterm `id` with `scope` (for the de Bruijn
+    /// `indices`) is known to fail in the current state: its pattern is an
+    /// instance of a pattern `id` failed in (see
+    /// [`TypeChecker::note_failure`]). Only a subterm that has failed pays
+    /// for writing its pattern out.
+    fn known_to_fail(&mut self, id: TermId, scope: &Scope, indices: &[u32]) -> bool {
+        self.spent += 1;
+        count_probes(1);
+        if !self.failed.contains_key(&id) {
+            return false;
+        }
+        let now = self.pattern(scope, indices);
+        let known = self.failed.remove(&id).expect("checked");
+        let mut found = false;
+        for p in &known {
+            self.spent += 1 + p.len() as u64;
+            if *p == now || self.is_instance(p, &now) {
+                found = true;
+                break;
+            }
+        }
+        count_probes(1);
+        self.failed.insert(id, known);
+        found
+    }
+
+    /// Whether pattern `now` is `σ(p)` for a substitution `σ` of the
+    /// [`Canon::Open`] variables of `p` that sends `Key` variables to
+    /// key-safe types. Each node of `p` is matched once, through a map to
+    /// the node of `now` it stands for, and a unit is paid for each.
+    fn is_instance(&mut self, p: &Scope, now: &Scope) -> bool {
+        if p.len() != now.len() {
+            return false;
+        }
+        let mut image: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut todo = Vec::new();
+        for (a, b) in p.iter().zip(now) {
+            match (*a, *b) {
+                (Slot::Mono, Slot::Mono) => {}
+                (Slot::Poly(x), Slot::Poly(y)) => todo.push((x, y)),
+                _ => return false,
+            }
+        }
+        while let Some((x, y)) = todo.pop() {
+            self.spent += 1;
+            count_probes(1);
+            if let Some(&z) = image.get(&x) {
+                if z != y {
+                    return false;
+                }
+                continue;
+            }
+            count_probes(1);
+            image.insert(x, y);
+            let matched = match (self.canon_nodes[x as usize], self.canon_nodes[y as usize]) {
+                (Canon::Open { key, .. }, _) => !key || self.key_safe(y),
+                (Canon::Con(h, a, b), Canon::Con(g, c, d)) if h == g => {
+                    if h.arity() >= 2 {
+                        todo.push((b, d));
+                    }
+                    if h.arity() >= 1 {
+                        todo.push((a, c));
+                    }
+                    true
+                }
+                _ => x == y,
+            };
+            if !matched {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether every type the [`Canon`] node `c` of a pattern stands for is a
+    /// key type: `Int`, `Bool`, `Unit`, a `Key` variable, or a pair of such.
+    fn key_safe(&mut self, c: u32) -> bool {
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        let mut todo = vec![c];
+        while let Some(c) = todo.pop() {
+            self.spent += 1;
+            count_probes(1);
+            if !seen.insert(c) {
+                continue;
+            }
+            let safe = match self.canon_nodes[c as usize] {
+                Canon::Open { key, .. } => key,
+                Canon::Free(r) => matches!(self.node(r), Node::Rigid { key: true }),
+                Canon::Con(Head::Int | Head::Bool | Head::Unit, ..) => true,
+                Canon::Con(Head::Pair, a, b) => {
+                    todo.extend([a, b]);
+                    true
+                }
+                Canon::Con(..) | Canon::Var { .. } => false,
+            };
+            if !safe {
+                return false;
+            }
+        }
+        true
     }
 
     /// Puts the checker back as it was at `cp`, which has been popped, and walks
@@ -2242,32 +2258,10 @@ impl TypeChecker {
             count_probes(1);
             self.memo.remove(&key);
         }
-        // Failures logged at or before this checkpoint's position of the trail
-        // hold here too, and so do those whose slots reach the same part of
-        // the store here (see [`TypeChecker::note_failure`]); the others go.
-        let mut kept = cp.failed_log;
-        for i in cp.failed_log..self.failed_log.len() {
-            self.spent += 1;
-            let holds = self.failed_log[i].trail <= cp.trail || {
-                let key = self.failed_log[i].key.1.clone();
-                self.spent += key.len() as u64;
-                self.slot_state(&key) == self.failed_log[i].state
-            };
-            if holds {
-                self.failed_log[i].trail = self.failed_log[i].trail.min(cp.trail);
-                self.failed_log.swap(kept, i);
-                kept += 1;
-            } else {
-                count_probes(1);
-                self.failed.remove(&self.failed_log[i].key);
-            }
-        }
-        self.failed_log.truncate(kept);
         self.level = cp.level;
         if self.checkpoints.is_empty() {
             self.trail.clear();
             self.memo_log.clear();
-            self.failed_log.clear();
         }
         Step::InPlace(cp.id, cp.want)
     }
