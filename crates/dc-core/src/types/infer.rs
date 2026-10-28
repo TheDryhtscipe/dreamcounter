@@ -139,7 +139,9 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 /// slots than there are bindings (no more than the steps taken), finding free
 /// variables stops between nodes, and an error writes out at most four types
 /// of at most [`MAX_TYPE_NODES`] nodes. So a call does at most about twice its
-/// budget, plus a constant. Emptying or freeing a hash table costs time in
+/// budget, plus a constant: the error text, or the result type written out
+/// (also at most [`MAX_TYPE_NODES`] nodes, not checked against the budget),
+/// about 1 ms at most. Emptying or freeing a hash table costs time in
 /// its capacity, and clearing a stack drops its elements, so the tables a
 /// unification, an instantiation or a call has grown, and the stacks a call
 /// has grown, are released when it ends, and the next one starts small: one
@@ -147,13 +149,15 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 /// each unit stands for at most four reads of the term, the store (or its
 /// trail), a scheme (a type node imported or a key looked up), a slot of a
 /// table or stack visited while emptying or freeing it, or a lookup,
-/// insertion or removal in a hash table, on terms built to find work that is
-/// not charged, and at budgets that stop a call at any point. On those terms,
-/// scaled up until a call uses millions of units, one unit takes 3 to 45 ns
-/// in a release build, most often 6 to 40 (October 2026); the slowest are
-/// terms of hundreds of thousands of shared nodes or more, whose tables no
-/// longer fit in the cache. So a call that uses the whole default budget
-/// takes about 0.05 to 0.7 s.
+/// insertion or removal in a hash table, and that each unit stands for at most
+/// one hash-table lookup, insertion or removal (the costliest of those reads
+/// on a large term), on terms built to find work that is not charged, and at
+/// budgets that stop a call at any point. On those terms, scaled up until a
+/// call uses millions of units, one unit takes 3 to 60 ns in a release build,
+/// most often 6 to 50 (October 2026); the slowest are terms of hundreds of
+/// thousands of shared nodes or more, whose tables no longer fit in the cache,
+/// so that a hash-table lookup is about one cache miss. So a call that uses
+/// the whole default budget takes about 0.05 to 1 s.
 ///
 /// Well-typed terms can need work exponential in their size: a shared subterm
 /// is inferred once for each different set of bindings its free variables see
