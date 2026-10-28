@@ -163,7 +163,10 @@ fn check_variant(v: Variant) {
         GrowthClass::Quadratic,
     );
     assert!(naive_named, "C does not name n^2 for {}", v.naive());
-    check_class(&family, &mut arena, &plan, v.good(), GrowthClass::NLogN);
+    // Refusing is allowed, but C names n log n for every good reference
+    // today; a refusal would be a change worth seeing.
+    let good_named = check_class(&family, &mut arena, &plan, v.good(), GrowthClass::NLogN);
+    assert!(good_named, "C does not name n log n for {}", v.good());
 }
 
 #[test]

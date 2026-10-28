@@ -1,9 +1,11 @@
 //! Sorted-order queries (bead P3.5): questions about a list of integers that
 //! a scan answers once the list is sorted.
 //!
-//! The input is a list of `n` integers in `[-10⁶, 10⁶]`, drawn uniformly, so
-//! duplicates are few; [`Variant::PairSums`] also takes a threshold `t` in
-//! the same range. The size is `n`. The variants:
+//! The input is a list of `n` integers in `[-10⁶, 10⁶]`; [`Variant::PairSums`]
+//! also takes a threshold `t` in that range. The size is `n`. Each element is
+//! drawn, with even odds, from the whole range or from a narrow one of about
+//! `n / 2` values (see [`narrow_bound`]), so every input has many equal
+//! values and a solution that mishandles ties fails the sweep. The variants:
 //!
 //! | variant | answer |
 //! |---|---|
@@ -43,6 +45,13 @@ pub const SIZES: &[u64] = &[16, 32, 64, 128, 256, 512];
 /// Elements, and the threshold of [`Variant::PairSums`], are drawn from
 /// `-VALUE_BOUND..=VALUE_BOUND`.
 pub const VALUE_BOUND: i64 = 1_000_000;
+
+/// The narrow range elements of an input of size `n` are drawn from half the
+/// time is `-narrow_bound(n)..=narrow_bound(n)`: about `n / 4` values each
+/// side of 0, so equal values are common.
+pub fn narrow_bound(n: u64) -> i64 {
+    (n / 4).clamp(1, VALUE_BOUND as u64) as i64
+}
 
 /// A variant of the family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,7 +239,12 @@ impl TaskFamily for SortedOrder {
     fn examples(&self) -> Vec<Example> {
         let one = |xs: &[i64], out: i64| Example::new(vec![list(xs)], Value::Int(out));
         match self.0 {
-            Variant::Inversions => vec![one(&[], 0), one(&[3, 1, 2], 2), one(&[5, -1, 5, 0], 3)],
+            Variant::Inversions => vec![
+                one(&[], 0),
+                one(&[3, 1, 2], 2),
+                one(&[5, -1, 5, 0], 3),
+                one(&[2, 2, 1, 1], 4),
+            ],
             Variant::PairSums => {
                 let two = |xs: &[i64], t: i64, out: i64| {
                     Example::new(vec![list(xs), Value::Int(t)], Value::Int(out))
@@ -239,21 +253,39 @@ impl TaskFamily for SortedOrder {
                     two(&[], 0, 0),
                     two(&[1, 2, 3], 4, 2),
                     two(&[-5, 10, 0, 2], 5, 4),
+                    two(&[3, 3, 1, 5], 6, 4),
                 ]
             }
             Variant::MinGap => vec![
+                one(&[], i64::MAX),
                 one(&[7], i64::MAX),
                 one(&[10, 3, 8], 2),
                 one(&[4, -2, 4], 0),
             ],
-            Variant::Distinct => vec![one(&[], 0), one(&[3, 1, 3], 2), one(&[-1, 0, 1, 0, -1], 3)],
-            Variant::LowerMedian => vec![one(&[5], 5), one(&[3, 1, 2], 2), one(&[4, -2, 9, 0], 0)],
+            Variant::Distinct => vec![
+                one(&[], 0),
+                one(&[3, 1, 3], 2),
+                one(&[-1, 0, 1, 0, -1], 3),
+                one(&[2, 2, 2, 2], 1),
+            ],
+            Variant::LowerMedian => vec![
+                one(&[], 0),
+                one(&[5], 5),
+                one(&[3, 1, 2], 2),
+                one(&[4, -2, 9, 0], 0),
+                one(&[2, 1, 1], 1),
+                one(&[7, 7, 7, 1], 7),
+            ],
         }
     }
 
     fn generate(&self, n: u64, rng: &mut TaskRng) -> Inputs {
+        let narrow = narrow_bound(n);
         let xs: Vec<i64> = (0..n)
-            .map(|_| rng.int_in(-VALUE_BOUND, VALUE_BOUND))
+            .map(|_| {
+                let bound = if rng.bool() { narrow } else { VALUE_BOUND };
+                rng.int_in(-bound, bound)
+            })
             .collect();
         let mut inputs = vec![list(&xs)];
         if self.0 == Variant::PairSums {
