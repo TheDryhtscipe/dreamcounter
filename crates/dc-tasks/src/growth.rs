@@ -50,19 +50,32 @@
 //! default window it is `½ ln(ln 1024 / ln 128) ≈ 0.178`, for `n` against
 //! `n log n` (and `1` against `log n`).
 //!
-//! The *tolerance* `τ` is the larger of a floor, [`ClassSelect::misfit_fraction`]
-//! (default ¼) times the separation, which absorbs small lower-order terms
-//! such as the `+ 2n` in `n log₂ n + 2n` (but not `+ 4n`, a `NoFit`), and [`ClassSelect::noise_z`] (default 3)
-//! times the seed noise: the largest standard error of a size's median `ln`
-//! step count, `√(π/2) · s / √k` for `k` seeds with sample standard deviation
-//! `s` of their `ln` steps (the large-sample standard error of a median). A
-//! class is named only if it is the one class with misfit at most `τ`; if
-//! none is, the verdict is [`ClassVerdict::NoFit`] (`n^1.5`, `n² log n`).
-//! Half the separation bounds `τ`: below it at most one class can be within
-//! `τ`, but at or above it a series between two classes can sit just inside
-//! one and just outside the other, so C then refuses with
-//! [`ClassVerdict::TooNoisy`] whatever the misfits. Noise can therefore only
-//! make C refuse, never make it name a class.
+//! The *tolerance* `τ` is [`ClassSelect::misfit_fraction`] (default ¼)
+//! times the separation. It absorbs small lower-order terms such as the
+//! `+ 2n` in `n log₂ n + 2n` (but not `+ 4n`, a `NoFit`). Since `τ` is below
+//! half the separation, at most one class is within `τ` of any series.
+//!
+//! The *noise margin* `m` is [`ClassSelect::noise_z`] (default 3) times the
+//! seed noise: the largest standard error of a size's median `ln` step count,
+//! `√(π/2) · s / √k` for `k` seeds with sample standard deviation `s` of
+//! their `ln` steps (the large-sample standard error of a median). How the
+//! noise is found is set by [`ClassSelect::noise_model`]. C names a class if
+//! its misfit is at most `τ` and no other class's is at most `τ + m`. If
+//! some class's misfit is at most `τ + m` but that does not hold, the verdict
+//! is [`ClassVerdict::TooNoisy`]; if none is, it is [`ClassVerdict::NoFit`]
+//! (`n^1.5`, `n² log n`). With the medians fixed, raising the noise can
+//! therefore only turn a verdict into `TooNoisy`, never name a class or
+//! change which class is named. If the true medians are within `τ` of a
+//! class and nothing else is within `τ + 2m` of them, C names that class as
+//! long as each median is off by at most `m`.
+//!
+//! With one seed per size the seeds say nothing about the noise. Then, under
+//! the default [`NoiseModel::FromSeeds`], C refuses with
+//! [`ClassVerdict::NoiseUnknown`]: a single noisy seed can sit closer to a
+//! neighbouring class than to its own. A caller whose step counts are exact
+//! says so with [`NoiseModel::Exact`]; one that knows the noise from
+//! elsewhere (for example, one seed of a sweep whose other seeds measured
+//! it) passes [`NoiseModel::Known`].
 //!
 //! # What a verdict means
 //!
@@ -71,7 +84,9 @@
 //! not a proof of asymptotic growth. Growth close to a class is named as
 //! that class: `n^1.2` as `n log n`, `n^1.04` as `n`, and `n log n + 30n`
 //! (a large lower-order term) as `n` over `128..1024`, where `ln n` varies by
-//! only a factor 1.43. Telling such cases apart needs larger sizes.
+//! only a factor 1.43. Larger sizes do not settle this: `τ` scales with the
+//! separation, which grows with the window, so over `2¹² ..= 2²⁰` an exact
+//! `n^1.1` is named `n log n`.
 //!
 //! # Conventions
 //!
@@ -690,14 +705,18 @@ pub struct ClassCandidate {
 /// What estimator C concludes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassVerdict {
-    /// Exactly one class is within tolerance.
+    /// The class's misfit is within the tolerance, and no other class's is
+    /// within the tolerance plus the noise margin.
     Class(GrowthClass),
-    /// The seed noise puts the tolerance at or above half the separation, so
-    /// several classes could fit and C does not choose. Raised before the
-    /// misfits are looked at.
+    /// Some class is within the tolerance plus the noise margin, but not as
+    /// [`ClassVerdict::Class`] requires: the medians are too noisy to say
+    /// which class, or whether any.
     TooNoisy,
-    /// No class is within tolerance: the growth lies between classes (such as
-    /// `n^1.5`) or outside them.
+    /// Every size in the window has one seed, so the noise is unknown, and
+    /// the [`NoiseModel`] does not supply it.
+    NoiseUnknown,
+    /// No class is within the tolerance plus the noise margin: the growth
+    /// lies between classes (such as `n^1.5`) or outside them.
     NoFit,
 }
 
@@ -708,15 +727,17 @@ pub struct ClassFit {
     pub verdict: ClassVerdict,
     /// Every class's fit, in the order of [`GrowthClass::ALL`].
     pub candidates: [ClassCandidate; 7],
-    /// The largest misfit at which a class counts as fitting, in `ln` units.
+    /// The largest misfit at which a class is named, in `ln` units.
     pub tolerance: f64,
+    /// How far noise could move a misfit: [`ClassSelect::noise_z`] times
+    /// the noise, in `ln` units; 0 if the noise is unknown.
+    pub noise_margin: f64,
     /// The smallest `½ range(ln f − ln g)` over pairs of classes on the
     /// window: how far apart the closest classes are.
     pub separation: f64,
     /// The largest standard error of a median `ln` step count over the
-    /// window, estimated from the sizes with at least two seeds. `None` if
-    /// every size in the window has a single seed, so the noise is unknown
-    /// and only the floor applies.
+    /// window, as the [`NoiseModel`] gives it. `None` if it is unknown
+    /// (verdict [`ClassVerdict::NoiseUnknown`]).
     pub noise: Option<f64>,
     /// The sizes fitted.
     pub window: FitWindow,
@@ -738,9 +759,24 @@ impl ClassFit {
     pub fn class(&self) -> Option<GrowthClass> {
         match self.verdict {
             ClassVerdict::Class(c) => Some(c),
-            ClassVerdict::TooNoisy | ClassVerdict::NoFit => None,
+            ClassVerdict::TooNoisy | ClassVerdict::NoiseUnknown | ClassVerdict::NoFit => None,
         }
     }
+}
+
+/// How estimator C finds the noise in the median step counts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NoiseModel {
+    /// From the spread between seeds, at the sizes in the window with at
+    /// least two. If there are none, C refuses with
+    /// [`ClassVerdict::NoiseUnknown`].
+    FromSeeds,
+    /// The step counts are exact: noise 0. For deterministic programs on
+    /// fixed inputs, and for closed-form series.
+    Exact,
+    /// The standard error of each median `ln` step count is at most this;
+    /// finite and `≥ 0`.
+    Known(f64),
 }
 
 /// Estimator C: class selection among [`GrowthClass::ALL`] (spec §9). See the
@@ -753,9 +789,11 @@ pub struct ClassSelect {
     /// ½ the classes are exclusive for exact step counts; the default ¼ leaves
     /// half of that margin for lower-order terms.
     pub misfit_fraction: f64,
-    /// How many standard errors of seed noise the tolerance allows; finite
+    /// How many standard errors of noise the noise margin allows; finite
     /// and `≥ 0`.
     pub noise_z: f64,
+    /// How the noise is found.
+    pub noise_model: NoiseModel,
 }
 
 impl Default for ClassSelect {
@@ -764,6 +802,7 @@ impl Default for ClassSelect {
             window: Window::UpperHalf,
             misfit_fraction: 0.25,
             noise_z: 3.0,
+            noise_model: NoiseModel::FromSeeds,
         }
     }
 }
@@ -780,7 +819,8 @@ impl ClassSelect {
     /// See [`GrowthError`]. Besides the medians, every seed's step count in
     /// the window must be positive ([`GrowthError::ZeroSteps`]), since the
     /// noise is estimated from their logarithms. [`GrowthError::BadParameter`]
-    /// if `misfit_fraction` or `noise_z` is out of range.
+    /// if `misfit_fraction`, `noise_z` or a [`NoiseModel::Known`] noise is out
+    /// of range.
     pub fn fit(&self, sweep: &Sweep) -> Result<ClassFit, GrowthError> {
         if !(0.0..0.5).contains(&self.misfit_fraction) {
             return Err(GrowthError::BadParameter {
@@ -789,6 +829,13 @@ impl ClassSelect {
         }
         if !(self.noise_z.is_finite() && self.noise_z >= 0.0) {
             return Err(GrowthError::BadParameter { name: "noise_z" });
+        }
+        if let NoiseModel::Known(v) = self.noise_model {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(GrowthError::BadParameter {
+                    name: "noise_model",
+                });
+            }
         }
         let (points, window) = window_points(sweep, self.window, Self::MIN_POINTS, 2)?;
         let ln_steps: Vec<f64> = points.iter().map(|&(_, s)| ln_u64(s)).collect();
@@ -813,19 +860,32 @@ impl ClassSelect {
                 separation = separation.min((hi - lo) / 2.0);
             }
         }
-        let noise = seed_noise(sweep, window.n_min)?;
-        let tolerance =
-            (self.misfit_fraction * separation).max(self.noise_z * noise.unwrap_or(0.0));
-        // Exclusivity: with τ < separation / 2 at most one class is within τ.
-        let verdict = if tolerance >= separation / 2.0 {
-            ClassVerdict::TooNoisy
-        } else {
-            match candidates.iter().find(|c| c.misfit <= tolerance) {
-                Some(c) => ClassVerdict::Class(c.class),
-                None => ClassVerdict::NoFit,
+        // Checked whatever the model, so that a zero seed is always an error.
+        let from_seeds = seed_noise(sweep, window.n_min)?;
+        let noise = match self.noise_model {
+            NoiseModel::FromSeeds => from_seeds,
+            NoiseModel::Exact => Some(0.0),
+            NoiseModel::Known(v) => Some(v),
+        };
+        // Exclusivity: τ < separation / 2, so at most one class is within τ.
+        let tolerance = self.misfit_fraction * separation;
+        let noise_margin = self.noise_z * noise.unwrap_or(0.0);
+        let verdict = match noise {
+            None => ClassVerdict::NoiseUnknown,
+            Some(_) => {
+                let within = |limit: f64| candidates.iter().filter(move |c| c.misfit <= limit);
+                match within(tolerance).next() {
+                    Some(c) if within(tolerance + noise_margin).count() == 1 => {
+                        ClassVerdict::Class(c.class)
+                    }
+                    _ if within(tolerance + noise_margin).next().is_some() => {
+                        ClassVerdict::TooNoisy
+                    }
+                    _ => ClassVerdict::NoFit,
+                }
             }
         };
-        let finite = [tolerance, separation, noise.unwrap_or(0.0)]
+        let finite = [tolerance, noise_margin, separation, noise.unwrap_or(0.0)]
             .iter()
             .chain(
                 candidates
@@ -840,6 +900,7 @@ impl ClassSelect {
             verdict,
             candidates,
             tolerance,
+            noise_margin,
             separation,
             noise,
             window,

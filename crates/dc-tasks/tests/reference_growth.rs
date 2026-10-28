@@ -31,10 +31,13 @@
 //!
 //! Estimator C names the class itself, and must name the right one on the
 //! medians, except that on a short sweep it may refuse as too noisy
-//! (insertion sort up to 512). On each seed alone it may refuse (with one seed the noise is
-//! unknown, so only its tolerance floor applies, and insertion sort's
-//! seeds vary by about 12 % in steps), but it must never name another
-//! class.
+//! (insertion sort up to 512). On each seed alone it may refuse, but it must
+//! never name another class. One seed per size says nothing about the noise,
+//! so each seed alone is fitted with [`NoiseModel::Known`]: the noise of one
+//! seed's `ln` step count, measured on the full sweep as the largest sample
+//! standard deviation over the seeds at a size in the window (insertion
+//! sort's seeds vary by about 12 % in steps). The exact series of the
+//! meta-test are fitted with [`NoiseModel::Exact`].
 //!
 //! Estimators A and B fit the medians over seeds, as the pipeline does. B's
 //! choice of `γ` is right on the medians but not on every seed alone: its
@@ -51,8 +54,8 @@ use dc_eval::Value;
 use dc_surface::prelude::{Prelude, PreludeMode};
 use dc_tasks::growth::{
     ClassFit, ClassSelect, ClassVerdict, FitQuality, FitWindow, GrowthClass, GrowthError,
-    GrowthEstimator, GrowthFit, LogLogFit, LogLogSlope, PowerLogFit, PowerLogGrid, SizeObservation,
-    SizeOutcome, Sweep, Window, DEFAULT_SIZES,
+    GrowthEstimator, GrowthFit, LogLogFit, LogLogSlope, NoiseModel, PowerLogFit, PowerLogGrid,
+    SizeObservation, SizeOutcome, Sweep, Window, DEFAULT_SIZES,
 };
 use dc_tasks::harness::{
     check_input_sizes, measure, validate_family, FuelPlan, HarnessConfig, Measurement,
@@ -475,22 +478,67 @@ fn check_c(fit: &ClassFit, expected: Class) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "C: {:?} (best {} misfit {:.4}, tolerance {:.4}), expected {want:?}",
+            "C: {:?} (best {} misfit {:.4}, tolerance {:.4}, noise margin {:.4}), \
+             expected {want:?}",
             fit.verdict,
             fit.best().class,
             fit.best().misfit,
-            fit.tolerance
+            fit.tolerance,
+            fit.noise_margin
         ))
     }
 }
 
-/// Checks that estimator C, on each seed's step counts alone, names
-/// `expected` or refuses, and never names another class. Returns how many
-/// seeds it refused.
-fn check_c_per_seed(sweep: &Sweep, expected: Class) -> Result<usize, String> {
+/// The noise of a single seed's `ln` step count, measured on the full sweep:
+/// the largest sample standard deviation of the seeds' `ln` steps at a size
+/// in `window`. This is the spread of one measurement, not the standard
+/// error of a median. `None` if no size in the window has two seeds.
+fn single_seed_noise(sweep: &Sweep, window: &FitWindow) -> Option<f64> {
+    sweep
+        .observations()
+        .iter()
+        .filter(|o| o.n >= window.n_min)
+        .filter_map(|o| match &o.outcome {
+            SizeOutcome::Completed { steps } if steps.len() >= 2 => {
+                let ys: Vec<f64> = steps.iter().map(|&s| (s as f64).ln()).collect();
+                let k = ys.len() as f64;
+                let mean = ys.iter().sum::<f64>() / k;
+                let var = ys.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / (k - 1.0);
+                Some(var.sqrt())
+            }
+            SizeOutcome::Completed { .. } => None,
+            other => panic!("n = {}: {other:?}", o.n),
+        })
+        .reduce(f64::max)
+}
+
+/// The noise model for fitting each seed of `sweep` alone: the single-seed
+/// noise measured on the full sweep (see [`single_seed_noise`]).
+fn per_seed_noise(sweep: &Sweep, window: &FitWindow) -> NoiseModel {
+    NoiseModel::Known(single_seed_noise(sweep, window).expect("a size in the window has seeds"))
+}
+
+/// Estimator C for one seed alone, with the given noise model.
+fn c_per_seed(noise_model: NoiseModel) -> ClassSelect {
+    ClassSelect {
+        noise_model,
+        ..ClassSelect::default()
+    }
+}
+
+/// Checks that estimator C, on each seed's step counts alone with
+/// `noise_model`, names `expected` or refuses, and never names another
+/// class. Returns how many seeds it refused.
+fn check_c_per_seed(
+    sweep: &Sweep,
+    expected: Class,
+    noise_model: NoiseModel,
+) -> Result<usize, String> {
     let mut refused = 0;
     for (seed, one) in per_seed(sweep).iter().enumerate() {
-        let f = ClassSelect::default().fit(one).map_err(|e| e.to_string())?;
+        let f = c_per_seed(noise_model)
+            .fit(one)
+            .map_err(|e| e.to_string())?;
         match f.verdict {
             ClassVerdict::Class(k) if k == expected.c_class() => {}
             ClassVerdict::Class(k) => {
@@ -499,7 +547,9 @@ fn check_c_per_seed(sweep: &Sweep, expected: Class) -> Result<usize, String> {
                     expected.c_class()
                 ))
             }
-            ClassVerdict::TooNoisy | ClassVerdict::NoFit => refused += 1,
+            ClassVerdict::TooNoisy | ClassVerdict::NoiseUnknown | ClassVerdict::NoFit => {
+                refused += 1
+            }
         }
     }
     Ok(refused)
@@ -582,27 +632,32 @@ fn run<F: TaskFamily>(family: &F, reference: &str, entry: &str) -> Run {
     let b = PowerLogGrid::default().fit(&sweep).expect("B fits");
     let c = ClassSelect::default().fit(&sweep).expect("C fits");
     println!(
-        "RESULT {entry}: C {:?} tolerance {:.4} separation {:.4} noise {:?} misfits {:?}",
+        "RESULT {entry}: C {:?} tolerance {:.4} noise_margin {:.4} separation {:.4} noise {:?} \
+         misfits {:?}",
         c.verdict,
         c.tolerance,
+        c.noise_margin,
         c.separation,
         c.noise,
         c.candidates
             .map(|k| (k.class.to_string(), (k.misfit * 1e4).round() / 1e4))
     );
+    let seed_model = per_seed_noise(&sweep, &c.window);
     let per_seed_c: Vec<String> = per_seed(&sweep)
         .iter()
-        .map(|s| match ClassSelect::default().fit(s) {
+        .map(|s| match c_per_seed(seed_model).fit(s) {
             Ok(f) => format!(
-                "{:?} best {} {:.4}",
+                "{:?} best {} {:.4} tolerance {:.4} noise_margin {:.4}",
                 f.verdict,
                 f.best().class,
-                f.best().misfit
+                f.best().misfit,
+                f.tolerance,
+                f.noise_margin
             ),
             Err(e) => e.to_string(),
         })
         .collect();
-    println!("RESULT {entry}: C per seed {per_seed_c:?}");
+    println!("RESULT {entry}: C per seed with {seed_model:?}: {per_seed_c:?}");
     let r2 = match a.quality {
         FitQuality::RSquared(r) => r,
         FitQuality::ZeroVariance => f64::NAN,
@@ -674,7 +729,8 @@ fn check_polynomial<F: TaskFamily>(
     if !(c_medians == COnMedians::NamesOrTooNoisy && r.c.verdict == ClassVerdict::TooNoisy) {
         check_c(&r.c, class).unwrap_or_else(|e| panic!("{entry}: {e}"));
     }
-    check_c_per_seed(&r.sweep, class).unwrap_or_else(|e| panic!("{entry}: {e}"));
+    check_c_per_seed(&r.sweep, class, per_seed_noise(&r.sweep, &r.c.window))
+        .unwrap_or_else(|e| panic!("{entry}: {e}"));
     let drift = slope_drift(&r.sweep);
     assert!(drift.abs() < POLY_MAX_DRIFT, "{entry}: drift {drift}");
 }
@@ -702,8 +758,9 @@ fn merge_sort_is_n_log_n() {
 fn insertion_sort_is_quadratic() {
     // Measured under merge sort's fuel plan, as a candidate for the family
     // would be: ten times merge sort's steps is still enough up to 512. On this
-    // short sweep the seeds' spread (about 12 %) puts C's tolerance above half
-    // the separation, so C may refuse; on the default sweep it must name n²
+    // short sweep the seeds' spread (about 12 %) gives a noise margin that may
+    // bring another class within reach, so C may refuse as too noisy; on the
+    // default sweep it must name n²
     // (class_select_holds_on_every_seed_of_the_default_sweep).
     check_polynomial(
         &REF_SORT,
@@ -730,7 +787,8 @@ fn class_select_holds_on_every_seed_of_the_default_sweep() {
     for (entry, class) in [("msort", Class::NLogN), ("isort", Class::Quadratic)] {
         let r = run(&full, "msort", entry);
         check_c(&r.c, class).unwrap_or_else(|e| panic!("{entry}: {e}"));
-        let refused = check_c_per_seed(&r.sweep, class).unwrap_or_else(|e| panic!("{entry}: {e}"));
+        let refused = check_c_per_seed(&r.sweep, class, per_seed_noise(&r.sweep, &r.c.window))
+            .unwrap_or_else(|e| panic!("{entry}: {e}"));
         println!("RESULT {entry}: C refused {refused} of 5 seeds alone on the default sweep");
     }
 }
@@ -760,7 +818,12 @@ fn subset_enumeration_is_exponential() {
         r.a.alpha
     );
     check_c(&r.c, Class::Exponential).unwrap_or_else(|e| panic!("{e}"));
-    check_c_per_seed(&r.sweep, Class::Exponential).unwrap_or_else(|e| panic!("{e}"));
+    check_c_per_seed(
+        &r.sweep,
+        Class::Exponential,
+        per_seed_noise(&r.sweep, &r.c.window),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     // The lower and upper thirds are 6 apart in mean n.
     let drift = slope_drift(&r.sweep);
     assert!(
@@ -824,13 +887,17 @@ fn the_checks_reject_a_wrong_estimator_and_a_wrong_class() {
             let b = PowerLogGrid::default().fit(&sweep).expect("a fit");
             assert!(check_b(&b, class).is_ok(), "{class:?}");
         }
-        let c = ClassSelect::default().fit(&sweep).expect("a fit");
+        // The series is exact, with one seed per size.
+        let c = c_per_seed(NoiseModel::Exact).fit(&sweep).expect("a fit");
         assert!(check_c(&c, class).is_ok(), "{class:?}");
         for &other in CLASSES.iter().filter(|&&o| o != class) {
             assert!(check_c(&c, other).is_err(), "{class:?} passed as {other:?}");
             // A sweep whose every seed is the exact series fails the
             // per-seed check for every other class.
-            assert!(check_c_per_seed(&sweep, other).is_err(), "{class:?}");
+            assert!(
+                check_c_per_seed(&sweep, other, NoiseModel::Exact).is_err(),
+                "{class:?}"
+            );
         }
     }
     // B's γ check: an exact n log n series is not taken for n or n².
