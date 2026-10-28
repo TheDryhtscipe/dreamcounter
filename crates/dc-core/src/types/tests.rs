@@ -1266,8 +1266,8 @@ fn ill_typed_leaf_chain(a: &mut Arena, n: usize, open: bool) -> TermId {
 #[test]
 fn ill_typed_shared_leaves_are_located_in_polynomial_steps() {
     // Each use of a subterm whose fresh inference failed is walked in place at
-    // once, not tried again from a checkpoint: otherwise every level doubles the
-    // work of locating the error.
+    // once, not tried again from a checkpoint: otherwise each level is tried
+    // afresh again under the level above it.
     for open in [false, true] {
         let mut a = Arena::new();
         let small = ill_typed_leaf_chain(&mut a, 10, open);
@@ -1307,6 +1307,11 @@ fn only_failed_fresh_inference_marks_a_key_failed() {
     tree.tree_walk = true;
     assert_eq!(tc.infer(&a, f, NO_LIBS), tree.infer(&a, f, NO_LIBS));
     assert_eq!(tc.failed_keys(), 0);
+    // A closed subterm ill typed on its own is marked, so the count is not
+    // always 0.
+    let f = parse_term(&mut a, "(lam (if $0 (add true 1) (add true 1)))");
+    assert_eq!(tc.infer(&a, f, NO_LIBS), tree.infer(&a, f, NO_LIBS));
+    assert_eq!(tc.failed_keys(), 1);
 }
 
 /// `lam x. let (lam (pair x $0)) in t_n`, with `t_0 = ($0 1)` and `t_(k+1) =
@@ -1367,11 +1372,46 @@ const FIX_X: &str = "(fst (pair true (add (fst ($0 1)) 1)))";
 /// Walked as a tree, each is about `2^N` steps.
 const CHAIN_DEPTH: usize = 40;
 
+/// How many times its first walk the second walk of a call may cost, for
+/// each time it goes back to a checkpoint and once more. The second walk
+/// tries each use as the first walk does, and each time it goes back it
+/// walks one use in place, which costs about what the first walk did; a
+/// walk in place never does work that a later error throws away, as the
+/// error goes back to the outermost use being tried. The most measured on
+/// the random terms below is about 1.6 times. A term whose second walk does
+/// more than the first for the same uses is outside this: copying kept types
+/// out of reach of checkpoints can double at each level
+/// (dreamcounter-715365), but none of the terms checked here does that.
+const LOCATE_COST_FACTOR: u64 = 4;
+
+/// Units the second walk may spend past [`LOCATE_COST_FACTOR`], for small
+/// terms.
+const LOCATE_COST_SLACK: u64 = 100;
+
+/// Checks the second walk of the last call of `tc`: it went back to a
+/// checkpoint no more often than there are shared subterms, and cost no more
+/// than [`LOCATE_COST_FACTOR`] times the first walk for each time it went
+/// back and once more, plus [`LOCATE_COST_SLACK`].
+fn locate_cost(tc: &TypeChecker) -> Result<(), String> {
+    let (first, rollbacks) = (tc.first_units(), tc.rollbacks());
+    let shared = tc.shared_subterms() as u64;
+    if rollbacks > shared {
+        return Err(format!("{rollbacks} rollbacks, {shared} shared subterms"));
+    }
+    let locate = tc.spent() - first;
+    if locate > LOCATE_COST_FACTOR * (rollbacks + 1) * first + LOCATE_COST_SLACK {
+        return Err(format!(
+            "the second walk took {locate} units, the first {first}, with {rollbacks} rollbacks"
+        ));
+    }
+    Ok(())
+}
+
 /// Builds the chain `build` at depth 8 and at [`CHAIN_DEPTH`], and checks
 /// that inferring each, and checking it against `expected(n)`, reports the
 /// error the tree walk reports, with no walk taking more than `steps(N)`
-/// steps. The tree walk of each chain fails in its leftmost leaf, so it is
-/// cheap at any depth, and is not bounded.
+/// steps, and within [`locate_cost`]. The tree walk of each chain fails in
+/// its leftmost leaf, so it is cheap at any depth, and is not bounded.
 fn assert_chain_located(
     name: &str,
     build: impl Fn(&mut Arena, usize) -> TermId,
@@ -1386,15 +1426,18 @@ fn assert_chain_located(
         tree.tree_walk = true;
         let want = tree.infer(&a, t, NO_LIBS);
         assert!(want.is_err(), "{name} at {n}");
-        assert_eq!(bounded(limit).infer(&a, t, NO_LIBS), want, "{name} at {n}");
+        let mut tc = bounded(limit);
+        assert_eq!(tc.infer(&a, t, NO_LIBS), want, "{name} at {n}");
+        assert_eq!(locate_cost(&tc), Ok(()), "{name} at {n}");
         let expected = expected(n);
         let want = tree.check(&a, t, NO_LIBS, &expected);
         assert!(want.is_err(), "{name} at {n} against {expected}");
         assert_eq!(
-            bounded(limit).check(&a, t, NO_LIBS, &expected),
+            tc.check(&a, t, NO_LIBS, &expected),
             want,
             "{name} at {n} against {expected}"
         );
+        assert_eq!(locate_cost(&tc), Ok(()), "{name} at {n} against {expected}");
     }
 }
 
@@ -1857,8 +1900,11 @@ fn assert_two_helpers_located(leaf: &str, first: &str, second: &str, leaves: [&s
         assert_eq!(e.term_text, leaf, "{e}");
     }
     for t in [small, big] {
-        assert_eq!(bounded(limit).infer(&a, t, NO_LIBS), want_infer);
-        assert_eq!(bounded(limit).check(&a, t, NO_LIBS, &expected), want_check);
+        let mut tc = bounded(limit);
+        assert_eq!(tc.infer(&a, t, NO_LIBS), want_infer);
+        assert_eq!(locate_cost(&tc), Ok(()));
+        assert_eq!(tc.check(&a, t, NO_LIBS, &expected), want_check);
+        assert_eq!(locate_cost(&tc), Ok(()));
     }
 }
 
@@ -2024,6 +2070,75 @@ fn locating_under_a_large_helper_does_not_rewrite_its_type_at_every_use() {
     assert_eq!(got, tree.infer(&a, big, NO_LIBS));
 }
 
+/// Builds a chain of shared subterms at a given depth.
+type Chain = fn(&mut Arena, usize) -> TermId;
+
+#[test]
+fn an_error_goes_back_once_for_each_level_of_a_chain() {
+    // An error goes back to the outermost use being tried, which is then
+    // walked in place. The error is inside that use, so every later use gone
+    // back to is inside it too: one level further down the chain each time.
+    let levels: [(&str, Chain); 15] = [
+        ("s2", |a, n| {
+            chain_under_an_open_helper(a, n, "true", S2_LEAF, None)
+        }),
+        ("s7", |a, n| {
+            let leaf = parse_term(a, "(add ($0 1) 1)");
+            helpers_over_a_lambda_variable_from(a, n, leaf)
+        }),
+        ("s8", |a, n| {
+            chain_under_an_open_helper(a, n, "true", S8_LEAF, Some(S8_FIRST))
+        }),
+        ("g3", |a, n| {
+            chain_under_an_open_helper(a, n, FIX_X, S8_LEAF, Some(S8_FIRST))
+        }),
+        ("g6", |a, n| {
+            chain_under_an_open_helper(a, n, FIX_X, S2_LEAF, None)
+        }),
+        ("g9", chain_fixing_helpers_of_its_own),
+        ("r2", |a, n| {
+            chain_with_conds(a, n, 1, "(lam (pair $1 $0))", deepening, S2_LEAF, None)
+        }),
+        ("m", |a, n| {
+            let helper = "(lam (pair $2 $0))";
+            let (cond, first) = (through_a_parameter, Some("(add $1 1)"));
+            chain_with_conds(a, n, 2, helper, cond, S2_LEAF, first)
+        }),
+        ("partition", |a, n| partition_chain(a, n, true)),
+        ("partition without fixing y", |a, n| {
+            partition_chain(a, n, false)
+        }),
+        ("p2", parts_fixed_under_helpers_of_the_level_above),
+        ("wide10", |a, n| chain_with_wide_conditions(a, n, 10, false)),
+        ("wideshared200", |a, n| {
+            chain_with_wide_conditions(a, n, 200, true)
+        }),
+        ("helpers made over a monomorphic variable", |a, n| {
+            chain_making_helpers_over_mono(a, n, S2_LEAF, "(fst (pair true ($2 1)))")
+        }),
+        ("large helper", |a, n| chain_under_a_large_helper(a, n, 20)),
+    ];
+    // Here the first try fails in the leaf, and the walk in place of the
+    // outermost use fails before it reaches a use whose key is not marked
+    // failed, but one: so twice, however deep the chain.
+    let twice: [(&str, Chain); 2] = [
+        ("fastfail", failing_at_once_in_place),
+        ("closed scopes", |a, n| {
+            chain_making_helpers_over_mono(a, n, S2_LEAF, "(fst (pair true ($0 1)))")
+        }),
+    ];
+    let mut a = Arena::new();
+    for n in [8, CHAIN_DEPTH] {
+        let shapes = levels.iter().map(|&(name, build)| (name, build, n as u64));
+        for (name, build, rollbacks) in shapes.chain(twice.iter().map(|&(m, b)| (m, b, 2))) {
+            let t = build(&mut a, n);
+            let mut tc = TypeChecker::new();
+            assert!(tc.infer(&a, t, NO_LIBS).is_err(), "{name} at {n}");
+            assert_eq!(tc.rollbacks(), rollbacks, "{name} at {n}");
+        }
+    }
+}
+
 #[test]
 fn shared_subterms_with_many_free_variables_agree_with_the_tree() {
     // More free variables than the memo records one by one: the scope is all the
@@ -2124,6 +2239,7 @@ fn reusing_shared_subterms_agrees_with_walking_the_tree() {
             let want = tree.infer(&a, id, NO_LIBS);
             // Errors too: an error is located by walking the tree again.
             prop_assert_eq!(&got, &want, "{}", src);
+            prop_assert_eq!(locate_cost(&memo), Ok(()), "{}", src);
             if let Ok(s) = &want {
                 typed.set(typed.get() + 1);
                 prop_assert!(memo.check(&a, id, NO_LIBS, s).is_ok(), "{}", src);
@@ -2137,9 +2253,81 @@ fn reusing_shared_subterms_agrees_with_walking_the_tree() {
                         src,
                         t
                     );
+                    prop_assert_eq!(locate_cost(&memo), Ok(()), "{} against {}", src, t);
                 }
             } else {
                 untyped.set(untyped.get() + 1);
+            }
+            Ok(())
+        })
+        .unwrap();
+    // Both outcomes must be exercised for the comparison to mean anything.
+    assert!(typed.get() > 400, "only {} well typed", typed.get());
+    assert!(untyped.get() > 400, "only {} ill typed", untyped.get());
+}
+
+/// Random terms under `lam x. let h = (lam (pair x $0)) in ...`, whose
+/// shared subterms use polymorphic helpers whose types have the free variable
+/// `x`, and constrain `x` in different ways, so that whether a shared subterm
+/// is typable depends on what `x` has been found to be.
+fn arb_open_helper_src() -> impl Strategy<Value = String> {
+    let leaf = prop_oneof![
+        (0u32..3).prop_map(|i| format!("${i}")),
+        (-1i64..2).prop_map(|n| n.to_string()),
+        Just("true".to_string()),
+        Just("(fst ($0 1))".to_string()),
+        Just("(snd ($0 true))".to_string()),
+        Just("(add (fst ($0 1)) 1)".to_string()),
+        Just("(if (fst ($0 1)) true true)".to_string()),
+        Just("(add (snd ($0 1)) true)".to_string()),
+        Just("($0 (fst ($0 1)))".to_string()),
+        proptest::sample::select(Prim::ALL).prop_map(|p| p.name().to_string()),
+    ];
+    let body = leaf.prop_recursive(6, 64, 3, |inner| {
+        prop_oneof![
+            2 => inner.clone().prop_map(|b| format!("(lam {b})")),
+            2 => (inner.clone(), inner.clone()).prop_map(|(f, a)| format!("({f} {a})")),
+            3 => (inner.clone(), inner.clone()).prop_map(|(c, t)| format!("(if {c} {t} {t})")),
+            2 => (inner.clone(), inner.clone()).prop_map(|(u, t)| format!("(pair {u} {t})")),
+            2 => inner.clone().prop_map(|t| {
+                format!("(if true {t} (let (lam (pair (fst ($0 0)) $0)) {t}))")
+            }),
+            1 => inner.clone().prop_map(|t| format!("(let (lam (pair $1 $0)) {t})")),
+            1 => (inner.clone(), inner).prop_map(|(x, b)| format!("(let {x} (pair {b} {b}))")),
+        ]
+    });
+    body.prop_map(|b| format!("(lam (let (lam (pair $1 $0)) {b}))"))
+}
+
+#[test]
+fn shared_subterms_under_open_helpers_agree_with_walking_the_tree() {
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(4000));
+    let (typed, untyped) = (std::cell::Cell::new(0u32), std::cell::Cell::new(0u32));
+    runner
+        .run(&arb_open_helper_src(), |src| {
+            let mut a = Arena::new();
+            let id = sexpr::parse(&mut a, &src).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let mut memo = TypeChecker::new();
+            let mut tree = TypeChecker::new();
+            tree.tree_walk = true;
+            let want = tree.infer(&a, id, NO_LIBS);
+            prop_assert_eq!(&memo.infer(&a, id, NO_LIBS), &want, "{}", src);
+            prop_assert_eq!(locate_cost(&memo), Ok(()), "{}", src);
+            if want.is_ok() {
+                typed.set(typed.get() + 1);
+            } else {
+                untyped.set(untyped.get() + 1);
+            }
+            for t in ["Int -> (Int, Bool)", "Bool -> Bool", "a -> a"] {
+                let s = sch(t);
+                prop_assert_eq!(
+                    memo.check(&a, id, NO_LIBS, &s),
+                    tree.check(&a, id, NO_LIBS, &s),
+                    "{} against {}",
+                    src,
+                    t
+                );
+                prop_assert_eq!(locate_cost(&memo), Ok(()), "{} against {}", src, t);
             }
             Ok(())
         })
@@ -2610,6 +2798,16 @@ fn adversarial_shapes(a: &mut Arena) -> Vec<(&'static str, TermId)> {
         ("if nest", if_nest(a, 100_000)),
         ("large scheme uses", large_scheme_uses(a, 20)),
         ("chain rollback", chain_rollback(a, 2_000, 2_000)),
+        (
+            "open scope chain",
+            chain_under_an_open_helper(a, 300, "true", S2_LEAF, None),
+        ),
+        ("partition", partition_chain(a, 24, true)),
+        ("fastfail", failing_at_once_in_place(a, 2_000)),
+        (
+            "closed scope chain",
+            chain_making_helpers_over_mono(a, 2_000, S2_LEAF, "(fst (pair true ($0 1)))"),
+        ),
     ]
 }
 

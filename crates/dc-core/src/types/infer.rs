@@ -40,8 +40,10 @@
 //! An ill-typed term is walked a second time, so that its error is the one
 //! tree-walking HM reports, which names the subterm where the clash happens
 //! (see [`TypeChecker::run`]). That walk reuses shared subterms too, and goes
-//! into one only where its use fails, so its cost is polynomial, not
-//! exponential, in the size of the DAG.
+//! into one only where its use fails. An error goes back to the outermost use
+//! being tried, so the walk goes back at most once for each level of nesting
+//! of shared uses, and costs about as much as the first walk for each time it
+//! goes back and once more. The work budget bounds both walks.
 //!
 //! **Work budget.** Reuse of shared subterms is keyed on the bindings they see,
 //! and a well-typed term can make exponentially many different sets of them, so
@@ -509,8 +511,9 @@ pub struct TypeChecker {
     /// Walks every term as a tree, without reusing shared subterms: the
     /// reference the tests compare the memoised walk with.
     pub(super) tree_walk: bool,
-    /// Tries each use of a shared subterm from a [`Checkpoint`], and walks it
-    /// again in place if that fails (see [`TypeChecker::run`]).
+    /// Tries each use of a shared subterm from a [`Checkpoint`], and on an
+    /// error walks the outermost use being tried again in place (see
+    /// [`TypeChecker::run`]).
     locate: bool,
     /// The uses of shared subterms being tried, innermost last.
     checkpoints: Vec<Checkpoint>,
@@ -538,6 +541,18 @@ pub struct TypeChecker {
     /// Walks of the term the last call started (see [`TypeChecker::run`]).
     #[cfg(test)]
     pub(super) walks: u32,
+    /// Times the second walk of the last call went back to a checkpoint.
+    #[cfg(test)]
+    rollbacks: u64,
+    /// Units of work the first walk of the last call did.
+    #[cfg(test)]
+    first_units: u64,
+    /// Shared subterms the last call found.
+    #[cfg(test)]
+    shared_len: usize,
+    /// Keys the last call marked as failed.
+    #[cfg(test)]
+    failed_len: usize,
 }
 
 /// The work budget of a [`TypeChecker`]; [`DEFAULT_WORK_BUDGET`] unless set.
@@ -704,19 +719,39 @@ impl TypeChecker {
     /// elsewhere in the term.
     ///
     /// The second walk tries each use of a shared subterm as the first does,
-    /// from a [`Checkpoint`]. If the use fails, the checker goes back to the
-    /// checkpoint and walks that subterm in place, as the tree walk would,
-    /// trying the uses of shared subterms inside it in the same way. A use that
-    /// works makes the same unifications, up to renaming of fresh variables, as
-    /// the tree walk of that subterm does, in a different order; unification
-    /// succeeds or fails on the whole set, whatever the order. So the walk takes
-    /// the same unifications as the tree walk, up to the one that fails, and
-    /// reports the same error. An error unwinds to the innermost use being
-    /// tried, so every use is walked in place at most once for each use being
-    /// tried around it. A use whose subterm, inferred afresh for a closed scope,
-    /// fails is walked in place at once from then on, since it fails in every
-    /// state of the store; without that, a chain of shared subterms over a leaf
-    /// that is ill typed on its own takes time exponential in its length.
+    /// from a [`Checkpoint`]. A use that works makes the same unifications, up
+    /// to renaming of fresh variables, as the tree walk of that subterm does,
+    /// in a different order; unification succeeds or fails on the whole set,
+    /// whatever the order. If an error happens while uses are being tried, the
+    /// checker goes back to the checkpoint of the outermost of them and walks
+    /// that subterm in place, as the tree walk would, trying the uses of shared
+    /// subterms inside it in the same way. So the walk takes the same
+    /// unifications as the tree walk, up to the one that fails, and reports the
+    /// same error.
+    ///
+    /// Going back to the outermost use bounds the work. The walk in place
+    /// makes every unification the failed try made, and the rest of the
+    /// subterm's, so it fails too, inside that subterm. So each later error
+    /// goes back to a use inside it, one level of sharing further in: the walk
+    /// goes back at most once for each level of nesting of shared uses, and no
+    /// more often than there are shared subterms. Nothing walked in place is
+    /// undone by a later error. Between two goings back the walk is a walk
+    /// with reuse, like the first, so the second walk costs about as much as
+    /// the first for each time it goes back and once more. Going back to the
+    /// innermost use instead would walk a use in place again under every try
+    /// around it, which doubles the work at each level of a chain such as
+    /// `(if c t t)` nested `n` deep.
+    ///
+    /// A use whose subterm, inferred afresh for a closed scope, failed is
+    /// walked in place at once from then on, since it fails in every state of
+    /// the store. When an error goes back, every use being tried whose key is
+    /// closed and not yet in the memo is one of those. Without that, each level
+    /// of a chain over a leaf that is ill typed on its own would be tried
+    /// afresh again under the level above it.
+    ///
+    /// The second walk can still be large: on a chain `n` deep it goes back
+    /// about `n` times, and one walk with reuse can be large itself. The work
+    /// budget is the bound on both.
     ///
     /// Both walks share the call's work budget. If the first runs out, that is
     /// the error. If only the second does, the first walk's error is returned:
@@ -730,6 +765,11 @@ impl TypeChecker {
         expected: Option<&Scheme>,
     ) -> Result<Ty, TypeError> {
         let result = self.run_walks(arena, libs, term, expected);
+        #[cfg(test)]
+        {
+            self.shared_len = self.shared.len();
+            self.failed_len = self.failed.len();
+        }
         self.release_tables();
         self.release_stacks();
         result
@@ -747,8 +787,13 @@ impl TypeChecker {
         #[cfg(test)]
         {
             self.walks = 0;
+            self.rollbacks = 0;
         }
         let first = self.walk_from_scratch(arena, libs, term, expected);
+        #[cfg(test)]
+        {
+            self.first_units = self.spent;
+        }
         let Err(e) = first else {
             return first;
         };
@@ -1757,21 +1802,8 @@ impl TypeChecker {
                     return Err(self.out_of_work(arena, root));
                 }
                 // Only the second walk of [`TypeChecker::run`] has checkpoints.
-                Err(e) => match self.checkpoints.pop() {
-                    None => return Err(e),
-                    Some(cp) => {
-                        // A use whose key is not in the memo failed while its
-                        // subterm was being inferred afresh.
-                        if let Some(key) = &cp.closed_key {
-                            self.spent += 2;
-                            count_probes(2);
-                            if !self.memo.contains_key(key) {
-                                self.failed.insert(key.clone());
-                            }
-                        }
-                        self.back_to(cp)
-                    }
-                },
+                Err(e) if self.checkpoints.is_empty() => return Err(e),
+                Err(_) => self.unwind(),
             };
         }
     }
@@ -1893,13 +1925,32 @@ impl TypeChecker {
     /// How many keys the last call marked as failed.
     #[cfg(test)]
     pub(super) fn failed_keys(&self) -> usize {
-        self.failed.len()
+        self.failed_len
     }
 
     /// The units of work the last call did.
     #[cfg(test)]
     pub(super) fn spent(&self) -> u64 {
         self.spent
+    }
+
+    /// The times the second walk of the last call went back to a checkpoint.
+    #[cfg(test)]
+    pub(super) fn rollbacks(&self) -> u64 {
+        self.rollbacks
+    }
+
+    /// The shared subterms the last call found.
+    #[cfg(test)]
+    pub(super) fn shared_subterms(&self) -> usize {
+        self.shared_len
+    }
+
+    /// The units of work the first walk of the last call did; the rest of
+    /// [`TypeChecker::spent`] is the second walk's.
+    #[cfg(test)]
+    pub(super) fn first_units(&self) -> u64 {
+        self.first_units
     }
 
     /// Whether no binding in `scope` has a type with free variables: then
@@ -2001,8 +2052,48 @@ impl TypeChecker {
         map.get(&root).copied()
     }
 
-    /// Puts the checker back as it was at `cp`, which has been popped, and walks
-    /// its shared subterm in place.
+    /// Goes back to the outermost use being tried, after an error, and walks
+    /// it in place (see [`TypeChecker::run`]).
+    ///
+    /// Every use being tried is dropped. A use whose key has a closed scope and
+    /// is not in the memo failed while its subterm was being inferred afresh,
+    /// so its key is marked failed. A key goes into the memo before its scope
+    /// is applied and before the type is checked against the position, so a
+    /// use that failed only there is not marked.
+    fn unwind(&mut self) -> Step {
+        let mut open = std::mem::take(&mut self.checkpoints);
+        for cp in &open {
+            if let Some(key) = &cp.closed_key {
+                self.spent += 2;
+                count_probes(2);
+                if !self.memo.contains_key(key) {
+                    self.failed.insert(key.clone());
+                }
+            }
+        }
+        let outer = open.swap_remove(0);
+        // Kept empty, to reuse its allocation.
+        open.clear();
+        self.checkpoints = open;
+        #[cfg(test)]
+        {
+            self.rollbacks += 1;
+            debug_assert!(
+                self.rollbacks <= self.shared.len() as u64,
+                "{} rollbacks with {} shared subterms",
+                self.rollbacks,
+                self.shared.len()
+            );
+        }
+        self.back_to(outer)
+    }
+
+    /// Puts the checker back as it was at `cp`, the outermost checkpoint, which
+    /// has been taken off the stack with all the others, and walks its shared
+    /// subterm in place. Every node made before `cp` and changed since was
+    /// saved on the trail, since every checkpoint after it was made later and
+    /// so starts at a later node; nothing reachable after going back refers to
+    /// a node made since, except kept types copied by [`TypeChecker::freeze`].
     fn back_to(&mut self, cp: Checkpoint) -> Step {
         for (t, n) in self.trail.drain(cp.trail..).rev() {
             #[cfg(test)]
@@ -2024,10 +2115,12 @@ impl TypeChecker {
             self.memo.remove(&key);
         }
         self.level = cp.level;
-        if self.checkpoints.is_empty() {
-            self.trail.clear();
-            self.memo_log.clear();
-        }
+        debug_assert!(
+            self.checkpoints.is_empty(),
+            "only the outermost is gone back to"
+        );
+        self.trail.clear();
+        self.memo_log.clear();
         Step::InPlace(cp.id, cp.want)
     }
 
