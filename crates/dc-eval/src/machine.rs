@@ -48,13 +48,44 @@ impl Outcome {
     }
 }
 
-impl fmt::Display for Outcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Outcome {
+    /// Formats the outcome with its value bounded as by
+    /// [`Value::display_within`]: at most `limit` values and tree nodes, and
+    /// each part beyond them as `...`. Use this to print or log outcomes.
+    pub fn display_within(&self, limit: u64) -> OutcomeWithin<'_> {
+        OutcomeWithin {
+            outcome: self,
+            limit,
+        }
+    }
+
+    fn write(&self, limit: u64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Outcome::Value(v, s) => write!(f, "Value({v}, {s})"),
+            Outcome::Value(v, s) => write!(f, "Value({}, {s})", v.display_within(limit)),
             Outcome::Error(k, s) => write!(f, "Error({k:?}, {s})"),
             Outcome::Timeout(s) => write!(f, "Timeout({s})"),
         }
+    }
+}
+
+/// Writes the whole value, as `Display` for [`Value`] does; see
+/// [`Outcome::display_within`] for a bounded form.
+impl fmt::Display for Outcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write(u64::MAX, f)
+    }
+}
+
+/// An outcome formatted with a bound; see [`Outcome::display_within`].
+#[derive(Clone, Copy, Debug)]
+pub struct OutcomeWithin<'a> {
+    outcome: &'a Outcome,
+    limit: u64,
+}
+
+impl fmt::Display for OutcomeWithin<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.outcome.write(self.limit, f)
     }
 }
 
@@ -475,7 +506,7 @@ impl<'a> Machine<'a> {
             (Prim::Eq, [a, b]) => {
                 // Comparing more pairs than the fuel left can only time out, so the
                 // comparison stops one pair above it.
-                let (result, nodes) = structural_eq(a, b, self.fuel_left());
+                let (result, nodes) = structural_eq(a, b, self.fuel_left(), None);
                 self.charge(cost::eq(nodes))?;
                 match result {
                     EqResult::Data(same) => ret(V::Bool(same)),

@@ -40,10 +40,14 @@
 //!    core term will nest: each node is one level, and a list, tuple, argument
 //!    list or parameter list adds a level per element, since each becomes one
 //!    more nested application, lambda or `let` in core.
+//!
+//! From level [`HANDOFF_DEPTH`] of the first measure down, parsing goes on on a
+//! thread of its own (see [`crate::stack`]).
 
 use crate::ast::{Arm, BinOp, Ctor, Def, Expr, ExprKind, LetLhs, Pat, PatKind};
 use crate::error::{ErrorKind, Source, Span, SurfaceError};
 use crate::lexer::{lex, Tok, Token};
+use crate::stack::{on_deep_stack, HANDOFF_DEPTH};
 use crate::MAX_DEPTH;
 
 type PResult<T> = Result<T, SurfaceError>;
@@ -352,13 +356,18 @@ impl<'s> Parser<'s> {
         Ok(params)
     }
 
-    /// Runs `f` one nesting level deeper, or fails past [`MAX_DEPTH`].
-    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+    /// Runs `f` one nesting level deeper, or fails past [`MAX_DEPTH`]. The level
+    /// [`HANDOFF_DEPTH`] runs on a thread of its own.
+    fn nested<T: Send>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T> + Send) -> PResult<T> {
         if self.depth >= MAX_DEPTH {
             return Err(too_deep(self.src, self.span()));
         }
         self.depth += 1;
-        let r = f(self);
+        let r = if self.depth == HANDOFF_DEPTH {
+            on_deep_stack("dc-parse", || f(self))
+        } else {
+            f(self)
+        };
         self.depth -= 1;
         r
     }

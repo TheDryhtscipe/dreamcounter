@@ -9,6 +9,13 @@ use rustc_hash::FxHashMap;
 
 use crate::prim::Prim;
 
+#[cfg(test)]
+thread_local! {
+    /// Calls of [`Arena::get`] on this thread: the tests compare it with the
+    /// work a pass over terms is charged for.
+    pub(crate) static GETS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Index of a term in an [`Arena`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TermId(u32);
@@ -93,6 +100,8 @@ impl Arena {
     ///
     /// Panics if `id` is not in this arena.
     pub fn get(&self, id: TermId) -> Term {
+        #[cfg(test)]
+        GETS.with(|g| g.set(g.get() + 1));
         self.nodes[id.index()]
     }
 

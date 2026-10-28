@@ -1544,3 +1544,887 @@ proptest! {
         }
     }
 }
+
+/// A well-typed closed term of type `Int` whose shared subterms see exponentially
+/// many different scopes: `t_0 = (let (pair $0 (pair $1 ... unit)) 0)` uses all
+/// `n` bindings, and `t_{k+1} = (let (pair (let (lam $0) t_k) (let (lam (lam $1))
+/// t_k)) 0)`. Each path to `t_0` binds every variable to one of two closed
+/// polymorphic helpers of different types, so `t_k` is inferred for up to
+/// `2^(n-k)` scopes. Returns `t_n`.
+fn helper_choices(a: &mut Arena, n: usize) -> TermId {
+    let mut pairs = String::from("unit");
+    for i in (0..n).rev() {
+        pairs = format!("(pair ${i} {pairs})");
+    }
+    let mut t = parse_term(a, &format!("(let {pairs} 0)"));
+    let pair = a.prim(Prim::Pair);
+    let id = parse_term(a, "(lam $0)");
+    let konst = parse_term(a, "(lam (lam $1))");
+    let zero = a.int(0);
+    for _ in 0..n {
+        let l = a.let_(id, t);
+        let r = a.let_(konst, t);
+        let p = a.apps(pair, &[l, r]);
+        t = a.let_(p, zero);
+    }
+    t
+}
+
+fn too_much_work(limit: u64) -> TypeErrorKind {
+    TypeErrorKind::TooMuchWork { limit }
+}
+
+#[test]
+fn exponential_work_is_refused_quickly() {
+    // 151 distinct nodes. Without a budget this takes about 8 s in a release
+    // build and minutes in a debug one; the default budget stops it in about
+    // 0.2 s in a release build (debug builds are about 18 times slower).
+    let mut a = Arena::new();
+    let t = helper_choices(&mut a, 18);
+    let start = std::time::Instant::now();
+    let e = infer(&a, t, NO_LIBS).unwrap_err();
+    let elapsed = start.elapsed();
+    assert_eq!(*e.kind, too_much_work(DEFAULT_WORK_BUDGET), "{e}");
+    assert!(e.to_string().contains("units of work"), "{e}");
+    let limit = if cfg!(debug_assertions) { 15 } else { 1 };
+    assert!(
+        elapsed < std::time::Duration::from_secs(limit),
+        "{elapsed:?}"
+    );
+}
+
+#[test]
+fn default_budget_admits_normal_programs() {
+    let mut a = Arena::new();
+    // Two to the eight scopes for the innermost shared subterm: real work, far
+    // below the budget.
+    let t = helper_choices(&mut a, 8);
+    let mut tc = TypeChecker::new();
+    assert_eq!(tc.work_budget(), DEFAULT_WORK_BUDGET);
+    assert_eq!(tc.infer(&a, t, NO_LIBS), Ok(sch("Int")));
+    assert_eq!(tc.check(&a, t, NO_LIBS, &sch("Int")), Ok(()));
+    let src = "(lam (foldl (lam (lam (add $1 (length (array_to_list (array_of_list $0)))))) \
+               0 $0))";
+    assert_infers(src, "List (List a) -> Int");
+}
+
+#[test]
+fn a_smaller_budget_refuses_what_the_default_admits() {
+    let mut a = Arena::new();
+    let t = helper_choices(&mut a, 8);
+    assert_eq!(infer(&a, t, NO_LIBS), Ok(sch("Int")));
+    let mut tc = TypeChecker::with_work_budget(1_000);
+    assert_eq!(tc.work_budget(), 1_000);
+    let e = tc.infer(&a, t, NO_LIBS).unwrap_err();
+    assert_eq!(*e.kind, too_much_work(1_000), "{e}");
+    let e = tc.check(&a, t, NO_LIBS, &sch("Int")).unwrap_err();
+    assert_eq!(*e.kind, too_much_work(1_000), "{e}");
+    // A small term fits in the small budget, and the budget applies per call.
+    let one = parse_term(&mut a, "(add 1 2)");
+    assert_eq!(tc.infer(&a, one, NO_LIBS), Ok(sch("Int")));
+    assert_eq!(tc.infer(&a, one, NO_LIBS), Ok(sch("Int")));
+    // Raising the budget again admits the term on the same checker.
+    tc.set_work_budget(DEFAULT_WORK_BUDGET);
+    assert_eq!(tc.infer(&a, t, NO_LIBS), Ok(sch("Int")));
+}
+
+/// `(pair p_1 (pair p_2 ... (pair p_l unit)))` where `p_0 = 0` and `p_i = (p_{i-1}
+/// 0)`: every prefix of the longest application spine is also a child elsewhere,
+/// so the spines of the distinct nodes have about `l^2 / 2` children in all.
+fn spine_prefixes(a: &mut Arena, l: usize) -> TermId {
+    let zero = a.int(0);
+    let mut prefixes = Vec::with_capacity(l);
+    let mut p = zero;
+    for _ in 0..l {
+        p = a.app(p, zero);
+        prefixes.push(p);
+    }
+    let pair = a.prim(Prim::Pair);
+    let mut t = a.unit();
+    for &q in prefixes.iter().rev() {
+        t = a.apps(pair, &[q, t]);
+    }
+    t
+}
+
+#[test]
+fn finding_shared_subterms_is_charged_to_the_budget() {
+    // Children of all the spines: about 125 000, against a budget of 10 000. The
+    // search for shared subterms runs before the first step of the term walk, so
+    // it must refuse the term itself: the walk would stop at its sixth step.
+    let mut a = Arena::new();
+    let t = spine_prefixes(&mut a, 500);
+    let mut tc = TypeChecker::with_work_budget(10_000);
+    tc.step_limit = Some(5);
+    let e = tc.infer(&a, t, NO_LIBS).unwrap_err();
+    assert_eq!(*e.kind, too_much_work(10_000), "{e}");
+    // With enough budget the term is checked, and the search is paid for.
+    let mut tc = TypeChecker::new();
+    assert!(
+        tc.infer(&a, t, NO_LIBS).is_err(),
+        "applying an Int is an error"
+    );
+    assert!(tc.spent() >= 500 * 499 / 2, "{}", tc.spent());
+}
+
+/// `d` lets of `(lam $0)` around `c_u`, where `c_0 = 0` and `c_{k+1} = (let (pair
+/// s c_k) 0)`. `s = (pair $0 (pair $1 ... (pair $65 $(d-1))))` has more than
+/// [`MAX_FREE_VARS`] free variables, so its scope has a slot for each of the `d`
+/// bindings, and it is used `u` times.
+fn wide_scope_uses(a: &mut Arena, d: u32, u: usize) -> TermId {
+    let pair = a.prim(Prim::Pair);
+    let id = parse_term(a, "(lam $0)");
+    let mut s = a.var(d - 1);
+    for i in (0..66u32).rev() {
+        let v = a.var(i);
+        s = a.apps(pair, &[v, s]);
+    }
+    let zero = a.int(0);
+    let mut c = zero;
+    for _ in 0..u {
+        let p = a.apps(pair, &[s, c]);
+        c = a.let_(p, zero);
+    }
+    let mut t = c;
+    for _ in 0..d {
+        t = a.let_(id, t);
+    }
+    t
+}
+
+#[test]
+fn each_use_of_a_shared_subterm_pays_for_its_scope() {
+    // Each use builds, hashes and compares a key of 20 000 slots. Without
+    // charging for that, the call spends about 470 000 units, under 20 000 a use.
+    let (d, u) = (20_000, 50);
+    let mut a = Arena::new();
+    let t = wide_scope_uses(&mut a, d, u);
+    let mut tc = TypeChecker::new();
+    assert_eq!(tc.infer(&a, t, NO_LIBS), Ok(sch("Int")));
+    assert!(tc.spent() >= u64::from(d) * u as u64, "{}", tc.spent());
+}
+
+#[test]
+fn running_out_while_locating_returns_the_first_error() {
+    // The first walk reports the clash at the whole shared subterm; the second
+    // walk names `$0`. The smallest budget that does not refuse the term is one
+    // the first walk fits in and the second does not, so it gives the first
+    // walk's error.
+    let mut a = Arena::new();
+    let t = parse_term(&mut a, "(lam (if $0 (add $0 1) (add $0 1)))");
+    let located = TypeChecker::new().infer(&a, t, NO_LIBS).unwrap_err();
+    assert_eq!(located.term_text, "$0", "{located}");
+    let result = |budget: u64| TypeChecker::with_work_budget(budget).infer(&a, t, NO_LIBS);
+    let (mut lo, mut hi) = (1u64, 1_000_000u64);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match result(mid) {
+            Err(e) if *e.kind == too_much_work(mid) => lo = mid + 1,
+            _ => hi = mid,
+        }
+    }
+    let first = result(lo).unwrap_err();
+    assert_eq!(first.term_text, "(add $0 1)", "{first}");
+    assert!(first.context.contains("shared subterm"), "{first}");
+}
+
+/// Reads of the term arena, the type store and schemes, table slots visited
+/// and hash-table probes on this thread so far.
+fn reads() -> u64 {
+    crate::term::GETS.with(std::cell::Cell::get)
+        + super::infer::STORE_READS.with(std::cell::Cell::get)
+        + super::infer::SCHEME_READS.with(std::cell::Cell::get)
+        + super::infer::TABLE_SLOTS.with(std::cell::Cell::get)
+        + super::infer::PROBES.with(std::cell::Cell::get)
+}
+
+/// Infers `t` with `tc` against [`adversarial_libs`] and returns the reads it
+/// took and the units it was charged.
+fn reads_and_units(tc: &mut TypeChecker, a: &Arena, t: TermId) -> (u64, u64) {
+    let before = reads();
+    let _ = tc.infer(a, t, &adversarial_libs());
+    (reads() - before, tc.spent())
+}
+
+/// Checks `t` with `tc` against `expected` and returns the reads it took and
+/// the units it was charged.
+fn check_reads_and_units(
+    tc: &mut TypeChecker,
+    a: &Arena,
+    t: TermId,
+    expected: &Scheme,
+) -> (u64, u64) {
+    let libs = adversarial_libs();
+    let before = reads();
+    let _ = tc.check(a, t, &libs, expected);
+    (reads() - before, tc.spent())
+}
+
+/// A balanced tree of pairs over the variables `lo..hi`.
+fn pair_tree(lo: u32, hi: u32) -> Type {
+    if hi - lo == 1 {
+        Type::Var(TyVar(lo))
+    } else {
+        let mid = lo + (hi - lo) / 2;
+        Type::pair(pair_tree(lo, mid), pair_tree(mid, hi))
+    }
+}
+
+/// The number of variables of [`large_key_scheme`]: its type has `2v - 1`
+/// nodes, under [`MAX_TYPE_NODES`].
+const LARGE_SCHEME_VARS: u32 = 4_096;
+
+/// A scheme of [`LARGE_SCHEME_VARS`] variables, each with a `Key` constraint,
+/// in a balanced tree of pairs.
+fn large_key_scheme() -> Scheme {
+    let keys: Vec<TyVar> = (0..LARGE_SCHEME_VARS).map(TyVar).collect();
+    Scheme::with_keys(pair_tree(0, LARGE_SCHEME_VARS), &keys)
+}
+
+/// The library the adversarial shapes may use: `lib0` has
+/// [`large_key_scheme`].
+fn adversarial_libs() -> Vec<Scheme> {
+    vec![large_key_scheme()]
+}
+
+/// `c_n`, where `c_0 = unit` and `c_{k+1} = (snd (pair lib0 c_k))`: `n` uses of
+/// a library with a large scheme. Type `Unit`.
+fn large_scheme_uses(a: &mut Arena, n: usize) -> TermId {
+    let lib = a.lib(LibId(0));
+    let pair = a.prim(Prim::Pair);
+    let snd = a.prim(Prim::Snd);
+    let mut c = a.unit();
+    for _ in 0..n {
+        let p = a.apps(pair, &[lib, c]);
+        c = a.app(snd, p);
+    }
+    c
+}
+
+/// `((lam ($0 0 ... 0)) k)` with `l` arguments, where `k = (lam (lam ... 0))` is
+/// `l` deep: the head of the spine has a variable type, so each argument
+/// unifies it with an arrow. Type `Int`.
+fn variable_head_spine(a: &mut Arena, l: usize) -> TermId {
+    let zero = a.int(0);
+    let v = a.var(0);
+    let body = a.apps(v, &vec![zero; l]);
+    let f = a.lam(body);
+    let mut k = zero;
+    for _ in 0..l {
+        k = a.lam(k);
+    }
+    a.app(f, k)
+}
+
+/// `c_m`, where `c_0 = 0` and `c_{k+1} = (h c_k)` with `h = (lam (i i ... i))`, `l`
+/// arguments, and `i = (lam $0)`: a head whose text has a long spine, applied
+/// `m` times.
+fn long_head_chain(a: &mut Arena, l: usize, m: usize) -> TermId {
+    let i = parse_term(a, "(lam $0)");
+    let body = a.apps(i, &vec![i; l]);
+    let h = a.lam(body);
+    let mut c = a.int(0);
+    for _ in 0..m {
+        c = a.app(h, c);
+    }
+    c
+}
+
+/// `c_d`, where `c_0 = (0 unit ... unit)` with `l` arguments and `c_{k+1} = (if
+/// true c_k c_k)`: ill typed at the bottom of `d` levels of sharing.
+fn shared_bad_spine(a: &mut Arena, l: usize, d: usize) -> TermId {
+    let zero = a.int(0);
+    let unit = a.unit();
+    let mut c = a.apps(zero, &vec![unit; l]);
+    let t = a.bool(true);
+    for _ in 0..d {
+        c = a.if_(t, c, c);
+    }
+    c
+}
+
+/// `c_d`, where `c_0 = 0` and `c_{k+1} = (if true c_k c_k)`.
+fn if_nest(a: &mut Arena, d: usize) -> TermId {
+    let mut c = a.int(0);
+    let t = a.bool(true);
+    for _ in 0..d {
+        c = a.if_(t, c, c);
+    }
+    c
+}
+
+/// `(lam c_d)`, where `c_0 = (add $0 1)` and `c_{k+1} = (if true c_k c_k)`:
+/// each shared subterm has a free variable.
+fn open_if_nest(a: &mut Arena, d: usize) -> TermId {
+    let add = a.prim(Prim::Add);
+    let (v0, one, t) = (a.var(0), a.int(1), a.bool(true));
+    let mut c = a.apps(add, &[v0, one]);
+    for _ in 0..d {
+        c = a.if_(t, c, c);
+    }
+    a.lam(c)
+}
+
+/// `c_{n-1}`, where `c_0 = 0` and `c_i = (if true c_{i-1} c_r)` for an `r < i`
+/// drawn from a fixed pseudo-random sequence: a DAG whose shared nodes are
+/// reached in no particular order.
+fn random_if_dag(a: &mut Arena, n: usize) -> TermId {
+    let t = a.bool(true);
+    let mut cs = vec![a.int(0)];
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for i in 1..n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let r = (x % i as u64) as usize;
+        let c = a.if_(t, cs[i - 1], cs[r]);
+        cs.push(c);
+    }
+    cs[n - 1]
+}
+
+/// Under `n` lambdas, `(if (eq $0 $1) (if (eq $1 $2) ... (if $(n-1) c_d 0) ...
+/// 0) 0)`, where `c_0 = (add $0 1)` and `c_{k+1} = (if true c_k c_k)`: the
+/// conditions link the variables of the lambdas in a chain, the last fixes
+/// them to `Bool`, and `c_d` is ill typed at the bottom of `d` levels of
+/// sharing, so the second walk goes back over the chain at each level.
+fn chain_rollback(a: &mut Arena, n: u32, d: usize) -> TermId {
+    let add = a.prim(Prim::Add);
+    let eq = a.prim(Prim::Eq);
+    let (zero, one, t) = (a.int(0), a.int(1), a.bool(true));
+    let v0 = a.var(0);
+    let mut c = a.apps(add, &[v0, one]);
+    for _ in 0..d {
+        c = a.if_(t, c, c);
+    }
+    let last = a.var(n - 1);
+    let mut body = a.if_(last, c, zero);
+    for i in (0..n - 1).rev() {
+        let (x, y) = (a.var(i), a.var(i + 1));
+        let cond = a.apps(eq, &[x, y]);
+        body = a.if_(cond, body, zero);
+    }
+    for _ in 0..n {
+        body = a.lam(body);
+    }
+    body
+}
+
+/// The most reads of the arena and the store a unit of work may stand for.
+const READS_PER_UNIT: u64 = 4;
+
+/// The most units a call may spend past twice a small budget. The step that
+/// runs past the budget is paid in full: a unification can visit every node of
+/// the store, which is no larger than the units spent so far, and an error can
+/// write out a few types of at most [`MAX_TYPE_NODES`] nodes.
+const OVERRUN: u64 = 4 * MAX_TYPE_NODES as u64 + 1_000;
+
+/// Terms whose checking once did work that was not charged to the budget.
+fn adversarial_shapes(a: &mut Arena) -> Vec<(&'static str, TermId)> {
+    vec![
+        ("variable head spine", variable_head_spine(a, 2_000)),
+        ("long head chain", long_head_chain(a, 2_000, 2_000)),
+        ("shared bad spine", shared_bad_spine(a, 20_000, 100)),
+        ("spine prefixes", spine_prefixes(a, 2_000)),
+        ("wide scope uses", wide_scope_uses(a, 2_000, 20)),
+        ("helper choices", helper_choices(a, 10)),
+        ("if nest", if_nest(a, 100_000)),
+        ("large scheme uses", large_scheme_uses(a, 20)),
+        ("chain rollback", chain_rollback(a, 2_000, 2_000)),
+    ]
+}
+
+#[test]
+fn every_read_of_the_term_or_the_store_is_charged() {
+    // A judge for passes the budget does not see: each unit charged must
+    // stand for a bounded number of reads of the term arena and the type
+    // store, whatever the term.
+    let mut a = Arena::new();
+    let shapes = adversarial_shapes(&mut a);
+    let normal = parse_term(
+        &mut a,
+        "(lam (foldl (lam (lam (add $1 (length (array_to_list (array_of_list $0)))))) 0 $0))",
+    );
+    for (name, t) in shapes.into_iter().chain([("normal", normal)]) {
+        let mut tc = TypeChecker::new();
+        let (reads, units) = reads_and_units(&mut tc, &a, t);
+        assert!(
+            reads <= READS_PER_UNIT * units + 1_000,
+            "{name}: {reads} reads for {units} units"
+        );
+    }
+}
+
+#[test]
+fn a_small_budget_bounds_the_work_on_any_term() {
+    // The work of a call that runs out is bounded by its budget, not by the
+    // size of the term: the search for shared subterms, the collection of a
+    // spine and the error text all stop.
+    let budget = 1_000;
+    let mut a = Arena::new();
+    let mut shapes = adversarial_shapes(&mut a);
+    let zero = a.int(0);
+    shapes.push(("long spine", a.apps(zero, &vec![zero; 100_000])));
+    // The tree walk skips the search, so it shows the term walk's own checks.
+    for tree_walk in [false, true] {
+        for &(name, t) in &shapes {
+            let mut tc = TypeChecker::with_work_budget(budget);
+            tc.tree_walk = tree_walk;
+            let (reads, units) = reads_and_units(&mut tc, &a, t);
+            assert!(
+                units <= 2 * budget + OVERRUN,
+                "{name} (tree walk {tree_walk}): {units} units against a budget of {budget}"
+            );
+            assert!(
+                reads <= READS_PER_UNIT * units + 1_000,
+                "{name} (tree walk {tree_walk}): {reads} reads for {units} units"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_search_and_free_variables_are_charged_at_any_budget() {
+    // The search for shared subterms and the finding of the free variables of
+    // a shared subterm each probe hash tables a few times per node. A budget
+    // that stops the call soon after them leaves their reads to be paid by
+    // their own units, not by those of the term walk after them. Both stop
+    // between nodes, so the reads and units a larger budget adds are those of
+    // the passes it reaches, and each pass must pay for its own reads. Table
+    // and stack slots freed at the end are left out of what is added: a table
+    // doubles at once, and is paid for by all the units that filled it.
+    let slots = || super::infer::TABLE_SLOTS.with(std::cell::Cell::get);
+    let mut a = Arena::new();
+    let shapes = [
+        ("if nest", if_nest(&mut a, 20_000)),
+        ("open if nest", open_if_nest(&mut a, 20_000)),
+        ("random if DAG", random_if_dag(&mut a, 20_000)),
+    ];
+    for (name, t) in shapes {
+        let mut tc = TypeChecker::new();
+        let _ = reads_and_units(&mut tc, &a, t);
+        let full = tc.spent();
+        let mut last = (0, 0);
+        for i in 1..=60 {
+            let budget = full * i / 60;
+            let mut tc = TypeChecker::with_work_budget(budget);
+            let before = slots();
+            let (reads, units) = reads_and_units(&mut tc, &a, t);
+            assert!(
+                reads <= READS_PER_UNIT * units + 1_000,
+                "{name}, budget {budget}: {reads} reads for {units} units"
+            );
+            let reads = reads - (slots() - before);
+            let (more_reads, more_units) = (reads.saturating_sub(last.0), units - last.1);
+            assert!(
+                more_reads <= READS_PER_UNIT * more_units + 1_000,
+                "{name}, budget {budget}: {more_reads} more reads for {more_units} more units"
+            );
+            last = (reads, units);
+        }
+    }
+}
+
+#[test]
+fn each_hash_table_probe_is_charged() {
+    // Hash-table probes miss the cache on large terms, so they cost more than
+    // the other reads and the time of a unit follows them. Within the slack of
+    // READS_PER_UNIT a pass could probe several times per unit unseen; this
+    // holds probes alone to one per unit.
+    let probes = || super::infer::PROBES.with(std::cell::Cell::get);
+    let mut a = Arena::new();
+    let mut shapes = adversarial_shapes(&mut a);
+    shapes.push(("open if nest", open_if_nest(&mut a, 20_000)));
+    shapes.push(("random if DAG", random_if_dag(&mut a, 20_000)));
+    for (name, t) in shapes {
+        let mut tc = TypeChecker::new();
+        let before = probes();
+        let _ = reads_and_units(&mut tc, &a, t);
+        let (probed, units) = (probes() - before, tc.spent());
+        assert!(
+            probed <= units + 1_000,
+            "{name}: {probed} probes for {units} units"
+        );
+    }
+}
+
+#[test]
+fn checking_against_a_large_key_scheme_is_charged() {
+    // Each variable of the expected type and of a library's scheme is made
+    // once per walk or use, and whether it has a `Key` constraint is looked
+    // up: the lookup must cost a bounded number of reads per unit charged,
+    // whatever the number of keys.
+    let mut a = Arena::new();
+    let t = a.lib(LibId(0));
+    let expected = large_key_scheme();
+    for budget in [1_000, DEFAULT_WORK_BUDGET] {
+        let mut tc = TypeChecker::with_work_budget(budget);
+        let (reads, units) = check_reads_and_units(&mut tc, &a, t, &expected);
+        assert!(
+            reads <= READS_PER_UNIT * units + 1_000,
+            "budget {budget}: {reads} reads for {units} units"
+        );
+        assert!(
+            units <= 2 * budget + OVERRUN,
+            "{units} units against a budget of {budget}"
+        );
+    }
+    let libs = adversarial_libs();
+    assert_eq!(TypeChecker::new().check(&a, t, &libs, &expected), Ok(()));
+}
+
+/// A balanced tree of `n` pairs of `Int`, whose last leaf is `last`.
+fn closed_pair_tree(n: u32, last: &Type) -> Type {
+    fn go(lo: u32, hi: u32, n: u32, last: &Type) -> Type {
+        if hi - lo == 1 {
+            if hi == n {
+                last.clone()
+            } else {
+                Type::Int
+            }
+        } else {
+            let mid = lo + (hi - lo) / 2;
+            Type::pair(go(lo, mid, n, last), go(mid, hi, n, last))
+        }
+    }
+    go(0, n, n, last)
+}
+
+#[test]
+fn a_step_that_errors_past_the_budget_reports_too_much_work() {
+    // The unification of the branches of the `if` is one step that visits
+    // both large types and fails at their last leaves. Under a budget it runs
+    // past, the call is out of work, not ill typed.
+    let libs = vec![
+        Scheme::new(closed_pair_tree(4_096, &Type::Int)),
+        Scheme::new(closed_pair_tree(4_096, &Type::Bool)),
+    ];
+    let mut a = Arena::new();
+    let t = parse_term(&mut a, "(if true lib_0 lib_1)");
+    let mut tc = TypeChecker::new();
+    let e = tc.infer(&a, t, &libs).unwrap_err();
+    assert!(!matches!(*e.kind, TypeErrorKind::TooMuchWork { .. }), "{e}");
+    let full = tc.spent();
+    let mut past = 0;
+    for budget in (1..full).step_by(101) {
+        let mut tc = TypeChecker::with_work_budget(budget);
+        let e = tc.infer(&a, t, &libs).unwrap_err();
+        if tc.spent() > budget {
+            past += 1;
+            assert_eq!(*e.kind, too_much_work(budget), "budget {budget}");
+        }
+    }
+    assert!(past > 0);
+}
+
+/// `c_k`, where `c_0 = base` and `c_{j+1} = (let c_j (pair $0 $0))`: a term
+/// whose type is a pair tree `k` deep with one store node per level.
+fn doubling(a: &mut Arena, base: TermId, k: usize) -> TermId {
+    let body = parse_term(a, "(pair $0 $0)");
+    let mut c = base;
+    for _ in 0..k {
+        c = a.let_(c, body);
+    }
+    c
+}
+
+/// A balanced tree of pairs `k` deep whose `2^k` leaves are `leaf(i)`.
+fn distinct_tree(a: &mut Arena, k: u32, leaf: &mut dyn FnMut(&mut Arena, i64) -> TermId) -> TermId {
+    fn go(
+        a: &mut Arena,
+        lo: i64,
+        hi: i64,
+        leaf: &mut dyn FnMut(&mut Arena, i64) -> TermId,
+    ) -> TermId {
+        if hi - lo == 1 {
+            leaf(a, lo)
+        } else {
+            let mid = lo + (hi - lo) / 2;
+            let l = go(a, lo, mid, leaf);
+            let r = go(a, mid, hi, leaf);
+            let pair = a.prim(Prim::Pair);
+            a.apps(pair, &[l, r])
+        }
+    }
+    go(a, 0, 1 << k, leaf)
+}
+
+/// `(if true A B)` where `A` is a tree `k` deep of distinct nodes whose leaves
+/// are distinct doublings `k` deep, and `B` is `k` doublings of a tree `k`
+/// deep of distinct nodes. Both types are the full pair tree `2k` deep over
+/// `Int`, but the sharing differs: below depth `k`, each of `A`'s `2^k` chains
+/// meets every node of `B`'s tree, so unifying them visits `4^k` pairs of
+/// store nodes, from types of about `k 2^k` nodes each. The `if` is bound by a
+/// `let` whose body is `0`, as its type is too large to write out. Type `Int`.
+fn crossed_sharing(a: &mut Arena, k: u32) -> TermId {
+    let zero = a.int(0);
+    crossed_sharing_then(a, k, zero)
+}
+
+/// [`crossed_sharing`] with `body` in place of `0` under the `let`.
+fn crossed_sharing_then(a: &mut Arena, k: u32, body: TermId) -> TermId {
+    let depth = k as usize;
+    let left = distinct_tree(a, k, &mut |a, i| {
+        let base = a.int(i);
+        doubling(a, base, depth)
+    });
+    let tree = distinct_tree(a, k, &mut |a, i| a.int(i));
+    let right = doubling(a, tree, depth);
+    let t = a.bool(true);
+    let both = a.if_(t, left, right);
+    a.let_(both, body)
+}
+
+/// `(cons 1 (cons 1 ... nil))`, `m` deep: `m` small unifications of lists.
+fn cons_chain(a: &mut Arena, m: usize) -> TermId {
+    let cons = a.prim(Prim::Cons);
+    let one = a.int(1);
+    let mut c = a.prim(Prim::Nil);
+    for _ in 0..m {
+        c = a.apps(cons, &[one, c]);
+    }
+    c
+}
+
+#[test]
+fn a_large_unification_does_not_slow_later_ones() {
+    // Emptying a hash table costs time in its capacity, which a large
+    // unification raises. The unifications after it, in the same call or the
+    // next call on the same checker, must not pay for that each time.
+    let mut a = Arena::new();
+    let chain = cons_chain(&mut a, 20_000);
+    let t = crossed_sharing_then(&mut a, 9, chain);
+    let mut tc = TypeChecker::new();
+    let (reads, units) = reads_and_units(&mut tc, &a, t);
+    assert!(
+        reads <= READS_PER_UNIT * units + 1_000,
+        "in one call: {reads} reads for {units} units"
+    );
+    let (reads, units) = reads_and_units(&mut tc, &a, chain);
+    assert!(
+        reads <= READS_PER_UNIT * units + 1_000,
+        "in the next call: {reads} reads for {units} units"
+    );
+}
+
+/// `(cons (pair x_1 x_1) (cons ... nil))` with `x_i = (cons i nil)`: `n`
+/// distinct shared subterms, which fill the checker's per-walk tables.
+fn many_shared(a: &mut Arena, n: usize) -> TermId {
+    let (cons, pair, nil) = (a.prim(Prim::Cons), a.prim(Prim::Pair), a.prim(Prim::Nil));
+    let mut t = nil;
+    for i in 0..n {
+        let k = a.int(i as i64);
+        let x = a.apps(cons, &[k, nil]);
+        let p = a.apps(pair, &[x, x]);
+        t = a.apps(cons, &[p, t]);
+    }
+    t
+}
+
+/// `(let (lam (pair $0 (pair $0 ... (pair $0 $0)))) 0)` with `k` pairs: a
+/// polymorphic binding whose type has `k` different subtrees, each of which
+/// the checker gives a [`Canon`](super::infer) id.
+fn deep_polymorphic_let(a: &mut Arena, k: usize) -> TermId {
+    let pair = a.prim(Prim::Pair);
+    let v0 = a.var(0);
+    let mut t = v0;
+    for _ in 0..k {
+        t = a.apps(pair, &[v0, t]);
+    }
+    let f = a.lam(t);
+    let zero = a.int(0);
+    a.let_(f, zero)
+}
+
+#[test]
+fn a_large_call_does_not_slow_later_calls() {
+    // A call fills the tables that the next call empties. Clearing a full
+    // table costs time in its capacity, and so does freeing a large empty
+    // one, so the small calls after a large one must not inherit its tables.
+    // Each large call fills a different table: the memo and the shared
+    // subterms, the ids of the types of polymorphic bindings, and the keys
+    // whose fresh inference failed. A call that runs out deep in the walk
+    // leaves its stacks full instead: the pending shared subterms, the frames
+    // and the bindings, whose elements the next call would drop.
+    let mut a = Arena::new();
+    let bigs = [
+        (
+            "many shared",
+            many_shared(&mut a, 20_000),
+            DEFAULT_WORK_BUDGET,
+        ),
+        (
+            "deep polymorphic let",
+            deep_polymorphic_let(&mut a, 1_000),
+            DEFAULT_WORK_BUDGET,
+        ),
+        (
+            "failed keys",
+            ill_typed_leaf_chain(&mut a, 1_000, false),
+            DEFAULT_WORK_BUDGET,
+        ),
+        (
+            "deep open if nest",
+            open_if_nest(&mut a, 100_000),
+            1_000_000,
+        ),
+    ];
+    let (add, one, two) = (a.prim(Prim::Add), a.int(1), a.int(2));
+    let small = a.apps(add, &[one, two]);
+    for (name, big, budget) in bigs {
+        let mut tc = TypeChecker::with_work_budget(budget);
+        let (reads, units) = reads_and_units(&mut tc, &a, big);
+        assert!(
+            reads <= READS_PER_UNIT * units + 1_000,
+            "{name}, large call: {reads} reads for {units} units"
+        );
+        tc.set_work_budget(100);
+        for call in 1..=2 {
+            let (reads, units) = reads_and_units(&mut tc, &a, small);
+            assert!(
+                reads <= READS_PER_UNIT * units + 1_000,
+                "{name}, small call {call}: {reads} reads for {units} units"
+            );
+        }
+    }
+}
+
+#[test]
+fn one_unification_is_bounded_by_the_budget() {
+    // A unification of two types that share differently visits pairs of
+    // nodes, as many as the product of their sizes. The budget must stop it
+    // there, not after it.
+    let mut a = Arena::new();
+    let t = crossed_sharing(&mut a, 9);
+    let mut tc = TypeChecker::new();
+    assert!(tc.infer(&a, t, NO_LIBS).is_ok());
+    let full = tc.spent();
+    let mut tried = 0;
+    for budget in (1_000..full).step_by((full / 40) as usize) {
+        let mut tc = TypeChecker::with_work_budget(budget);
+        let e = tc.infer(&a, t, NO_LIBS).unwrap_err();
+        assert_eq!(*e.kind, too_much_work(budget), "budget {budget}");
+        assert!(
+            tc.spent() <= 2 * budget + OVERRUN,
+            "{} units against a budget of {budget}",
+            tc.spent()
+        );
+        tried += 1;
+    }
+    assert!(tried >= 20);
+}
+
+#[test]
+fn running_out_in_the_first_walk_does_not_start_the_second() {
+    // The second walk only names the clash the first one found; if the first
+    // ran out of work there is no clash to name.
+    let mut a = Arena::new();
+    let t = parse_term(&mut a, "(lam (if $0 (add $0 1) (add $0 1)))");
+    let mut tc = TypeChecker::new();
+    assert!(tc.infer(&a, t, NO_LIBS).is_err());
+    assert_eq!(tc.walks, 2);
+    let full = tc.spent();
+    for budget in 1..=full {
+        let mut tc = TypeChecker::with_work_budget(budget);
+        let e = tc.infer(&a, t, NO_LIBS).unwrap_err();
+        if *e.kind == too_much_work(budget) {
+            assert_eq!(tc.walks, 1, "budget {budget}");
+        }
+    }
+}
+
+#[test]
+fn bounded_printing_of_a_long_spine_stops_early() {
+    // The head of a spine is at its far end. Printing stops once the
+    // arguments met are enough to pass the limit, so it never walks to it.
+    let mut a = Arena::new();
+    let zero = a.int(0);
+    let one = a.int(1);
+    let spine = a.apps(zero, &vec![one; 100_000]);
+    let t = a.lam(spine);
+    let before = crate::term::GETS.with(std::cell::Cell::get);
+    let text = super::infer::short(&a, t);
+    let gets = crate::term::GETS.with(std::cell::Cell::get) - before;
+    assert!(gets <= 1_000, "{gets} reads");
+    let kept = text.strip_suffix(" ...").expect("long text ends with ...");
+    assert!(sexpr::print(&a, t).starts_with(kept), "{text}");
+    // Under the limit, a spine prints whole.
+    let short_spine = a.apps(zero, &[one; 50]);
+    let full = sexpr::print(&a, short_spine);
+    assert_eq!(super::infer::short(&a, short_spine), full);
+}
+
+/// Under 64 lambdas, `(pair c_n c_n)`, where `c_0 = (pair $f(0) (pair $f(1) ...
+/// (pair $f(62) $f(63))))` and `c_{k+1} = (pair c_k unit)`.
+fn chain_over_variables(a: &mut Arena, n: u64, f: impl Fn(u32) -> u32) -> TermId {
+    let pair = a.prim(Prim::Pair);
+    let mut c = a.var(f(63));
+    for i in (0..63u32).rev() {
+        let x = a.var(f(i));
+        c = a.apps(pair, &[x, c]);
+    }
+    let unit = a.unit();
+    for _ in 0..n {
+        c = a.apps(pair, &[c, unit]);
+    }
+    let mut t = a.apps(pair, &[c, c]);
+    for _ in 0..64 {
+        t = a.lam(t);
+    }
+    t
+}
+
+#[test]
+fn finding_free_variables_is_charged_to_the_budget() {
+    // Two terms of the same shape. In the first every node of the chain has 64
+    // free variables, so finding the free variables of the shared `c_n`
+    // gathers 64 indices for each of the two application nodes of each level;
+    // in the second each has one.
+    let n = 300u64;
+    let mut a = Arena::new();
+    let wide = chain_over_variables(&mut a, n, |i| i);
+    let narrow = chain_over_variables(&mut a, n, |_| 0);
+    let spent = |t: TermId| {
+        let mut tc = TypeChecker::new();
+        assert!(tc.infer(&a, t, NO_LIBS).is_ok());
+        tc.spent()
+    };
+    let (wide, narrow) = (spent(wide), spent(narrow));
+    assert!(wide >= narrow + 120 * n, "{wide} against {narrow}");
+}
+
+#[test]
+fn finding_free_variables_stops_at_the_budget() {
+    // Each node of the chain has 64 free variables, so finding them costs
+    // about twenty times what the search for shared subterms does. A budget
+    // the search just fits in must stop the finding too.
+    let n = 3_000;
+    let mut a = Arena::new();
+    let t = chain_over_variables(&mut a, n, |i| i);
+    // The search takes about 18 000 units.
+    for budget in (1..=60).map(|i| i * 1_000) {
+        let mut tc = TypeChecker::with_work_budget(budget);
+        let _ = tc.infer(&a, t, NO_LIBS);
+        assert!(
+            tc.spent() <= 2 * budget + OVERRUN,
+            "budget {budget}: {} units",
+            tc.spent()
+        );
+    }
+}
+
+#[test]
+fn a_long_chain_of_links_keeps_the_error_located() {
+    // The conditions link the variables of the lambdas one to the next. If
+    // each new link made the chain longer, the second walk would follow the
+    // whole chain again after each failed use, and run out of work long before
+    // naming the clash; linking by rank keeps each path short.
+    let n = 2_000;
+    let mut a = Arena::new();
+    let t = chain_rollback(&mut a, n, n as usize);
+    let mut tc = TypeChecker::with_work_budget(2_000_000);
+    let e = tc.infer(&a, t, NO_LIBS).unwrap_err();
+    assert_eq!(tc.walks, 2);
+    assert_eq!(e.term_text, "$0", "{e}");
+    assert!(tc.spent() <= 300 * u64::from(n), "{} units", tc.spent());
+}
