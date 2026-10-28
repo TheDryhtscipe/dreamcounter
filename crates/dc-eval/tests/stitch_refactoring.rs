@@ -111,7 +111,7 @@ fn lib_schemes(a: &Arena, libs: &[LibDef]) -> Vec<Scheme> {
     let mut out: Vec<Scheme> = Vec::with_capacity(libs.len());
     for def in libs {
         let s = infer(a, def.term, &out)
-            .unwrap_or_else(|e| panic!("{}: {e}", sexpr::print(a, def.term)));
+            .unwrap_or_else(|e| panic!("{}: {e}", sexpr::print(a, def.term).unwrap()));
         out.push(s);
     }
     out
@@ -144,8 +144,8 @@ fn decode_case(case: &Case) -> Decoded {
         sexpr::parse(&mut a, case.original).unwrap_or_else(|e| panic!("{}: {e}", case.original));
     let expanded = expand(&mut a, &libs, p).unwrap_or_else(|e| panic!("{}: {e}", case.rewritten));
     assert_eq!(
-        sexpr::print(&a, expanded),
-        sexpr::print(&a, original),
+        sexpr::print(&a, expanded).unwrap(),
+        sexpr::print(&a, original).unwrap(),
         "{}",
         case.rewritten
     );

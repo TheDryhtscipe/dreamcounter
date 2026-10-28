@@ -106,8 +106,8 @@ proptest! {
         let got = compile_expression(&mut arena, &text)
             .map_err(|err| TestCaseError::fail(format!("{text}: {err}")))?;
         prop_assert_eq!(
-            sexpr::print(&arena, got),
-            sexpr::print(&arena, expected),
+            sexpr::print(&arena, got).unwrap(),
+            sexpr::print(&arena, expected).unwrap(),
             "text: {}", text
         );
     }
@@ -276,7 +276,7 @@ fn recompile(text: &str) -> Result<String, String> {
     let id = env
         .close_expression(&mut arena, "pretty", text)
         .map_err(|e| format!("{text}\n{e}"))?;
-    Ok(sexpr::print(&arena, id))
+    Ok(sexpr::print(&arena, id).unwrap())
 }
 
 proptest! {
@@ -287,7 +287,7 @@ proptest! {
         let mut arena = Arena::new();
         let id = realise(&mut arena, &g, 0);
         prop_assume!(arena.is_closed(id));
-        let expected = sexpr::print(&arena, id);
+        let expected = sexpr::print(&arena, id).unwrap();
         let text = pretty(&arena, id, lib_name).unwrap();
         let back = recompile(&text).map_err(TestCaseError::fail)?;
         prop_assert_eq!(&back, &expected, "printed as: {}", text);
@@ -355,7 +355,7 @@ fn pretty_prints_spec_examples_readably() {
         assert_eq!(text, expected, "{name}");
         assert_eq!(
             recompile(&text).unwrap(),
-            sexpr::print(&arena, id),
+            sexpr::print(&arena, id).unwrap(),
             "{name} did not round-trip"
         );
     }

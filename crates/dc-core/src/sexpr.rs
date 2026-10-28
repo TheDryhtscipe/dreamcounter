@@ -12,23 +12,53 @@
 //! ```
 //!
 //! [`print`](fn@print) always flattens application spines, so `parse(print(t)) == t` for every
-//! term `t`.
+//! term `t` it prints. It refuses a term with more than [`MAX_PRINT_NODES`]
+//! nodes written out as a tree; [`print_bounded`] writes a prefix of any term.
 
 use std::fmt::{self, Write as _};
 
 use crate::prim::Prim;
 use crate::term::{Arena, LibId, Term, TermId};
 
-/// Prints `id` in core syntax.
+/// The most nodes a term [`print`](fn@print) prints may have, written out as a
+/// tree (see [`Arena::tree_size`]). Each node adds at most 21 bytes of text (the
+/// most is a 20-digit integer literal and the space before it), so the text of a
+/// term within the limit is at most 21 MiB.
+pub const MAX_PRINT_NODES: usize = 1 << 20;
+
+/// Why [`print`](fn@print) refused a term: it has more than [`MAX_PRINT_NODES`]
+/// nodes written out as a tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooLarge;
+
+impl fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the term has more than {MAX_PRINT_NODES} nodes written out, too many to print"
+        )
+    }
+}
+
+impl std::error::Error for TooLarge {}
+
+/// Prints `id` in core syntax: the whole term, so that [`parse`] reads it back.
+///
+/// Shared subterms are printed at each use, so the text of a DAG built in an
+/// arena can be exponentially longer than its number of distinct nodes. So it
+/// first measures the term written out as a tree, at a cost linear in the
+/// number of distinct nodes, and refuses one with more than
+/// [`MAX_PRINT_NODES`] nodes. For text that only needs to show a term, such as
+/// an error message, use [`print_bounded`], which writes a prefix of any term.
 ///
 /// It walks with an explicit stack, so any depth of term prints without risk of
-/// a stack overflow. Shared subterms are printed at each use, so the text can be
-/// exponentially longer than the number of distinct nodes; use
-/// [`print_bounded`] for a bounded cost.
-pub fn print(arena: &Arena, id: TermId) -> String {
+/// a stack overflow.
+pub fn print(arena: &Arena, id: TermId) -> Result<String, TooLarge> {
+    arena.tree_size(id, MAX_PRINT_NODES).ok_or(TooLarge)?;
     let mut out = String::new();
-    print_bounded(arena, id, usize::MAX, &mut out);
-    out
+    let whole = print_bounded(arena, id, usize::MAX, &mut out);
+    debug_assert!(whole, "print_bounded stops only past its limit");
+    Ok(out)
 }
 
 /// Appends `id` in core syntax to `out`, stopping once the text is known to be
@@ -431,7 +461,7 @@ mod tests {
     fn round_trip(src: &str) {
         let mut a = Arena::new();
         let id = parse(&mut a, src).unwrap_or_else(|e| panic!("{src}: {e}"));
-        assert_eq!(print(&a, id), src);
+        assert_eq!(print(&a, id).unwrap(), src);
     }
 
     #[test]
@@ -487,14 +517,14 @@ mod tests {
         for _ in 0..DEEP {
             t = a.lam(t);
         }
-        let text = print(&a, t);
+        let text = print(&a, t).unwrap();
         assert_eq!(text.len(), DEEP * "(lam )".len() + "$0".len());
         assert!(text.starts_with("(lam (lam "));
         assert_eq!(parse(&mut a, &text), Ok(t));
         let mut fresh = Arena::new();
         let back = parse(&mut fresh, &text).unwrap();
         assert_eq!(fresh.len(), a.len());
-        assert_eq!(print(&fresh, back), text);
+        assert_eq!(print(&fresh, back).unwrap(), text);
     }
 
     #[test]
@@ -524,7 +554,7 @@ mod tests {
             };
         }
         for t in [arg, head, forms] {
-            let text = print(&a, t);
+            let text = print(&a, t).unwrap();
             assert_eq!(parse(&mut a, &text), Ok(t));
         }
     }
@@ -543,6 +573,51 @@ mod tests {
         let short = format!("{open}true{}", ")".repeat(DEEP - 1));
         let e = parse(&mut a, &short).unwrap_err();
         assert!(e.message.contains("unexpected end of input"), "{e}");
+    }
+
+    /// `(if true t t)` nested `n` deep over `$0`: `n + 3` distinct nodes, and
+    /// `3 * 2^n - 2` nodes written out as a tree.
+    fn shared_ifs(a: &mut Arena, n: usize) -> TermId {
+        let c = a.bool(true);
+        let mut t = a.var(0);
+        for _ in 0..n {
+            t = a.if_(c, t, t);
+        }
+        t
+    }
+
+    #[test]
+    fn print_refuses_terms_over_the_node_limit() {
+        let mut a = Arena::new();
+        // 3 * 2^19 - 2 = 1_572_862 nodes written out, from 21 distinct ones.
+        let t = shared_ifs(&mut a, 19);
+        match print(&a, t) {
+            Err(e) => assert_eq!(e, TooLarge),
+            Ok(text) => panic!("printed {} bytes over the node limit", text.len()),
+        }
+        // `(and t t)` nested 19 deep is 2^20 - 1 nodes written out; one `lam`
+        // around it reaches the limit exactly, and a second goes over.
+        let mut t = a.bool(false);
+        for _ in 0..19 {
+            t = a.and(t, t);
+        }
+        let at_limit = a.lam(t);
+        assert_eq!(a.tree_size(at_limit, usize::MAX), Some(MAX_PRINT_NODES));
+        let text = print(&a, at_limit).expect("a term at the limit prints");
+        assert_eq!(parse(&mut a, &text), Ok(at_limit));
+        let over = a.lam(at_limit);
+        assert_eq!(print(&a, over), Err(TooLarge));
+    }
+
+    #[test]
+    fn print_refuses_a_huge_dag_in_linear_time() {
+        // 103 distinct nodes, 3 * 2^100 - 2 written out.
+        let mut a = Arena::new();
+        let t = shared_ifs(&mut a, 100);
+        let before = crate::term::GETS.with(std::cell::Cell::get);
+        assert_eq!(print(&a, t), Err(TooLarge));
+        let reads = crate::term::GETS.with(std::cell::Cell::get) - before;
+        assert!(reads <= 2 * 103, "{reads} reads");
     }
 
     fn arb_term(arena: std::rc::Rc<std::cell::RefCell<Arena>>) -> impl Strategy<Value = TermId> {
@@ -577,11 +652,11 @@ mod tests {
         let mut runner = proptest::test_runner::TestRunner::default();
         runner
             .run(&arb_term(arena.clone()), |id| {
-                let text = print(&arena.borrow(), id);
+                let text = print(&arena.borrow(), id).unwrap();
                 let mut fresh = Arena::new();
                 let back =
                     parse(&mut fresh, &text).map_err(|e| TestCaseError::fail(e.to_string()))?;
-                prop_assert_eq!(print(&fresh, back), text.clone());
+                prop_assert_eq!(print(&fresh, back).unwrap(), text.clone());
                 // Parsing into the original arena must find the very same node.
                 let again = parse(&mut arena.borrow_mut(), &text)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;

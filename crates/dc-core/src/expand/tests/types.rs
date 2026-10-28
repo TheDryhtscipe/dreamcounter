@@ -27,7 +27,7 @@ fn lib_schemes(a: &Arena, libs: &[LibDef]) -> Vec<Scheme> {
     let mut out: Vec<Scheme> = Vec::with_capacity(libs.len());
     for (i, def) in libs.iter().enumerate() {
         let s = infer(a, def.term, &out)
-            .unwrap_or_else(|e| panic!("lib_{i} {}: {e}", sexpr::print(a, def.term)));
+            .unwrap_or_else(|e| panic!("lib_{i} {}: {e}", sexpr::print(a, def.term).unwrap()));
         out.push(s);
     }
     out
@@ -42,8 +42,8 @@ fn both_types(libs: &[(&str, u32)], prog: &str) -> (Scheme, Scheme) {
     let refactored = infer(&a, p, &schemes).unwrap_or_else(|e| panic!("{prog}: {e}"));
     let e = expand(&mut a, &libs, p).unwrap_or_else(|e| panic!("{prog}: {e}"));
     let no_libs: &[Scheme] = &[];
-    let expanded =
-        infer(&a, e, no_libs).unwrap_or_else(|err| panic!("{}: {err}", sexpr::print(&a, e)));
+    let expanded = infer(&a, e, no_libs)
+        .unwrap_or_else(|err| panic!("{}: {err}", sexpr::print(&a, e).unwrap()));
     (refactored, expanded)
 }
 
@@ -279,17 +279,17 @@ fn refactored_programs_type_as_their_expansion() {
         prop_assert!(
             expanded_type.is_ok(),
             "{} has type {refactored} but its expansion {} does not type: {:?}",
-            sexpr::print(&a, rewritten),
-            sexpr::print(&a, expanded),
+            sexpr::print(&a, rewritten).unwrap(),
+            sexpr::print(&a, expanded).unwrap(),
             expanded_type
         );
         prop_assert_eq!(
             check_type(&a, expanded, no_libs, &refactored),
             Ok(()),
             "{} has type {} but its expansion {} does not have it",
-            sexpr::print(&a, rewritten),
+            sexpr::print(&a, rewritten).unwrap(),
             refactored,
-            sexpr::print(&a, expanded)
+            sexpr::print(&a, expanded).unwrap()
         );
         typed.set(typed.get() + 1);
         if expanded_type.as_ref() == Ok(&refactored) {
