@@ -51,9 +51,12 @@
 //! `n log n` (and `1` against `log n`).
 //!
 //! The *tolerance* `τ` is [`ClassSelect::misfit_fraction`] (default ¼)
-//! times the separation. It absorbs small lower-order terms such as the
-//! `+ 2n` in `n log₂ n + 2n` (but not `+ 4n`, a `NoFit`). Since `τ` is below
-//! half the separation, at most one class is within `τ` of any series.
+//! times the separation, capped at [`ClassSelect::max_tolerance`] (default
+//! 0.04). On the default window the cap applies: `τ = 0.04`, so every
+//! median is within about 4% of `c · f(n)`. It absorbs small lower-order
+//! terms such as the `+ 2n` in `n log₂ n + 2n` (misfit 0.035 over
+//! `128..1024`, but not `+ 4n`, a `NoFit`). Since `τ` is below half the
+//! separation, at most one class is within `τ` of any series.
 //!
 //! The *noise margin* `m` is [`ClassSelect::noise_z`] (default 3) times the
 //! seed noise: the largest standard error of a size's median `ln` step count,
@@ -82,11 +85,19 @@
 //! A named class says that over the window every median step count is
 //! within a factor `e^τ` of `c · f(n)`. It is a statement about the window,
 //! not a proof of asymptotic growth. Growth close to a class is named as
-//! that class: `n^1.2` as `n log n`, `n^1.04` as `n`, and `n log n + 30n`
-//! (a large lower-order term) as `n` over `128..1024`, where `ln n` varies by
-//! only a factor 1.43. Larger sizes do not settle this: `τ` scales with the
-//! separation, which grows with the window, so over `2¹² ..= 2²⁰` an exact
-//! `n^1.1` is named `n log n`.
+//! that class. Over `128..1024`, where `ln n` varies by only a factor 1.43,
+//! exact `n^a` is named `n log n` for `a` from 1.134 to 1.208 and `n` for
+//! `a` from 0.962 to 1.038; `n log n + 30n` (a large lower-order term) is
+//! named `n`. The tolerance cannot shrink enough to refuse these without
+//! refusing real `n log n` programs, whose lower-order terms give misfits
+//! of about 0.02 over windows this narrow. What separates them is a window
+//! over which `ln n` varies more: the cap keeps `τ` from growing with the
+//! separation, so over `2⁸ ..= 2²⁰` (a factor 2.5) no exact `n^a` is named
+//! `n log n`. The window must be wide in `ln n`, not only in `n`: over
+//! `2¹² ..= 2²⁰` (a factor 1.67), `n^a` for `a` from 1.08 to 1.104 still is.
+//! A wide window also refuses lower-order terms that are large at its
+//! small end: over `2⁸ ..= 2²⁰`, `n log₂ n + 2n` has misfit 0.064 and is a
+//! `NoFit`.
 //!
 //! # Conventions
 //!
@@ -791,6 +802,10 @@ pub struct ClassSelect {
     /// ½ the classes are exclusive for exact step counts; the default ¼ leaves
     /// half of that margin for lower-order terms.
     pub misfit_fraction: f64,
+    /// The most the tolerance floor can be, whatever the separation;
+    /// `≥ 0`, and `f64::INFINITY` for no cap. The default 0.04 lets each
+    /// median step count differ from `c · f(n)` by about 4%.
+    pub max_tolerance: f64,
     /// How many standard errors of noise the noise margin allows; finite
     /// and `≥ 0`.
     pub noise_z: f64,
@@ -803,6 +818,7 @@ impl Default for ClassSelect {
         Self {
             window: Window::UpperHalf,
             misfit_fraction: 0.25,
+            max_tolerance: 0.04,
             noise_z: 3.0,
             noise_model: NoiseModel::FromSeeds,
         }
@@ -821,12 +837,17 @@ impl ClassSelect {
     /// See [`GrowthError`]. Besides the medians, every seed's step count in
     /// the window must be positive ([`GrowthError::ZeroSteps`]), since the
     /// noise is estimated from their logarithms. [`GrowthError::BadParameter`]
-    /// if `misfit_fraction`, `noise_z` or a [`NoiseModel::Known`] noise is out
+    /// if `misfit_fraction`, `max_tolerance`, `noise_z` or a [`NoiseModel::Known`] noise is out
     /// of range.
     pub fn fit(&self, sweep: &Sweep) -> Result<ClassFit, GrowthError> {
         if !(0.0..0.5).contains(&self.misfit_fraction) {
             return Err(GrowthError::BadParameter {
                 name: "misfit_fraction",
+            });
+        }
+        if self.max_tolerance.is_nan() || self.max_tolerance < 0.0 {
+            return Err(GrowthError::BadParameter {
+                name: "max_tolerance",
             });
         }
         if !(self.noise_z.is_finite() && self.noise_z >= 0.0) {
@@ -870,7 +891,7 @@ impl ClassSelect {
             NoiseModel::Known(v) => Some(v),
         };
         // Exclusivity: τ < separation / 2, so at most one class is within τ.
-        let tolerance = self.misfit_fraction * separation;
+        let tolerance = (self.misfit_fraction * separation).min(self.max_tolerance);
         let noise_margin = self.noise_z * noise.unwrap_or(0.0);
         let verdict = match noise {
             None => ClassVerdict::NoiseUnknown,

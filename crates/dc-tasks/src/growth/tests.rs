@@ -817,9 +817,11 @@ fn default_separation() -> f64 {
     0.5 * (10.0f64 / 7.0).ln()
 }
 
-/// The default tolerance on the default window.
+/// The default tolerance on the default window: a quarter of the
+/// separation, 0.0446, capped at 0.04.
 fn default_tolerance() -> f64 {
-    ClassSelect::default().misfit_fraction * default_separation()
+    let d = ClassSelect::default();
+    (d.misfit_fraction * default_separation()).min(d.max_tolerance)
 }
 
 /// A class and an exact step series of it.
@@ -879,6 +881,64 @@ fn c_refuses_growth_outside_its_classes() {
         let fit = c(&default_sweep(f));
         assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
         assert!(fit.best().misfit > fit.tolerance);
+    }
+}
+
+/// `2⁸, 2¹⁰, …, 2²⁰`.
+const WIDE_SIZES: [u64; 7] = [1 << 8, 1 << 10, 1 << 12, 1 << 14, 1 << 16, 1 << 18, 1 << 20];
+
+/// Exact `100 · n^a` over `2⁸, 2¹⁰, …, 2²⁰`, all fitted: a window where
+/// `ln n` varies by a factor 2.5 and the separation is 0.458.
+fn wide_power_law(a: f64) -> (ClassSelect, Sweep) {
+    let sweep = Sweep::from_fn(&WIDE_SIZES, |n| ((n as f64).powf(a) * 100.0).round() as u64)
+        .expect("valid");
+    let select = ClassSelect {
+        window: Window::All,
+        ..c_with(NoiseModel::Exact)
+    };
+    (select, sweep)
+}
+
+#[test]
+fn c_tolerance_does_not_grow_with_a_wide_window() {
+    // A quarter of the separation would be 0.115 here, within which exact
+    // n^1.1 (misfit 0.072 from n log n) is named n log n. Capped, the
+    // tolerance stays where it is on the default window, and the wider
+    // window tells n^1.1 from n log n.
+    let (select, sweep) = wide_power_law(1.1);
+    let fit = select.fit(&sweep).expect("fits");
+    assert!(fit.separation > 0.45, "{fit:?}");
+    let nlogn = fit.candidates[GrowthClass::NLogN as usize].misfit;
+    assert!(nlogn > 0.07 && nlogn < 0.075, "{fit:?}");
+    assert_eq!(
+        fit.tolerance,
+        ClassSelect::default().max_tolerance,
+        "{fit:?}"
+    );
+    assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
+
+    // Uncapped, it is named n log n: the cap is what refuses it.
+    let uncapped = ClassSelect {
+        max_tolerance: f64::INFINITY,
+        ..select
+    };
+    let fit = uncapped.fit(&sweep).expect("fits");
+    assert!((fit.tolerance - 0.25 * fit.separation).abs() < EXACT);
+    assert_eq!(fit.verdict, ClassVerdict::Class(GrowthClass::NLogN));
+
+    // A lower-order term that is large at the window's small end is refused:
+    // ½ (ln(1 + 2/8) − ln(1 + 2/20)) = 0.064.
+    let plus_2n = Sweep::from_fn(&WIDE_SIZES, |n| n * log2(n) + 2 * n).expect("valid");
+    let fit = select.fit(&plus_2n).expect("fits");
+    let nlogn = fit.candidates[GrowthClass::NLogN as usize].misfit;
+    assert!((nlogn - 0.0639).abs() < 1e-3, "{fit:?}");
+    assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
+
+    // The classes themselves are still named on the wide window.
+    for (a, class) in [(1.0, GrowthClass::Linear), (2.0, GrowthClass::Quadratic)] {
+        let (select, sweep) = wide_power_law(a);
+        let fit = select.fit(&sweep).expect("fits");
+        assert_eq!(fit.verdict, ClassVerdict::Class(class), "{fit:?}");
     }
 }
 
@@ -1066,6 +1126,20 @@ fn c_rejects_parameters_out_of_range() {
     let mut cases = vec![
         (
             ClassSelect {
+                max_tolerance: -0.01,
+                ..ClassSelect::default()
+            },
+            "max_tolerance",
+        ),
+        (
+            ClassSelect {
+                max_tolerance: f64::NAN,
+                ..ClassSelect::default()
+            },
+            "max_tolerance",
+        ),
+        (
+            ClassSelect {
                 misfit_fraction: 0.5,
                 ..ClassSelect::default()
             },
@@ -1237,7 +1311,8 @@ proptest! {
             (got, want) => prop_assert!(false, "noise {got:?}, expected {want:?}"),
         }
         let defaults = ClassSelect::default();
-        prop_assert!((fit.tolerance - defaults.misfit_fraction * sep).abs() < 1e-9);
+        let floor = (defaults.misfit_fraction * sep).min(defaults.max_tolerance);
+        prop_assert!((fit.tolerance - floor).abs() < 1e-9);
         prop_assert!(fit.tolerance < sep / 2.0);
         prop_assert!(
             (fit.noise_margin - defaults.noise_z * noise.unwrap_or(0.0)).abs() < 1e-9
