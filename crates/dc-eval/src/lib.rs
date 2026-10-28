@@ -10,7 +10,9 @@
 //! does not grow the Rust stack. Evaluation, dropping, structural equality and
 //! formatting of values use explicit work lists instead of host recursion over
 //! the value structure (see [`value`]); the one bounded exception is `imbl`'s own
-//! tree inside a single array. The `dc_core::sexpr` parser and printer used to
+//! tree inside a single array. Values can share parts, so print or log them with
+//! [`Value::display_within`] or [`Outcome::display_within`], whose output is
+//! bounded; `Display` writes the whole value. The `dc_core::sexpr` parser and printer used to
 //! build test terms do recurse over the term.
 //!
 //! ```
@@ -30,5 +32,5 @@ pub mod cost;
 mod machine;
 pub mod value;
 
-pub use machine::{apply, eval, ErrorKind, Outcome, Stuck, UNLIMITED};
-pub use value::{Env, Fun, List, MemoKey, Tree, Value};
+pub use machine::{apply, eval, ErrorKind, Outcome, OutcomeWithin, Stuck, UNLIMITED};
+pub use value::{DisplayWithin, Env, Fun, List, MemoKey, Tree, Value, DEBUG_NODES};
