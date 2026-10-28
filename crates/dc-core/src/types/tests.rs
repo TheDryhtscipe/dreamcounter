@@ -1356,15 +1356,21 @@ fn shared_subterms_under_new_helpers_with_free_type_variables_are_reused() {
 }
 
 /// `lam x. let h = (lam (pair x $0)) in body`, where `body` is `t_n`, or
-/// `(pair first t_n)` if `first` is given, with `t_(k+1) = (if true t_k t_k)`
-/// and `t_0 = leaf`, both read with `h` as `$0` and `x` as `$1`: every shared
+/// `(pair first t_n)` if `first` is given, with `t_(k+1) = (if cond t_k t_k)`
+/// and `t_0 = leaf`, all read with `h` as `$0` and `x` as `$1`: every shared
 /// subterm uses the polymorphic helper `h`, whose type has the free variable
 /// `x`.
-fn chain_under_an_open_helper(a: &mut Arena, n: usize, leaf: &str, first: Option<&str>) -> TermId {
-    let yes = a.bool(true);
+fn chain_under_an_open_helper(
+    a: &mut Arena,
+    n: usize,
+    cond: &str,
+    leaf: &str,
+    first: Option<&str>,
+) -> TermId {
+    let cond = parse_term(a, cond);
     let mut t = parse_term(a, leaf);
     for _ in 0..n {
-        t = a.if_(yes, t, t);
+        t = a.if_(cond, t, t);
     }
     if let Some(first) = first {
         let (pair, first) = (a.prim(Prim::Pair), parse_term(a, first));
@@ -1382,7 +1388,7 @@ fn open_scope_failures(a: &mut Arena, n: usize) -> Vec<(&'static str, TermId)> {
     vec![
         (
             "s2: ill typed whatever the helper's free variable is",
-            chain_under_an_open_helper(a, n, "(add (snd ($0 1)) true)", None),
+            chain_under_an_open_helper(a, n, "true", S2_LEAF, None),
         ),
         (
             "s7: a new helper at every level",
@@ -1390,14 +1396,70 @@ fn open_scope_failures(a: &mut Arena, n: usize) -> Vec<(&'static str, TermId)> {
         ),
         (
             "s8: ill typed only once the helper's free variable is Int",
-            chain_under_an_open_helper(
-                a,
-                n,
-                "(if (fst ($0 1)) true true)",
-                Some("(add (fst ($0 1)) 1)"),
-            ),
+            chain_under_an_open_helper(a, n, "true", S8_LEAF, Some(S8_FIRST)),
+        ),
+        (
+            "g3: s8 with a use of the helper that fixes its free variable at every level",
+            chain_under_an_open_helper(a, n, FIX_X, S8_LEAF, Some(S8_FIRST)),
+        ),
+        (
+            "g6: s2 with a use of the helper that fixes its free variable at every level",
+            chain_under_an_open_helper(a, n, FIX_X, S2_LEAF, None),
+        ),
+        (
+            "g9: s2 with the free variable of a helper of its own fixed at every level",
+            chain_fixing_helpers_of_its_own(a, n),
         ),
     ]
+}
+
+/// The leaf of s2: ill typed whatever the helper's free variable is.
+const S2_LEAF: &str = "(add (snd ($0 1)) true)";
+/// The leaf of s8, ill typed once the helper's free variable is `Int`, and the
+/// first part of the pair around its chain, which makes it `Int`.
+const S8_LEAF: &str = "(if (fst ($0 1)) true true)";
+const S8_FIRST: &str = "(add (fst ($0 1)) 1)";
+/// A condition that fixes the helper's free variable to `Int` again: once it
+/// is, unifying it with `Int` changes nothing.
+const FIX_X: &str = "(fst (pair true (add (fst ($0 1)) 1)))";
+
+/// `lam x. lam z_1 ... lam z_n. let g_n = (lam (pair z_n $0)) in ... let g_1 =
+/// (lam (pair z_1 $0)) in let h = (lam (pair x $0)) in t_n`, with `t_0` the
+/// leaf of s2 and `t_k = (if (fst (pair true (add (fst (g_k 1)) 1))) t_(k-1)
+/// t_(k-1))`. Each level fixes the free variable `z_k` of a helper of its
+/// own, a node made before any use is tried, which the keys below it do not
+/// depend on: their scopes reach out to `g_(k-1)` only.
+fn chain_fixing_helpers_of_its_own(a: &mut Arena, n: usize) -> TermId {
+    let width = u32::try_from(n).expect("a small depth");
+    let mut t = parse_term(a, S2_LEAF);
+    for k in 1..=width {
+        // Under the `let`s, `h` is `$0` and `g_k` is `$k`.
+        let cond = parse_term(a, &format!("(fst (pair true (add (fst (${k} 1)) 1)))"));
+        t = a.if_(cond, t, t);
+    }
+    // Under the `let`s of `g_1 ... g_n` and the argument, `x` is `$(2n + 1)`.
+    let h = parse_term(a, &format!("(lam (pair ${} $0))", 2 * width + 1));
+    let mut body = a.let_(h, t);
+    for k in 1..=width {
+        // Under the `let`s of `g_(k+1) ... g_n` and the argument, `z_k` is
+        // `$(2n - 2k + 1)`.
+        let g = parse_term(a, &format!("(lam (pair ${} $0))", 2 * (width - k) + 1));
+        body = a.let_(g, body);
+    }
+    for _ in 0..=n {
+        body = a.lam(body);
+    }
+    body
+}
+
+/// The type [`assert_open_scope_failure_located`] checks the shape of
+/// [`open_scope_failures`] with depth `n` against.
+fn open_scope_expected(name: &str, n: usize) -> Scheme {
+    if name.starts_with("g9") {
+        sch(&format!("{}Bool", "Int -> ".repeat(n + 1)))
+    } else {
+        sch("Int -> (Int, Bool)")
+    }
 }
 
 /// Checks that the error of shape `which` of [`open_scope_failures`] is the
@@ -1408,10 +1470,16 @@ fn open_scope_failures(a: &mut Arena, n: usize) -> Vec<(&'static str, TermId)> {
 fn assert_open_scope_failure_located(which: usize) {
     const SMALL: usize = 10;
     const N: usize = 40;
-    // About 50 steps a level are taken; the tree walk takes 2^N.
-    const STEPS: u64 = 100 * N as u64;
     let mut a = Arena::new();
     let (name, small) = open_scope_failures(&mut a, SMALL)[which];
+    // About 50 steps a level are taken; the tree walk takes 2^N. In g9 each
+    // failed level is walked in place down to the leaf, through a condition
+    // of its own at every level below, which takes about 15 N^2 steps in all.
+    let steps: u64 = if name.starts_with("g9") {
+        20 * (N * N) as u64
+    } else {
+        100 * N as u64
+    };
     let (_, big) = open_scope_failures(&mut a, N)[which];
     let mut tree = TypeChecker::new();
     tree.tree_walk = true;
@@ -1419,8 +1487,8 @@ fn assert_open_scope_failure_located(which: usize) {
     assert!(want.is_err(), "{name}");
     assert_eq!(TypeChecker::new().infer(&a, small, NO_LIBS), want, "{name}");
     // The error is in the leaf, so it is the same at every depth.
-    assert_eq!(bounded(STEPS).infer(&a, big, NO_LIBS), want, "{name}");
-    let expected = sch("Int -> (Int, Bool)");
+    assert_eq!(bounded(steps).infer(&a, big, NO_LIBS), want, "{name}");
+    let expected = open_scope_expected(name, SMALL);
     let want = tree.check(&a, small, NO_LIBS, &expected);
     assert!(want.is_err(), "{name}");
     assert_eq!(
@@ -1428,8 +1496,10 @@ fn assert_open_scope_failure_located(which: usize) {
         want,
         "{name}"
     );
+    let expected = open_scope_expected(name, N);
+    let want = tree.check(&a, big, NO_LIBS, &expected);
     assert_eq!(
-        bounded(STEPS).check(&a, big, NO_LIBS, &expected),
+        bounded(steps).check(&a, big, NO_LIBS, &expected),
         want,
         "{name}"
     );
@@ -1448,6 +1518,21 @@ fn open_scope_failures_are_located_in_polynomial_steps_s7() {
 #[test]
 fn open_scope_failures_are_located_in_polynomial_steps_s8() {
     assert_open_scope_failure_located(2);
+}
+
+#[test]
+fn open_scope_failures_are_located_in_polynomial_steps_g3() {
+    assert_open_scope_failure_located(3);
+}
+
+#[test]
+fn open_scope_failures_are_located_in_polynomial_steps_g6() {
+    assert_open_scope_failure_located(4);
+}
+
+#[test]
+fn open_scope_failures_are_located_in_polynomial_steps_g9() {
+    assert_open_scope_failure_located(5);
 }
 
 #[test]
@@ -1606,6 +1691,11 @@ fn arb_open_helper_src() -> impl Strategy<Value = String> {
     body.prop_map(|b| format!("(lam (let (lam (pair $1 $0)) {b}))"))
 }
 
+/// Compares the errors of the memoised walk and the tree walk. Which keys are
+/// marked failed changes only the work done, not the error (see
+/// `TypeChecker::note_failure`), so this test does not notice if keys stop
+/// being marked or are dropped too soon: the step bounds of
+/// `open_scope_failures_are_located_in_polynomial_steps_*` guard that.
 #[test]
 fn shared_subterms_under_open_helpers_agree_with_walking_the_tree() {
     let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(4000));

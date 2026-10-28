@@ -506,6 +506,8 @@ pub struct TypeChecker {
     canon: FxHashMap<Canon, u32>,
     /// For each [`Canon`] id, whether that type has no free variables.
     canon_closed: Vec<bool>,
+    /// The [`Canon`] node of each id.
+    canon_nodes: Vec<Canon>,
     /// Walks every term as a tree, without reusing shared subterms: the
     /// reference the tests compare the memoised walk with.
     pub(super) tree_walk: bool,
@@ -527,9 +529,8 @@ pub struct TypeChecker {
     /// [`TypeChecker::note_failure`] for why they would fail).
     failed: FxHashSet<MemoKey>,
     /// The keys with an open scope added to `failed` since the oldest
-    /// checkpoint, in the order added, each with the length of the trail at
-    /// the checkpoint of the use that failed.
-    failed_log: Vec<(MemoKey, usize)>,
+    /// checkpoint, in the order added.
+    failed_log: Vec<LoggedFailure>,
     /// Steps taken by the term walk of the current call.
     steps: u64,
     /// Units of work done by the current call (see [`DEFAULT_WORK_BUDGET`]).
@@ -578,6 +579,19 @@ struct Checkpoint {
     memo_log: usize,
     failed_log: usize,
     level: u32,
+}
+
+/// A key with an open scope in `failed`, with what
+/// [`TypeChecker::back_to`] needs to tell whether it still fails (see
+/// [`TypeChecker::note_failure`]).
+#[derive(Clone, Debug)]
+struct LoggedFailure {
+    key: MemoKey,
+    /// The length of the trail at a state the key fails in.
+    trail: usize,
+    /// The part of the store the key's slots reach, in that state, written
+    /// out by [`TypeChecker::slot_state`].
+    state: Vec<u32>,
 }
 
 /// Where a unification happens, for the error message.
@@ -728,9 +742,10 @@ impl TypeChecker {
     /// in place at once from then on, for as long as the subterm is known to
     /// fail in that scope (see [`TypeChecker::note_failure`]): always if no
     /// binding in its scope has a type with free variables, else until the
-    /// walk goes back past the state it failed in. Without that, a chain of
-    /// shared subterms over a leaf that is ill typed takes time exponential in
-    /// its length.
+    /// walk goes back to a checkpoint made before it failed at which the
+    /// store nodes those types reach differ from what they were when it
+    /// failed. Without that, a chain of shared subterms over a leaf that is
+    /// ill typed takes time exponential in its length.
     ///
     /// Both walks share the call's work budget. If the first runs out, that is
     /// the error. If only the second does, the first walk's error is returned:
@@ -835,6 +850,7 @@ impl TypeChecker {
         release_vec(&mut self.spine);
         release_vec(&mut self.pending);
         release_vec(&mut self.canon_closed);
+        release_vec(&mut self.canon_nodes);
         release_vec(&mut self.checkpoints);
         release_vec(&mut self.trail);
         release_vec(&mut self.memo_log);
@@ -849,6 +865,7 @@ impl TypeChecker {
                 + self.spine.capacity()
                 + self.pending.capacity()
                 + self.canon_closed.capacity()
+                + self.canon_nodes.capacity()
                 + self.checkpoints.capacity()
                 + self.trail.capacity()
                 + self.memo_log.capacity()
@@ -868,6 +885,7 @@ impl TypeChecker {
         self.pending.clear();
         empty_map(&mut self.canon);
         self.canon_closed.clear();
+        self.canon_nodes.clear();
         self.steps = 0;
         self.checkpoints.clear();
         self.trail.clear();
@@ -940,6 +958,7 @@ impl TypeChecker {
                     }
                 };
                 self.canon_closed.push(closed);
+                self.canon_nodes.push(canon);
             }
             ids.insert(r, id);
         }
@@ -1089,6 +1108,11 @@ impl TypeChecker {
         }
         let mut cur = t;
         while let Node::Link(next) = self.node(cur) {
+            if next == root {
+                // Already compressed: writing it again would only add to the
+                // trail.
+                break;
+            }
             self.set(cur, Node::Link(root));
             cur = next;
         }
@@ -1778,8 +1802,17 @@ impl TypeChecker {
                 Err(e) => match self.checkpoints.pop() {
                     None => return Err(e),
                     Some(cp) => {
-                        self.note_failure(&cp);
-                        self.back_to(cp)
+                        // A key whose kept type was in the memo did not fail
+                        // to infer: its use did not fit. Checked before going
+                        // back, which drops the kept types made since `cp`.
+                        self.spent += 1;
+                        count_probes(1);
+                        let inferred = self.memo.contains_key(&cp.key);
+                        let step = self.back_to(&cp);
+                        if !inferred {
+                            self.note_failure(&cp);
+                        }
+                        step
                     }
                 },
             };
@@ -2015,11 +2048,12 @@ impl TypeChecker {
         map.get(&root).copied()
     }
 
-    /// Notes that the use tried from `cp`, which has been popped, has failed.
-    /// If its key is not in the memo, the failure came from inferring its
-    /// subterm afresh (a key goes into the memo as soon as that works, before
-    /// the use is fitted to its position), and the key goes into `failed`, so
-    /// that later uses of it are walked in place at once.
+    /// Notes that the use tried from `cp` has failed in inferring its subterm
+    /// afresh, and the checker has gone back to `cp`. The caller checks that:
+    /// the key was not in the memo when the use failed (a key goes into the
+    /// memo as soon as inference works, before the use is fitted to its
+    /// position). The key goes into `failed`, so that later uses of it are
+    /// walked in place at once.
     ///
     /// Which uses are walked in place changes the work done, not the error
     /// reported: a use walked in place is walked as the tree walk walks it
@@ -2052,13 +2086,16 @@ impl TypeChecker {
     /// walk.
     ///
     /// Going back to a checkpoint undoes refinements, so a key with an open
-    /// scope is also logged with `t`, the length of the trail at `cp`, whose
-    /// state the walk goes back to now. [`TypeChecker::back_to`] some
-    /// checkpoint `p` keeps it if `t <= p.trail`, else removes it. Each logged
-    /// key fails in the state at some moment `m` when the trail had length
-    /// `t`, from which the walk has gone forward, except back to checkpoints
-    /// made after `m`; at first, `m` is when `cp` was made. Going back to `p`
-    /// keeps that true:
+    /// scope is also logged with a state it fails in: the length of the trail
+    /// at `cp`, and the part of the store its slots reach there, written out
+    /// by [`TypeChecker::slot_state`]. The walk is in that state now.
+    /// [`TypeChecker::back_to`] some checkpoint `p` keeps the key if the
+    /// logged length is at most `p.trail`, or else if its slots reach the same
+    /// part of the store at `p` as they did when it was logged. It removes it
+    /// otherwise. Each logged key fails in the state at some moment `m` when
+    /// the trail had the logged length `t`, from which the walk has gone
+    /// forward, except back to checkpoints made after `m`; at first, `m` is
+    /// when `cp` was made. Going back to `p` keeps that true:
     ///
     /// - If `p` was made after `m`, its state was reached from `m`'s.
     /// - Else `p.trail <= t`, as the trail does not shrink past a checkpoint
@@ -2073,13 +2110,20 @@ impl TypeChecker {
     ///   types frozen past checkpoints are copies whose only variables are
     ///   quantified. A slot is made from a type the walk reaches, so no later
     ///   binding has that slot, and the key is never looked up again.
+    /// - If `p.trail < t` but the slots reach, at `p`, the same nodes with the
+    ///   same contents as at `m`, inferring the subterm afresh at `p` meets
+    ///   the same types as at `m`, as it reads the store only through its
+    ///   bindings and nodes it makes itself. So the key fails at `p`, which
+    ///   becomes its `m`, and its logged length becomes `p.trail`. Changes
+    ///   that leave those nodes alone, such as fixing a variable of a binding
+    ///   the key does not depend on, no longer drop the key.
     ///
     /// Once no checkpoint is left, nothing can be undone, so the log is
     /// cleared and its keys stay in `failed` until the end of the walk.
     fn note_failure(&mut self, cp: &Checkpoint) {
-        self.spent += 2;
-        count_probes(2);
-        if self.memo.contains_key(&cp.key) || !self.failed.insert(cp.key.clone()) {
+        self.spent += 1;
+        count_probes(1);
+        if !self.failed.insert(cp.key.clone()) {
             return;
         }
         #[cfg(test)]
@@ -2090,13 +2134,95 @@ impl TypeChecker {
             // Paid now: the unit of its removal, or of its drop when the log
             // is cleared.
             self.spent += 1;
-            self.failed_log.push((cp.key.clone(), cp.trail));
+            let state = self.slot_state(&cp.key.1);
+            self.failed_log.push(LoggedFailure {
+                key: cp.key.clone(),
+                trail: cp.trail,
+                state,
+            });
         }
+    }
+
+    /// The part of the store the polymorphic slots of `scope` reach, written
+    /// out: the [`Canon`] of each slot names the unbound and rigid variables
+    /// of its type, and each is written out with what it now resolves to. A
+    /// node met again is written as a reference to its first appearance, so
+    /// the text is no longer than the nodes it reaches. Two texts are equal
+    /// only if the slots reach the same nodes, with the same contents up to
+    /// links. Links are followed without being compressed, so this changes
+    /// nothing. A unit is paid for each [`Canon`] node and each store node
+    /// read.
+    fn slot_state(&mut self, scope: &Scope) -> Vec<u32> {
+        const REF: u32 = 0;
+        const VAR: u32 = 1;
+        const RIGID: u32 = 2;
+        const CON: u32 = 3;
+        let mut free = Vec::new();
+        let mut seen_canon: FxHashSet<u32> = FxHashSet::default();
+        let mut stack: Vec<u32> = scope
+            .iter()
+            .filter_map(|slot| match *slot {
+                Slot::Poly(c) if !self.canon_closed[c as usize] => Some(c),
+                _ => None,
+            })
+            .collect();
+        while let Some(c) = stack.pop() {
+            self.spent += 1;
+            count_probes(1);
+            if !seen_canon.insert(c) {
+                continue;
+            }
+            match self.canon_nodes[c as usize] {
+                Canon::Var { .. } => {}
+                Canon::Free(t) => free.push(t),
+                Canon::Con(h, a, b) => {
+                    if h.arity() >= 2 && !self.canon_closed[b as usize] {
+                        stack.push(b);
+                    }
+                    if h.arity() >= 1 && !self.canon_closed[a as usize] {
+                        stack.push(a);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut ids: FxHashMap<Ty, u32> = FxHashMap::default();
+        let mut todo: Vec<Ty> = free.into_iter().rev().collect();
+        while let Some(t) = todo.pop() {
+            let mut r = t;
+            self.spent += 1;
+            while let Node::Link(next) = self.node(r) {
+                self.spent += 1;
+                r = next;
+            }
+            count_probes(1);
+            if let Some(&i) = ids.get(&r) {
+                out.extend([REF, i]);
+                continue;
+            }
+            let next = u32::try_from(ids.len()).expect("fewer than 2^32 type nodes");
+            ids.insert(r, next);
+            match self.node(r) {
+                Node::Var { level, key, .. } => out.extend([VAR, r, level, u32::from(key)]),
+                Node::Rigid { key } => out.extend([RIGID, r, u32::from(key)]),
+                Node::Con(h, a, b) => {
+                    out.extend([CON, h as u32]);
+                    if h.arity() >= 2 {
+                        todo.push(b);
+                    }
+                    if h.arity() >= 1 {
+                        todo.push(a);
+                    }
+                }
+                Node::Link(_) => unreachable!("links were followed"),
+            }
+        }
+        out
     }
 
     /// Puts the checker back as it was at `cp`, which has been popped, and walks
     /// its shared subterm in place.
-    fn back_to(&mut self, cp: Checkpoint) -> Step {
+    fn back_to(&mut self, cp: &Checkpoint) -> Step {
         for (t, n) in self.trail.drain(cp.trail..).rev() {
             #[cfg(test)]
             STORE_READS.with(|r| r.set(r.get() + 1));
@@ -2116,17 +2242,24 @@ impl TypeChecker {
             count_probes(1);
             self.memo.remove(&key);
         }
-        // Failures noted at this checkpoint's position of the trail hold here
-        // too (see [`TypeChecker::note_failure`]); those noted further on go.
+        // Failures logged at or before this checkpoint's position of the trail
+        // hold here too, and so do those whose slots reach the same part of
+        // the store here (see [`TypeChecker::note_failure`]); the others go.
         let mut kept = cp.failed_log;
         for i in cp.failed_log..self.failed_log.len() {
             self.spent += 1;
-            if self.failed_log[i].1 <= cp.trail {
+            let holds = self.failed_log[i].trail <= cp.trail || {
+                let key = self.failed_log[i].key.1.clone();
+                self.spent += key.len() as u64;
+                self.slot_state(&key) == self.failed_log[i].state
+            };
+            if holds {
+                self.failed_log[i].trail = self.failed_log[i].trail.min(cp.trail);
                 self.failed_log.swap(kept, i);
                 kept += 1;
             } else {
                 count_probes(1);
-                self.failed.remove(&self.failed_log[i].0);
+                self.failed.remove(&self.failed_log[i].key);
             }
         }
         self.failed_log.truncate(kept);
