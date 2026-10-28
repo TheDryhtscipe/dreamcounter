@@ -136,12 +136,14 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 /// slots than there are bindings (no more than the steps taken), finding free
 /// variables visits no more nodes than the search has paid for, and an error
 /// writes out at most four types of at most [`MAX_TYPE_NODES`] nodes. So a
-/// call does at most about twice its budget, plus a constant. The hash tables
-/// the checker keeps between uses are emptied at a cost bounded by what they
-/// held, not by their capacity, so one large call or unification does not
-/// slow later ones. The tests check that each unit stands for at most four
-/// reads of the term, the store, a scheme (a type node imported or a key
-/// looked up) or a table slot visited while emptying, on terms built to find
+/// call does at most about twice its budget, plus a constant. Emptying or
+/// freeing a hash table costs time in its capacity, so the tables a
+/// unification, an instantiation or a call has grown are released when it
+/// ends, and the next one starts with small tables: one large call or
+/// unification does not slow later ones. The tests check that each unit
+/// stands for at most four reads of the term, the store, a scheme (a type node
+/// imported or a key looked up) or a table slot visited while emptying or
+/// freeing a table, on terms built to find
 /// work that is not charged. On those terms, one unit
 /// takes 2 to 50 ns in a release build, most often 10 to 20 (October 2026), so
 /// a call that uses the whole default budget takes about 0.15 to 0.35 s.
@@ -171,7 +173,7 @@ thread_local! {
     /// constructor or variable visited and one per key looked at.
     pub(super) static SCHEME_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Slots of hash tables kept between uses visited when they are emptied:
-    /// the capacity of a table cleared, or the entries of one dropped.
+    /// the capacity of a table cleared or dropped.
     pub(super) static TABLE_SLOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -700,6 +702,19 @@ impl TypeChecker {
         term: TermId,
         expected: Option<&Scheme>,
     ) -> Result<Ty, TypeError> {
+        let result = self.run_walks(arena, libs, term, expected);
+        self.release_tables();
+        result
+    }
+
+    /// The walks of [`TypeChecker::run`].
+    fn run_walks<L: LibEnv + ?Sized>(
+        &mut self,
+        arena: &Arena,
+        libs: &L,
+        term: TermId,
+        expected: Option<&Scheme>,
+    ) -> Result<Ty, TypeError> {
         self.spent = 0;
         #[cfg(test)]
         {
@@ -748,6 +763,22 @@ impl TypeChecker {
             Want::at(want, "the whole term, checked against its expected type")
         });
         self.walk(arena, libs, term, want)
+    }
+
+    /// Empties the hash tables at the end of a call (see [`empty_set`]), so the
+    /// next call starts with small ones. Emptying a table costs time in its
+    /// capacity, which this call paid for as it filled the table; left full,
+    /// a later call would pay it again, however little work that call does.
+    /// Only hash tables go: the store, which the returned type points into,
+    /// stays.
+    fn release_tables(&mut self) {
+        release_set(&mut self.shared);
+        release_map(&mut self.free_vars);
+        release_map(&mut self.memo);
+        release_map(&mut self.canon);
+        release_set(&mut self.failed);
+        release_set(&mut self.seen_pairs);
+        release_map(&mut self.inst);
     }
 
     fn reset(&mut self) {
@@ -1064,6 +1095,7 @@ impl TypeChecker {
             }
         }
         self.pairs = pairs;
+        release_set(&mut seen);
         self.seen_pairs = seen;
         result
     }
@@ -1230,6 +1262,7 @@ impl TypeChecker {
             }
         }
         let out = map.get(&root).copied().unwrap_or(root);
+        release_map(&mut map);
         self.inst = map;
         out
     }
@@ -2396,24 +2429,51 @@ fn empty_set<K, S: Default>(t: &mut std::collections::HashSet<K, S>) {
     }
 }
 
+/// Largest capacity a table keeps between calls (see
+/// [`TypeChecker::release_tables`]).
+const KEPT_CAPACITY: usize = 64;
+
+/// Drops a hash table kept between calls if it is larger than
+/// [`KEPT_CAPACITY`], else clears it.
+fn release_map<K, V, S: Default>(t: &mut HashMap<K, V, S>) {
+    if t.capacity() > KEPT_CAPACITY {
+        count_table_slots(t.capacity());
+        *t = HashMap::default();
+    } else {
+        empty_map(t);
+    }
+}
+
+/// [`release_map`] for a hash set.
+fn release_set<K, S: Default>(t: &mut std::collections::HashSet<K, S>) {
+    if t.capacity() > KEPT_CAPACITY {
+        count_table_slots(t.capacity());
+        *t = std::collections::HashSet::default();
+    } else {
+        empty_set(t);
+    }
+}
+
+/// Counts `n` slots of a kept table visited, in tests.
+fn count_table_slots(n: usize) {
+    #[cfg(test)]
+    TABLE_SLOTS.with(|c| c.set(c.get() + n as u64));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
 /// Whether to clear a table of `len` entries and `capacity` slots rather than
 /// replace it with an empty one. Clearing a table that holds anything visits
 /// every slot, and capacity never shrinks, so one large use would make every
 /// later small one slow. A table much larger than its contents is dropped
-/// instead, which visits only the entries. Either way, emptying costs at most
-/// a constant times the entries the table held, which were charged as they
-/// were added, plus a constant.
+/// instead. Freeing a table also costs time in its capacity, so callers
+/// release a grown table when they finish with it (see [`release_set`]), and
+/// the tables emptied here hold no more than [`KEPT_CAPACITY`] slots more than
+/// twice what was charged since.
 fn keep_table(len: usize, capacity: usize) -> bool {
-    let keep = capacity <= 2 * len + 64;
-    #[cfg(test)]
-    {
-        let visited = match (keep, len) {
-            (_, 0) => 0,
-            (true, _) => capacity,
-            (false, _) => len,
-        };
-        TABLE_SLOTS.with(|c| c.set(c.get() + visited as u64));
-    }
+    let keep = capacity <= 2 * len + KEPT_CAPACITY;
+    // Freeing a table costs time in its capacity too.
+    count_table_slots(if keep && len == 0 { 0 } else { capacity });
     keep
 }
 

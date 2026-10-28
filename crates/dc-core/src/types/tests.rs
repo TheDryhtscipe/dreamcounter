@@ -2082,6 +2082,45 @@ fn a_large_unification_does_not_slow_later_ones() {
     );
 }
 
+/// `(cons (pair x_1 x_1) (cons ... nil))` with `x_i = (cons i nil)`: `n`
+/// distinct shared subterms, which fill the checker's per-walk tables.
+fn many_shared(a: &mut Arena, n: usize) -> TermId {
+    let (cons, pair, nil) = (a.prim(Prim::Cons), a.prim(Prim::Pair), a.prim(Prim::Nil));
+    let mut t = nil;
+    for i in 0..n {
+        let k = a.int(i as i64);
+        let x = a.apps(cons, &[k, nil]);
+        let p = a.apps(pair, &[x, x]);
+        t = a.apps(cons, &[p, t]);
+    }
+    t
+}
+
+#[test]
+fn a_large_call_does_not_slow_later_calls() {
+    // A call fills the tables that the next call empties. Clearing a full
+    // table costs time in its capacity, and so does freeing a large empty
+    // one, so the small calls after a large one must not inherit its tables.
+    let mut a = Arena::new();
+    let big = many_shared(&mut a, 20_000);
+    let (add, one, two) = (a.prim(Prim::Add), a.int(1), a.int(2));
+    let small = a.apps(add, &[one, two]);
+    let mut tc = TypeChecker::new();
+    let (reads, units) = reads_and_units(&mut tc, &a, big);
+    assert!(
+        reads <= READS_PER_UNIT * units + 1_000,
+        "large call: {reads} reads for {units} units"
+    );
+    tc.set_work_budget(100);
+    for call in 1..=2 {
+        let (reads, units) = reads_and_units(&mut tc, &a, small);
+        assert!(
+            reads <= READS_PER_UNIT * units + 1_000,
+            "small call {call}: {reads} reads for {units} units"
+        );
+    }
+}
+
 #[test]
 fn one_unification_is_bounded_by_the_budget() {
     // A unification of two types that share differently visits pairs of
