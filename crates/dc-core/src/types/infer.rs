@@ -117,12 +117,16 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 /// [`TypeChecker::check`] may do unless [`TypeChecker::set_work_budget`] says
 /// otherwise; more is a [`TypeErrorKind::TooMuchWork`] error.
 ///
-/// A unit is a step of the term walk, a type node made, or a node looked up in
-/// the store, so every walk over the store pays for the nodes it visits. The
-/// budget is checked between steps of the term walk, so a call can overrun it
-/// by the work of one step. Each walk over the store in a step visits a node (for
-/// unification, a pair of nodes) at most once, and the store has no more nodes
-/// than the units already spent. One unit takes about
+/// A unit is a step of the term walk, a type node made, a node looked up in the
+/// store, a node or child visited in the search for shared subterms, an index
+/// gathered while finding a subterm's free variables, or a slot of the key a use
+/// of a shared subterm is looked up by. So every walk over the store or the term
+/// pays for what it visits. The budget is checked between steps of the term
+/// walk and between nodes of the search, so a call can overrun it by the work of
+/// one step. That work is counted in full; it is bounded by the store's size
+/// (no more than the units already spent), the environment's depth (no more
+/// than the steps taken) and, the first time a shared subterm's free variables
+/// are found, the number of its distinct nodes. One unit takes about
 /// 20 ns in a release build. Well-typed terms can need work exponential in their
 /// size: a shared subterm is inferred once for each different set of bindings
 /// its free variables see (see the module documentation), and polymorphic
@@ -131,11 +135,12 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 ///
 /// Measured (October 2026): the reference programs, the prelude and every
 /// program in the test suites outside the checker's own stress tests take at
-/// most about 11 000 units, and the stress tests at most 6.3 million (the tree
-/// walk of a shared `if` nest 18 deep; 200 000-deep terms take under 6
-/// million). The default of 16 million admits all of those, the realistic
-/// programs by a factor of over 1 000, and refuses a well-typed 151-node term
-/// that takes about 10 s without it (450 million units) in about 0.35 s.
+/// most about 9 400 units, and the stress tests at most 7.2 million (a
+/// 200 000-deep nest of `let` and `if`; the tree walk of a shared `if` nest 18
+/// deep takes 6.3 million). The default of 16 million admits all of those, the
+/// realistic programs by a factor of over 1 000, and refuses a well-typed
+/// 151-node term that takes about 10 s without it (450 million units) in about
+/// 0.35 s.
 pub const DEFAULT_WORK_BUDGET: u64 = 16_000_000;
 
 /// Index of a node in the type store.
@@ -714,13 +719,20 @@ impl TypeChecker {
     /// never infers a prefix `(f a1 ... ai)` on its own. So `t` in `(add t 1)` and
     /// `(add t 2)` counts as reached twice, although both reach it through the one
     /// node `(add t)`.
-    fn find_shared(&mut self, arena: &Arena, root: TermId) {
+    ///
+    /// A spine is walked whole each time it is reached, so the search pays a unit
+    /// for each node it pops and each child it finds. It returns false, having
+    /// stopped, once that runs past the budget.
+    fn find_shared(&mut self, arena: &Arena, root: TermId) -> bool {
         let mut seen: FxHashSet<TermId> = FxHashSet::default();
         let mut edges: FxHashSet<TermId> = FxHashSet::default();
         let mut stack = vec![root];
         let mut kids = Vec::new();
         seen.insert(root);
         while let Some(id) = stack.pop() {
+            if self.spent > self.budget.0 {
+                return false;
+            }
             kids.clear();
             let node = arena.get(id);
             if let Term::App(..) = node {
@@ -733,6 +745,7 @@ impl TypeChecker {
             } else {
                 kids.extend(children(&node));
             }
+            self.spent += 1 + kids.len() as u64;
             for &c in &kids {
                 if !edges.insert(c) && !children(&arena.get(c)).is_empty() {
                     self.shared.insert(c);
@@ -742,6 +755,7 @@ impl TypeChecker {
                 }
             }
         }
+        self.spent <= self.budget.0
     }
 
     // ------------------------------------------------------------ store
@@ -1411,17 +1425,15 @@ impl TypeChecker {
         root: TermId,
         want: Option<Want>,
     ) -> Result<Ty, TypeError> {
-        if !self.tree_walk {
-            self.find_shared(arena, root);
+        if !self.tree_walk && !self.find_shared(arena, root) {
+            return Err(self.out_of_work(arena, root));
         }
         let mut step = Step::Eval(root, want);
         loop {
             self.steps += 1;
             self.spent += 1;
             if self.spent > self.budget.0 {
-                let mut e = plain_error(arena, root, too_much_work(self.budget.0));
-                e.context = "the whole term".into();
-                return Err(e);
+                return Err(self.out_of_work(arena, root));
             }
             #[cfg(test)]
             {
@@ -1467,6 +1479,13 @@ impl TypeChecker {
         }
     }
 
+    /// The error for a call that has run out of work budget.
+    fn out_of_work(&self, arena: &Arena, root: TermId) -> TypeError {
+        let mut e = plain_error(arena, root, too_much_work(self.budget.0));
+        e.context = "the whole term".into();
+        e
+    }
+
     /// Starts on shared subterm `id`: reuses its kept type for this [`Scope`], or
     /// infers it afresh (see [`TypeChecker::walk`]).
     fn shared_subterm(
@@ -1476,7 +1495,7 @@ impl TypeChecker {
         want: Option<Want>,
     ) -> Result<Step, TypeError> {
         if !self.free_vars.contains_key(&id) {
-            free_vars(arena, id, &mut self.free_vars);
+            self.spent += free_vars(arena, id, &mut self.free_vars);
         }
         let fv = &self.free_vars[&id];
         let len = self.env.len();
@@ -1488,6 +1507,9 @@ impl TypeChecker {
             return self.descend_unshared(id, want);
         }
         let indices = fv.indices();
+        // Building, hashing, comparing and keeping the key each take time in
+        // proportion to its length.
+        self.spent += indices.len() as u64;
         let mut scope = Vec::with_capacity(indices.len());
         for &i in &indices {
             let b = self.env[len - 1 - i as usize];
@@ -1558,6 +1580,12 @@ impl TypeChecker {
     #[cfg(test)]
     pub(super) fn failed_keys(&self) -> usize {
         self.failed.len()
+    }
+
+    /// The units of work the last call did.
+    #[cfg(test)]
+    pub(super) fn spent(&self) -> u64 {
+        self.spent
     }
 
     /// Whether no binding in `scope` has a type with free variables: then
@@ -2133,8 +2161,11 @@ impl TypeChecker {
 /// Records in `memo` the [`FreeVars`] of `id` and of every node under it that
 /// `memo` does not already hold. It walks with an explicit stack and visits each
 /// distinct node once; a node's list is at most [`MAX_FREE_VARS`] long, so the
-/// cost is linear in the number of distinct nodes.
-fn free_vars(arena: &Arena, id: TermId, memo: &mut FxHashMap<TermId, FreeVars>) {
+/// cost is linear in the number of distinct nodes. Returns the units of work it
+/// did: one for each node it records, and one for each index it gathers from
+/// the node's children.
+fn free_vars(arena: &Arena, id: TermId, memo: &mut FxHashMap<TermId, FreeVars>) -> u64 {
+    let mut spent = 0u64;
     // A node is pushed with `false` to be expanded, and again with `true` to be
     // computed once its children are done.
     let mut stack = vec![(id, false)];
@@ -2170,6 +2201,7 @@ fn free_vars(arena: &Arena, id: TermId, memo: &mut FxHashMap<TermId, FreeVars>) 
                 let mut vars: Option<Vec<u32>> = Some(Vec::new());
                 for (c, shift) in parts {
                     let child = &memo[&c];
+                    spent += child.vars.as_ref().map_or(1, |v| v.len() as u64);
                     depth = depth.max(child.depth.saturating_sub(shift));
                     match (&mut vars, &child.vars) {
                         (Some(acc), Some(cv)) => {
@@ -2186,8 +2218,10 @@ fn free_vars(arena: &Arena, id: TermId, memo: &mut FxHashMap<TermId, FreeVars>) 
                 FreeVars { depth, vars }
             }
         };
+        spent += 1;
         memo.insert(t, fv);
     }
+    spent
 }
 
 /// Whether `e` says that the call ran out of work budget.

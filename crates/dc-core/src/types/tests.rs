@@ -1526,3 +1526,103 @@ fn a_smaller_budget_refuses_what_the_default_admits() {
     tc.set_work_budget(DEFAULT_WORK_BUDGET);
     assert_eq!(tc.infer(&a, t, NO_LIBS), Ok(sch("Int")));
 }
+
+/// `(pair p_1 (pair p_2 ... (pair p_l unit)))` where `p_0 = 0` and `p_i = (p_{i-1}
+/// 0)`: every prefix of the longest application spine is also a child elsewhere,
+/// so the spines of the distinct nodes have about `l^2 / 2` children in all.
+fn spine_prefixes(a: &mut Arena, l: usize) -> TermId {
+    let zero = a.int(0);
+    let mut prefixes = Vec::with_capacity(l);
+    let mut p = zero;
+    for _ in 0..l {
+        p = a.app(p, zero);
+        prefixes.push(p);
+    }
+    let pair = a.prim(Prim::Pair);
+    let mut t = a.unit();
+    for &q in prefixes.iter().rev() {
+        t = a.apps(pair, &[q, t]);
+    }
+    t
+}
+
+#[test]
+fn finding_shared_subterms_is_charged_to_the_budget() {
+    // Children of all the spines: about 125 000, against a budget of 10 000. The
+    // search for shared subterms runs before the first step of the term walk, so
+    // it must refuse the term itself: the walk would stop at its sixth step.
+    let mut a = Arena::new();
+    let t = spine_prefixes(&mut a, 500);
+    let mut tc = TypeChecker::with_work_budget(10_000);
+    tc.step_limit = Some(5);
+    let e = tc.infer(&a, t, NO_LIBS).unwrap_err();
+    assert_eq!(*e.kind, too_much_work(10_000), "{e}");
+    // With enough budget the term is checked, and the search is paid for.
+    let mut tc = TypeChecker::new();
+    assert!(
+        tc.infer(&a, t, NO_LIBS).is_err(),
+        "applying an Int is an error"
+    );
+    assert!(tc.spent() >= 500 * 499 / 2, "{}", tc.spent());
+}
+
+/// `d` lets of `(lam $0)` around `c_u`, where `c_0 = 0` and `c_{k+1} = (let (pair
+/// s c_k) 0)`. `s = (pair $0 (pair $1 ... (pair $65 $(d-1))))` has more than
+/// [`MAX_FREE_VARS`] free variables, so its scope has a slot for each of the `d`
+/// bindings, and it is used `u` times.
+fn wide_scope_uses(a: &mut Arena, d: u32, u: usize) -> TermId {
+    let pair = a.prim(Prim::Pair);
+    let id = parse_term(a, "(lam $0)");
+    let mut s = a.var(d - 1);
+    for i in (0..66u32).rev() {
+        let v = a.var(i);
+        s = a.apps(pair, &[v, s]);
+    }
+    let zero = a.int(0);
+    let mut c = zero;
+    for _ in 0..u {
+        let p = a.apps(pair, &[s, c]);
+        c = a.let_(p, zero);
+    }
+    let mut t = c;
+    for _ in 0..d {
+        t = a.let_(id, t);
+    }
+    t
+}
+
+#[test]
+fn each_use_of_a_shared_subterm_pays_for_its_scope() {
+    // Each use builds, hashes and compares a key of 20 000 slots. Without
+    // charging for that, the call spends about 470 000 units, under 20 000 a use.
+    let (d, u) = (20_000, 50);
+    let mut a = Arena::new();
+    let t = wide_scope_uses(&mut a, d, u);
+    let mut tc = TypeChecker::new();
+    assert_eq!(tc.infer(&a, t, NO_LIBS), Ok(sch("Int")));
+    assert!(tc.spent() >= u64::from(d) * u as u64, "{}", tc.spent());
+}
+
+#[test]
+fn running_out_while_locating_returns_the_first_error() {
+    // The first walk reports the clash at the whole shared subterm; the second
+    // walk names `$0`. The smallest budget that does not refuse the term is one
+    // the first walk fits in and the second does not, so it gives the first
+    // walk's error.
+    let mut a = Arena::new();
+    let t = parse_term(&mut a, "(lam (if $0 (add $0 1) (add $0 1)))");
+    let located = TypeChecker::new().infer(&a, t, NO_LIBS).unwrap_err();
+    assert_eq!(located.term_text, "$0", "{located}");
+    let result = |budget: u64| TypeChecker::with_work_budget(budget).infer(&a, t, NO_LIBS);
+    let (mut lo, mut hi) = (1u64, 1_000_000u64);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match result(mid) {
+            Err(e) if *e.kind == too_much_work(mid) => lo = mid + 1,
+            _ => hi = mid,
+        }
+    }
+    let first = result(lo).unwrap_err();
+    assert_eq!(first.term_text, "(add $0 1)", "{first}");
+    assert!(first.context.contains("shared subterm"), "{first}");
+}
