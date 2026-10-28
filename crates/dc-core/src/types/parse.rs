@@ -24,7 +24,10 @@
 //! recursive descent needs megabytes of stack in a debug build.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
+
+use rustc_hash::FxHashMap;
 
 use super::{Scheme, TyVar, Type, MAX_TYPE_DEPTH};
 
@@ -102,7 +105,27 @@ struct Parser<'a> {
     toks: Vec<(Tok<'a>, usize)>,
     pos: usize,
     end: usize,
-    names: Vec<&'a str>,
+    /// Each variable name seen so far and its number, in order of first appearance.
+    names: FxHashMap<Name<'a>, u32>,
+}
+
+/// A variable name as a key of [`Parser::names`]. In test builds each equality
+/// comparison is counted in `probes`, as for [`TyVar`].
+#[derive(Clone, Copy, Debug, Eq)]
+struct Name<'a>(&'a str);
+
+impl Hash for Name<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl PartialEq for Name<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        super::probes::add(1);
+        self.0 == other.0
+    }
 }
 
 /// A part of a type that [`Parser::ty`] has begun and that waits for more input.
@@ -170,14 +193,8 @@ impl<'a> Parser<'a> {
     }
 
     fn var(&mut self, name: &'a str) -> TyVar {
-        let i = match self.names.iter().position(|&n| n == name) {
-            Some(i) => i,
-            None => {
-                self.names.push(name);
-                self.names.len() - 1
-            }
-        };
-        TyVar(u32::try_from(i).expect("fewer than 2^32 type variables"))
+        let next = u32::try_from(self.names.len()).expect("fewer than 2^32 type variables");
+        TyVar(*self.names.entry(Name(name)).or_insert(next))
     }
 
     /// Parses a `type` with an explicit stack of [`Frame`]s, so the host stack does
@@ -328,7 +345,7 @@ fn parser(src: &str) -> Result<Parser<'_>, TypeParseError> {
         toks: tokenize(src)?,
         pos: 0,
         end: src.len(),
-        names: vec![],
+        names: FxHashMap::default(),
     })
 }
 
