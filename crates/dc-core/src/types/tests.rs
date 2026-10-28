@@ -1851,6 +1851,33 @@ fn if_nest(a: &mut Arena, d: usize) -> TermId {
     c
 }
 
+/// Under `n` lambdas, `(if (eq $0 $1) (if (eq $1 $2) ... (if $(n-1) c_d 0) ...
+/// 0) 0)`, where `c_0 = (add $0 1)` and `c_{k+1} = (if true c_k c_k)`: the
+/// conditions link the variables of the lambdas in a chain, the last fixes
+/// them to `Bool`, and `c_d` is ill typed at the bottom of `d` levels of
+/// sharing, so the second walk goes back over the chain at each level.
+fn chain_rollback(a: &mut Arena, n: u32, d: usize) -> TermId {
+    let add = a.prim(Prim::Add);
+    let eq = a.prim(Prim::Eq);
+    let (zero, one, t) = (a.int(0), a.int(1), a.bool(true));
+    let v0 = a.var(0);
+    let mut c = a.apps(add, &[v0, one]);
+    for _ in 0..d {
+        c = a.if_(t, c, c);
+    }
+    let last = a.var(n - 1);
+    let mut body = a.if_(last, c, zero);
+    for i in (0..n - 1).rev() {
+        let (x, y) = (a.var(i), a.var(i + 1));
+        let cond = a.apps(eq, &[x, y]);
+        body = a.if_(cond, body, zero);
+    }
+    for _ in 0..n {
+        body = a.lam(body);
+    }
+    body
+}
+
 /// The most reads of the arena and the store a unit of work may stand for.
 const READS_PER_UNIT: u64 = 4;
 
@@ -1871,6 +1898,7 @@ fn adversarial_shapes(a: &mut Arena) -> Vec<(&'static str, TermId)> {
         ("helper choices", helper_choices(a, 10)),
         ("if nest", if_nest(a, 100_000)),
         ("large scheme uses", large_scheme_uses(a, 20)),
+        ("chain rollback", chain_rollback(a, 2_000, 2_000)),
     ]
 }
 

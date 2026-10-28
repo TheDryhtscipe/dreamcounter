@@ -166,7 +166,8 @@ pub const DEFAULT_WORK_BUDGET: u64 = 16_000_000;
 
 #[cfg(test)]
 thread_local! {
-    /// Reads of the type store on this thread: the tests compare it with the
+    /// Reads of the type store on this thread, counting each old node saved to
+    /// the trail and each restored from it: the tests compare it with the
     /// units of work charged.
     pub(super) static STORE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Reads of library and expected schemes on this thread: one per type
@@ -939,6 +940,8 @@ impl TypeChecker {
     fn set(&mut self, t: Ty, n: Node) {
         let i = t as usize;
         if self.checkpoints.last().is_some_and(|cp| i < cp.nodes) {
+            #[cfg(test)]
+            STORE_READS.with(|r| r.set(r.get() + 1));
             self.trail.push((t, self.nodes[i]));
         }
         self.nodes[i] = n;
@@ -1866,6 +1869,8 @@ impl TypeChecker {
     /// its shared subterm in place.
     fn back_to(&mut self, cp: Checkpoint) -> Step {
         for (t, n) in self.trail.drain(cp.trail..).rev() {
+            #[cfg(test)]
+            STORE_READS.with(|r| r.set(r.get() + 1));
             self.nodes[t as usize] = n;
         }
         self.frames.truncate(cp.frames);
