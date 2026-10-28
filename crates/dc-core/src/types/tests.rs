@@ -1759,6 +1759,103 @@ fn a_failure_under_one_open_helper_does_not_match_another_of_another_shape() {
     );
 }
 
+/// `lam x. lam y. (pair U U)`, with `U = (pair (let (lam (pair x $0)) (pair
+/// (add x 1) t_n)) (let (lam (pair y $0)) (pair (if y 1 1) t_n)))`, `t_(k+1) =
+/// (if true t_k t_k)` and `t_0 = (add (fst ($0 1)) 1)`. Both helpers are
+/// `a -> (v, a)`, of one shape, over a free variable that each `let` body
+/// then fixes: `x` to `Int`, under which the chain is well typed, and `y` to
+/// `Bool`, under which it is not.
+fn chain_under_helpers_of_one_shape(a: &mut Arena, n: usize) -> TermId {
+    let mut t = parse_term(a, "(add (fst ($0 1)) 1)");
+    let yes = a.bool(true);
+    for _ in 0..n {
+        t = a.if_(yes, t, t);
+    }
+    let pair = a.prim(Prim::Pair);
+    let mut branch = |helper: &str, fix: &str| {
+        let (helper, fix) = (parse_term(a, helper), parse_term(a, fix));
+        let body = a.apps(pair, &[fix, t]);
+        a.let_(helper, body)
+    };
+    let first = branch("(lam (pair $2 $0))", "(add $2 1)");
+    let second = branch("(lam (pair $1 $0))", "(if $1 1 1)");
+    let u = a.apps(pair, &[first, second]);
+    let body = a.apps(pair, &[u, u]);
+    let body = a.lam(body);
+    a.lam(body)
+}
+
+/// A failure under the helper over `y`, which is `Bool`, says nothing about
+/// the helper of the same shape over `x`, which is `Int`: a pattern must
+/// write out what a binding's free variables resolve to. If it matched, the
+/// well-typed chain would be walked in place as a tree: `2^n`.
+#[test]
+fn a_failure_under_one_helper_does_not_match_another_of_the_same_shape() {
+    const N: usize = 40;
+    let limit = 20 * (N * N) as u64;
+    let mut a = Arena::new();
+    let small = chain_under_helpers_of_one_shape(&mut a, 8);
+    let big = chain_under_helpers_of_one_shape(&mut a, N);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    // Walked as a tree, the big chain is `2^N`; the error is at the same leaf
+    // of the small one, since terms are shared in the arena.
+    let want = tree.infer(&a, small, NO_LIBS);
+    let e = want
+        .as_ref()
+        .expect_err("ill typed under the helper over y");
+    assert_eq!(e.term_text, "(fst ($0 1))", "{e}");
+    for t in [small, big] {
+        assert_eq!(bounded(limit).infer(&a, t, NO_LIBS), want);
+    }
+}
+
+/// `lam y. let g_0 = (lam (pair y $0)) in S_n`, with `S_0 = leaf` and `S_k =
+/// (let z = y in let g = (lam (pair z $0)) in (if cond S_(k-1) S_(k-1)))`:
+/// each level binds a helper of its own over a monomorphic variable of its
+/// scope. `cond` sees the level's helper as `$0` and its parent's as `$2`.
+fn chain_making_helpers_over_mono(a: &mut Arena, n: usize, leaf: &str, cond: &str) -> TermId {
+    let mut t = parse_term(a, leaf);
+    let c = parse_term(a, cond);
+    let y = a.var(1);
+    let helper = parse_term(a, "(lam (pair $1 $0))");
+    for _ in 0..n {
+        let body = a.if_(c, t, t);
+        let inner = a.let_(helper, body);
+        t = a.let_(y, inner);
+    }
+    let body = a.let_(helper, t);
+    a.lam(body)
+}
+
+/// A level's helper is built over the fresh variable that stands for its
+/// monomorphic `z` when the level is tried afresh, and over `z`'s own node
+/// when it is walked in place. A failure must be recognised in both, so a
+/// helper is told apart by the shape of its type and what its free variables
+/// resolve to, not by which nodes they are. Keyed by those nodes, every
+/// level is tried afresh again under each level walked in place: `2^n`.
+#[test]
+fn failures_under_helpers_made_inside_the_subterm_are_located_in_polynomial_steps() {
+    const N: usize = 40;
+    let cond = "(fst (pair true ($2 1)))";
+    let mut a = Arena::new();
+    let small = chain_making_helpers_over_mono(&mut a, 8, S2_LEAF, cond);
+    let big = chain_making_helpers_over_mono(&mut a, N, S2_LEAF, cond);
+    let limit = 20 * (N * N) as u64;
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let expected = sch("a -> b");
+    for t in [small, big] {
+        // The tree walk fails in the leftmost leaf, so it is cheap at any depth.
+        let want = tree.infer(&a, t, NO_LIBS);
+        assert!(want.is_err());
+        assert_eq!(bounded(limit).infer(&a, t, NO_LIBS), want);
+        let want = tree.check(&a, t, NO_LIBS, &expected);
+        assert!(want.is_err());
+        assert_eq!(bounded(limit).check(&a, t, NO_LIBS, &expected), want);
+    }
+}
+
 /// `lam x. let h = (lam (let (pair x x) (let (pair $0 $0) ... (pair $0
 /// arg)))) in t_n`, with `m` `let`s in the helper and `t_n` the chain of s2:
 /// a helper whose type is a DAG of `m` nodes over one free variable.

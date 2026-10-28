@@ -459,10 +459,11 @@ enum Bound {
     /// A polymorphic binding whose type has no free variables, by its
     /// [`Canon`] id.
     Closed(u32),
-    /// A polymorphic binding whose type has free variables: its [`Canon`] id,
-    /// which fixes its shape and quantified variables, and the [`Canon`] ids
-    /// of what its free variables, in order of first occurrence, resolve to
-    /// now, written with [`Canon::Open`] variables.
+    /// A polymorphic binding whose type has free variables: the shape of its
+    /// type (see [`TypeChecker::shape_of_class`]), which fixes its
+    /// quantified variables and where each free variable occurs, and the
+    /// [`Canon`] ids of what its free variables, in order of first
+    /// occurrence, resolve to now, written with [`Canon::Open`] variables.
     Open(u32, Box<[u32]>),
 }
 
@@ -557,9 +558,10 @@ pub struct TypeChecker {
     /// A use whose pattern is an instance of one of them fails too, so it is
     /// walked in place at once (see [`TypeChecker::note_failure`]).
     failed: FxHashMap<TermId, Vec<Pattern>>,
-    /// The free variables of each [`Canon`] id of a polymorphic binding met
-    /// by [`TypeChecker::pattern`], in order of first occurrence.
-    class_free: FxHashMap<u32, Box<[Ty]>>,
+    /// For each [`Canon`] id of a polymorphic binding met by
+    /// [`TypeChecker::pattern`], its shape and its free variables (see
+    /// [`TypeChecker::shape_of_class`]).
+    class_shape: FxHashMap<u32, (u32, Box<[Ty]>)>,
     /// Steps taken by the term walk of the current call.
     steps: u64,
     /// Units of work done by the current call (see [`DEFAULT_WORK_BUDGET`]).
@@ -848,7 +850,7 @@ impl TypeChecker {
         release_map(&mut self.memo);
         release_map(&mut self.canon);
         release_map(&mut self.failed);
-        release_map(&mut self.class_free);
+        release_map(&mut self.class_shape);
         release_set(&mut self.seen_pairs);
         release_map(&mut self.inst);
     }
@@ -905,7 +907,7 @@ impl TypeChecker {
         self.trail.clear();
         self.memo_log.clear();
         empty_map(&mut self.failed);
-        empty_map(&mut self.class_free);
+        empty_map(&mut self.class_shape);
     }
 
     /// Pushes a binding for a new innermost variable.
@@ -973,34 +975,40 @@ impl TypeChecker {
                     Canon::Con(h, id(a, h.arity() >= 1), id(b, h.arity() >= 2))
                 }
             };
-            let next = u32::try_from(self.canon.len()).expect("fewer than 2^32 types");
-            count_probes(2);
-            let id = *self.canon.entry(canon).or_insert(next);
-            if id == next {
-                let closed = match canon {
-                    Canon::Var { .. } => true,
-                    Canon::Free(_) | Canon::Open { .. } => false,
-                    Canon::Con(h, a, b) => {
-                        let closed = |c: u32| self.canon_closed[c as usize];
-                        (h.arity() < 1 || closed(a)) && (h.arity() < 2 || closed(b))
-                    }
-                };
-                let bound = match canon {
-                    Canon::Var { .. } => true,
-                    Canon::Free(_) | Canon::Open { .. } => false,
-                    Canon::Con(h, a, b) => {
-                        let bound = |c: u32| self.canon_bound[c as usize];
-                        (h.arity() >= 1 && bound(a)) || (h.arity() >= 2 && bound(b))
-                    }
-                };
-                self.canon_closed.push(closed);
-                self.canon_nodes.push(canon);
-                self.canon_bound.push(bound);
-            }
+            let id = self.intern(canon);
             ids.insert(r, id);
         }
         count_probes(1);
         ids[&root]
+    }
+
+    /// The [`Canon`] id of `canon`, whose children already have ids.
+    fn intern(&mut self, canon: Canon) -> u32 {
+        let next = u32::try_from(self.canon.len()).expect("fewer than 2^32 types");
+        count_probes(2);
+        let id = *self.canon.entry(canon).or_insert(next);
+        if id == next {
+            let closed = match canon {
+                Canon::Var { .. } => true,
+                Canon::Free(_) | Canon::Open { .. } => false,
+                Canon::Con(h, a, b) => {
+                    let closed = |c: u32| self.canon_closed[c as usize];
+                    (h.arity() < 1 || closed(a)) && (h.arity() < 2 || closed(b))
+                }
+            };
+            let bound = match canon {
+                Canon::Var { .. } => true,
+                Canon::Free(_) | Canon::Open { .. } => false,
+                Canon::Con(h, a, b) => {
+                    let bound = |c: u32| self.canon_bound[c as usize];
+                    (h.arity() >= 1 && bound(a)) || (h.arity() >= 2 && bound(b))
+                }
+            };
+            self.canon_closed.push(closed);
+            self.canon_nodes.push(canon);
+            self.canon_bound.push(bound);
+        }
+        id
     }
 
     /// Finds the non-leaf subterms of `root` that more than one edge of the DAG
@@ -2166,54 +2174,80 @@ impl TypeChecker {
                 Slot::Mono => Bound::Mono,
                 Slot::Poly(c) if self.canon_closed[c as usize] => Bound::Closed(c),
                 Slot::Poly(c) => {
-                    let free = self.free_of_class(c);
+                    let (shape, free) = self.shape_of_class(c);
                     let now = free
                         .iter()
                         .map(|&t| self.canonical(t, Some(&mut open)))
                         .collect();
-                    Bound::Open(c, now)
+                    Bound::Open(shape, now)
                 }
             });
         }
         out
     }
 
-    /// The free variables of the type with [`Canon`] id `c`, in order of
-    /// first occurrence, found once for each id; a unit is paid for each
-    /// node met.
-    fn free_of_class(&mut self, c: u32) -> Box<[Ty]> {
+    /// The shape of the type with [`Canon`] id `c` and its free variables,
+    /// in order of first occurrence, found once for each id. The shape is
+    /// the [`Canon`] id of that type with its `i`th free variable written as
+    /// [`Canon::Open`] `i`: two bindings of the same shape whose free
+    /// variables resolve to the same types have the same type, whichever
+    /// nodes those variables are. A unit is paid for each node met.
+    fn shape_of_class(&mut self, c: u32) -> (u32, Box<[Ty]>) {
         self.spent += 1;
         count_probes(1);
-        if let Some(free) = self.class_free.get(&c) {
+        if let Some((shape, free)) = self.class_shape.get(&c) {
             self.spent += free.len() as u64;
-            return free.clone();
+            return (*shape, free.clone());
         }
         let mut free = Vec::new();
-        let mut seen: FxHashSet<u32> = FxHashSet::default();
-        let mut todo = vec![c];
-        while let Some(c) = todo.pop() {
+        let mut position: FxHashMap<Ty, u32> = FxHashMap::default();
+        let mut ids: FxHashMap<u32, u32> = FxHashMap::default();
+        // As in [`TypeChecker::canonical`]: a constructor is pushed with
+        // `false` to be expanded and again with `true` once its children are
+        // done, and children are popped left to right.
+        let mut stack = vec![(c, false)];
+        while let Some((d, children_done)) = stack.pop() {
             self.spent += 1;
             count_probes(1);
-            if !seen.insert(c) {
+            if ids.contains_key(&d) {
                 continue;
             }
-            match self.canon_nodes[c as usize] {
-                Canon::Free(t) => free.push(t),
-                Canon::Con(h, a, b) => {
-                    if h.arity() >= 2 {
-                        todo.push(b);
-                    }
-                    if h.arity() >= 1 {
-                        todo.push(a);
+            let shape = match self.canon_nodes[d as usize] {
+                Canon::Free(t) => {
+                    let next = u32::try_from(free.len()).expect("fewer than 2^32 variables");
+                    free.push(t);
+                    position.insert(t, next);
+                    Canon::Open {
+                        index: next,
+                        key: false,
                     }
                 }
-                Canon::Var { .. } | Canon::Open { .. } => {}
-            }
+                Canon::Con(h, a, b) => {
+                    if !children_done {
+                        stack.push((d, true));
+                        if h.arity() >= 2 {
+                            stack.push((b, false));
+                        }
+                        if h.arity() >= 1 {
+                            stack.push((a, false));
+                        }
+                        continue;
+                    }
+                    count_probes(h.arity() as u64);
+                    let id = |x: u32, used: bool| if used { ids[&x] } else { 0 };
+                    Canon::Con(h, id(a, h.arity() >= 1), id(b, h.arity() >= 2))
+                }
+                canon @ (Canon::Var { .. } | Canon::Open { .. }) => canon,
+            };
+            let id = self.intern(shape);
+            count_probes(1);
+            ids.insert(d, id);
         }
+        let shape = ids[&c];
         let free: Box<[Ty]> = free.into();
         count_probes(1);
-        self.class_free.insert(c, free.clone());
-        free
+        self.class_shape.insert(c, (shape, free.clone()));
+        (shape, free)
     }
 
     /// Whether a use of shared subterm `id` with `scope` is known to fail in the current state: its pattern is an
