@@ -1727,3 +1727,200 @@ fn running_out_while_locating_returns_the_first_error() {
     assert_eq!(first.term_text, "(add $0 1)", "{first}");
     assert!(first.context.contains("shared subterm"), "{first}");
 }
+
+/// Reads of the term arena and the type store on this thread so far.
+fn reads() -> u64 {
+    crate::term::GETS.with(std::cell::Cell::get)
+        + super::infer::STORE_READS.with(std::cell::Cell::get)
+}
+
+/// Infers `t` with `tc` and returns the reads it took and the units it was
+/// charged.
+fn reads_and_units(tc: &mut TypeChecker, a: &Arena, t: TermId) -> (u64, u64) {
+    let before = reads();
+    let _ = tc.infer(a, t, NO_LIBS);
+    (reads() - before, tc.spent())
+}
+
+/// `((lam ($0 0 ... 0)) k)` with `l` arguments, where `k = (lam (lam ... 0))` is
+/// `l` deep: the head of the spine has a variable type, so each argument
+/// unifies it with an arrow. Type `Int`.
+fn variable_head_spine(a: &mut Arena, l: usize) -> TermId {
+    let zero = a.int(0);
+    let v = a.var(0);
+    let body = a.apps(v, &vec![zero; l]);
+    let f = a.lam(body);
+    let mut k = zero;
+    for _ in 0..l {
+        k = a.lam(k);
+    }
+    a.app(f, k)
+}
+
+/// `c_m`, where `c_0 = 0` and `c_{k+1} = (h c_k)` with `h = (lam (i i ... i))`, `l`
+/// arguments, and `i = (lam $0)`: a head whose text has a long spine, applied
+/// `m` times.
+fn long_head_chain(a: &mut Arena, l: usize, m: usize) -> TermId {
+    let i = parse_term(a, "(lam $0)");
+    let body = a.apps(i, &vec![i; l]);
+    let h = a.lam(body);
+    let mut c = a.int(0);
+    for _ in 0..m {
+        c = a.app(h, c);
+    }
+    c
+}
+
+/// `c_d`, where `c_0 = (0 unit ... unit)` with `l` arguments and `c_{k+1} = (if
+/// true c_k c_k)`: ill typed at the bottom of `d` levels of sharing.
+fn shared_bad_spine(a: &mut Arena, l: usize, d: usize) -> TermId {
+    let zero = a.int(0);
+    let unit = a.unit();
+    let mut c = a.apps(zero, &vec![unit; l]);
+    let t = a.bool(true);
+    for _ in 0..d {
+        c = a.if_(t, c, c);
+    }
+    c
+}
+
+/// `c_d`, where `c_0 = 0` and `c_{k+1} = (if true c_k c_k)`.
+fn if_nest(a: &mut Arena, d: usize) -> TermId {
+    let mut c = a.int(0);
+    let t = a.bool(true);
+    for _ in 0..d {
+        c = a.if_(t, c, c);
+    }
+    c
+}
+
+/// The most reads of the arena and the store a unit of work may stand for.
+const READS_PER_UNIT: u64 = 4;
+
+/// The most units a call may spend past twice a small budget. The step that
+/// runs past the budget is paid in full: a unification can visit every node of
+/// the store, which is no larger than the units spent so far, and an error can
+/// write out a few types of at most [`MAX_TYPE_NODES`] nodes.
+const OVERRUN: u64 = 4 * MAX_TYPE_NODES as u64 + 1_000;
+
+/// Terms whose checking once did work that was not charged to the budget.
+fn adversarial_shapes(a: &mut Arena) -> Vec<(&'static str, TermId)> {
+    vec![
+        ("variable head spine", variable_head_spine(a, 2_000)),
+        ("long head chain", long_head_chain(a, 2_000, 2_000)),
+        ("shared bad spine", shared_bad_spine(a, 20_000, 100)),
+        ("spine prefixes", spine_prefixes(a, 2_000)),
+        ("wide scope uses", wide_scope_uses(a, 2_000, 20)),
+        ("helper choices", helper_choices(a, 10)),
+        ("if nest", if_nest(a, 100_000)),
+    ]
+}
+
+#[test]
+fn every_read_of_the_term_or_the_store_is_charged() {
+    // A judge for passes the budget does not see: each unit charged must
+    // stand for a bounded number of reads of the term arena and the type
+    // store, whatever the term.
+    let mut a = Arena::new();
+    let shapes = adversarial_shapes(&mut a);
+    let normal = parse_term(
+        &mut a,
+        "(lam (foldl (lam (lam (add $1 (length (array_to_list (array_of_list $0)))))) 0 $0))",
+    );
+    for (name, t) in shapes.into_iter().chain([("normal", normal)]) {
+        let mut tc = TypeChecker::new();
+        let (reads, units) = reads_and_units(&mut tc, &a, t);
+        assert!(
+            reads <= READS_PER_UNIT * units + 1_000,
+            "{name}: {reads} reads for {units} units"
+        );
+    }
+}
+
+#[test]
+fn a_small_budget_bounds_the_work_on_any_term() {
+    // The work of a call that runs out is bounded by its budget, not by the
+    // size of the term: the search for shared subterms, the collection of a
+    // spine and the error text all stop.
+    let budget = 1_000;
+    let mut a = Arena::new();
+    let mut shapes = adversarial_shapes(&mut a);
+    let zero = a.int(0);
+    shapes.push(("long spine", a.apps(zero, &vec![zero; 100_000])));
+    // The tree walk skips the search, so it shows the term walk's own checks.
+    for tree_walk in [false, true] {
+        for &(name, t) in &shapes {
+            let mut tc = TypeChecker::with_work_budget(budget);
+            tc.tree_walk = tree_walk;
+            let (reads, units) = reads_and_units(&mut tc, &a, t);
+            assert!(
+                units <= 2 * budget + OVERRUN,
+                "{name} (tree walk {tree_walk}): {units} units against a budget of {budget}"
+            );
+            assert!(
+                reads <= READS_PER_UNIT * units + 1_000,
+                "{name} (tree walk {tree_walk}): {reads} reads for {units} units"
+            );
+        }
+    }
+}
+
+#[test]
+fn bounded_printing_of_a_long_spine_stops_early() {
+    // The head of a spine is at its far end. Printing stops once the
+    // arguments met are enough to pass the limit, so it never walks to it.
+    let mut a = Arena::new();
+    let zero = a.int(0);
+    let one = a.int(1);
+    let spine = a.apps(zero, &vec![one; 100_000]);
+    let t = a.lam(spine);
+    let before = crate::term::GETS.with(std::cell::Cell::get);
+    let text = super::infer::short(&a, t);
+    let gets = crate::term::GETS.with(std::cell::Cell::get) - before;
+    assert!(gets <= 1_000, "{gets} reads");
+    let kept = text.strip_suffix(" ...").expect("long text ends with ...");
+    assert!(sexpr::print(&a, t).starts_with(kept), "{text}");
+    // Under the limit, a spine prints whole.
+    let short_spine = a.apps(zero, &[one; 50]);
+    let full = sexpr::print(&a, short_spine);
+    assert_eq!(super::infer::short(&a, short_spine), full);
+}
+
+/// Under 64 lambdas, `(pair c_n c_n)`, where `c_0 = (pair $f(0) (pair $f(1) ...
+/// (pair $f(62) $f(63))))` and `c_{k+1} = (pair c_k unit)`.
+fn chain_over_variables(a: &mut Arena, n: u64, f: impl Fn(u32) -> u32) -> TermId {
+    let pair = a.prim(Prim::Pair);
+    let mut c = a.var(f(63));
+    for i in (0..63u32).rev() {
+        let x = a.var(f(i));
+        c = a.apps(pair, &[x, c]);
+    }
+    let unit = a.unit();
+    for _ in 0..n {
+        c = a.apps(pair, &[c, unit]);
+    }
+    let mut t = a.apps(pair, &[c, c]);
+    for _ in 0..64 {
+        t = a.lam(t);
+    }
+    t
+}
+
+#[test]
+fn finding_free_variables_is_charged_to_the_budget() {
+    // Two terms of the same shape. In the first every node of the chain has 64
+    // free variables, so finding the free variables of the shared `c_n`
+    // gathers 64 indices for each of the two application nodes of each level;
+    // in the second each has one.
+    let n = 300u64;
+    let mut a = Arena::new();
+    let wide = chain_over_variables(&mut a, n, |i| i);
+    let narrow = chain_over_variables(&mut a, n, |_| 0);
+    let spent = |t: TermId| {
+        let mut tc = TypeChecker::new();
+        assert!(tc.infer(&a, t, NO_LIBS).is_ok());
+        tc.spent()
+    };
+    let (wide, narrow) = (spent(wide), spent(narrow));
+    assert!(wide >= narrow + 120 * n, "{wide} against {narrow}");
+}

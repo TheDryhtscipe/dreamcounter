@@ -31,16 +31,23 @@ pub fn print(arena: &Arena, id: TermId) -> String {
     out
 }
 
-/// Appends `id` in core syntax to `out`, stopping as soon as `out` is longer than
-/// `limit` bytes. Each application visited pushes its whole spine first, and up
-/// to about `limit` nodes are visited, so the cost is bounded by about `limit`
-/// times the length of the longest atom or application spine, not by the size of
-/// the term. Returns whether the whole term was written.
+/// Appends `id` in core syntax to `out`, stopping once the text is known to be
+/// longer than `limit` bytes. Returns whether the whole term was written; if
+/// not, what was written is a prefix of it.
+///
+/// Its cost is linear in `limit`, whatever the size of the term. Each item
+/// visited writes at least one byte, so it visits at most `limit + 1` of them.
+/// The head of an application spine is at its far end, so the spine is walked
+/// before anything of it is written; every argument met on the way writes at
+/// least two bytes (a space and the argument) once it is printed. So once more
+/// than `limit / 2` arguments have been met in all, the text is longer than
+/// `limit`, and the walk stops there, after writing the opening `(`.
 pub fn print_bounded(arena: &Arena, id: TermId, limit: usize, out: &mut String) -> bool {
     enum Item {
         Term(TermId),
         Text(&'static str),
     }
+    let mut args_left = (limit / 2).saturating_add(1);
     let mut todo = vec![Item::Term(id)];
     while let Some(item) = todo.pop() {
         if out.len() > limit {
@@ -90,6 +97,10 @@ pub fn print_bounded(arena: &Arena, id: TermId, limit: usize, out: &mut String) 
                 todo.push(Item::Text(")"));
                 let mut head = t;
                 while let Term::App(f, a) = arena.get(head) {
+                    if args_left == 0 {
+                        return false;
+                    }
+                    args_left -= 1;
                     todo.push(Item::Term(a));
                     todo.push(Item::Text(" "));
                     head = f;

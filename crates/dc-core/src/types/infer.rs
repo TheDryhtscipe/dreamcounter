@@ -117,31 +117,49 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 /// [`TypeChecker::check`] may do unless [`TypeChecker::set_work_budget`] says
 /// otherwise; more is a [`TypeErrorKind::TooMuchWork`] error.
 ///
-/// A unit is a step of the term walk, a type node made, a node looked up in the
-/// store, a node or child visited in the search for shared subterms, an index
-/// gathered while finding a subterm's free variables, or a slot of the key a use
-/// of a shared subterm is looked up by. So every walk over the store or the term
-/// pays for what it visits. The budget is checked between steps of the term
-/// walk and between nodes of the search, so a call can overrun it by the work of
-/// one step. That work is counted in full; it is bounded by the store's size
-/// (no more than the units already spent), the environment's depth (no more
-/// than the steps taken) and, the first time a shared subterm's free variables
-/// are found, the number of its distinct nodes. One unit takes about
-/// 20 ns in a release build. Well-typed terms can need work exponential in their
-/// size: a shared subterm is inferred once for each different set of bindings
-/// its free variables see (see the module documentation), and polymorphic
-/// helpers of different types can make that set exponentially large. So the
-/// budget is what keeps the checker from hanging on an untrusted term.
+/// A unit is a step of the term walk, an argument collected from an
+/// application spine, a type node made, a node looked up in the store, a node
+/// or child visited in the search for shared subterms, an index gathered while
+/// finding a subterm's free variables, or a slot of the key a use of a shared
+/// subterm is looked up by. The text of an error is written only when the
+/// error is made: a term in it is cut to 200 bytes at a cost
+/// linear in that, whatever the size of the term, and a type in it is written
+/// out a unit a node.
+///
+/// The budget is checked between steps of the term walk, between nodes of the
+/// search and between the arguments of a spine, so a call can overrun it by the
+/// rest of one step. That work is counted in full, and bounded: a unification
+/// visits no more nodes than the store holds (no more than the units already
+/// spent), a scope key has no more slots than there are bindings (no more than
+/// the steps taken), finding free variables visits no more nodes than the
+/// search has paid for, and an error writes out at most four types of at most
+/// [`MAX_TYPE_NODES`] nodes. So a call does at most about twice its budget, plus
+/// a constant. The tests check that each unit stands for at most four reads of
+/// the term or the store, on terms built to find work that is not charged.
+/// One unit takes 20 to 60 ns in a release build, most often 20 to 40.
+///
+/// Well-typed terms can need work exponential in their size: a shared subterm
+/// is inferred once for each different set of bindings its free variables see
+/// (see the module documentation), and polymorphic helpers of different types
+/// can make that set exponentially large. So the budget is what keeps the
+/// checker from hanging on an untrusted term.
 ///
 /// Measured (October 2026): the reference programs, the prelude and every
 /// program in the test suites outside the checker's own stress tests take at
 /// most about 9 400 units, and the stress tests at most 7.2 million (a
 /// 200 000-deep nest of `let` and `if`; the tree walk of a shared `if` nest 18
-/// deep takes 6.3 million). The default of 16 million admits all of those, the
+/// deep takes 6.8 million). The default of 16 million admits all of those, the
 /// realistic programs by a factor of over 1 000, and refuses a well-typed
 /// 151-node term that takes about 10 s without it (450 million units) in about
 /// 0.35 s.
 pub const DEFAULT_WORK_BUDGET: u64 = 16_000_000;
+
+#[cfg(test)]
+thread_local! {
+    /// Reads of the type store on this thread: the tests compare it with the
+    /// units of work charged.
+    pub(super) static STORE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Index of a node in the type store.
 type Ty = u32;
@@ -474,16 +492,63 @@ struct Checkpoint {
 }
 
 /// Where a unification happens, for the error message.
+#[derive(Clone, Copy, Debug)]
 struct Site {
     term: TermId,
-    context: String,
+    context: Context,
 }
 
 impl Site {
-    fn new(term: TermId, context: impl Into<String>) -> Site {
+    fn new(term: TermId, context: impl Into<Context>) -> Site {
         Site {
             term,
             context: context.into(),
+        }
+    }
+}
+
+/// The description of a [`Site`]'s position. It is written out only when an
+/// error is made, so a unification that works costs nothing for it.
+#[derive(Clone, Copy, Debug)]
+enum Context {
+    Text(&'static str),
+    /// An operand of `and` or `or`.
+    Operand {
+        first: bool,
+        op: &'static str,
+    },
+    /// Argument `i` (from 0) of an application whose head is `head`.
+    Argument {
+        i: usize,
+        head: TermId,
+    },
+    /// The head of application `app`.
+    FunctionPosition {
+        app: TermId,
+    },
+}
+
+impl From<&'static str> for Context {
+    fn from(text: &'static str) -> Context {
+        Context::Text(text)
+    }
+}
+
+impl Context {
+    /// The text of the description. Terms in it are cut short by [`short`].
+    fn describe(self, arena: &Arena) -> String {
+        match self {
+            Context::Text(text) => text.into(),
+            Context::Operand { first, op } => {
+                let which = if first { "first" } else { "second" };
+                format!("the {which} operand of `{op}`")
+            }
+            Context::Argument { i, head } => {
+                format!("argument {} of `{}`", i + 1, short(arena, head))
+            }
+            Context::FunctionPosition { app } => {
+                format!("the function position of `{}`", short(arena, app))
+            }
         }
     }
 }
@@ -722,7 +787,8 @@ impl TypeChecker {
     ///
     /// A spine is walked whole each time it is reached, so the search pays a unit
     /// for each node it pops and each child it finds. It returns false, having
-    /// stopped, once that runs past the budget.
+    /// stopped, once that runs past the budget; it checks between nodes and
+    /// between the links of a spine, which can be as long as the term.
     fn find_shared(&mut self, arena: &Arena, root: TermId) -> bool {
         let mut seen: FxHashSet<TermId> = FxHashSet::default();
         let mut edges: FxHashSet<TermId> = FxHashSet::default();
@@ -735,17 +801,23 @@ impl TypeChecker {
             }
             kids.clear();
             let node = arena.get(id);
+            self.spent += 1;
             if let Term::App(..) = node {
                 let mut head = id;
                 while let Term::App(f, a) = arena.get(head) {
+                    if self.spent > self.budget.0 {
+                        return false;
+                    }
+                    self.spent += 1;
                     kids.push(a);
                     head = f;
                 }
                 kids.push(head);
+                self.spent += 1;
             } else {
                 kids.extend(children(&node));
+                self.spent += kids.len() as u64;
             }
-            self.spent += 1 + kids.len() as u64;
             for &c in &kids {
                 if !edges.insert(c) && !children(&arena.get(c)).is_empty() {
                     self.shared.insert(c);
@@ -768,6 +840,8 @@ impl TypeChecker {
     }
 
     fn node(&self, t: Ty) -> Node {
+        #[cfg(test)]
+        STORE_READS.with(|r| r.set(r.get() + 1));
         self.nodes[t as usize]
     }
 
@@ -1461,6 +1535,11 @@ impl TypeChecker {
             };
             step = match next {
                 Ok(next) => next,
+                // A step that ran past the budget ends the call, whatever its
+                // outcome: going back to a checkpoint would only do more work.
+                Err(_) if self.spent > self.budget.0 => {
+                    return Err(self.out_of_work(arena, root));
+                }
                 // Only the second walk of [`TypeChecker::run`] has checkpoints.
                 Err(e) => match self.checkpoints.pop() {
                     None => return Err(e),
@@ -1827,9 +1906,15 @@ impl TypeChecker {
                 return Ok(Step::Eval(first, None));
             }
             Term::App(..) => {
+                // A unit per argument, checked as it goes: a spine can be as
+                // long as the term.
                 let start = self.spine.len();
                 let mut head = id;
                 while let Term::App(f, a) = arena.get(head) {
+                    if self.spent > self.budget.0 {
+                        return Err(plain_error(arena, id, too_much_work(self.budget.0)));
+                    }
+                    self.spent += 1;
                     self.spine.push(a);
                     head = f;
                 }
@@ -1910,13 +1995,13 @@ impl TypeChecker {
                 Step::Return(then_ty)
             }
             Frame::BoolFirst { first, second, op } => {
-                let ctx = format!("the first operand of `{op}`");
+                let ctx = Context::Operand { first: true, op };
                 self.expect(arena, BOOL, t, Site::new(first, ctx))?;
                 self.frames.push(Frame::BoolSecond { second, op });
                 Step::Eval(second, None)
             }
             Frame::BoolSecond { second, op } => {
-                let ctx = format!("the second operand of `{op}`");
+                let ctx = Context::Operand { first: false, op };
                 self.expect(arena, BOOL, t, Site::new(second, ctx))?;
                 Step::Return(BOOL)
             }
@@ -1969,7 +2054,7 @@ impl TypeChecker {
                 want,
             } => {
                 let arg = self.spine[sp.start + i];
-                let ctx = format!("argument {} of `{}`", i + 1, short(arena, sp.head));
+                let ctx = Context::Argument { i, head: sp.head };
                 self.expect(arena, param, t, Site::new(arg, ctx))?;
                 self.next_arg(arena, sp, i + 1, ret, want)?
             }
@@ -2056,7 +2141,7 @@ impl TypeChecker {
             Node::Var { .. } => {
                 let (p, r) = (self.fresh(), self.fresh());
                 let want = self.arrow(p, r);
-                let ctx = format!("the function position of `{}`", short(arena, sp.app));
+                let ctx = Context::FunctionPosition { app: sp.app };
                 self.expect(arena, want, rf, Site::new(sp.head, ctx))?;
                 Ok(Some((p, r)))
             }
@@ -2095,7 +2180,7 @@ impl TypeChecker {
             kind: Box::new(kind),
             term: site.term,
             term_text: short(arena, site.term),
-            context: site.context,
+            context: site.context.describe(arena),
             note,
         }
     }
@@ -2250,14 +2335,15 @@ fn plain_error(arena: &Arena, term: TermId, kind: TypeErrorKind) -> TypeError {
     }
 }
 
-/// `id` in core syntax (as [`crate::sexpr::print`] writes it), cut to
-/// [`MAX_TERM_TEXT`] bytes followed by ` ...`. It stops writing once past the limit,
-/// so its cost does not depend on the size or depth of the term.
+/// `id` in core syntax (as [`crate::sexpr::print`] writes it), or, if that is
+/// longer than [`MAX_TERM_TEXT`] bytes, a prefix of it of at most that many
+/// bytes followed by ` ...`. Its cost is linear in [`MAX_TERM_TEXT`], whatever
+/// the size or depth of the term (see [`crate::sexpr::print_bounded`]).
 pub(super) fn short(arena: &Arena, id: TermId) -> String {
     let mut out = String::new();
-    crate::sexpr::print_bounded(arena, id, MAX_TERM_TEXT, &mut out);
-    if out.len() > MAX_TERM_TEXT {
-        let mut cut = MAX_TERM_TEXT;
+    let whole = crate::sexpr::print_bounded(arena, id, MAX_TERM_TEXT, &mut out);
+    if !whole || out.len() > MAX_TERM_TEXT {
+        let mut cut = MAX_TERM_TEXT.min(out.len());
         while !out.is_char_boundary(cut) {
             cut -= 1;
         }
