@@ -1,8 +1,12 @@
 //! The benchmark programs (spec §11) at small n: each gives its Rust reference
 //! result, its step count is deterministic, and a wrong result is rejected.
 
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::Duration;
+
 use dc_bench::{programs, BenchError, Instance, Program};
-use dc_eval::Value;
+use dc_eval::{Tree, Value};
 
 /// The spec §11 set, with the input size each is benchmarked at.
 const SPEC_SET: [(&str, i64); 6] = [
@@ -93,5 +97,35 @@ fn a_wrong_result_is_rejected() {
             Err(BenchError::WrongResult { .. }) => {}
             other => panic!("{name}: expected WrongResult, got {other:?}"),
         }
+    }
+}
+
+#[test]
+fn a_wrong_result_is_shown_shortened_even_when_shared() {
+    // The expected value is a tree of 2^64 - 1 nodes built from 64 shared ones;
+    // the error must show a prefix of it without walking the whole tree.
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let p = program("sum");
+        let c = p.compile().unwrap();
+        let mut t = Tree::leaf();
+        for k in 0..64 {
+            t = Tree::node(t.clone(), Value::Int(k), t);
+        }
+        let wrong = Instance::new(p.inputs(p.small_n), Value::tree(t));
+        let shown = match c.run(&wrong) {
+            Err(e @ BenchError::WrongResult { .. }) => e.to_string(),
+            other => format!("expected WrongResult, got {other:?}"),
+        };
+        let _ = tx.send(shown);
+    });
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(s) => {
+            assert!(s.contains("expected Node (Node ("), "{s}");
+            assert!(s.ends_with("..."), "{s}");
+            assert!(s.len() < 1_000, "{} bytes", s.len());
+        }
+        Err(RecvTimeoutError::Timeout) => panic!("the error was not shown within 20 s"),
+        Err(RecvTimeoutError::Disconnected) => panic!("the test thread panicked"),
     }
 }

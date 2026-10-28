@@ -13,14 +13,22 @@
 //! equality, memo keys, `Display` and `Debug` are iterative too. The remaining host
 //! recursion is inside `imbl`'s own tree, whose depth is logarithmic in the size of
 //! one array.
+//!
+//! Values can share parts, so a value can be exponentially larger as a tree than
+//! in memory: `loop 64 (node $0 i $0)` has 2^64 nodes. `PartialEq` remembers the
+//! pairs of shared parts it has compared, so its work is bounded by the memory
+//! the two values use, not by their size as trees. `Debug` and
+//! [`Value::display_within`] write a bounded prefix and mark the rest with `...`;
+//! `Display` writes the whole tree, so use it only on values known to be small.
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::mem;
+use std::ptr;
 use std::rc::{Rc, Weak};
 
 use dc_core::{Prim, TermId};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// A dc value.
 #[derive(Clone)]
@@ -675,6 +683,36 @@ pub(crate) enum EqResult {
     OverLimit,
 }
 
+/// A pair of shared value parts that [`structural_eq`] has already compared: a
+/// kind tag (value, list cell or tree node, whose addresses can coincide) and
+/// the two addresses.
+pub(crate) type SeenPairs = FxHashSet<(u8, *const (), *const ())>;
+
+/// The identity of a compound pair of parts, if it can be shared: pairs,
+/// options, arrays, list cells and tree nodes. Scalars, `nil` and `leaf` are
+/// cheaper to compare again than to remember.
+fn pair_id(item: &EqWork<'_>) -> Option<(u8, *const (), *const ())> {
+    match item {
+        EqWork::Value(x @ (Value::Pair(_) | Value::Option(Some(_)) | Value::Array(_)), y) => {
+            Some((0, ptr::from_ref(*x).cast(), ptr::from_ref(*y).cast()))
+        }
+        EqWork::List(List(Some(c)), List(Some(d))) => {
+            Some((1, Rc::as_ptr(c).cast(), Rc::as_ptr(d).cast()))
+        }
+        EqWork::Tree(Tree(Some(m)), Tree(Some(n))) => {
+            Some((2, Rc::as_ptr(m).cast(), Rc::as_ptr(n).cast()))
+        }
+        _ => None,
+    }
+}
+
+/// A pair of parts still to compare in [`structural_eq`].
+enum EqWork<'a> {
+    Value(&'a Value, &'a Value),
+    List(&'a List, &'a List),
+    Tree(&'a Tree, &'a Tree),
+}
+
 /// Structural equality of data values, as `eq` computes it, with the number of
 /// value-node pairs compared. The comparison runs left to right in pre-order and
 /// stops at the first difference or at the first function value; the pair that
@@ -685,15 +723,27 @@ pub(crate) enum EqResult {
 /// Nodes: every scalar, pair, option, array, list cell (including the final `nil`)
 /// and tree node (including each `leaf`) is one node. A list or tree value is not a
 /// node of its own apart from its cells.
-pub(crate) fn structural_eq(a: &Value, b: &Value, limit: u64) -> (EqResult, u64) {
-    enum Work<'a> {
-        Value(&'a Value, &'a Value),
-        List(&'a List, &'a List),
-        Tree(&'a Tree, &'a Tree),
-    }
+///
+/// With `seen`, a compound pair of parts at the same two addresses as one already
+/// compared is skipped and not counted: values are immutable, so it compares the
+/// same way again, and the first comparison's result already decides the answer.
+/// The data result is unchanged, but the count is then of distinct pairs, not the
+/// cost model's count, so the machine passes `None`.
+pub(crate) fn structural_eq(
+    a: &Value,
+    b: &Value,
+    limit: u64,
+    mut seen: Option<&mut SeenPairs>,
+) -> (EqResult, u64) {
+    use EqWork as Work;
     let mut work = vec![Work::Value(a, b)];
     let mut nodes = 0u64;
     while let Some(item) = work.pop() {
+        if let (Some(seen), Some(id)) = (seen.as_deref_mut(), pair_id(&item)) {
+            if !seen.insert(id) {
+                continue;
+            }
+        }
         let same = match item {
             Work::List(l, m) => {
                 nodes += 1;
@@ -769,15 +819,26 @@ pub(crate) fn structural_eq(a: &Value, b: &Value, limit: u64) -> (EqResult, u64)
     (EqResult::Data(true), nodes)
 }
 
+/// The number of values and tree nodes `Debug` writes before it elides the rest
+/// with `...`.
+pub const DEBUG_NODES: u64 = 1_000;
+
+/// The marker for elided parts in bounded output.
+const ELIDED: &str = "...";
+
+/// Writes at most [`DEBUG_NODES`] values and tree nodes, in the same syntax as
+/// `Display`, so that test failures and logged errors stay short however large a
+/// value is.
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
+        write_value(Piece::Value(self), DEBUG_NODES, f)
     }
 }
 
+/// Bounded like `Debug` for [`Value`], with the list syntax `[1; 2]`.
 impl fmt::Debug for List {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.iter()).finish()
+        write_value(Piece::List(self), DEBUG_NODES, f)
     }
 }
 
@@ -798,100 +859,183 @@ impl fmt::Debug for TreeNode {
     }
 }
 
+/// Bounded like `Debug` for [`Value`].
 impl fmt::Debug for Tree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_value(Piece::Tree(self), f)
+        write_value(Piece::Tree(self), DEBUG_NODES, f)
     }
 }
 
 /// A piece of output still to write.
 enum Piece<'a> {
     Value(&'a Value),
+    List(&'a List),
     Tree(&'a Tree),
     Text(&'static str),
+    /// The elements of a list after its first, each preceded by `; `.
+    ListRest(&'a List),
+    /// The elements of an array from the index on, each preceded by `; `.
+    ArrayRest(&'a imbl::Vector<Value>, usize),
 }
 
 /// Writes a value with an explicit work stack, so deeply nested values format
 /// without host recursion.
-fn write_value(start: Piece<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+///
+/// At most `limit` values and tree nodes are written. After that, each part not
+/// yet written is written as `...` (the rest of a list or an array as one `...`),
+/// and the brackets still open are closed. The work stack grows by a constant per
+/// node written, so the output and the work are both O(`limit`), whatever the
+/// size of the value.
+fn write_value(start: Piece<'_>, limit: u64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let mut work = vec![start];
+    let mut written = 0u64;
     while let Some(piece) = work.pop() {
+        let full = written >= limit;
         match piece {
             Piece::Text(s) => f.write_str(s)?,
-            Piece::Tree(t) => match &t.0 {
-                None => f.write_str("Leaf")?,
-                Some(n) => {
-                    // Pushed in reverse: `Node (left, value, right)`.
-                    work.push(Piece::Text(")"));
-                    work.push(Piece::Tree(&n.right));
-                    work.push(Piece::Text(", "));
-                    work.push(Piece::Value(&n.value));
-                    work.push(Piece::Text(", "));
-                    work.push(Piece::Tree(&n.left));
-                    work.push(Piece::Text("Node ("));
+            Piece::ListRest(l) => {
+                if let Some(c) = &l.0 {
+                    if full {
+                        write!(f, "; {ELIDED}")?;
+                    } else {
+                        work.push(Piece::ListRest(&c.tail));
+                        work.push(Piece::Value(&c.head));
+                        work.push(Piece::Text("; "));
+                    }
+                }
+            }
+            Piece::ArrayRest(a, i) => {
+                if let Some(x) = a.get(i) {
+                    if full {
+                        write!(f, "; {ELIDED}")?;
+                    } else {
+                        work.push(Piece::ArrayRest(a, i + 1));
+                        work.push(Piece::Value(x));
+                        work.push(Piece::Text("; "));
+                    }
+                }
+            }
+            Piece::List(l) => match &l.0 {
+                None => f.write_str("[]")?,
+                Some(c) => {
+                    work.push(Piece::Text("]"));
+                    work.push(Piece::ListRest(&c.tail));
+                    work.push(Piece::Value(&c.head));
+                    work.push(Piece::Text("["));
                 }
             },
-            Piece::Value(v) => match v {
-                Value::Int(n) => write!(f, "{n}")?,
-                Value::Bool(b) => write!(f, "{b}")?,
-                Value::Unit => f.write_str("()")?,
-                Value::Pair(p) => {
-                    work.push(Piece::Text(")"));
-                    work.push(Piece::Value(&p.1));
-                    work.push(Piece::Text(", "));
-                    work.push(Piece::Value(&p.0));
-                    work.push(Piece::Text("("));
+            // A tree value is written as its root node, which is counted below.
+            Piece::Value(Value::Tree(t)) => work.push(Piece::Tree(t)),
+            Piece::Value(_) | Piece::Tree(_) if full => f.write_str(ELIDED)?,
+            Piece::Tree(t) => {
+                written += 1;
+                match &t.0 {
+                    None => f.write_str("Leaf")?,
+                    Some(n) => {
+                        // Pushed in reverse: `Node (left, value, right)`.
+                        work.push(Piece::Text(")"));
+                        work.push(Piece::Tree(&n.right));
+                        work.push(Piece::Text(", "));
+                        work.push(Piece::Value(&n.value));
+                        work.push(Piece::Text(", "));
+                        work.push(Piece::Tree(&n.left));
+                        work.push(Piece::Text("Node ("));
+                    }
                 }
-                Value::Option(None) => f.write_str("None")?,
-                Value::Option(Some(x)) => {
-                    work.push(Piece::Text(")"));
-                    work.push(Piece::Value(x));
-                    work.push(Piece::Text("Some ("));
+            }
+            Piece::Value(v) => {
+                written += 1;
+                match v {
+                    Value::Int(n) => write!(f, "{n}")?,
+                    Value::Bool(b) => write!(f, "{b}")?,
+                    Value::Unit => f.write_str("()")?,
+                    Value::Pair(p) => {
+                        work.push(Piece::Text(")"));
+                        work.push(Piece::Value(&p.1));
+                        work.push(Piece::Text(", "));
+                        work.push(Piece::Value(&p.0));
+                        work.push(Piece::Text("("));
+                    }
+                    Value::Option(None) => f.write_str("None")?,
+                    Value::Option(Some(x)) => {
+                        work.push(Piece::Text(")"));
+                        work.push(Piece::Value(x));
+                        work.push(Piece::Text("Some ("));
+                    }
+                    Value::List(l) => work.push(Piece::List(l)),
+                    Value::Array(a) => match a.front() {
+                        None => f.write_str("[||]")?,
+                        Some(x) => {
+                            work.push(Piece::Text("|]"));
+                            work.push(Piece::ArrayRest(a, 1));
+                            work.push(Piece::Value(x));
+                            work.push(Piece::Text("[|"));
+                        }
+                    },
+                    Value::Tree(t) => work.push(Piece::Tree(t)),
+                    Value::Fun(_) => f.write_str("<fun>")?,
                 }
-                Value::List(l) => {
-                    let items: Vec<&Value> = l.iter().collect();
-                    push_seq(&mut work, "[", &items, "]");
-                }
-                Value::Array(a) => {
-                    let items: Vec<&Value> = a.iter().collect();
-                    push_seq(&mut work, "[|", &items, "|]");
-                }
-                Value::Tree(t) => work.push(Piece::Tree(t)),
-                Value::Fun(_) => f.write_str("<fun>")?,
-            },
+            }
         }
     }
     Ok(())
 }
 
-/// Pushes `open item; item; ... close` in reverse onto the work stack.
-fn push_seq<'a>(
-    work: &mut Vec<Piece<'a>>,
-    open: &'static str,
-    items: &[&'a Value],
-    close: &'static str,
-) {
-    work.push(Piece::Text(close));
-    for (i, &x) in items.iter().enumerate().rev() {
-        work.push(Piece::Value(x));
-        if i > 0 {
-            work.push(Piece::Text("; "));
-        }
-    }
-    work.push(Piece::Text(open));
-}
-
+/// Writes the whole value as a tree. A value with shared parts can be
+/// exponentially longer written out than it is in memory, so use this only on
+/// values known to be small; [`Value::display_within`] bounds the output.
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_value(Piece::Value(self), f)
+        write_value(Piece::Value(self), u64::MAX, f)
     }
 }
 
-/// Structural equality for tests and tools. Function values are never equal, even
-/// to themselves.
+impl Value {
+    /// Formats at most `limit` values and tree nodes of this value, in the
+    /// `Display` syntax, and each part beyond them as `...`. The output and the
+    /// work are O(`limit`), however large the value is as a tree. With a limit
+    /// at least the value's size the output is the same as `Display`'s.
+    pub fn display_within(&self, limit: u64) -> DisplayWithin<'_> {
+        DisplayWithin { value: self, limit }
+    }
+}
+
+/// A value formatted with a bound; see [`Value::display_within`].
+#[derive(Clone, Copy, Debug)]
+pub struct DisplayWithin<'a> {
+    value: &'a Value,
+    limit: u64,
+}
+
+impl fmt::Display for DisplayWithin<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_value(Piece::Value(self.value), self.limit, f)
+    }
+}
+
+/// Values above this many node pairs are compared with [`SeenPairs`].
+const PLAIN_EQ_NODES: u64 = 1 << 12;
+
+/// Structural equality for tests, tools and task checks. Function values are
+/// never equal, even to themselves.
+///
+/// Exact, and bounded by the memory the values use rather than their size as
+/// trees. Values up to 4096 node pairs are compared directly. Larger ones are
+/// compared again, remembering the pairs of parts already compared, so each
+/// distinct pair of parts (by address) is compared once. That is at most the
+/// product of the two values' part counts in memory, and linear in them when
+/// the values have the same sharing, as two runs of one program do.
 impl PartialEq for Value {
     fn eq(&self, other: &Value) -> bool {
-        matches!(structural_eq(self, other, u64::MAX).0, EqResult::Data(true))
+        match structural_eq(self, other, PLAIN_EQ_NODES, None).0 {
+            EqResult::Data(same) => same,
+            EqResult::Function => false,
+            EqResult::OverLimit => {
+                let mut seen = SeenPairs::default();
+                let (result, _) = structural_eq(self, other, u64::MAX, Some(&mut seen));
+                result == EqResult::Data(true)
+            }
+        }
     }
 }
 
