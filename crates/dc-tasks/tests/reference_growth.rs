@@ -11,8 +11,8 @@
 //!
 //! # How the checks are set
 //!
-//! Neither estimator names a class (spec §9's class selector, estimator C, is
-//! not built), so the tests classify the fitted slope themselves. Each class's
+//! Estimators A and B do not name a class, so for them the tests classify
+//! the fitted slope themselves. Each class's
 //! *ideal* slope is the least-squares slope of `ln f(n)` on `ln n` over the
 //! upper half of the family's sweep, worked out in this file without the
 //! estimator: 1 for `n`, 2 for `n²`, and an ordinary least-squares sum for
@@ -29,13 +29,25 @@
 //! [`B_ALPHA_TOLERANCE`] of the class's exponent. The tolerances follow from
 //! the gaps between classes, not from the runs.
 //!
-//! Both estimators fit the medians over seeds, as the pipeline does. B's
-//! choice of `γ` is right on the medians but not on every seed alone, and its
-//! [`PowerLogFit::gamma_stability`] is below the spread between seeds for
-//! both sorts (merge sort on the debug sweep: about 0.0004 against 0.0097 in
-//! `ln` steps). The stronger, per-seed requirement is the ignored test
-//! [`power_log_gamma_holds_on_every_seed_of_the_default_sweep`], which fails
-//! today.
+//! Estimator C names the class itself. On the medians and on each seed
+//! alone it must name the right class or refuse, and never name another
+//! class (the acceptance criterion of bead dreamcounter-db440d). Where the
+//! step counts are exact or nearly so (`sum_ref`, `msort`, `zero_subsets`)
+//! it must name the class on the medians. Insertion sort's seeds vary by
+//! about 12 % in steps, so its medians are about 0.04 from `n²` in `ln`
+//! units, above C's tolerance of 0.01, and C refuses them as too noisy.
+//! One seed per size says nothing about the noise, so each seed alone is
+//! fitted with [`NoiseModel::Known`]: the noise of one seed's `ln` step
+//! count, measured on the full sweep as the largest sample standard
+//! deviation over the seeds at a size in the window. The exact series of
+//! the meta-test are fitted with [`NoiseModel::Exact`].
+//!
+//! Estimators A and B fit the medians over seeds, as the pipeline does. B's
+//! choice of `γ` is right on the medians but not on every seed alone: its
+//! [`PowerLogFit::gamma_stability`] is far below the spread between seeds
+//! for both sorts (merge sort on the debug sweep: about 0.0004 against
+//! 0.0097 in `ln` steps). B's `γ` is therefore not a class verdict; C is
+//! (bead dreamcounter-db440d).
 //!
 //! The sweeps are short so that the tests run in seconds in a debug build:
 //! `ref-sort` stops at 512 and `zero-subsets` runs `n = 4, 6, ..., 14`.
@@ -44,8 +56,9 @@ use dc_core::{Arena, Scheme, TermId};
 use dc_eval::Value;
 use dc_surface::prelude::{Prelude, PreludeMode};
 use dc_tasks::growth::{
-    FitQuality, FitWindow, GrowthError, GrowthEstimator, GrowthFit, LogLogFit, LogLogSlope,
-    PowerLogFit, PowerLogGrid, SizeObservation, SizeOutcome, Sweep, Window, DEFAULT_SIZES,
+    ClassFit, ClassSelect, ClassVerdict, FitQuality, FitWindow, GrowthClass, GrowthError,
+    GrowthEstimator, GrowthFit, LogLogFit, LogLogSlope, NoiseModel, PowerLogFit, PowerLogGrid,
+    SizeObservation, SizeOutcome, Sweep, Window, DEFAULT_SIZES,
 };
 use dc_tasks::harness::{
     check_input_sizes, measure, validate_family, FuelPlan, HarnessConfig, Measurement,
@@ -291,6 +304,16 @@ impl Class {
         v.round() as u64
     }
 
+    /// The class estimator C should name.
+    fn c_class(self) -> GrowthClass {
+        match self {
+            Class::Linear => GrowthClass::Linear,
+            Class::NLogN => GrowthClass::NLogN,
+            Class::Quadratic => GrowthClass::Quadratic,
+            Class::Exponential => GrowthClass::Exponential,
+        }
+    }
+
     /// The exponent of `n` and of `ln n` that estimator B should find, for the
     /// polynomial classes.
     fn b_target(self) -> Option<(f64, u8)> {
@@ -451,22 +474,88 @@ fn check_b(fit: &PowerLogFit, expected: Class) -> Result<(), String> {
     Ok(())
 }
 
-/// Checks that estimator B chooses the class's `γ` on each seed's step counts
-/// alone, not only on the medians.
-fn check_b_per_seed(sweep: &Sweep, expected: Class) -> Result<(), String> {
-    let (_, gamma) = expected.b_target().expect("a polynomial class");
+/// Checks that estimator C names `expected` on the medians.
+fn check_c(fit: &ClassFit, expected: Class) -> Result<(), String> {
+    let want = ClassVerdict::Class(expected.c_class());
+    if fit.verdict == want {
+        Ok(())
+    } else {
+        Err(format!(
+            "C: {:?} (best {} misfit {:.4}, tolerance {:.4}, noise margin {:.4}), \
+             expected {want:?}",
+            fit.verdict,
+            fit.best().class,
+            fit.best().misfit,
+            fit.tolerance,
+            fit.noise_margin
+        ))
+    }
+}
+
+/// The noise of a single seed's `ln` step count, measured on the full sweep:
+/// the largest sample standard deviation of the seeds' `ln` steps at a size
+/// in `window`. This is the spread of one measurement, not the standard
+/// error of a median. `None` if no size in the window has two seeds.
+fn single_seed_noise(sweep: &Sweep, window: &FitWindow) -> Option<f64> {
+    sweep
+        .observations()
+        .iter()
+        .filter(|o| o.n >= window.n_min)
+        .filter_map(|o| match &o.outcome {
+            SizeOutcome::Completed { steps } if steps.len() >= 2 => {
+                let ys: Vec<f64> = steps.iter().map(|&s| (s as f64).ln()).collect();
+                let k = ys.len() as f64;
+                let mean = ys.iter().sum::<f64>() / k;
+                let var = ys.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / (k - 1.0);
+                Some(var.sqrt())
+            }
+            SizeOutcome::Completed { .. } => None,
+            other => panic!("n = {}: {other:?}", o.n),
+        })
+        .reduce(f64::max)
+}
+
+/// The noise model for fitting each seed of `sweep` alone: the single-seed
+/// noise measured on the full sweep (see [`single_seed_noise`]).
+fn per_seed_noise(sweep: &Sweep, window: &FitWindow) -> NoiseModel {
+    NoiseModel::Known(single_seed_noise(sweep, window).expect("a size in the window has seeds"))
+}
+
+/// Estimator C for one seed alone, with the given noise model.
+fn c_per_seed(noise_model: NoiseModel) -> ClassSelect {
+    ClassSelect {
+        noise_model,
+        ..ClassSelect::default()
+    }
+}
+
+/// Checks that estimator C, on each seed's step counts alone with
+/// `noise_model`, names `expected` or refuses, and never names another
+/// class. Returns how many seeds it refused.
+fn check_c_per_seed(
+    sweep: &Sweep,
+    expected: Class,
+    noise_model: NoiseModel,
+) -> Result<usize, String> {
+    let mut refused = 0;
     for (seed, one) in per_seed(sweep).iter().enumerate() {
-        let f = PowerLogGrid::default()
+        let f = c_per_seed(noise_model)
             .fit(one)
             .map_err(|e| e.to_string())?;
-        if f.best.gamma != gamma {
-            return Err(format!(
-                "B: seed {seed} alone gives gamma {} (gamma_hat {:.3}), expected {gamma}",
-                f.best.gamma, f.gamma_hat
-            ));
+        match f.verdict {
+            ClassVerdict::Class(k) if k == expected.c_class() => {}
+            ClassVerdict::Class(k) => {
+                return Err(format!(
+                    "C: seed {seed} alone names {k}, expected {}",
+                    expected.c_class()
+                ))
+            }
+            ClassVerdict::TooNoisy | ClassVerdict::NoiseUnknown | ClassVerdict::NoFit => {
+                refused += 1
+            }
         }
     }
-    Ok(())
+    Ok(refused)
 }
 
 /// One sweep per seed, each holding only that seed's step count at every
@@ -524,6 +613,7 @@ struct Run {
     sweep: Sweep,
     a: LogLogFit,
     b: PowerLogFit,
+    c: ClassFit,
 }
 
 /// Validates the family, makes its fuel plan from `reference` and measures
@@ -543,6 +633,32 @@ fn run<F: TaskFamily>(family: &F, reference: &str, entry: &str) -> Run {
     };
     let a = est.fit(&sweep).expect("A fits");
     let b = PowerLogGrid::default().fit(&sweep).expect("B fits");
+    let c = ClassSelect::default().fit(&sweep).expect("C fits");
+    println!(
+        "RESULT {entry}: C {:?} tolerance {:.4} noise_margin {:.4} noise {:?} misfits {:?}",
+        c.verdict,
+        c.tolerance,
+        c.noise_margin,
+        c.noise,
+        c.candidates
+            .map(|k| (k.class.to_string(), (k.misfit * 1e4).round() / 1e4))
+    );
+    let seed_model = per_seed_noise(&sweep, &c.window);
+    let per_seed_c: Vec<String> = per_seed(&sweep)
+        .iter()
+        .map(|s| match c_per_seed(seed_model).fit(s) {
+            Ok(f) => format!(
+                "{:?} best {} {:.4} r {:.3} noise_margin {:.4}",
+                f.verdict,
+                f.best().class,
+                f.best().misfit,
+                f.best().r,
+                f.noise_margin
+            ),
+            Err(e) => e.to_string(),
+        })
+        .collect();
+    println!("RESULT {entry}: C per seed with {seed_model:?}: {per_seed_c:?}");
     let r2 = match a.quality {
         FitQuality::RSquared(r) => r,
         FitQuality::ZeroVariance => f64::NAN,
@@ -574,7 +690,7 @@ fn run<F: TaskFamily>(family: &F, reference: &str, entry: &str) -> Run {
         })
         .collect();
     println!("RESULT {entry}: B per seed (gamma:gamma_hat) {per_seed_gamma:?}");
-    Run { sweep, a, b }
+    Run { sweep, a, b, c }
 }
 
 /// The ideal slopes are taken over [`upper_half`]; estimator A must have
@@ -588,7 +704,58 @@ fn check_window(a: &LogLogFit, sizes: &[u64]) {
     );
 }
 
-fn check_polynomial<F: TaskFamily>(family: &F, reference: &str, entry: &str, class: Class) {
+/// What estimator C must do on the medians.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum COnMedians {
+    /// Name the class.
+    Names,
+    /// Name the class, or refuse because the seeds are too noisy.
+    NamesOrTooNoisy,
+    /// Refuse as too noisy because the class's misfit is above the default
+    /// tolerance but within the noise margin of it.
+    TooNoisy,
+}
+
+/// Checks estimator C on the medians, as `on_medians` requires.
+fn check_c_on_medians(
+    fit: &ClassFit,
+    expected: Class,
+    on_medians: COnMedians,
+) -> Result<(), String> {
+    match on_medians {
+        COnMedians::Names => check_c(fit, expected),
+        COnMedians::NamesOrTooNoisy if fit.verdict == ClassVerdict::TooNoisy => Ok(()),
+        COnMedians::NamesOrTooNoisy => check_c(fit, expected),
+        COnMedians::TooNoisy => {
+            let misfit = fit.candidates[expected.c_class() as usize].misfit;
+            let tolerance = ClassSelect::default().tolerance;
+            if fit.verdict == ClassVerdict::TooNoisy
+                && misfit > tolerance
+                && misfit <= tolerance + fit.noise_margin
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "C: {:?} ({} misfit {misfit:.4}, tolerance {:.4}, noise margin {:.4}), \
+                     expected TooNoisy with the misfit above the tolerance {tolerance} \
+                     and within the noise margin of it",
+                    fit.verdict,
+                    expected.c_class(),
+                    fit.tolerance,
+                    fit.noise_margin
+                ))
+            }
+        }
+    }
+}
+
+fn check_polynomial<F: TaskFamily>(
+    family: &F,
+    reference: &str,
+    entry: &str,
+    class: Class,
+    c_medians: COnMedians,
+) {
     let r = run(family, reference, entry);
     check_window(&r.a, &family.sizes());
     let c = check_a(r.a.alpha, &family.sizes(), class).unwrap_or_else(|e| panic!("{entry}: {e}"));
@@ -597,6 +764,9 @@ fn check_polynomial<F: TaskFamily>(family: &F, reference: &str, entry: &str, cla
         c.ideal, c.distance, c.gap
     );
     check_b(&r.b, class).unwrap_or_else(|e| panic!("{entry}: {e}"));
+    check_c_on_medians(&r.c, class, c_medians).unwrap_or_else(|e| panic!("{entry}: {e}"));
+    check_c_per_seed(&r.sweep, class, per_seed_noise(&r.sweep, &r.c.window))
+        .unwrap_or_else(|e| panic!("{entry}: {e}"));
     let drift = slope_drift(&r.sweep);
     assert!(drift.abs() < POLY_MAX_DRIFT, "{entry}: drift {drift}");
 }
@@ -606,47 +776,65 @@ fn check_polynomial<F: TaskFamily>(family: &F, reference: &str, entry: &str, cla
 
 #[test]
 fn sum_is_linear() {
-    check_polynomial(&RefSum, "sum_ref", "sum_ref", Class::Linear);
+    check_polynomial(
+        &RefSum,
+        "sum_ref",
+        "sum_ref",
+        Class::Linear,
+        COnMedians::Names,
+    );
 }
 
 #[test]
 fn merge_sort_is_n_log_n() {
-    check_polynomial(&REF_SORT, "msort", "msort", Class::NLogN);
+    check_polynomial(&REF_SORT, "msort", "msort", Class::NLogN, COnMedians::Names);
 }
 
 #[test]
 fn insertion_sort_is_quadratic() {
     // Measured under merge sort's fuel plan, as a candidate for the family
-    // would be: ten times merge sort's steps is still enough up to 512.
-    check_polynomial(&REF_SORT, "msort", "isort", Class::Quadratic);
+    // would be: ten times merge sort's steps is still enough up to 512. The
+    // seeds' spread (about 12 %) leaves the medians about 0.04 from n², above
+    // C's tolerance of 0.01 but within the noise margin, so C refuses them as
+    // too noisy.
+    check_polynomial(
+        &REF_SORT,
+        "msort",
+        "isort",
+        Class::Quadratic,
+        COnMedians::TooNoisy,
+    );
 }
 
-/// Estimator B's `γ` on each seed alone, over the default sweep
-/// `16, ..., 1024`. Fails today: insertion sort's seed 1 alone gives `γ = 1`
-/// (`γ̂ = 0.665`), and on the shorter debug sweep merge sort's seeds 2 and 3
-/// give `γ = 0`. The medians are right in both cases, but B's
-/// `gamma_stability` (0.0135 for insertion sort) is far below the spread
-/// between seeds (0.119 in `ln` steps), so the right answer on the medians is
-/// not guaranteed. Slow in a debug build; run with
+/// Estimator C over the default sweep `16, ..., 1024`, on the medians and on
+/// each seed alone: it names the right class or refuses, and never names
+/// another class. Merge sort must be named on the medians; insertion sort,
+/// whose seeds vary by about 12 %, may be refused as too noisy. This
+/// replaces a check that estimator B's `γ` holds on every seed, which cannot
+/// pass: insertion sort's seed 1 alone gives `γ = 1` (`γ̂ = 0.665`), because
+/// B's `gamma_stability` (0.0135) is far below the spread between seeds
+/// (0.119 in `ln` steps). Slow in a debug build; run with
 /// `cargo test --release -p dc-tasks --test reference_growth -- --ignored`.
 #[test]
-#[ignore = "estimator B's gamma is not robust to the seed spread; see bead dreamcounter-db440d"]
-fn power_log_gamma_holds_on_every_seed_of_the_default_sweep() {
+#[ignore = "slow in a debug build; run in release"]
+fn class_select_holds_on_every_seed_of_the_default_sweep() {
     let full = RefSort {
         sizes: &DEFAULT_SIZES,
     };
-    let mut failures = Vec::new();
-    for (entry, class) in [("msort", Class::NLogN), ("isort", Class::Quadratic)] {
+    for (entry, class, on_medians) in [
+        ("msort", Class::NLogN, COnMedians::Names),
+        ("isort", Class::Quadratic, COnMedians::NamesOrTooNoisy),
+    ] {
         let r = run(&full, "msort", entry);
-        if let Err(e) = check_b_per_seed(&r.sweep, class) {
-            failures.push(format!("{entry}: {e}"));
-        }
+        check_c_on_medians(&r.c, class, on_medians).unwrap_or_else(|e| panic!("{entry}: {e}"));
+        let refused = check_c_per_seed(&r.sweep, class, per_seed_noise(&r.sweep, &r.c.window))
+            .unwrap_or_else(|e| panic!("{entry}: {e}"));
+        println!("RESULT {entry}: C refused {refused} of 5 seeds alone on the default sweep");
     }
-    assert!(failures.is_empty(), "{failures:?}");
 }
 
-/// Neither estimator has an exponential class. Estimator A reports a slope
-/// near `ln 2 · n` over the window, which is far from every polynomial
+/// Estimator C names `2ⁿ`. Estimator A has no exponential class: it reports a
+/// slope near `ln 2 · n` over the window, which is far from every polynomial
 /// class on this sweep, and the slope rises as the window moves up; that
 /// rise is what tells `2ⁿ` from a high-degree polynomial.
 #[test]
@@ -669,6 +857,13 @@ fn subset_enumeration_is_exponential() {
         "alpha {} outside [{lo}, {hi}]",
         r.a.alpha
     );
+    check_c(&r.c, Class::Exponential).unwrap_or_else(|e| panic!("{e}"));
+    check_c_per_seed(
+        &r.sweep,
+        Class::Exponential,
+        per_seed_noise(&r.sweep, &r.c.window),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     // The lower and upper thirds are 6 apart in mean n.
     let drift = slope_drift(&r.sweep);
     assert!(
@@ -704,29 +899,45 @@ fn the_checks_reject_a_wrong_estimator_and_a_wrong_class() {
         let sweep = Sweep::from_fn(&sizes, |n| class.steps(n)).expect("valid sizes");
         let real = LogLogSlope::default().estimate(&sweep).expect("a fit");
         let stub = AlwaysLinear.estimate(&sweep).expect("a fit");
-        assert!(check_a(real.alpha(), &sizes, class).is_ok(), "{class:?}");
+        let (real, stub) = (
+            real.alpha().expect("A has an exponent"),
+            stub.alpha().expect("A has an exponent"),
+        );
+        assert!(check_a(real, &sizes, class).is_ok(), "{class:?}");
         // On an exact series, A must give the closed-form slope itself, not
         // merely land in the right class: this is what catches a distorted A.
         let ideal = class.ideal_slope(&sizes);
         assert!(
-            (real.alpha() - ideal).abs() < A_EXACT_TOLERANCE,
+            (real - ideal).abs() < A_EXACT_TOLERANCE,
             "{class:?}: A gives {} on the exact series, closed form {ideal}",
-            real.alpha()
+            real
         );
         for &other in CLASSES.iter().filter(|&&o| o != class) {
             assert!(
-                check_a(real.alpha(), &sizes, other).is_err(),
+                check_a(real, &sizes, other).is_err(),
                 "{class:?} passed as {other:?}"
             );
         }
         assert_eq!(
-            check_a(stub.alpha(), &sizes, class).is_ok(),
+            check_a(stub, &sizes, class).is_ok(),
             class == Class::Linear,
             "{class:?}"
         );
         if class.b_target().is_some() {
             let b = PowerLogGrid::default().fit(&sweep).expect("a fit");
             assert!(check_b(&b, class).is_ok(), "{class:?}");
+        }
+        // The series is exact, with one seed per size.
+        let c = c_per_seed(NoiseModel::Exact).fit(&sweep).expect("a fit");
+        assert!(check_c(&c, class).is_ok(), "{class:?}");
+        for &other in CLASSES.iter().filter(|&&o| o != class) {
+            assert!(check_c(&c, other).is_err(), "{class:?} passed as {other:?}");
+            // A sweep whose every seed is the exact series fails the
+            // per-seed check for every other class.
+            assert!(
+                check_c_per_seed(&sweep, other, NoiseModel::Exact).is_err(),
+                "{class:?}"
+            );
         }
     }
     // B's γ check: an exact n log n series is not taken for n or n².
