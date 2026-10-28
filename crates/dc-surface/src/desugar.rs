@@ -69,13 +69,14 @@
 //! match or let.
 
 use std::collections::{BTreeSet, HashMap};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dc_core::{term, Arena, Prim, Term, TermId};
 
 use crate::ast::{Arm, BinOp, Ctor, Def, Expr, ExprKind, LetLhs, Pat, PatKind};
 use crate::error::{ErrorKind, Source, Span, SurfaceError};
 use crate::parser;
+use crate::stack::{on_deep_stack, HANDOFF_DEPTH};
 
 type DResult<T> = Result<T, SurfaceError>;
 
@@ -90,8 +91,8 @@ pub(crate) struct Global {
 pub(crate) enum GlobalKind {
     /// A definition from source, compiled on demand.
     Def {
-        def: Rc<Def>,
-        source: Rc<Source>,
+        def: Arc<Def>,
+        source: Arc<Source>,
         /// Indices of the globals its body refers to.
         deps: Vec<usize>,
     },
@@ -208,8 +209,10 @@ pub(crate) struct Ctx<'a> {
     defining: Vec<(String, usize)>,
     /// Globals referred to.
     pub deps: BTreeSet<usize>,
-    src: Rc<Source>,
+    src: Arc<Source>,
     next_hidden: u32,
+    /// How many calls of [`Ctx::expr`] are under way.
+    depth: usize,
     /// In a validation pass, inline names compile to a placeholder: the arena is a
     /// scratch arena that does not hold their terms.
     validating: bool,
@@ -220,7 +223,7 @@ impl<'a> Ctx<'a> {
         arena: &'a mut Arena,
         globals: &'a [Global],
         store: &'a Arena,
-        src: Rc<Source>,
+        src: Arc<Source>,
         validating: bool,
     ) -> Ctx<'a> {
         Ctx {
@@ -233,6 +236,7 @@ impl<'a> Ctx<'a> {
             deps: BTreeSet::new(),
             src,
             next_hidden: 0,
+            depth: 0,
             validating,
         }
     }
@@ -246,7 +250,7 @@ impl<'a> Ctx<'a> {
         self.scope.push(b);
     }
 
-    pub fn set_source(&mut self, src: Rc<Source>) {
+    pub fn set_source(&mut self, src: Arc<Source>) {
         self.src = src;
     }
 
@@ -536,7 +540,20 @@ impl<'a> Ctx<'a> {
         self.arena.prim(p)
     }
 
+    /// Compiles `e`. The level [`HANDOFF_DEPTH`] runs on a thread of its own
+    /// (see [`crate::stack`]).
     fn expr(&mut self, e: &Expr) -> DResult<TermId> {
+        self.depth += 1;
+        let r = if self.depth == HANDOFF_DEPTH {
+            on_deep_stack("dc-desugar", || self.expr_here(e))
+        } else {
+            self.expr_here(e)
+        };
+        self.depth -= 1;
+        r
+    }
+
+    fn expr_here(&mut self, e: &Expr) -> DResult<TermId> {
         match &e.kind {
             ExprKind::Int(n) => Ok(self.arena.int(*n)),
             ExprKind::Bool(b) => Ok(self.arena.bool(*b)),
@@ -1106,7 +1123,7 @@ impl TopLevel {
     /// definitions. `source_name` appears in error messages. On error nothing is
     /// added. Returns the names defined, in order.
     pub fn add_source(&mut self, source_name: &str, text: &str) -> DResult<Vec<String>> {
-        let src = Rc::new(Source::new(source_name, text));
+        let src = Arc::new(Source::new(source_name, text));
         let defs = parser::parse_program(&src)?;
         let mut globals = self.globals.clone();
         let mut names = vec![];
@@ -1124,7 +1141,7 @@ impl TopLevel {
             globals.push(Global {
                 name: def.name.clone(),
                 kind: GlobalKind::Def {
-                    def: Rc::new(def),
+                    def: Arc::new(def),
                     source: src.clone(),
                     deps,
                 },
@@ -1212,7 +1229,7 @@ impl TopLevel {
             return Ok(copy_term(&self.store, t, arena, &mut HashMap::new()));
         }
         let keep = self.reachable([g]);
-        let src = Rc::new(Source::new("<entry>", ""));
+        let src = Arc::new(Source::new("<entry>", ""));
         let mut ctx = Ctx::new(arena, &self.globals, &self.store, src, false);
         let mut defs = Self::bind_reachable(&mut ctx, &self.globals, &keep)?;
         // The entry is the last definition kept: `let d in $0` is just `d`.
@@ -1227,7 +1244,7 @@ impl TopLevel {
         source_name: &str,
         text: &str,
     ) -> DResult<TermId> {
-        let src = Rc::new(Source::new(source_name, text));
+        let src = Arc::new(Source::new(source_name, text));
         let e = parser::parse_expression(&src)?;
         let deps = {
             let mut scratch = Arena::new();
