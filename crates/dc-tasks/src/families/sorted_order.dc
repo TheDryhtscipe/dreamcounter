@@ -1,0 +1,145 @@
+-- Reference solutions of the sorted-order family (bead P3.5), in dc surface
+-- syntax, compiled against the prelude. Each variant has a naive solution
+-- that looks at every pair of positions (n^2) and a good one that sorts by
+-- merge sort first and then scans (n log n). The naive ones scan in full,
+-- without stopping early, so their step counts barely depend on the input.
+
+-- The number of elements of xs that satisfy p. Both branches cost the same,
+-- so the steps do not depend on how many elements satisfy p.
+let count_where p xs = foldl (fun acc y -> acc + (if p y then 1 else 0)) 0 xs
+
+let absdiff x y = if x <= y then y - x else x - y
+
+let merge ab =
+  bfix (length (fst ab) + length (snd ab) + 1)
+    (fun self (a, b) ->
+      match a with
+      | [] -> b
+      | x :: xs ->
+        match b with
+        | [] -> a
+        | y :: ys -> if x <= y then x :: self (xs, b) else y :: self (a, ys))
+    ab
+
+let msort xs =
+  bfix (length xs + 1)
+    (fun self xs ->
+      if length xs <= 1 then xs
+      else
+        let (l, r) = split_at (length xs / 2) xs in
+        merge (self l, self r))
+    xs
+
+-- (a) Inversions: pairs i < j with xs[i] > xs[j].
+
+let inversions_naive xs =
+  bfix (length xs + 1)
+    (fun self ys ->
+      match ys with
+      | [] -> 0
+      | x :: rest -> count_where (fun y -> x > y) rest + self rest)
+    xs
+
+-- Merges two sorted lists and counts the pairs (x in a, y in b) with x > y:
+-- each y taken before the rest of a is greater than all of it.
+let merge_count ab =
+  bfix (length (fst ab) + length (snd ab) + 1)
+    (fun self (a, b) ->
+      match a with
+      | [] -> (b, 0)
+      | x :: xs ->
+        match b with
+        | [] -> (a, 0)
+        | y :: ys ->
+          if x <= y then
+            let (m, c) = self (xs, b) in (x :: m, c)
+          else
+            let (m, c) = self (a, ys) in (y :: m, c + length a))
+    ab
+
+let sort_count xs =
+  bfix (length xs + 1)
+    (fun self xs ->
+      if length xs <= 1 then (xs, 0)
+      else
+        let (l, r) = split_at (length xs / 2) xs in
+        let (sl, cl) = self l in
+        let (sr, cr) = self r in
+        let (m, c) = merge_count (sl, sr) in
+        (m, cl + cr + c))
+    xs
+
+let inversions_good xs = snd (sort_count xs)
+
+-- (b) Pair sums: pairs i < j with xs[i] + xs[j] <= t.
+
+let pair_sums_naive xs t =
+  bfix (length xs + 1)
+    (fun self ys ->
+      match ys with
+      | [] -> 0
+      | x :: rest -> count_where (fun y -> x + y <= t) rest + self rest)
+    xs
+
+-- Two pointers over the sorted array: if a[i] + a[j] <= t, so is a[i] + a[k]
+-- for every k in i+1..j.
+let pair_sums_good xs t =
+  let a = array_of_list (msort xs) in
+  bfix (length xs + 1)
+    (fun self i j ->
+      if j <= i then 0
+      else if array_get a i + array_get a j <= t then (j - i) + self (i + 1) j
+      else self i (j - 1))
+    0 (length xs - 1)
+
+-- (c) Minimum gap: the least |xs[i] - xs[j]| over i < j; max_int if there is
+-- no pair.
+
+let min_gap_naive xs =
+  bfix (length xs + 1)
+    (fun self ys ->
+      match ys with
+      | [] -> max_int
+      | x :: rest ->
+        min (foldl (fun m y -> min m (absdiff x y)) max_int rest) (self rest))
+    xs
+
+let min_gap_good xs =
+  match msort xs with
+  | [] -> max_int
+  | x :: rest ->
+    fst (foldl (fun (m, prev) y -> (min m (y - prev), y)) (max_int, x) rest)
+
+-- (d) Distinct values.
+
+let distinct_naive xs =
+  bfix (length xs + 1)
+    (fun self ys ->
+      match ys with
+      | [] -> 0
+      | x :: rest ->
+        (if count_where (fun y -> y = x) rest = 0 then 1 else 0) + self rest)
+    xs
+
+let distinct_good xs =
+  match msort xs with
+  | [] -> 0
+  | x :: rest ->
+    fst (foldl (fun (c, prev) y -> if y = prev then (c, y) else (c + 1, y)) (1, x) rest)
+
+-- (e) Lower median: the element at index (n - 1) / 2 in sorted order; 0 for
+-- an empty list.
+
+-- x is the median when fewer than k + 1 elements are below it and more than
+-- k are at most it.
+let lower_median_naive xs =
+  let k = (length xs - 1) / 2 in
+  foldl
+    (fun acc x ->
+      let less = count_where (fun y -> y < x) xs in
+      let le = count_where (fun y -> y <= x) xs in
+      if less <= k && k < le then x else acc)
+    0 xs
+
+let lower_median_good xs =
+  if length xs = 0 then 0 else nth (msort xs) ((length xs - 1) / 2)
