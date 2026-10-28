@@ -43,6 +43,12 @@
 //! into one only where its use fails, so its cost is polynomial, not
 //! exponential, in the size of the DAG.
 //!
+//! **Work budget.** Reuse of shared subterms is keyed on the bindings they see,
+//! and a well-typed term can make exponentially many different sets of them, so
+//! each call has a budget of work ([`DEFAULT_WORK_BUDGET`] unless
+//! [`TypeChecker::set_work_budget`] says otherwise). A call that runs out fails
+//! with [`TypeErrorKind::TooMuchWork`], whether or not the term is well typed.
+//!
 //! **Checking.** [`TypeChecker::check`] pushes the expected type into the term:
 //! through `lam` (parameter and body), the body of `let`, both branches of `if`, and
 //! the result of an application before its arguments. So a clash with a task
@@ -65,7 +71,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{Scheme, TyVar, Type, TypeError, TypeErrorKind};
 use crate::prim::Prim;
-use crate::term::{children, Arena, LibId, Term, TermId};
+use crate::term::{Arena, LibId, Term, TermId};
 
 /// The types of library abstractions (spec §8), looked up by [`LibId`].
 ///
@@ -106,6 +112,124 @@ pub const MAX_TYPE_NODES: usize = 10_000;
 
 /// The deepest nesting a [`Type`] produced by the checker may have.
 pub const MAX_TYPE_DEPTH: usize = 500;
+
+/// The most units of work one call of [`TypeChecker::infer`] or
+/// [`TypeChecker::check`] may do unless [`TypeChecker::set_work_budget`] says
+/// otherwise; more is a [`TypeErrorKind::TooMuchWork`] error.
+///
+/// A unit is a step of the term walk, an argument collected from an
+/// application spine, a type node made, a node looked up in the store, a link
+/// followed to find a variable's representative, a node, link or child visited
+/// in the search for shared subterms, a child found again there, a node
+/// recorded or a lookup of a child while finding a subterm's free variables,
+/// an index gathered there, a lookup of a shared subterm in the tables of free
+/// variables, kept types or failed keys, or a slot of the key a use of a
+/// shared subterm is looked up by.
+/// The text of an error is written only when the error is made: a term in it
+/// is cut to 200 bytes at a cost linear in that, whatever the size of the
+/// term, and a type in it is written out a unit a node.
+///
+/// The budget is checked between steps of the term walk, between nodes of the
+/// search, between the arguments of a spine and between the pairs of nodes a
+/// unification visits (types that share differently can make those as many as
+/// the product of their sizes), so a call can overrun it by the rest of one
+/// step. That work is counted in full, and bounded: a unification stops at the
+/// next pair, a check for occurrence or for a key type visits each node of the
+/// store once (no more than the units already spent), a scope key has no more
+/// slots than there are bindings (no more than the steps taken), finding free
+/// variables stops between nodes, and an error writes out at most four types
+/// of at most [`MAX_TYPE_NODES`] nodes. So a call does at most about twice its
+/// budget, plus a constant: the error text, or the result type written out
+/// (also at most [`MAX_TYPE_NODES`] nodes, not checked against the budget),
+/// about 1 ms at most. Emptying or freeing a hash table costs time in
+/// its capacity, and clearing a stack drops its elements, so the tables a
+/// unification, an instantiation or a call has grown, and the stacks a call
+/// has grown, are released when it ends, and the next one starts small: one
+/// large call or unification does not slow later ones. The tests check that
+/// each unit stands for at most four reads of the term, the store (or its
+/// trail), a scheme (a type node imported or a key looked up), a slot of a
+/// table or stack visited while emptying or freeing it, or a lookup,
+/// insertion or removal in a hash table, and that each unit stands for at most
+/// one hash-table lookup, insertion or removal (the costliest of those reads
+/// on a large term), on terms built to find work that is not charged, and at
+/// budgets that stop a call at any point. On those terms, scaled up until a
+/// call uses millions of units, one unit takes 3 to 60 ns in a release build,
+/// most often 6 to 50 (October 2026); the slowest are terms of hundreds of
+/// thousands of shared nodes or more, whose tables no longer fit in the cache,
+/// so that a hash-table lookup is about one cache miss. So a call that uses
+/// the whole default budget takes about 0.05 to 1 s.
+///
+/// Well-typed terms can need work exponential in their size: a shared subterm
+/// is inferred once for each different set of bindings its free variables see
+/// (see the module documentation), and polymorphic helpers of different types
+/// can make that set exponentially large. So the budget is what keeps the
+/// checker from hanging on an untrusted term.
+///
+/// Measured (October 2026): the reference programs, the prelude and every
+/// program in the test suites outside the checker's own stress tests take at
+/// most about 9 400 units, and the stress tests at most 8.0 million (a
+/// 200 000-deep nest of `let` and `if`; the tree walk of a shared `if` nest 18
+/// deep takes 7.1 million). The default of 16 million admits all of those, the
+/// realistic programs by a factor of over 1 000, and refuses a well-typed
+/// 151-node term that takes about 8 s without it (580 million units) in about
+/// 0.2 s.
+pub const DEFAULT_WORK_BUDGET: u64 = 16_000_000;
+
+#[cfg(test)]
+thread_local! {
+    /// Reads of the type store on this thread, counting each old node saved to
+    /// the trail and each restored from it: the tests compare it with the
+    /// units of work charged.
+    pub(super) static STORE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Reads of library and expected schemes on this thread: one per type
+    /// constructor or variable visited and one per key looked at.
+    pub(super) static SCHEME_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Slots of hash tables and stacks kept between uses visited when they
+    /// are emptied: the capacity of a table or stack cleared or dropped.
+    pub(super) static TABLE_SLOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Lookups, insertions and removals in the checker's hash tables on this
+    /// thread. On a large table each is likely a cache miss, so it costs more
+    /// than a read of the term or the store.
+    pub(super) static PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one read of a scheme, in tests.
+fn count_scheme_read() {
+    #[cfg(test)]
+    SCHEME_READS.with(|r| r.set(r.get() + 1));
+}
+
+/// Counts `n` probes of hash tables, in tests.
+fn count_probes(n: u64) {
+    #[cfg(test)]
+    PROBES.with(|r| r.set(r.get() + n));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+/// The variables of a scheme that carry a `Key` constraint. A lookup takes the
+/// same time however many there are; making the set reads each key once, and a
+/// scheme has no more keys than variables, each of which costs a unit to make.
+struct KeySet(FxHashSet<TyVar>);
+
+impl KeySet {
+    fn of(s: &Scheme) -> KeySet {
+        KeySet(
+            s.keys()
+                .iter()
+                .map(|&k| {
+                    count_scheme_read();
+                    k
+                })
+                .collect(),
+        )
+    }
+
+    fn contains(&self, v: TyVar) -> bool {
+        count_scheme_read();
+        self.0.contains(&v)
+    }
+}
 
 /// Index of a node in the type store.
 type Ty = u32;
@@ -150,7 +274,10 @@ enum Node {
     /// Unified with another node.
     Link(Ty),
     /// An unbound variable at a `let` depth, or [`GENERIC`] when quantified.
-    Var { level: u32, key: bool },
+    /// `rank` is at most the base-2 log of the number of variables linked to
+    /// it, so the paths [`TypeChecker::resolve`] follows stay short (see
+    /// [`TypeChecker::unify`]).
+    Var { level: u32, key: bool, rank: u8 },
     /// A rigid variable from an expected type in [`TypeChecker::check`]. It equals
     /// only itself.
     Rigid { key: bool },
@@ -167,6 +294,8 @@ enum UnifyError {
     Occurs(Ty, Ty),
     /// A non-key type where a `Key` type is required.
     Key(Ty),
+    /// The call ran out of work budget part way through.
+    OutOfWork,
 }
 
 /// A type written out as a [`Type`] would exceed [`MAX_TYPE_NODES`] or
@@ -398,10 +527,27 @@ pub struct TypeChecker {
     failed: FxHashSet<MemoKey>,
     /// Steps taken by the term walk of the current call.
     steps: u64,
+    /// Units of work done by the current call (see [`DEFAULT_WORK_BUDGET`]).
+    spent: u64,
+    /// The most units of work one call may do.
+    budget: WorkBudget,
     /// The most steps of the term walk one call may take; more is a panic. Lets
     /// the tests bound the work without a timer.
     #[cfg(test)]
     pub(super) step_limit: Option<u64>,
+    /// Walks of the term the last call started (see [`TypeChecker::run`]).
+    #[cfg(test)]
+    pub(super) walks: u32,
+}
+
+/// The work budget of a [`TypeChecker`]; [`DEFAULT_WORK_BUDGET`] unless set.
+#[derive(Clone, Copy, Debug)]
+struct WorkBudget(u64);
+
+impl Default for WorkBudget {
+    fn default() -> WorkBudget {
+        WorkBudget(DEFAULT_WORK_BUDGET)
+    }
 }
 
 /// The state of the checker before a use of a shared subterm is tried, to go
@@ -424,16 +570,63 @@ struct Checkpoint {
 }
 
 /// Where a unification happens, for the error message.
+#[derive(Clone, Copy, Debug)]
 struct Site {
     term: TermId,
-    context: String,
+    context: Context,
 }
 
 impl Site {
-    fn new(term: TermId, context: impl Into<String>) -> Site {
+    fn new(term: TermId, context: impl Into<Context>) -> Site {
         Site {
             term,
             context: context.into(),
+        }
+    }
+}
+
+/// The description of a [`Site`]'s position. It is written out only when an
+/// error is made, so a unification that works costs nothing for it.
+#[derive(Clone, Copy, Debug)]
+enum Context {
+    Text(&'static str),
+    /// An operand of `and` or `or`.
+    Operand {
+        first: bool,
+        op: &'static str,
+    },
+    /// Argument `i` (from 0) of an application whose head is `head`.
+    Argument {
+        i: usize,
+        head: TermId,
+    },
+    /// The head of application `app`.
+    FunctionPosition {
+        app: TermId,
+    },
+}
+
+impl From<&'static str> for Context {
+    fn from(text: &'static str) -> Context {
+        Context::Text(text)
+    }
+}
+
+impl Context {
+    /// The text of the description. Terms in it are cut short by [`short`].
+    fn describe(self, arena: &Arena) -> String {
+        match self {
+            Context::Text(text) => text.into(),
+            Context::Operand { first, op } => {
+                let which = if first { "first" } else { "second" };
+                format!("the {which} operand of `{op}`")
+            }
+            Context::Argument { i, head } => {
+                format!("argument {} of `{}`", i + 1, short(arena, head))
+            }
+            Context::FunctionPosition { app } => {
+                format!("the function position of `{}`", short(arena, app))
+            }
         }
     }
 }
@@ -442,6 +635,27 @@ impl TypeChecker {
     /// A new checker.
     pub fn new() -> TypeChecker {
         TypeChecker::default()
+    }
+
+    /// A new checker whose calls may each do at most `limit` units of work (see
+    /// [`TypeChecker::set_work_budget`]).
+    pub fn with_work_budget(limit: u64) -> TypeChecker {
+        let mut tc = TypeChecker::new();
+        tc.set_work_budget(limit);
+        tc
+    }
+
+    /// Limits each later call of [`TypeChecker::infer`] or [`TypeChecker::check`]
+    /// to `limit` units of work; one that needs more fails with
+    /// [`TypeErrorKind::TooMuchWork`]. See [`DEFAULT_WORK_BUDGET`] for what a unit
+    /// is and how far past the limit a call can go before it stops.
+    pub fn set_work_budget(&mut self, limit: u64) {
+        self.budget = WorkBudget(limit);
+    }
+
+    /// The most units of work each call may do.
+    pub fn work_budget(&self) -> u64 {
+        self.budget.0
     }
 
     /// Infers the principal type scheme of `term`, closed under `libs`.
@@ -503,6 +717,11 @@ impl TypeChecker {
     /// fails is walked in place at once from then on, since it fails in every
     /// state of the store; without that, a chain of shared subterms over a leaf
     /// that is ill typed on its own takes time exponential in its length.
+    ///
+    /// Both walks share the call's work budget. If the first runs out, that is
+    /// the error. If only the second does, the first walk's error is returned:
+    /// the term is ill typed either way, and only where the error is named
+    /// changes.
     fn run<L: LibEnv + ?Sized>(
         &mut self,
         arena: &Arena,
@@ -510,11 +729,30 @@ impl TypeChecker {
         term: TermId,
         expected: Option<&Scheme>,
     ) -> Result<Ty, TypeError> {
+        let result = self.run_walks(arena, libs, term, expected);
+        self.release_tables();
+        self.release_stacks();
+        result
+    }
+
+    /// The walks of [`TypeChecker::run`].
+    fn run_walks<L: LibEnv + ?Sized>(
+        &mut self,
+        arena: &Arena,
+        libs: &L,
+        term: TermId,
+        expected: Option<&Scheme>,
+    ) -> Result<Ty, TypeError> {
+        self.spent = 0;
+        #[cfg(test)]
+        {
+            self.walks = 0;
+        }
         let first = self.walk_from_scratch(arena, libs, term, expected);
         let Err(e) = first else {
             return first;
         };
-        if self.tree_walk || self.shared.is_empty() {
+        if self.tree_walk || self.shared.is_empty() || out_of_budget(&e) {
             return Err(e);
         }
         self.locate = true;
@@ -522,8 +760,8 @@ impl TypeChecker {
         self.locate = false;
         debug_assert!(again.is_err(), "both walks accept the same terms");
         match again {
-            Err(located) => Err(located),
-            Ok(_) => Err(e),
+            Err(located) if !out_of_budget(&located) => Err(located),
+            _ => Err(e),
         }
     }
 
@@ -535,20 +773,70 @@ impl TypeChecker {
         term: TermId,
         expected: Option<&Scheme>,
     ) -> Result<Ty, TypeError> {
+        #[cfg(test)]
+        {
+            self.walks += 1;
+        }
         self.reset();
         let want = expected.map(|expected| {
+            let keys = KeySet::of(expected);
             let mut rigid: FxHashMap<TyVar, Ty> = FxHashMap::default();
-            for v in expected.vars() {
-                let key = expected.keys().contains(&v);
-                rigid.insert(v, self.push(Node::Rigid { key }));
-            }
-            let want = self.import(expected.ty(), &mut |_, v| rigid[&v]);
+            let want = self.import(expected.ty(), &mut |this, v| {
+                count_probes(1);
+                *rigid.entry(v).or_insert_with(|| {
+                    this.push(Node::Rigid {
+                        key: keys.contains(v),
+                    })
+                })
+            });
             Want::at(want, "the whole term, checked against its expected type")
         });
         self.walk(arena, libs, term, want)
     }
 
+    /// Empties the hash tables at the end of a call (see [`empty_set`]), so the
+    /// next call starts with small ones. Emptying a table costs time in its
+    /// capacity, which this call paid for as it filled the table; left full,
+    /// a later call would pay it again, however little work that call does.
+    /// Only hash tables go: the store, which the returned type points into,
+    /// stays.
+    fn release_tables(&mut self) {
+        release_set(&mut self.shared);
+        release_map(&mut self.free_vars);
+        release_map(&mut self.memo);
+        release_map(&mut self.canon);
+        release_set(&mut self.failed);
+        release_set(&mut self.seen_pairs);
+        release_map(&mut self.inst);
+    }
+
+    /// Frees the stacks of the walk at the end of a call, as
+    /// [`TypeChecker::release_tables`] does the tables. A call that stops deep
+    /// in the walk leaves them long, and clearing one drops its elements, some
+    /// of which own allocations.
+    fn release_stacks(&mut self) {
+        release_vec(&mut self.env);
+        release_vec(&mut self.frames);
+        release_vec(&mut self.spine);
+        release_vec(&mut self.pending);
+        release_vec(&mut self.canon_closed);
+        release_vec(&mut self.checkpoints);
+        release_vec(&mut self.trail);
+        release_vec(&mut self.memo_log);
+    }
+
     fn reset(&mut self) {
+        // Clearing a stack drops its elements, some of which own allocations.
+        count_table_slots(
+            self.env.capacity()
+                + self.frames.capacity()
+                + self.spine.capacity()
+                + self.pending.capacity()
+                + self.canon_closed.capacity()
+                + self.checkpoints.capacity()
+                + self.trail.capacity()
+                + self.memo_log.capacity(),
+        );
         self.nodes.clear();
         self.nodes.push(Node::Con(Head::Int, 0, 0));
         self.nodes.push(Node::Con(Head::Bool, 0, 0));
@@ -557,17 +845,17 @@ impl TypeChecker {
         self.env.clear();
         self.frames.clear();
         self.spine.clear();
-        self.shared.clear();
-        self.free_vars.clear();
-        self.memo.clear();
+        empty_set(&mut self.shared);
+        empty_map(&mut self.free_vars);
+        empty_map(&mut self.memo);
         self.pending.clear();
-        self.canon.clear();
+        empty_map(&mut self.canon);
         self.canon_closed.clear();
         self.steps = 0;
         self.checkpoints.clear();
         self.trail.clear();
         self.memo_log.clear();
-        self.failed.clear();
+        empty_set(&mut self.failed);
     }
 
     /// Pushes a binding for a new innermost variable.
@@ -586,6 +874,7 @@ impl TypeChecker {
         let root = self.resolve(t);
         let mut stack = vec![(root, false)];
         while let Some((r, children_done)) = stack.pop() {
+            count_probes(1);
             if ids.contains_key(&r) {
                 continue;
             }
@@ -593,6 +882,7 @@ impl TypeChecker {
                 Node::Var {
                     level: GENERIC,
                     key,
+                    ..
                 } => {
                     vars += 1;
                     Canon::Var {
@@ -614,11 +904,13 @@ impl TypeChecker {
                         }
                         continue;
                     }
+                    count_probes(h.arity() as u64);
                     let id = |c: Ty, used: bool| if used { ids[&c] } else { 0 };
                     Canon::Con(h, id(a, h.arity() >= 1), id(b, h.arity() >= 2))
                 }
             };
             let next = u32::try_from(self.canon.len()).expect("fewer than 2^32 types");
+            count_probes(2);
             let id = *self.canon.entry(canon).or_insert(next);
             if id == next {
                 let closed = match canon {
@@ -633,6 +925,7 @@ impl TypeChecker {
             }
             ids.insert(r, id);
         }
+        count_probes(1);
         ids[&root]
     }
 
@@ -642,51 +935,81 @@ impl TypeChecker {
     /// never infers a prefix `(f a1 ... ai)` on its own. So `t` in `(add t 1)` and
     /// `(add t 2)` counts as reached twice, although both reach it through the one
     /// node `(add t)`.
-    fn find_shared(&mut self, arena: &Arena, root: TermId) {
+    ///
+    /// A spine is walked whole each time it is reached, so the search pays a unit
+    /// for each node it pops, each link of a spine it follows, each child it
+    /// looks up in the set of nodes seen and each child it finds again. It
+    /// returns false, having stopped, once that runs past the budget; it checks
+    /// between nodes and between the links of a spine, which can be as long as
+    /// the term.
+    fn find_shared(&mut self, arena: &Arena, root: TermId) -> bool {
+        // The root has no parent, so a node other than it is seen once some
+        // edge reaches it, and shared once another edge does.
         let mut seen: FxHashSet<TermId> = FxHashSet::default();
-        let mut edges: FxHashSet<TermId> = FxHashSet::default();
         let mut stack = vec![root];
         let mut kids = Vec::new();
+        count_probes(1);
         seen.insert(root);
         while let Some(id) = stack.pop() {
+            if self.spent > self.budget.0 {
+                return false;
+            }
             kids.clear();
             let node = arena.get(id);
+            self.spent += 1;
             if let Term::App(..) = node {
                 let mut head = id;
                 while let Term::App(f, a) = arena.get(head) {
+                    if self.spent > self.budget.0 {
+                        return false;
+                    }
+                    self.spent += 1;
                     kids.push(a);
                     head = f;
                 }
                 kids.push(head);
             } else {
-                kids.extend(children(&node));
+                push_term_children(&mut kids, &node);
             }
             for &c in &kids {
-                if !edges.insert(c) && !children(&arena.get(c)).is_empty() {
-                    self.shared.insert(c);
-                }
+                self.spent += 1;
+                count_probes(1);
                 if seen.insert(c) {
                     stack.push(c);
+                } else if !is_term_leaf(&arena.get(c)) {
+                    self.spent += 1;
+                    count_probes(1);
+                    self.shared.insert(c);
                 }
             }
         }
+        self.spent <= self.budget.0
     }
 
     // ------------------------------------------------------------ store
 
     fn push(&mut self, n: Node) -> Ty {
+        self.spent += 1;
         let id = Ty::try_from(self.nodes.len()).expect("fewer than 2^32 type nodes");
         self.nodes.push(n);
         id
     }
 
     fn node(&self, t: Ty) -> Node {
+        #[cfg(test)]
+        STORE_READS.with(|r| r.set(r.get() + 1));
         self.nodes[t as usize]
     }
 
+    /// Changes node `t` to `n`. If a checkpoint may go back to the old node, it
+    /// is saved on the trail. That is not charged on its own: every change
+    /// follows a charged step on the same node (a link followed, a node visited
+    /// or a pair unified), and a step makes at most two changes.
     fn set(&mut self, t: Ty, n: Node) {
         let i = t as usize;
         if self.checkpoints.last().is_some_and(|cp| i < cp.nodes) {
+            #[cfg(test)]
+            STORE_READS.with(|r| r.set(r.get() + 1));
             self.trail.push((t, self.nodes[i]));
         }
         self.nodes[i] = n;
@@ -696,6 +1019,7 @@ impl TypeChecker {
         self.push(Node::Var {
             level: self.level,
             key: false,
+            rank: 0,
         })
     }
 
@@ -735,10 +1059,14 @@ impl TypeChecker {
         self.con2(Head::Pair, a, b)
     }
 
-    /// Follows links to the representative node, compressing the path.
+    /// Follows links to the representative node, compressing the path. Each
+    /// link followed costs a unit: going back to a checkpoint undoes the
+    /// compression, so a long path can be walked again after each failed use.
     fn resolve(&mut self, t: Ty) -> Ty {
+        self.spent += 1;
         let mut root = t;
         while let Node::Link(next) = self.node(root) {
+            self.spent += 1;
             root = next;
         }
         let mut cur = t;
@@ -793,33 +1121,56 @@ impl TypeChecker {
         let mut pairs = std::mem::take(&mut self.pairs);
         let mut seen = std::mem::take(&mut self.seen_pairs);
         pairs.clear();
-        seen.clear();
+        empty_set(&mut seen);
         pairs.push((expected, found));
         let mut result = Ok(());
         while let Some((x, y)) = pairs.pop() {
+            // Shared structure can make the pairs visited as many as the
+            // product of the two types' sizes, so the budget is checked here.
+            if self.spent > self.budget.0 {
+                result = Err(UnifyError::OutOfWork);
+                break;
+            }
             let a = self.resolve(x);
             let b = self.resolve(y);
             if a == b {
                 continue;
             }
             let step = match (self.node(a), self.node(b)) {
-                (Node::Var { level: la, key: ka }, Node::Var { level: lb, key: kb }) => {
-                    self.set(a, Node::Link(b));
+                (
+                    Node::Var {
+                        level: la,
+                        key: ka,
+                        rank: ra,
+                    },
+                    Node::Var {
+                        level: lb,
+                        key: kb,
+                        rank: rb,
+                    },
+                ) => {
+                    // The variable of lower rank is linked to the other, so a
+                    // path of links is no longer than the log of the number of
+                    // variables (union by rank).
+                    let (child, root) = if ra > rb { (b, a) } else { (a, b) };
+                    self.set(child, Node::Link(root));
                     self.set(
-                        b,
+                        root,
                         Node::Var {
                             level: la.min(lb),
                             key: ka || kb,
+                            rank: if ra == rb { ra + 1 } else { ra.max(rb) },
                         },
                     );
                     Ok(())
                 }
-                (Node::Var { level, key }, _) => self.bind(a, level, key, b),
-                (_, Node::Var { level, key }) => self.bind(b, level, key, a),
+                (Node::Var { level, key, .. }, _) => self.bind(a, level, key, b),
+                (_, Node::Var { level, key, .. }) => self.bind(b, level, key, a),
                 (Node::Con(ha, a1, a2), Node::Con(hb, b1, b2)) if ha == hb => {
                     // Constructor nodes are not linked to each other (that would
                     // change how the expected side prints in an error), so a pair
                     // met again through shared structure is skipped here instead.
+                    count_probes(1);
                     if ha.arity() > 0 && seen.insert((a, b)) {
                         if ha.arity() >= 2 {
                             pairs.push((a2, b2));
@@ -836,6 +1187,7 @@ impl TypeChecker {
             }
         }
         self.pairs = pairs;
+        release_set(&mut seen);
         self.seen_pairs = seen;
         result
     }
@@ -865,13 +1217,17 @@ impl TypeChecker {
             }
             let n = self.node(r);
             match n {
-                Node::Var { level: l, key } => {
+                Node::Var {
+                    level: l,
+                    key,
+                    rank,
+                } => {
                     if r == v {
                         result = Err(UnifyError::Occurs(v, t));
                         break;
                     }
                     if l > level {
-                        self.set(r, Node::Var { level, key });
+                        self.set(r, Node::Var { level, key, rank });
                     }
                 }
                 Node::Con(..) => Self::push_children(&mut work, n),
@@ -896,7 +1252,14 @@ impl TypeChecker {
             }
             let n = self.node(r);
             match n {
-                Node::Var { level, .. } => self.set(r, Node::Var { level, key: true }),
+                Node::Var { level, rank, .. } => self.set(
+                    r,
+                    Node::Var {
+                        level,
+                        key: true,
+                        rank,
+                    },
+                ),
                 Node::Rigid { key: true } | Node::Con(Head::Int | Head::Bool | Head::Unit, ..) => {}
                 Node::Con(Head::Pair, ..) => Self::push_children(&mut work, n),
                 _ => {
@@ -926,13 +1289,14 @@ impl TypeChecker {
             }
             let n = self.node(r);
             match n {
-                Node::Var { level, key } if level > self.level => {
+                Node::Var { level, key, rank } if level > self.level => {
                     poly = true;
                     self.set(
                         r,
                         Node::Var {
                             level: GENERIC,
                             key,
+                            rank,
                         },
                     );
                 }
@@ -949,13 +1313,14 @@ impl TypeChecker {
     /// shared structure stays shared.
     fn instantiate(&mut self, t: Ty) -> Ty {
         let mut map = std::mem::take(&mut self.inst);
-        map.clear();
+        empty_map(&mut map);
         let root = self.resolve(t);
         // A node is pushed with `true` to be expanded; a constructor is pushed again
         // with `false` to be rebuilt once its children are done. Entries are
         // resolved roots.
         let mut expand: Vec<(Ty, bool)> = vec![(root, true)];
         while let Some((r, first)) = expand.pop() {
+            count_probes(2);
             if first {
                 if map.contains_key(&r) {
                     continue;
@@ -964,10 +1329,12 @@ impl TypeChecker {
                     Node::Var {
                         level: GENERIC,
                         key,
+                        ..
                     } => {
                         let n = self.push(Node::Var {
                             level: self.level,
                             key,
+                            rank: 0,
                         });
                         map.insert(r, n);
                     }
@@ -985,6 +1352,7 @@ impl TypeChecker {
                     }
                 }
             } else if let Node::Con(h, a, b) = self.node(r) {
+                count_probes(2);
                 let ra = self.resolve(a);
                 let na = map.get(&ra).copied().unwrap_or(ra);
                 let (rb, nb) = if h.arity() >= 2 {
@@ -1001,13 +1369,16 @@ impl TypeChecker {
                 map.insert(r, out);
             }
         }
+        count_probes(1);
         let out = map.get(&root).copied().unwrap_or(root);
+        release_map(&mut map);
         self.inst = map;
         out
     }
 
     /// Builds a public type into the store; `var` supplies the node for a variable.
     fn import(&mut self, t: &Type, var: &mut impl FnMut(&mut Self, TyVar) -> Ty) -> Ty {
+        count_scheme_read();
         match t {
             Type::Int => INT,
             Type::Bool => BOOL,
@@ -1044,12 +1415,15 @@ impl TypeChecker {
 
     /// A fresh instance of `s` at the current level.
     fn instantiate_scheme(&mut self, s: &Scheme) -> Ty {
+        let keys = KeySet::of(s);
         let mut map: FxHashMap<TyVar, Ty> = FxHashMap::default();
         self.import(s.ty(), &mut |this, v| {
+            count_probes(1);
             *map.entry(v).or_insert_with(|| {
                 this.push(Node::Var {
                     level: this.level,
-                    key: s.keys().contains(&v),
+                    key: keys.contains(v),
+                    rank: 0,
                 })
             })
         })
@@ -1079,6 +1453,7 @@ impl TypeChecker {
                             let next = TyVar(
                                 u32::try_from(names.len()).expect("fewer than 2^32 variables"),
                             );
+                            count_probes(1);
                             out.push(Type::Var(*names.entry(r).or_insert(next)));
                         }
                         Node::Con(h, a, b) => match h {
@@ -1125,6 +1500,7 @@ impl TypeChecker {
     fn export_scheme(&mut self, t: Ty) -> Result<Scheme, TooLarge> {
         let mut names = FxHashMap::default();
         let ty = self.export(t, &mut names)?;
+        count_probes(names.len() as u64);
         let keys: Vec<TyVar> = names
             .iter()
             .filter(|(&node, _)| {
@@ -1286,6 +1662,7 @@ impl TypeChecker {
                 let k = self.push(Node::Var {
                     level: self.level,
                     key: true,
+                    rank: 0,
                 });
                 let v = self.fresh();
                 let kv = self.arrow(k, v);
@@ -1337,12 +1714,16 @@ impl TypeChecker {
         root: TermId,
         want: Option<Want>,
     ) -> Result<Ty, TypeError> {
-        if !self.tree_walk {
-            self.find_shared(arena, root);
+        if !self.tree_walk && !self.find_shared(arena, root) {
+            return Err(self.out_of_work(arena, root));
         }
         let mut step = Step::Eval(root, want);
         loop {
             self.steps += 1;
+            self.spent += 1;
+            if self.spent > self.budget.0 {
+                return Err(self.out_of_work(arena, root));
+            }
             #[cfg(test)]
             {
                 if let Some(limit) = self.step_limit {
@@ -1354,6 +1735,7 @@ impl TypeChecker {
             }
             let next = match step {
                 Step::Eval(id, want) => {
+                    count_probes(1);
                     if self.shared.contains(&id) {
                         self.shared_subterm(arena, id, want)
                     } else {
@@ -1369,6 +1751,11 @@ impl TypeChecker {
             };
             step = match next {
                 Ok(next) => next,
+                // A step that ran past the budget ends the call, whatever its
+                // outcome: going back to a checkpoint would only do more work.
+                Err(_) if self.spent > self.budget.0 => {
+                    return Err(self.out_of_work(arena, root));
+                }
                 // Only the second walk of [`TypeChecker::run`] has checkpoints.
                 Err(e) => match self.checkpoints.pop() {
                     None => return Err(e),
@@ -1376,6 +1763,8 @@ impl TypeChecker {
                         // A use whose key is not in the memo failed while its
                         // subterm was being inferred afresh.
                         if let Some(key) = &cp.closed_key {
+                            self.spent += 2;
+                            count_probes(2);
                             if !self.memo.contains_key(key) {
                                 self.failed.insert(key.clone());
                             }
@@ -1387,6 +1776,13 @@ impl TypeChecker {
         }
     }
 
+    /// The error for a call that has run out of work budget.
+    fn out_of_work(&self, arena: &Arena, root: TermId) -> TypeError {
+        let mut e = plain_error(arena, root, too_much_work(self.budget.0));
+        e.context = "the whole term".into();
+        e
+    }
+
     /// Starts on shared subterm `id`: reuses its kept type for this [`Scope`], or
     /// infers it afresh (see [`TypeChecker::walk`]).
     fn shared_subterm(
@@ -1395,10 +1791,23 @@ impl TypeChecker {
         id: TermId,
         want: Option<Want>,
     ) -> Result<Step, TypeError> {
+        // A unit for each lookup in a table that grows with the term: on a
+        // large term each is likely a cache miss.
+        self.spent += 2;
+        count_probes(2);
         if !self.free_vars.contains_key(&id) {
-            free_vars(arena, id, &mut self.free_vars);
+            free_vars(
+                arena,
+                id,
+                &mut self.free_vars,
+                &mut self.spent,
+                self.budget.0,
+            );
         }
-        let fv = &self.free_vars[&id];
+        let Some(fv) = self.free_vars.get(&id) else {
+            // Finding them ran past the budget, which ends the call.
+            return Err(plain_error(arena, id, too_much_work(self.budget.0)));
+        };
         let len = self.env.len();
         if fv.depth as usize > len {
             // A free variable is unbound: walk it as a tree to report it.
@@ -1408,6 +1817,9 @@ impl TypeChecker {
             return self.descend_unshared(id, want);
         }
         let indices = fv.indices();
+        // Building, hashing, comparing and keeping the key each take time in
+        // proportion to its length.
+        self.spent += indices.len() as u64;
         let mut scope = Vec::with_capacity(indices.len());
         for &i in &indices {
             let b = self.env[len - 1 - i as usize];
@@ -1418,6 +1830,8 @@ impl TypeChecker {
         }
         let key = (id, scope);
         if self.locate {
+            self.spent += 1;
+            count_probes(1);
             if self.failed.contains(&key) {
                 // Fresh inference fails in every context, so this use fails too:
                 // trying it again would redo that work at every level of sharing.
@@ -1437,6 +1851,8 @@ impl TypeChecker {
                 level: self.level,
             });
         }
+        self.spent += 1;
+        count_probes(1);
         if let Some(&kept) = self.memo.get(&key) {
             let t = self.instantiate(kept);
             let t = self.apply_scope(arena, id, &key.1, &indices, t)?;
@@ -1478,6 +1894,12 @@ impl TypeChecker {
     #[cfg(test)]
     pub(super) fn failed_keys(&self) -> usize {
         self.failed.len()
+    }
+
+    /// The units of work the last call did.
+    #[cfg(test)]
+    pub(super) fn spent(&self) -> u64 {
+        self.spent
     }
 
     /// Whether no binding in `scope` has a type with free variables: then
@@ -1524,6 +1946,7 @@ impl TypeChecker {
         // As in `instantiate`: `true` to expand, `false` to rebuild.
         let mut stack: Vec<(Ty, bool)> = vec![(root, true)];
         while let Some((r, first)) = stack.pop() {
+            count_probes(2);
             if first {
                 if map.contains_key(&r) {
                     continue;
@@ -1532,10 +1955,12 @@ impl TypeChecker {
                     Node::Var {
                         level: GENERIC,
                         key,
+                        ..
                     } => {
                         let n = self.push(Node::Var {
                             level: GENERIC,
                             key,
+                            rank: 0,
                         });
                         map.insert(r, n);
                     }
@@ -1559,6 +1984,7 @@ impl TypeChecker {
             } else if let Node::Con(h, a, b) = self.node(r) {
                 let copy = |this: &mut Self, c: Ty, used: bool| {
                     if used {
+                        count_probes(1);
                         let rc = this.resolve(c);
                         map[&rc]
                     } else {
@@ -1571,6 +1997,7 @@ impl TypeChecker {
                 map.insert(r, out);
             }
         }
+        count_probes(1);
         map.get(&root).copied()
     }
 
@@ -1578,6 +2005,8 @@ impl TypeChecker {
     /// its shared subterm in place.
     fn back_to(&mut self, cp: Checkpoint) -> Step {
         for (t, n) in self.trail.drain(cp.trail..).rev() {
+            #[cfg(test)]
+            STORE_READS.with(|r| r.set(r.get() + 1));
             self.nodes[t as usize] = n;
         }
         self.frames.truncate(cp.frames);
@@ -1591,6 +2020,7 @@ impl TypeChecker {
         }
         self.env.truncate(cp.env);
         for key in self.memo_log.drain(cp.memo_log..) {
+            count_probes(1);
             self.memo.remove(&key);
         }
         self.level = cp.level;
@@ -1719,9 +2149,15 @@ impl TypeChecker {
                 return Ok(Step::Eval(first, None));
             }
             Term::App(..) => {
+                // A unit per argument, checked as it goes: a spine can be as
+                // long as the term.
                 let start = self.spine.len();
                 let mut head = id;
                 while let Term::App(f, a) = arena.get(head) {
+                    if self.spent > self.budget.0 {
+                        return Err(plain_error(arena, id, too_much_work(self.budget.0)));
+                    }
+                    self.spent += 1;
                     self.spine.push(a);
                     head = f;
                 }
@@ -1802,13 +2238,13 @@ impl TypeChecker {
                 Step::Return(then_ty)
             }
             Frame::BoolFirst { first, second, op } => {
-                let ctx = format!("the first operand of `{op}`");
+                let ctx = Context::Operand { first: true, op };
                 self.expect(arena, BOOL, t, Site::new(first, ctx))?;
                 self.frames.push(Frame::BoolSecond { second, op });
                 Step::Eval(second, None)
             }
             Frame::BoolSecond { second, op } => {
-                let ctx = format!("the second operand of `{op}`");
+                let ctx = Context::Operand { first: false, op };
                 self.expect(arena, BOOL, t, Site::new(second, ctx))?;
                 Step::Return(BOOL)
             }
@@ -1837,6 +2273,8 @@ impl TypeChecker {
                 // Kept before the scope is applied: a key in the memo is one
                 // whose fresh inference worked, which is how a failed use tells
                 // a failed fresh inference from a binder that does not fit.
+                self.spent += 2;
+                count_probes(2);
                 self.memo.insert(key, kept);
                 let indices = self.free_vars[&id].indices();
                 let t = self.apply_scope(arena, id, &scope, &indices, t)?;
@@ -1861,7 +2299,7 @@ impl TypeChecker {
                 want,
             } => {
                 let arg = self.spine[sp.start + i];
-                let ctx = format!("argument {} of `{}`", i + 1, short(arena, sp.head));
+                let ctx = Context::Argument { i, head: sp.head };
                 self.expect(arena, param, t, Site::new(arg, ctx))?;
                 self.next_arg(arena, sp, i + 1, ret, want)?
             }
@@ -1948,7 +2386,7 @@ impl TypeChecker {
             Node::Var { .. } => {
                 let (p, r) = (self.fresh(), self.fresh());
                 let want = self.arrow(p, r);
-                let ctx = format!("the function position of `{}`", short(arena, sp.app));
+                let ctx = Context::FunctionPosition { app: sp.app };
                 self.expect(arena, want, rf, Site::new(sp.head, ctx))?;
                 Ok(Some((p, r)))
             }
@@ -1987,7 +2425,7 @@ impl TypeChecker {
             kind: Box::new(kind),
             term: site.term,
             term_text: short(arena, site.term),
-            context: site.context,
+            context: site.context.describe(arena),
             note,
         }
     }
@@ -2030,6 +2468,7 @@ impl TypeChecker {
                 let ty = self.export(t, &mut names)?;
                 TypeErrorKind::InfiniteType { var, ty }
             }
+            UnifyError::OutOfWork => too_much_work(self.budget.0),
             UnifyError::Key(t) => {
                 let found = self.export(t, &mut names)?;
                 if self.is_rigid(t) {
@@ -2053,43 +2492,61 @@ impl TypeChecker {
 /// Records in `memo` the [`FreeVars`] of `id` and of every node under it that
 /// `memo` does not already hold. It walks with an explicit stack and visits each
 /// distinct node once; a node's list is at most [`MAX_FREE_VARS`] long, so the
-/// cost is linear in the number of distinct nodes.
-fn free_vars(arena: &Arena, id: TermId, memo: &mut FxHashMap<TermId, FreeVars>) {
+/// cost is linear in the number of distinct nodes. It adds to `spent` the units
+/// of work it does: one for each node it pops to expand (a lookup in `memo`),
+/// one for each node it records, and for each child of such a node, one for
+/// reading the child's list and one for each index it gathers from that list.
+/// It stops between nodes once `spent` is past `budget`, leaving `id` out of
+/// `memo` unless it was done.
+fn free_vars(
+    arena: &Arena,
+    id: TermId,
+    memo: &mut FxHashMap<TermId, FreeVars>,
+    spent: &mut u64,
+    budget: u64,
+) {
+    let mut kids = Vec::with_capacity(3);
     // A node is pushed with `false` to be expanded, and again with `true` to be
-    // computed once its children are done.
+    // computed once its children are done. A node is expanded at most once: one
+    // pushed again before it is computed is popped after it is.
     let mut stack = vec![(id, false)];
     while let Some((t, children_done)) = stack.pop() {
-        if memo.contains_key(&t) {
+        if *spent > budget {
+            return;
+        }
+        if !children_done {
+            *spent += 1;
+            count_probes(1);
+            if !memo.contains_key(&t) {
+                stack.push((t, true));
+                kids.clear();
+                push_term_children(&mut kids, &arena.get(t));
+                stack.extend(kids.iter().map(|&c| (c, false)));
+            }
             continue;
         }
         let node = arena.get(t);
-        if !children_done {
-            stack.push((t, true));
-            stack.extend(
-                children(&node)
-                    .into_iter()
-                    .filter(|c| !memo.contains_key(c))
-                    .map(|c| (c, false)),
-            );
-            continue;
-        }
-        // The free variables of each child, shifted out of the binders between
-        // `t` and the child.
-        let parts: Vec<(TermId, u32)> = match node {
-            Term::Lam(b) => vec![(b, 1)],
-            Term::Let(x, b) => vec![(x, 0), (b, 1)],
-            ref other => children(other).into_iter().map(|c| (c, 0)).collect(),
-        };
         let fv = match node {
             Term::Var(i) => FreeVars {
                 depth: i.saturating_add(1),
                 vars: Some(Box::new([i])),
             },
             _ => {
+                kids.clear();
+                push_term_children(&mut kids, &node);
                 let mut depth = 0u32;
                 let mut vars: Option<Vec<u32>> = Some(Vec::new());
-                for (c, shift) in parts {
+                for (k, &c) in kids.iter().enumerate() {
+                    // The binders between `t` and the child: a lambda binds
+                    // over its body, a `let` over its second child.
+                    let shift = match node {
+                        Term::Lam(_) => 1,
+                        Term::Let(..) => k as u32,
+                        _ => 0,
+                    };
+                    count_probes(1);
                     let child = &memo[&c];
+                    *spent += 1 + child.vars.as_ref().map_or(0, |v| v.len() as u64);
                     depth = depth.max(child.depth.saturating_sub(shift));
                     match (&mut vars, &child.vars) {
                         (Some(acc), Some(cv)) => {
@@ -2106,8 +2563,115 @@ fn free_vars(arena: &Arena, id: TermId, memo: &mut FxHashMap<TermId, FreeVars>) 
                 FreeVars { depth, vars }
             }
         };
+        *spent += 1;
+        count_probes(1);
         memo.insert(t, fv);
     }
+}
+
+/// Pushes the children of `node` onto `out` in the order of
+/// [`children`](crate::term::children), without allocating.
+fn push_term_children(out: &mut Vec<TermId>, node: &Term) {
+    match *node {
+        Term::Var(_) | Term::Int(_) | Term::Bool(_) | Term::Unit | Term::Prim(_) | Term::Lib(_) => {
+        }
+        Term::Lam(b) => out.push(b),
+        Term::App(a, b) | Term::Let(a, b) | Term::And(a, b) | Term::Or(a, b) => {
+            out.extend([a, b]);
+        }
+        Term::If(a, b, c) => out.extend([a, b, c]),
+    }
+}
+
+/// Whether `node` has no children (see [`children`](crate::term::children)).
+fn is_term_leaf(node: &Term) -> bool {
+    matches!(
+        node,
+        Term::Var(_) | Term::Int(_) | Term::Bool(_) | Term::Unit | Term::Prim(_) | Term::Lib(_)
+    )
+}
+
+/// Empties a hash table kept between uses (see [`empty_set`]).
+fn empty_map<K, V, S: Default>(t: &mut HashMap<K, V, S>) {
+    if keep_table(t.len(), t.capacity()) {
+        t.clear();
+    } else {
+        *t = HashMap::default();
+    }
+}
+
+/// Empties a hash set kept between uses.
+fn empty_set<K, S: Default>(t: &mut std::collections::HashSet<K, S>) {
+    if keep_table(t.len(), t.capacity()) {
+        t.clear();
+    } else {
+        *t = std::collections::HashSet::default();
+    }
+}
+
+/// Largest capacity a table keeps between calls (see
+/// [`TypeChecker::release_tables`]).
+const KEPT_CAPACITY: usize = 64;
+
+/// Drops a hash table kept between calls if it is larger than
+/// [`KEPT_CAPACITY`], else clears it.
+fn release_map<K, V, S: Default>(t: &mut HashMap<K, V, S>) {
+    if t.capacity() > KEPT_CAPACITY {
+        count_table_slots(t.capacity());
+        *t = HashMap::default();
+    } else {
+        empty_map(t);
+    }
+}
+
+/// [`release_map`] for a hash set.
+fn release_set<K, S: Default>(t: &mut std::collections::HashSet<K, S>) {
+    if t.capacity() > KEPT_CAPACITY {
+        count_table_slots(t.capacity());
+        *t = std::collections::HashSet::default();
+    } else {
+        empty_set(t);
+    }
+}
+
+/// Drops a stack kept between calls if it is larger than [`KEPT_CAPACITY`].
+fn release_vec<T>(v: &mut Vec<T>) {
+    if v.capacity() > KEPT_CAPACITY {
+        count_table_slots(v.capacity());
+        *v = Vec::new();
+    }
+}
+
+/// Counts `n` slots of a kept table visited, in tests.
+fn count_table_slots(n: usize) {
+    #[cfg(test)]
+    TABLE_SLOTS.with(|c| c.set(c.get() + n as u64));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+/// Whether to clear a table of `len` entries and `capacity` slots rather than
+/// replace it with an empty one. Clearing a table that holds anything visits
+/// every slot, and capacity never shrinks, so one large use would make every
+/// later small one slow. A table much larger than its contents is dropped
+/// instead. Freeing a table also costs time in its capacity, so callers
+/// release a grown table when they finish with it (see [`release_set`]), and
+/// the tables emptied here hold no more than [`KEPT_CAPACITY`] slots more than
+/// twice what was charged since.
+fn keep_table(len: usize, capacity: usize) -> bool {
+    let keep = capacity <= 2 * len + KEPT_CAPACITY;
+    // Freeing a table costs time in its capacity too.
+    count_table_slots(if keep && len == 0 { 0 } else { capacity });
+    keep
+}
+
+/// Whether `e` says that the call ran out of work budget.
+fn out_of_budget(e: &TypeError) -> bool {
+    matches!(*e.kind, TypeErrorKind::TooMuchWork { .. })
+}
+
+fn too_much_work(limit: u64) -> TypeErrorKind {
+    TypeErrorKind::TooMuchWork { limit }
 }
 
 fn too_large() -> TypeErrorKind {
@@ -2127,14 +2691,15 @@ fn plain_error(arena: &Arena, term: TermId, kind: TypeErrorKind) -> TypeError {
     }
 }
 
-/// `id` in core syntax (as [`crate::sexpr::print`] writes it), cut to
-/// [`MAX_TERM_TEXT`] bytes followed by ` ...`. It stops writing once past the limit,
-/// so its cost does not depend on the size or depth of the term.
+/// `id` in core syntax (as [`crate::sexpr::print`] writes it), or, if that is
+/// longer than [`MAX_TERM_TEXT`] bytes, a prefix of it of at most that many
+/// bytes followed by ` ...`. Its cost is linear in [`MAX_TERM_TEXT`], whatever
+/// the size or depth of the term (see [`crate::sexpr::print_bounded`]).
 pub(super) fn short(arena: &Arena, id: TermId) -> String {
     let mut out = String::new();
-    crate::sexpr::print_bounded(arena, id, MAX_TERM_TEXT, &mut out);
-    if out.len() > MAX_TERM_TEXT {
-        let mut cut = MAX_TERM_TEXT;
+    let whole = crate::sexpr::print_bounded(arena, id, MAX_TERM_TEXT, &mut out);
+    if !whole || out.len() > MAX_TERM_TEXT {
+        let mut cut = MAX_TERM_TEXT.min(out.len());
         while !out.is_char_boundary(cut) {
             cut -= 1;
         }

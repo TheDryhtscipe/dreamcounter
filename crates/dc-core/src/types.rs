@@ -32,7 +32,10 @@ mod parse;
 mod tests;
 
 pub use error::{TypeError, TypeErrorKind};
-pub use infer::{check, infer, prim_scheme, LibEnv, TypeChecker, MAX_TYPE_DEPTH, MAX_TYPE_NODES};
+pub use infer::{
+    check, infer, prim_scheme, LibEnv, TypeChecker, DEFAULT_WORK_BUDGET, MAX_TYPE_DEPTH,
+    MAX_TYPE_NODES,
+};
 pub use parse::TypeParseError;
 
 /// A type variable. It prints as `a`, `b`, ..., `z`, `a1`, `b1`, ...

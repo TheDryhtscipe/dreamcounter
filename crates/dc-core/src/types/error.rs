@@ -66,6 +66,15 @@ pub enum TypeErrorKind {
         /// The limit on nesting depth.
         max_depth: usize,
     },
+    /// Checking the term took more than `limit` units of work (see
+    /// [`TypeChecker::set_work_budget`](super::TypeChecker::set_work_budget)), so it
+    /// was stopped. The term may be well typed; it is refused because terms whose
+    /// shared subterms see many differently typed polymorphic bindings can take
+    /// time exponential in their size.
+    TooMuchWork {
+        /// The work budget that was exceeded.
+        limit: u64,
+    },
 }
 
 /// A type error at one subterm.
@@ -151,6 +160,12 @@ impl fmt::Display for TypeError {
                  written out, or nested more than {max_depth} deep); a common cause \
                  is a function that duplicates its argument's type, such as \
                  `(lam (pair $0 $0))`, applied many times"
+            )?,
+            TypeErrorKind::TooMuchWork { limit } => write!(
+                f,
+                "type checking this term took more than {limit} units of work, so it \
+                 was stopped; a common cause is a shared subterm used under many \
+                 different choices of polymorphic `let`-bound helpers"
             )?,
         }
         write!(f, "\n  term: {}", self.term_text)?;
