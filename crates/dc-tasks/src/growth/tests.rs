@@ -810,18 +810,9 @@ fn c_seeded(sweep: &Sweep) -> ClassFit {
     ClassSelect::default().fit(sweep).expect("C fits")
 }
 
-/// Half the range of `ln f₁ − ln f₂` over the default window for `f₁ = n log n`
-/// and `f₂ = n`: `½ ln(ln 1024 / ln 128) = ½ ln(10/7)`. It is also the
-/// separation of `log n` from `1`, and the smallest over all class pairs.
-fn default_separation() -> f64 {
-    0.5 * (10.0f64 / 7.0).ln()
-}
-
-/// The default tolerance on the default window: a quarter of the
-/// separation, 0.0446, capped at 0.04.
+/// The default tolerance.
 fn default_tolerance() -> f64 {
-    let d = ClassSelect::default();
-    (d.misfit_fraction * default_separation()).min(d.max_tolerance)
+    ClassSelect::default().tolerance
 }
 
 /// A class and an exact step series of it.
@@ -857,16 +848,116 @@ fn c_names_the_class_of_each_exact_series() {
     );
 }
 
+/// Exact `1000 · n^a` on the default sweep.
+fn power_law(a: f64) -> Sweep {
+    default_sweep(move |n| (1000.0 * (n as f64).powf(a)).round() as u64)
+}
+
 #[test]
-fn c_absorbs_lower_order_terms() {
+fn c_refuses_powers_near_a_class() {
+    // Each is within a few per cent of n, n log n or n² over part of the
+    // sweep, but no class with a bounded lower-order term follows it over
+    // all of 16..1024.
+    for a in [0.9, 0.95, 1.1, 1.14, 1.2, 1.3, 1.9, 2.1] {
+        let fit = c(&power_law(a));
+        assert_eq!(fit.verdict, ClassVerdict::NoFit, "n^{a}: {fit:?}");
+    }
+}
+
+#[test]
+fn c_names_classes_with_a_lower_order_term() {
     for (class, f) in [
         (GrowthClass::Linear, (|n| 3 * n + 5) as fn(u64) -> u64),
-        // 1 + 2/log2 n runs from 1.29 to 1.2 over the window: misfit 0.035.
         (GrowthClass::NLogN, |n| n * log2(n) + 2 * n),
+        // In natural logarithms this is n ln n + 4 ln 2 · n, a lower-order
+        // term as large as the main term at n = 16 (ρ = 1).
+        (GrowthClass::NLogN, |n| n * log2(n) + 4 * n),
         (GrowthClass::Quadratic, |n| n * n / 4 + 3 * n),
+        (GrowthClass::Cubic, |n| n * n * n + 7 * n * n),
     ] {
         let fit = c(&default_sweep(f));
         assert_eq!(fit.verdict, ClassVerdict::Class(class), "{fit:?}");
+        let k = fit.candidates[class as usize];
+        assert!(k.misfit < 1e-3, "{k:?}");
+    }
+    // Without the lower-order term the same series is refused: the term is
+    // what names it.
+    let one_term = ClassSelect {
+        lower_order_ratio: 0.0,
+        ..c_with(NoiseModel::Exact)
+    };
+    let fit = one_term
+        .fit(&default_sweep(|n| n * log2(n) + 4 * n))
+        .expect("fits");
+    assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
+    assert!(fit.candidates.iter().all(|k| k.r == 0.0), "{fit:?}");
+}
+
+#[test]
+fn c_lower_order_term_is_bounded_by_the_main_term() {
+    // n log2 n + 8n: the term is twice the main term at n = 16, beyond ρ = 1.
+    let sweep = default_sweep(|n| n * log2(n) + 8 * n);
+    let fit = c(&sweep);
+    assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
+    // r sits at its upper bound ρ q, q = min f/g = ln 16.
+    let k = fit.candidates[GrowthClass::NLogN as usize];
+    assert!((k.r - 16f64.ln()).abs() < EXACT, "{k:?}");
+    // With ρ = 2 it is named.
+    let wide = ClassSelect {
+        lower_order_ratio: 2.0,
+        ..c_with(NoiseModel::Exact)
+    };
+    let fit = wide.fit(&sweep).expect("fits");
+    assert_eq!(
+        fit.verdict,
+        ClassVerdict::Class(GrowthClass::NLogN),
+        "{fit:?}"
+    );
+    // A negative term is bounded by half the main term: n² − 0.9 n·16 at
+    // n = 16 is a tenth of n², beyond the bound.
+    let sweep = default_sweep(|n| n * n - 9 * n * 16 / 10);
+    let fit = c(&sweep);
+    let k = fit.candidates[GrowthClass::Quadratic as usize];
+    assert!((k.r + 8.0).abs() < EXACT, "{k:?}");
+    assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
+}
+
+/// Sizes of the `zero-subsets` reference family.
+const SUBSET_SIZES: [u64; 6] = [4, 6, 8, 10, 12, 14];
+
+#[test]
+fn c_tells_2_to_the_n_from_its_lower_order_term() {
+    // The lower-order term of 2ⁿ is n, which covers recurrences
+    // T(n) = 2 T(n − 1) + p(n) with p of degree 0 or 1. Over 4..14 a
+    // polynomial term can be as large as 2ⁿ itself, so larger terms, and
+    // growth near 2ⁿ, are refused.
+    let fit = |f: fn(u64) -> u64| c(&Sweep::from_fn(&SUBSET_SIZES, f).expect("valid"));
+    let exp = |b: f64| move |n: u64| (1000.0 * b.powi(n as i32)).round() as u64;
+    for (f, verdict) in [
+        (
+            (|n| 21 * (1 << n) - 8) as fn(u64) -> u64,
+            ClassVerdict::Class(GrowthClass::Exponential),
+        ),
+        (
+            |n| 1000 * ((1 << n) - n - 2),
+            ClassVerdict::Class(GrowthClass::Exponential),
+        ),
+        (
+            |n| 1000 * n * n * n,
+            ClassVerdict::Class(GrowthClass::Cubic),
+        ),
+        // n³ is 4 times 2ⁿ at n = 4: with n³ as the term this would be named.
+        (|n| (1000 << n) + 50 * n * n * n, ClassVerdict::NoFit),
+        (|n| n * (1000 << n), ClassVerdict::NoFit),
+        (|n| 1000 * n.pow(4), ClassVerdict::NoFit),
+        (|n| 1000 * n.pow(5), ClassVerdict::NoFit),
+    ] {
+        let got = fit(f);
+        assert_eq!(got.verdict, verdict, "{got:?}");
+    }
+    for b in [1.9, 2.1, 3.0] {
+        let got = c(&Sweep::from_fn(&SUBSET_SIZES, exp(b)).expect("valid"));
+        assert_eq!(got.verdict, ClassVerdict::NoFit, "{b}^n: {got:?}");
     }
 }
 
@@ -887,85 +978,64 @@ fn c_refuses_growth_outside_its_classes() {
 /// `2⁸, 2¹⁰, …, 2²⁰`.
 const WIDE_SIZES: [u64; 7] = [1 << 8, 1 << 10, 1 << 12, 1 << 14, 1 << 16, 1 << 18, 1 << 20];
 
-/// Exact `100 · n^a` over `2⁸, 2¹⁰, …, 2²⁰`, all fitted: a window where
-/// `ln n` varies by a factor 2.5 and the separation is 0.458.
-fn wide_power_law(a: f64) -> (ClassSelect, Sweep) {
-    let sweep = Sweep::from_fn(&WIDE_SIZES, |n| ((n as f64).powf(a) * 100.0).round() as u64)
-        .expect("valid");
-    let select = ClassSelect {
-        window: Window::All,
-        ..c_with(NoiseModel::Exact)
-    };
-    (select, sweep)
+/// Exact `100 · n^a` over `2⁸, 2¹⁰, …, 2²⁰`.
+fn wide_power_law(a: f64) -> Sweep {
+    Sweep::from_fn(&WIDE_SIZES, |n| ((n as f64).powf(a) * 100.0).round() as u64).expect("valid")
 }
 
 #[test]
-fn c_tolerance_does_not_grow_with_a_wide_window() {
-    // A quarter of the separation would be 0.115 here, within which exact
-    // n^1.1 (misfit 0.072 from n log n) is named n log n. Capped, the
-    // tolerance stays where it is on the default window, and the wider
-    // window tells n^1.1 from n log n.
-    let (select, sweep) = wide_power_law(1.1);
-    let fit = select.fit(&sweep).expect("fits");
-    assert!(fit.separation > 0.45, "{fit:?}");
-    let nlogn = fit.candidates[GrowthClass::NLogN as usize].misfit;
-    assert!(nlogn > 0.07 && nlogn < 0.075, "{fit:?}");
-    assert_eq!(
-        fit.tolerance,
-        ClassSelect::default().max_tolerance,
-        "{fit:?}"
-    );
-    assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
-
-    // Uncapped, it is named n log n: the cap is what refuses it.
-    let uncapped = ClassSelect {
-        max_tolerance: f64::INFINITY,
-        ..select
-    };
-    let fit = uncapped.fit(&sweep).expect("fits");
-    assert!((fit.tolerance - 0.25 * fit.separation).abs() < EXACT);
-    assert_eq!(fit.verdict, ClassVerdict::Class(GrowthClass::NLogN));
-
-    // A lower-order term that is large at the window's small end is refused:
-    // ½ (ln(1 + 2/8) − ln(1 + 2/20)) = 0.064.
-    let plus_2n = Sweep::from_fn(&WIDE_SIZES, |n| n * log2(n) + 2 * n).expect("valid");
-    let fit = select.fit(&plus_2n).expect("fits");
-    let nlogn = fit.candidates[GrowthClass::NLogN as usize].misfit;
-    assert!((nlogn - 0.0639).abs() < 1e-3, "{fit:?}");
-    assert_eq!(fit.verdict, ClassVerdict::NoFit, "{fit:?}");
-
-    // The classes themselves are still named on the wide window.
-    for (a, class) in [(1.0, GrowthClass::Linear), (2.0, GrowthClass::Quadratic)] {
-        let (select, sweep) = wide_power_law(a);
-        let fit = select.fit(&sweep).expect("fits");
-        assert_eq!(fit.verdict, ClassVerdict::Class(class), "{fit:?}");
+fn c_on_a_wide_window() {
+    // A wider window tells near-classes apart better, and the lower-order
+    // term still absorbs n log2 n + 2n, which is 25 % above n log2 n at
+    // n = 2⁸.
+    for (a, verdict) in [
+        (1.0, ClassVerdict::Class(GrowthClass::Linear)),
+        (1.05, ClassVerdict::NoFit),
+        (1.1, ClassVerdict::NoFit),
+        (2.0, ClassVerdict::Class(GrowthClass::Quadratic)),
+    ] {
+        let fit = c(&wide_power_law(a));
+        assert_eq!(fit.verdict, verdict, "n^{a}: {fit:?}");
     }
+    let plus_2n = Sweep::from_fn(&WIDE_SIZES, |n| n * log2(n) + 2 * n).expect("valid");
+    assert_eq!(c(&plus_2n).verdict, ClassVerdict::Class(GrowthClass::NLogN));
 }
 
 #[test]
 fn c_misfit_is_the_half_range_and_ln_c_the_midpoint() {
-    // Against class n, ln(3n + 5) − ln n = ln(3 + 5/n), which falls with n.
-    let fit = c(&default_sweep(|n| 3 * n + 5));
+    // With no lower-order term, against class n: ln(3n + 5) − ln n =
+    // ln(3 + 5/n), which falls with n.
+    let one_term = ClassSelect {
+        lower_order_ratio: 0.0,
+        ..c_with(NoiseModel::Exact)
+    };
+    let fit = one_term.fit(&default_sweep(|n| 3 * n + 5)).expect("fits");
     let lin = fit.candidates[GrowthClass::Linear as usize];
     assert_eq!(lin.class, GrowthClass::Linear);
-    let (hi, lo) = ((3.0 + 5.0 / 128.0f64).ln(), (3.0 + 5.0 / 1024.0f64).ln());
+    assert_eq!(lin.r, 0.0);
+    let (hi, lo) = ((3.0 + 5.0 / 16.0f64).ln(), (3.0 + 5.0 / 1024.0f64).ln());
     assert!((lin.misfit - (hi - lo) / 2.0).abs() < EXACT, "{lin:?}");
     assert!((lin.ln_c - (hi + lo) / 2.0).abs() < EXACT, "{lin:?}");
+
+    // With it, 3n + 5 = 3 (n + 5/3) exactly: r = 5/3, c = 3.
+    let fit = c(&default_sweep(|n| 3 * n + 5));
+    let lin = fit.candidates[GrowthClass::Linear as usize];
+    assert!((lin.r - 5.0 / 3.0).abs() < 1e-9, "{lin:?}");
+    assert!((lin.ln_c - 3f64.ln()).abs() < 1e-9, "{lin:?}");
+    assert!(lin.misfit < 1e-12, "{lin:?}");
 }
 
 #[test]
-fn c_separation_tolerance_and_margin_on_an_exact_series() {
+fn c_tolerance_and_margin_on_an_exact_series() {
     let fit = c(&default_sweep(|n| 3 * n));
-    assert!((fit.separation - default_separation()).abs() < EXACT);
     assert_eq!(fit.noise, Some(0.0), "exact: noise 0");
     assert_eq!(fit.noise_margin, 0.0);
-    assert!((fit.tolerance - default_tolerance()).abs() < EXACT);
-    // The cap binds on the default window: a quarter of the separation is
-    // 0.0446.
-    assert_eq!(fit.tolerance, 0.04);
-    // The default tolerance keeps classes exclusive: no series can lie
-    // within tolerance of two classes.
-    assert!(fit.tolerance < fit.separation / 2.0);
+    assert_eq!(fit.tolerance, 0.01);
+    assert_eq!(
+        (fit.window.n_min, fit.window.n_max, fit.window.points),
+        (16, 1024, 7),
+        "C fits the whole sweep by default"
+    );
 }
 
 #[test]
@@ -1016,10 +1086,10 @@ fn seeded_sweep(base: impl Fn(u64) -> u64, delta: f64) -> Sweep {
 }
 
 /// The noise C should report for [`seeded_sweep`]: the largest, over the
-/// window, of `√(π/2) · sd / √5`, the standard error of a median of five,
+/// sweep, of `√(π/2) · sd / √5`, the standard error of a median of five,
 /// with `sd` the sample standard deviation of the seeds' `ln` steps.
 fn seeded_noise(base: impl Fn(u64) -> u64, delta: f64) -> f64 {
-    [128u64, 256, 512, 1024]
+    DEFAULT_SIZES
         .iter()
         .map(|&n| {
             let b = base(n) as f64;
@@ -1050,7 +1120,7 @@ fn c_seed_noise_sets_the_noise_margin_not_the_tolerance() {
         "{fit:?}"
     );
     assert!((fit.noise_margin - z * noise).abs() < EXACT, "{fit:?}");
-    // n log n, a separation away from exact n, is beyond τ + m.
+    // n log n, 0.28 from exact n, is beyond τ + m.
     assert!(fit.candidates[GrowthClass::NLogN as usize].misfit > fit.tolerance + fit.noise_margin);
     assert_eq!(fit.verdict, ClassVerdict::Class(GrowthClass::Linear));
 }
@@ -1076,10 +1146,10 @@ fn c_refuses_when_noise_brings_another_class_within_reach() {
 
 #[test]
 fn c_never_names_a_class_for_noisy_growth_between_classes() {
-    // n^1.5 lies between n log n and n²: outside τ of both, but with seeds
-    // 13 % apart n log n is within τ + m. C refuses.
+    // n^1.5 lies between n log n and n²: outside τ of both (n log n at
+    // 0.376), but with seeds 15 % apart n log n is within τ + m. C refuses.
     let f = |n: u64| ((n as f64).powf(1.5) * 1000.0) as u64;
-    let sweep = seeded_sweep(f, 0.13);
+    let sweep = seeded_sweep(f, 0.15);
     let fit = c_seeded(&sweep);
     let nlogn = fit.candidates[GrowthClass::NLogN as usize].misfit;
     assert!(nlogn > fit.tolerance, "{fit:?}");
@@ -1129,38 +1199,45 @@ fn c_rejects_parameters_out_of_range() {
     let mut cases = vec![
         (
             ClassSelect {
-                max_tolerance: -0.01,
+                tolerance: -0.01,
                 ..ClassSelect::default()
             },
-            "max_tolerance",
+            "tolerance",
         ),
         (
             ClassSelect {
-                max_tolerance: f64::NAN,
+                tolerance: f64::NAN,
                 ..ClassSelect::default()
             },
-            "max_tolerance",
+            "tolerance",
         ),
         (
             ClassSelect {
-                misfit_fraction: 0.5,
+                tolerance: f64::INFINITY,
                 ..ClassSelect::default()
             },
-            "misfit_fraction",
+            "tolerance",
         ),
         (
             ClassSelect {
-                misfit_fraction: -0.1,
+                lower_order_ratio: -0.01,
                 ..ClassSelect::default()
             },
-            "misfit_fraction",
+            "lower_order_ratio",
         ),
         (
             ClassSelect {
-                misfit_fraction: f64::NAN,
+                lower_order_ratio: f64::NAN,
                 ..ClassSelect::default()
             },
-            "misfit_fraction",
+            "lower_order_ratio",
+        ),
+        (
+            ClassSelect {
+                lower_order_ratio: f64::INFINITY,
+                ..ClassSelect::default()
+            },
+            "lower_order_ratio",
         ),
         (
             ClassSelect {
@@ -1203,11 +1280,11 @@ fn c_refuses_incomplete_windows_and_short_ones() {
             errored: vec![]
         })
     );
-    let short = Sweep::from_fn(&[16, 32, 64, 128], |n| n).expect("valid");
+    let short = Sweep::from_fn(&[16, 32, 64], |n| n).expect("valid");
     assert_eq!(
         ClassSelect::default().fit(&short),
         Err(GrowthError::TooFewPoints {
-            points: 2,
+            points: 3,
             needed: ClassSelect::MIN_POINTS
         })
     );
@@ -1221,7 +1298,7 @@ fn c_refuses_incomplete_windows_and_short_ones() {
     for model in [NoiseModel::FromSeeds, NoiseModel::Exact] {
         assert_eq!(
             c_with(model).fit(&seed_zero),
-            Err(GrowthError::ZeroSteps { n: 128 })
+            Err(GrowthError::ZeroSteps { n: 16 })
         );
     }
 }
@@ -1246,10 +1323,76 @@ fn c_through_the_trait() {
     );
 }
 
+/// The smallest half range of [`two_term_residuals`] over `n_grid + 1`
+/// evenly spaced `r` from `lo` to `hi`, by brute force.
+fn scan_half_range(base: &[f64], h: &[f64], lo: f64, hi: f64, n_grid: u32) -> f64 {
+    (0..=n_grid)
+        .map(|i| {
+            let r = lo + (hi - lo) * f64::from(i) / f64::from(n_grid);
+            let d: Vec<f64> = base
+                .iter()
+                .zip(h)
+                .map(|(b, h)| b - (1.0 + r * h).ln())
+                .collect();
+            let hi = d.iter().copied().fold(f64::MIN, f64::max);
+            let lo = d.iter().copied().fold(f64::MAX, f64::min);
+            (hi - lo) / 2.0
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Checks a fitted `r` against a brute-force scan of
+/// `[−min(½, ρ) / max h, ρ / max h]`:
+/// `r` is in the interval, and no `r` of the scan does better than it by
+/// more than rounding. With `N` grid steps, the nearest grid point is within
+/// `1.5 / (N max h)` of `r`, where each residual moves by at most
+/// `2 max h` per unit of `r` (since `1 + r h ≥ ½`), so the scan's best is
+/// within `3 / N` above the true minimum.
+fn check_against_scan(base: &[f64], h: &[f64], ratio: f64, r: f64) -> Result<(), TestCaseError> {
+    const N: u32 = 3000;
+    let h_max = h.iter().copied().fold(0.0, f64::max);
+    let d: Vec<f64> = base
+        .iter()
+        .zip(h)
+        .map(|(b, h)| b - (1.0 + r * h).ln())
+        .collect();
+    let got = midpoint_and_half_range(&d).1;
+    if h_max == 0.0 || h.iter().all(|&v| v == h[0]) {
+        prop_assert_eq!(r, 0.0);
+        return Ok(());
+    }
+    let (lo, hi) = (-ratio.min(0.5) / h_max, ratio / h_max);
+    prop_assert!(r >= lo && r <= hi, "r {} outside [{}, {}]", r, lo, hi);
+    let scan = scan_half_range(base, h, lo, hi, N);
+    prop_assert!(got <= scan + 1e-12, "fit {} worse than scan {}", got, scan);
+    prop_assert!(
+        scan <= got + 3.0 / f64::from(N) + 1e-12,
+        "scan {} vs fit {}",
+        scan,
+        got
+    );
+    Ok(())
+}
+
 proptest! {
-    /// Whatever the step counts: every float is finite; the misfits, the
-    /// separation and the noise match a recomputation from the seeds; the
-    /// tolerance is the floor and below half the separation; the noise
+    /// The `r` fit agrees with a brute-force scan, for any residuals,
+    /// any positive `h` (some possibly equal) and any `ρ`.
+    #[test]
+    fn c_r_fit_matches_a_brute_force_scan(
+        points in prop::collection::vec((-3.0f64..3.0, 0.001f64..10.0), 4..8),
+        equal_h in any::<bool>(),
+        ratio in 0.0f64..4.0,
+    ) {
+        let base: Vec<f64> = points.iter().map(|p| p.0).collect();
+        let h: Vec<f64> = points.iter().map(|p| if equal_h { points[0].1 } else { p.1 }).collect();
+        let r = minimax_r(&base, &h, ratio);
+        check_against_scan(&base, &h, ratio, r)?;
+    }
+
+    /// Whatever the step counts: every float is finite; each class's `r`
+    /// agrees with a brute-force scan and its misfit and `ln c` with a
+    /// recomputation from the medians at that `r`; the noise matches a
+    /// recomputation from the seeds; the tolerance is the default; the noise
     /// margin is `noise_z` times the noise; and the verdict follows the rule
     /// in the module comment, recomputed here from the misfits.
     #[test]
@@ -1269,35 +1412,40 @@ proptest! {
                 .collect(),
         ).expect("valid");
         let fit = c_seeded(&sweep);
-        prop_assert!(fit.tolerance.is_finite() && fit.separation.is_finite());
         prop_assert!(fit.noise_margin.is_finite());
-        prop_assert!(fit.candidates.iter().all(|k| k.misfit.is_finite() && k.ln_c.is_finite()));
-        // Recompute the misfits and the separation from the medians here.
-        let window = [128u64, 256, 512, 1024];
-        let meds: Vec<f64> = sweep.medians()[3..].iter().map(|&(_, m)| (m as f64).ln()).collect();
-        let half_range = |d: &[f64]| {
+        prop_assert!(fit
+            .candidates
+            .iter()
+            .all(|k| k.misfit.is_finite() && k.ln_c.is_finite() && k.r.is_finite()));
+        // Recompute each class's residuals from the medians here.
+        let meds: Vec<f64> = sweep.medians().iter().map(|&(_, m)| (m as f64).ln()).collect();
+        let defaults = ClassSelect::default();
+        for (i, class) in GrowthClass::ALL.iter().enumerate() {
+            let k = fit.candidates[i];
+            prop_assert_eq!(k.class, *class);
+            let base: Vec<f64> = meds
+                .iter()
+                .zip(DEFAULT_SIZES)
+                .map(|(y, n)| y - class.ln_f(n))
+                .collect();
+            let h: Vec<f64> = DEFAULT_SIZES
+                .iter()
+                .map(|&n| match class.lower_order_term() {
+                    Some(g) => (g.ln_f(n) - class.ln_f(n)).exp(),
+                    None => 0.0,
+                })
+                .collect();
+            check_against_scan(&base, &h, defaults.lower_order_ratio, k.r)?;
+            let d: Vec<f64> = base.iter().zip(&h).map(|(b, h)| b - (1.0 + k.r * h).ln()).collect();
             let hi = d.iter().copied().fold(f64::MIN, f64::max);
             let lo = d.iter().copied().fold(f64::MAX, f64::min);
-            (hi - lo) / 2.0
-        };
-        let lnf: Vec<Vec<f64>> = GrowthClass::ALL
-            .iter()
-            .map(|k| window.iter().map(|&n| k.ln_f(n)).collect())
-            .collect();
-        let mut sep = f64::INFINITY;
-        for i in 0..7 {
-            let d: Vec<f64> = meds.iter().zip(&lnf[i]).map(|(y, f)| y - f).collect();
-            prop_assert!((fit.candidates[i].misfit - half_range(&d)).abs() < 1e-9);
-            for j in i + 1..7 {
-                let d: Vec<f64> = lnf[i].iter().zip(&lnf[j]).map(|(a, b)| a - b).collect();
-                sep = sep.min(half_range(&d));
-            }
+            prop_assert!((k.misfit - (hi - lo) / 2.0).abs() < 1e-9);
+            prop_assert!((k.ln_c - (hi + lo) / 2.0).abs() < 1e-9);
         }
-        prop_assert!((fit.separation - sep).abs() < 1e-9);
         // Recompute the noise: the largest standard error of a median over
         // the window, from the seeds' ln steps.
         let noise = (seeds >= 2).then(|| {
-            per_size[3..]
+            per_size
                 .iter()
                 .map(|s| {
                     let ys: Vec<f64> = s.iter().map(|&v| (v as f64).ln()).collect();
@@ -1313,10 +1461,7 @@ proptest! {
             (Some(got), Some(want)) => prop_assert!((got - want).abs() < 1e-9),
             (got, want) => prop_assert!(false, "noise {got:?}, expected {want:?}"),
         }
-        let defaults = ClassSelect::default();
-        let floor = (defaults.misfit_fraction * sep).min(defaults.max_tolerance);
-        prop_assert!((fit.tolerance - floor).abs() < 1e-9);
-        prop_assert!(fit.tolerance < sep / 2.0);
+        prop_assert_eq!(fit.tolerance, defaults.tolerance);
         prop_assert!(
             (fit.noise_margin - defaults.noise_z * noise.unwrap_or(0.0)).abs() < 1e-9
         );
@@ -1325,7 +1470,6 @@ proptest! {
         };
         let named = within(fit.tolerance);
         let near = within(fit.tolerance + fit.noise_margin);
-        prop_assert!(named.len() <= 1, "classes are exclusive within τ");
         let expected = match noise {
             None => ClassVerdict::NoiseUnknown,
             Some(_) if named.len() == 1 && near.len() == 1 => ClassVerdict::Class(named[0]),

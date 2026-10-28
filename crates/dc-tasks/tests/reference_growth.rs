@@ -29,15 +29,18 @@
 //! [`B_ALPHA_TOLERANCE`] of the class's exponent. The tolerances follow from
 //! the gaps between classes, not from the runs.
 //!
-//! Estimator C names the class itself, and must name the right one on the
-//! medians, except that on a short sweep it may refuse as too noisy
-//! (insertion sort up to 512). On each seed alone it may refuse, but it must
-//! never name another class. One seed per size says nothing about the noise,
-//! so each seed alone is fitted with [`NoiseModel::Known`]: the noise of one
-//! seed's `ln` step count, measured on the full sweep as the largest sample
-//! standard deviation over the seeds at a size in the window (insertion
-//! sort's seeds vary by about 12 % in steps). The exact series of the
-//! meta-test are fitted with [`NoiseModel::Exact`].
+//! Estimator C names the class itself. On the medians and on each seed
+//! alone it must name the right class or refuse, and never name another
+//! class (the acceptance criterion of bead dreamcounter-db440d). Where the
+//! step counts are exact or nearly so (`sum_ref`, `msort`, `zero_subsets`)
+//! it must name the class on the medians. Insertion sort's seeds vary by
+//! about 12 % in steps, so its medians are about 0.04 from `n²` in `ln`
+//! units, above C's tolerance of 0.01, and C refuses them as too noisy.
+//! One seed per size says nothing about the noise, so each seed alone is
+//! fitted with [`NoiseModel::Known`]: the noise of one seed's `ln` step
+//! count, measured on the full sweep as the largest sample standard
+//! deviation over the seeds at a size in the window. The exact series of
+//! the meta-test are fitted with [`NoiseModel::Exact`].
 //!
 //! Estimators A and B fit the medians over seeds, as the pipeline does. B's
 //! choice of `γ` is right on the medians but not on every seed alone: its
@@ -632,12 +635,10 @@ fn run<F: TaskFamily>(family: &F, reference: &str, entry: &str) -> Run {
     let b = PowerLogGrid::default().fit(&sweep).expect("B fits");
     let c = ClassSelect::default().fit(&sweep).expect("C fits");
     println!(
-        "RESULT {entry}: C {:?} tolerance {:.4} noise_margin {:.4} separation {:.4} noise {:?} \
-         misfits {:?}",
+        "RESULT {entry}: C {:?} tolerance {:.4} noise_margin {:.4} noise {:?} misfits {:?}",
         c.verdict,
         c.tolerance,
         c.noise_margin,
-        c.separation,
         c.noise,
         c.candidates
             .map(|k| (k.class.to_string(), (k.misfit * 1e4).round() / 1e4))
@@ -647,11 +648,11 @@ fn run<F: TaskFamily>(family: &F, reference: &str, entry: &str) -> Run {
         .iter()
         .map(|s| match c_per_seed(seed_model).fit(s) {
             Ok(f) => format!(
-                "{:?} best {} {:.4} tolerance {:.4} noise_margin {:.4}",
+                "{:?} best {} {:.4} r {:.3} noise_margin {:.4}",
                 f.verdict,
                 f.best().class,
                 f.best().misfit,
-                f.tolerance,
+                f.best().r,
                 f.noise_margin
             ),
             Err(e) => e.to_string(),
@@ -711,6 +712,20 @@ enum COnMedians {
     NamesOrTooNoisy,
 }
 
+/// Checks estimator C on the medians: it names `expected`, or, if
+/// `on_medians` allows it, refuses as too noisy.
+fn check_c_on_medians(
+    fit: &ClassFit,
+    expected: Class,
+    on_medians: COnMedians,
+) -> Result<(), String> {
+    if on_medians == COnMedians::NamesOrTooNoisy && fit.verdict == ClassVerdict::TooNoisy {
+        Ok(())
+    } else {
+        check_c(fit, expected)
+    }
+}
+
 fn check_polynomial<F: TaskFamily>(
     family: &F,
     reference: &str,
@@ -726,9 +741,7 @@ fn check_polynomial<F: TaskFamily>(
         c.ideal, c.distance, c.gap
     );
     check_b(&r.b, class).unwrap_or_else(|e| panic!("{entry}: {e}"));
-    if !(c_medians == COnMedians::NamesOrTooNoisy && r.c.verdict == ClassVerdict::TooNoisy) {
-        check_c(&r.c, class).unwrap_or_else(|e| panic!("{entry}: {e}"));
-    }
+    check_c_on_medians(&r.c, class, c_medians).unwrap_or_else(|e| panic!("{entry}: {e}"));
     check_c_per_seed(&r.sweep, class, per_seed_noise(&r.sweep, &r.c.window))
         .unwrap_or_else(|e| panic!("{entry}: {e}"));
     let drift = slope_drift(&r.sweep);
@@ -757,11 +770,9 @@ fn merge_sort_is_n_log_n() {
 #[test]
 fn insertion_sort_is_quadratic() {
     // Measured under merge sort's fuel plan, as a candidate for the family
-    // would be: ten times merge sort's steps is still enough up to 512. On this
-    // short sweep the seeds' spread (about 12 %) gives a noise margin that may
-    // bring another class within reach, so C may refuse as too noisy; on the
-    // default sweep it must name n²
-    // (class_select_holds_on_every_seed_of_the_default_sweep).
+    // would be: ten times merge sort's steps is still enough up to 512. The
+    // seeds' spread (about 12 %) leaves the medians outside C's tolerance of
+    // n², so C may refuse them as too noisy, but must not name another class.
     check_polynomial(
         &REF_SORT,
         "msort",
@@ -772,11 +783,13 @@ fn insertion_sort_is_quadratic() {
 }
 
 /// Estimator C over the default sweep `16, ..., 1024`, on the medians and on
-/// each seed alone. This replaces a check that estimator B's `γ` holds on
-/// every seed, which cannot pass: insertion sort's seed 1 alone gives
-/// `γ = 1` (`γ̂ = 0.665`), because B's `gamma_stability` (0.0135) is far
-/// below the spread between seeds (0.119 in `ln` steps). Slow in a debug
-/// build; run with
+/// each seed alone: it names the right class or refuses, and never names
+/// another class. Merge sort must be named on the medians; insertion sort,
+/// whose seeds vary by about 12 %, may be refused as too noisy. This
+/// replaces a check that estimator B's `γ` holds on every seed, which cannot
+/// pass: insertion sort's seed 1 alone gives `γ = 1` (`γ̂ = 0.665`), because
+/// B's `gamma_stability` (0.0135) is far below the spread between seeds
+/// (0.119 in `ln` steps). Slow in a debug build; run with
 /// `cargo test --release -p dc-tasks --test reference_growth -- --ignored`.
 #[test]
 #[ignore = "slow in a debug build; run in release"]
@@ -784,9 +797,12 @@ fn class_select_holds_on_every_seed_of_the_default_sweep() {
     let full = RefSort {
         sizes: &DEFAULT_SIZES,
     };
-    for (entry, class) in [("msort", Class::NLogN), ("isort", Class::Quadratic)] {
+    for (entry, class, on_medians) in [
+        ("msort", Class::NLogN, COnMedians::Names),
+        ("isort", Class::Quadratic, COnMedians::NamesOrTooNoisy),
+    ] {
         let r = run(&full, "msort", entry);
-        check_c(&r.c, class).unwrap_or_else(|e| panic!("{entry}: {e}"));
+        check_c_on_medians(&r.c, class, on_medians).unwrap_or_else(|e| panic!("{entry}: {e}"));
         let refused = check_c_per_seed(&r.sweep, class, per_seed_noise(&r.sweep, &r.c.window))
             .unwrap_or_else(|e| panic!("{entry}: {e}"));
         println!("RESULT {entry}: C refused {refused} of 5 seeds alone on the default sweep");

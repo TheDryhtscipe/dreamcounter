@@ -12,13 +12,14 @@
 //! * [`PowerLogGrid`] (estimator B): `steps ≈ c · n^α · (ln n)^γ` with
 //!   `γ ∈ {0, 1, 2}` and `α` continuous, choosing the `γ` with the smallest
 //!   residual sum of squares.
-//! * [`ClassSelect`] (estimator C): `steps ≈ c · f(n)` for `f` one of the
-//!   [`GrowthClass`]es `1, log n, n, n log n, n², n³, 2ⁿ`, naming a class only
-//!   when exactly one fits within a tolerance that allows for the spread
-//!   between seeds. It refuses rather than guess.
+//! * [`ClassSelect`] (estimator C): `steps ≈ c · (f(n) + r · g(n))` for `f`
+//!   one of the [`GrowthClass`]es `1, log n, n, n log n, n², n³, 2ⁿ` and `g`
+//!   its lower-order term, naming a class only when exactly one fits within
+//!   a tolerance and the spread between seeds cannot bring another within
+//!   reach. It refuses rather than guess.
 //!
-//! All three fit over the same [`Window`] of the sweep, by default its upper
-//! half.
+//! Each fits over a [`Window`] of the sweep: by default its upper half for A
+//! and B, and the whole sweep for C.
 //!
 //! # How decisive estimator B's `γ` is
 //!
@@ -39,24 +40,27 @@
 //!
 //! # How estimator C decides
 //!
-//! Each class has one free parameter, the constant `c`. C fits it in the
-//! Chebyshev (minimax) sense: with `d_i = ln steps_i − ln f(n_i)` over the
-//! window, `ln c` is the midpoint of the `d_i` and the class's *misfit* is
-//! half their range, so every median step count is within a factor
-//! `e^misfit` of `c · f(n)`. Half the range is a seminorm, so the triangle
-//! inequality applies to it: a series within `τ` of two classes `f` and `g`
-//! has `½ range(ln f − ln g) ≤ 2τ`. The *separation* of the window is the
-//! smallest `½ range(ln f − ln g)` over all pairs of classes; over the
-//! default window it is `½ ln(ln 1024 / ln 128) ≈ 0.178`, for `n` against
-//! `n log n` (and `1` against `log n`).
+//! Each class `f` has a lower-order term `g`
+//! ([`GrowthClass::lower_order_term`]): `1` for `log n` and `n`, `n` for
+//! `n log n`, `n²` and `2ⁿ`, and `n²` for `n³`. The class `1` has none. C
+//! fits `c · (f(n) + r · g(n))` in the Chebyshev (minimax) sense: with
+//! `d_i = ln steps_i − ln(f(n_i) + r · g(n_i))` over the window, `ln c` is
+//! the midpoint of the `d_i`, and `r` is chosen to make their range as small
+//! as possible. The class's *misfit* is half that range, so every median
+//! step count is within a factor `e^misfit` of the model. The bisection that
+//! finds `r` is exact up to rounding (see `minimax_r`).
 //!
-//! The *tolerance* `τ` is [`ClassSelect::misfit_fraction`] (default ¼)
-//! times the separation, capped at [`ClassSelect::max_tolerance`] (default
-//! 0.04). On the default window the cap applies: `τ = 0.04`, so every
-//! median is within about 4% of `c · f(n)`. It absorbs small lower-order
-//! terms such as the `+ 2n` in `n log₂ n + 2n` (misfit 0.035 over
-//! `128..1024`, but not `+ 4n`, a `NoFit`). Since `τ` is below half the
-//! separation, at most one class is within `τ` of any series.
+//! The term is bounded: `r · g(n)` is at most [`ClassSelect::lower_order_ratio`]
+//! (`ρ`, default 1) times `f(n)`, and at least `−½ f(n)`, at every size in
+//! the window. So `n log₂ n + 4n` (in natural logarithms `n ln n` plus a
+//! term as large as it at `n = 16`) is named `n log n`, but
+//! `n log₂ n + 8n` is not. Without the bound, `n log n + r n` could follow
+//! growth such as `n^1.1` over a short sweep.
+//!
+//! The *tolerance* `τ` is [`ClassSelect::tolerance`], an absolute 0.01 by
+//! default: every median within about 1 % of the model. C fits the whole
+//! sweep by default, because over the upper half alone (`128..1024`)
+//! `n log n + r n` follows `n^1.1` to within 0.003.
 //!
 //! The *noise margin* `m` is [`ClassSelect::noise_z`] (default 3) times the
 //! seed noise: the largest standard error of a size's median `ln` step count,
@@ -83,23 +87,19 @@
 //! # What a verdict means
 //!
 //! A named class says that over the window every median step count is
-//! within a factor `e^τ` of `c · f(n)`. It is a statement about the window,
-//! not a proof of asymptotic growth. Growth close to a class is named as
-//! that class. Over `128..1024`, where `ln n` varies by only a factor 1.43,
-//! exact `n^a` is named `n log n` for `a` from 1.133 to 1.210 and `n` for
-//! `a` from 0.962 to 1.038; `n log n + 30n` (a large lower-order term) is
-//! named `n`. The tolerance cannot shrink enough to refuse these without
-//! refusing real `n log n` programs, whose lower-order terms give misfits
-//! of about 0.02 over windows this narrow. What separates them is a window
-//! over which `ln n` varies more: the cap keeps `τ` from growing with the
-//! separation, so over `2⁸ ..= 2²⁰` (a factor 2.5) no exact `n^a` is named
-//! `n log n`. The window must be wide in `ln n`, not only in `n`: over
-//! `2¹² ..= 2²⁰` (a factor 1.67), `n^a` for `a` from 1.078 to 1.105 still is.
-//! A wide window also refuses lower-order terms that are large at its
-//! small end: over `2⁸ ..= 2²⁰`, `n log₂ n + 2n` has misfit 0.064 and is a
-//! `NoFit`. Real merge sort behaves like `n log₂ n + 1.4n`, so it is refused
-//! over windows from 64 up (`64..1024`, `64..16384`) that name it without
-//! the cap.
+//! within a factor `e^τ` of `c · (f(n) + r · g(n))`, with a lower-order term
+//! no larger than the main term. It is a statement about the window, not a
+//! proof of asymptotic growth. Over the default sweep `16..1024`, exact
+//! `n^a` is named `n` for `a` from 0.99 to 1.01, `n²` from 1.99 to 2.01 and
+//! `n³` from 2.99 to 3.01, and never `n log n`: the closest, `n^1.135`, has
+//! misfit 0.019 against it, about twice `τ`.
+//!
+//! The tolerance is below the noise of programs whose step counts vary much
+//! with their inputs. Insertion sort's seeds vary by about 12 % in steps,
+//! which leaves its medians about 0.04 from `n²`; C refuses them as
+//! `TooNoisy` rather than name a class. The noise of a median falls as
+//! `1/√k` with the number of seeds `k`, so more seeds bring such medians
+//! closer to their class.
 //!
 //! # Conventions
 //!
@@ -109,8 +109,9 @@
 //!   always an exact step count that was actually observed. See
 //!   [`median_steps`].
 //! * **Upper half.** For a sweep of `k` sizes sorted by `n`, the upper half is
-//!   the last `⌈k/2⌉` sizes, so for odd `k` the middle size is included. The
-//!   default 7-size sweep therefore fits over `n ∈ {128, 256, 512, 1024}`, the
+//!   the last `⌈k/2⌉` sizes, so for odd `k` the middle size is included. On
+//!   the default 7-size sweep A and B therefore fit over
+//!   `n ∈ {128, 256, 512, 1024}`, the
 //!   window the spec's `n log n` remark refers to. The window is chosen from
 //!   all sizes in the sweep, completed or not, so two programs run on the same
 //!   sweep are always compared over the same sizes.
@@ -685,6 +686,25 @@ impl GrowthClass {
             GrowthClass::Exponential => n as f64 * std::f64::consts::LN_2,
         }
     }
+
+    /// The class's lower-order term `g` in estimator C's model
+    /// `c · (f(n) + r · g(n))`: `1` for `log n` and `n`, `n` for `n log n`
+    /// and `n²`, `n²` for `n³`, and `n` for `2ⁿ`. `None` for `1`, which has
+    /// no lower-order term.
+    ///
+    /// For `2ⁿ` the term is `n`, not `n³`: a recurrence
+    /// `T(n) = 2 T(n − 1) + p(n)` gives `c · 2ⁿ − q(n)` with `q` of the
+    /// degree of `p`, usually 0 or 1.
+    pub fn lower_order_term(self) -> Option<GrowthClass> {
+        match self {
+            GrowthClass::Constant => None,
+            GrowthClass::Log | GrowthClass::Linear => Some(GrowthClass::Constant),
+            GrowthClass::NLogN | GrowthClass::Quadratic | GrowthClass::Exponential => {
+                Some(GrowthClass::Linear)
+            }
+            GrowthClass::Cubic => Some(GrowthClass::Quadratic),
+        }
+    }
 }
 
 impl fmt::Display for GrowthClass {
@@ -701,17 +721,23 @@ impl fmt::Display for GrowthClass {
     }
 }
 
-/// Estimator C's fit of one class.
+/// Estimator C's fit of one class: `steps ≈ c · (f(n) + r · g(n))`, with
+/// `g` the class's [`GrowthClass::lower_order_term`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClassCandidate {
     /// The class.
     pub class: GrowthClass,
-    /// The minimax `ln c`: the midpoint of `ln steps − ln f(n)` over the
-    /// window.
+    /// The coefficient `r` of the lower-order term, chosen with `c` to
+    /// minimise the misfit. Within `[−min(½, ρ) q, ρ q]`, where `q` is the smallest
+    /// `f(n) / g(n)` over the window and `ρ` is
+    /// [`ClassSelect::lower_order_ratio`]. 0 for the class `1`.
+    pub r: f64,
+    /// The minimax `ln c`: the midpoint of `ln steps − ln(f(n) + r · g(n))`
+    /// over the window.
     pub ln_c: f64,
-    /// Half the range of `ln steps − ln f(n)` over the window: every median
-    /// step count is within a factor `e^misfit` of `c · f(n)`. In `ln` units,
-    /// `≥ 0`.
+    /// Half the range of `ln steps − ln(f(n) + r · g(n))` over the window:
+    /// every median step count is within a factor `e^misfit` of
+    /// `c · (f(n) + r · g(n))`. In `ln` units, `≥ 0`.
     pub misfit: f64,
 }
 
@@ -731,7 +757,7 @@ pub enum ClassVerdict {
     /// the [`NoiseModel`] does not supply it.
     NoiseUnknown,
     /// No class is within the tolerance plus the noise margin: the growth
-    /// lies between classes (such as `n^1.5`) or outside them.
+    /// lies between classes (such as `n^1.5` or `n^1.2`) or outside them.
     NoFit,
 }
 
@@ -742,14 +768,12 @@ pub struct ClassFit {
     pub verdict: ClassVerdict,
     /// Every class's fit, in the order of [`GrowthClass::ALL`].
     pub candidates: [ClassCandidate; 7],
-    /// The largest misfit at which a class is named, in `ln` units.
+    /// The largest misfit at which a class is named, in `ln` units:
+    /// [`ClassSelect::tolerance`].
     pub tolerance: f64,
     /// How far noise could move a misfit: [`ClassSelect::noise_z`] times
     /// the noise, in `ln` units; 0 if the noise is unknown.
     pub noise_margin: f64,
-    /// The smallest `½ range(ln f − ln g)` over pairs of classes on the
-    /// window: how far apart the closest classes are.
-    pub separation: f64,
     /// The largest standard error of a median `ln` step count over the
     /// window, as the [`NoiseModel`] gives it. `None` if it is unknown
     /// (verdict [`ClassVerdict::NoiseUnknown`]).
@@ -798,18 +822,19 @@ pub enum NoiseModel {
 /// module comment for how it decides.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClassSelect {
-    /// The sizes to fit over.
+    /// The sizes to fit over. The default is the whole sweep
+    /// ([`Window::All`]): over the upper half alone, `n log n` with a
+    /// lower-order term follows `n^1.1` to within 0.003.
     pub window: Window,
-    /// The tolerance floor as a fraction of the separation, in `[0, ½)`,
-    /// before [`ClassSelect::max_tolerance`] caps it. Below ½ the classes are
-    /// exclusive for exact step counts. On the default window the cap binds,
-    /// so the default ¼ matters only on windows whose separation is below
-    /// 0.16.
-    pub misfit_fraction: f64,
-    /// The most the tolerance floor can be, whatever the separation;
-    /// `≥ 0`, and `f64::INFINITY` for no cap. The default 0.04 lets each
-    /// median step count differ from `c · f(n)` by about 4%.
-    pub max_tolerance: f64,
+    /// The largest misfit at which a class is named, in `ln` units; finite
+    /// and `≥ 0`. The default 0.01 lets each median step count differ from
+    /// the class's model by about 1%.
+    pub tolerance: f64,
+    /// `ρ`: how large the lower-order term may be against the main term,
+    /// `r · g(n) ≤ ρ · f(n)` at every size in the window; finite and `≥ 0`.
+    /// A negative term is bounded by `min(½, ρ)` times the main term, so the
+    /// model stays positive. 0 fits `c · f(n)` alone.
+    pub lower_order_ratio: f64,
     /// How many standard errors of noise the noise margin allows; finite
     /// and `≥ 0`.
     pub noise_z: f64,
@@ -820,9 +845,9 @@ pub struct ClassSelect {
 impl Default for ClassSelect {
     fn default() -> Self {
         Self {
-            window: Window::UpperHalf,
-            misfit_fraction: 0.25,
-            max_tolerance: 0.04,
+            window: Window::All,
+            tolerance: 0.01,
+            lower_order_ratio: 1.0,
             noise_z: 3.0,
             noise_model: NoiseModel::FromSeeds,
         }
@@ -830,9 +855,15 @@ impl Default for ClassSelect {
 }
 
 impl ClassSelect {
-    /// The fewest sizes in the window. On two, every class's misfit is half
-    /// a single difference, so the shape of growth is not tested.
-    pub const MIN_POINTS: usize = 3;
+    /// The fewest sizes in the window: the model has two parameters, `c`
+    /// and `r`, and the misfit should have two sizes beyond them to test
+    /// the shape of growth.
+    pub const MIN_POINTS: usize = 4;
+
+    /// The most a negative lower-order term can take off the main term, as
+    /// a fraction of it: `r · g(n) ≥ −½ f(n)` over the window (or
+    /// `−ρ f(n)` if [`ClassSelect::lower_order_ratio`] is smaller).
+    pub const MAX_NEGATIVE_RATIO: f64 = 0.5;
 
     /// Fits the sweep and returns the estimator's own result type.
     ///
@@ -841,24 +872,23 @@ impl ClassSelect {
     /// See [`GrowthError`]. Besides the medians, every seed's step count in
     /// the window must be positive ([`GrowthError::ZeroSteps`]), since the
     /// noise is estimated from their logarithms. [`GrowthError::BadParameter`]
-    /// if `misfit_fraction`, `max_tolerance`, `noise_z` or a [`NoiseModel::Known`] noise is out
-    /// of range.
+    /// if `tolerance`, `lower_order_ratio`, `noise_z` or a
+    /// [`NoiseModel::Known`] noise is out of range.
     pub fn fit(&self, sweep: &Sweep) -> Result<ClassFit, GrowthError> {
-        if !(0.0..0.5).contains(&self.misfit_fraction) {
+        let finite_non_negative = |v: f64| v.is_finite() && v >= 0.0;
+        if !finite_non_negative(self.tolerance) {
+            return Err(GrowthError::BadParameter { name: "tolerance" });
+        }
+        if !finite_non_negative(self.lower_order_ratio) {
             return Err(GrowthError::BadParameter {
-                name: "misfit_fraction",
+                name: "lower_order_ratio",
             });
         }
-        if self.max_tolerance.is_nan() || self.max_tolerance < 0.0 {
-            return Err(GrowthError::BadParameter {
-                name: "max_tolerance",
-            });
-        }
-        if !(self.noise_z.is_finite() && self.noise_z >= 0.0) {
+        if !finite_non_negative(self.noise_z) {
             return Err(GrowthError::BadParameter { name: "noise_z" });
         }
         if let NoiseModel::Known(v) = self.noise_model {
-            if !(v.is_finite() && v >= 0.0) {
+            if !finite_non_negative(v) {
                 return Err(GrowthError::BadParameter {
                     name: "noise_model",
                 });
@@ -866,27 +896,30 @@ impl ClassSelect {
         }
         let (points, window) = window_points(sweep, self.window, Self::MIN_POINTS, 2)?;
         let ln_steps: Vec<f64> = points.iter().map(|&(_, s)| ln_u64(s)).collect();
-        let ln_fs: Vec<Vec<f64>> = GrowthClass::ALL
-            .iter()
-            .map(|k| points.iter().map(|&(n, _)| k.ln_f(n)).collect())
-            .collect();
         let candidates = std::array::from_fn(|i| {
-            let d: Vec<f64> = ln_steps.iter().zip(&ln_fs[i]).map(|(y, f)| y - f).collect();
-            let (lo, hi) = min_max(&d);
+            let class = GrowthClass::ALL[i];
+            // base_i = ln steps_i − ln f(n_i); h_i = g(n_i) / f(n_i).
+            let base: Vec<f64> = ln_steps
+                .iter()
+                .zip(&points)
+                .map(|(y, &(n, _))| y - class.ln_f(n))
+                .collect();
+            let h: Vec<f64> = match class.lower_order_term() {
+                Some(g) => points
+                    .iter()
+                    .map(|&(n, _)| (g.ln_f(n) - class.ln_f(n)).exp())
+                    .collect(),
+                None => vec![0.0; points.len()],
+            };
+            let r = minimax_r(&base, &h, self.lower_order_ratio);
+            let (ln_c, misfit) = midpoint_and_half_range(&two_term_residuals(&base, &h, r));
             ClassCandidate {
-                class: GrowthClass::ALL[i],
-                ln_c: lo + (hi - lo) / 2.0,
-                misfit: (hi - lo) / 2.0,
+                class,
+                r,
+                ln_c,
+                misfit,
             }
         });
-        let mut separation = f64::INFINITY;
-        for i in 0..ln_fs.len() {
-            for j in i + 1..ln_fs.len() {
-                let d: Vec<f64> = ln_fs[i].iter().zip(&ln_fs[j]).map(|(a, b)| a - b).collect();
-                let (lo, hi) = min_max(&d);
-                separation = separation.min((hi - lo) / 2.0);
-            }
-        }
         // Checked whatever the model, so that a zero seed is always an error.
         let from_seeds = seed_noise(sweep, window.n_min)?;
         let noise = match self.noise_model {
@@ -894,8 +927,7 @@ impl ClassSelect {
             NoiseModel::Exact => Some(0.0),
             NoiseModel::Known(v) => Some(v),
         };
-        // Exclusivity: τ < separation / 2, so at most one class is within τ.
-        let tolerance = (self.misfit_fraction * separation).min(self.max_tolerance);
+        let tolerance = self.tolerance;
         let noise_margin = self.noise_z * noise.unwrap_or(0.0);
         let verdict = match noise {
             None => ClassVerdict::NoiseUnknown,
@@ -912,12 +944,12 @@ impl ClassSelect {
                 }
             }
         };
-        let finite = [tolerance, noise_margin, separation, noise.unwrap_or(0.0)]
+        let finite = [noise_margin, noise.unwrap_or(0.0)]
             .iter()
             .chain(
                 candidates
                     .iter()
-                    .flat_map(|c: &ClassCandidate| [&c.ln_c, &c.misfit]),
+                    .flat_map(|c: &ClassCandidate| [&c.r, &c.ln_c, &c.misfit]),
             )
             .all(|v| v.is_finite());
         if !finite {
@@ -928,10 +960,88 @@ impl ClassSelect {
             candidates,
             tolerance,
             noise_margin,
-            separation,
             noise,
             window,
         })
+    }
+}
+
+/// `base_i − ln(1 + r · h_i)`: with `base_i = ln steps_i − ln f(n_i)` and
+/// `h_i = g(n_i) / f(n_i)`, the residuals `ln steps_i − ln(f + r g)`.
+fn two_term_residuals(base: &[f64], h: &[f64], r: f64) -> Vec<f64> {
+    base.iter()
+        .zip(h)
+        .map(|(b, h)| b - (r * h).ln_1p())
+        .collect()
+}
+
+/// The midpoint and half the range of a non-empty slice.
+fn midpoint_and_half_range(d: &[f64]) -> (f64, f64) {
+    let (lo, hi) = min_max(d);
+    (lo + (hi - lo) / 2.0, (hi - lo) / 2.0)
+}
+
+/// The `r` in `[−min(½, ρ) / max h, ρ / max h]` that minimises the range of
+/// [`two_term_residuals`]; 0 if every `h_i` is equal (the term cannot
+/// change the range) or none is positive.
+///
+/// The range is the largest `e_ij(r) = d_i(r) − d_j(r)` over pairs of
+/// points. On the interval `1 + r h > 0` for every point, and
+/// `d e_ij / d r = h_j / (1 + r h_j) − h_i / (1 + r h_i)` has the sign of
+/// `h_j − h_i`, because `h / (1 + r h)` increases with `h`. So `I(r)`, the
+/// largest `e_ij` over pairs with `h_j > h_i`, never falls, and `D(r)`, the
+/// largest over pairs with `h_j < h_i`, never rises; pairs with equal `h`
+/// are constant. The range is `max(I, D, constant pairs)`, which is
+/// smallest where `I − D` changes sign, or at an end of the interval. That
+/// point is found by bisection, which is exact up to rounding and
+/// deterministic.
+fn minimax_r(base: &[f64], h: &[f64], ratio: f64) -> f64 {
+    let h_max = h.iter().copied().fold(0.0, f64::max);
+    let distinct = h.iter().any(|&v| v != h[0]);
+    if !(h_max > 0.0 && h_max.is_finite() && distinct) {
+        return 0.0;
+    }
+    let mut lo = -ClassSelect::MAX_NEGATIVE_RATIO.min(ratio) / h_max;
+    let mut hi = ratio / h_max;
+    // I(r) − D(r), which never falls as r rises.
+    let gap = |r: f64| {
+        let d = two_term_residuals(base, h, r);
+        let (mut rising, mut falling) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for i in 0..d.len() {
+            for j in 0..d.len() {
+                if h[j] > h[i] {
+                    rising = rising.max(d[i] - d[j]);
+                } else if h[j] < h[i] {
+                    falling = falling.max(d[i] - d[j]);
+                }
+            }
+        }
+        rising - falling
+    };
+    if gap(lo) >= 0.0 {
+        return lo;
+    }
+    if gap(hi) <= 0.0 {
+        return hi;
+    }
+    // gap(lo) < 0 < gap(hi). Halve until the bracket stops shrinking; a
+    // bracket of doubles cannot be halved more than about 2100 times.
+    for _ in 0..2200 {
+        let mid = lo + (hi - lo) / 2.0;
+        if mid <= lo || mid >= hi {
+            break;
+        }
+        if gap(mid) < 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let range = |r: f64| midpoint_and_half_range(&two_term_residuals(base, h, r)).1;
+    if range(lo) <= range(hi) {
+        lo
+    } else {
+        hi
     }
 }
 
