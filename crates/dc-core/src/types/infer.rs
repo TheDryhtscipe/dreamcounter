@@ -1912,7 +1912,7 @@ impl TypeChecker {
         if self.locate {
             self.spent += 1;
             count_probes(1);
-            if self.known_to_fail(id, &key.1, &indices) {
+            if self.known_to_fail(id, &key.1) {
                 // Fresh inference would fail in this state, so this use fails
                 // too: trying it again would redo that work at every level of
                 // sharing.
@@ -2110,14 +2110,20 @@ impl TypeChecker {
     /// (Damas and Milner 1982), so inference fails exactly when no
     /// substitution for the unbound variables of those types, keeping rigid
     /// variables and sending `Key` variables to key types, types the subterm
-    /// under them. That is a property of the pattern, which writes those
-    /// types out with their unbound variables numbered, and names no node
-    /// that can change: it means the same in every state of the store, and
-    /// going back to a checkpoint cannot make it untrue. If a pattern `P`
-    /// fails and the current pattern is `σ(P)`, where `σ` keeps rigid
-    /// variables and quantified structure and sends `Key` variables to
-    /// key-safe types, a substitution `S` that typed the subterm now would
-    /// make `S ∘ σ` type it under `P`. So the use fails now too.
+    /// under them. That is a property of the pattern. It writes each
+    /// polymorphic binding's type as the [`Canon`] id it had when bound,
+    /// which fixes its shape and its quantified variables, with what that
+    /// type's free variables resolve to now, their unbound variables
+    /// numbered. It names no node that can change: it means the same in
+    /// every state of the store, and going back to a checkpoint cannot make
+    /// it untrue. If a pattern `P` fails and the current pattern is `σ(P)`,
+    /// with the same [`Canon`] id for each binding, where `σ` keeps rigid
+    /// variables and sends `Key` variables to key-safe types, a substitution
+    /// `S` that typed the subterm now would make `S ∘ σ` type it under `P`.
+    /// So the use fails now too. `σ` must not send a numbered variable to a
+    /// type with a quantified variable of a binding: the free variable would
+    /// be captured, and a binding `a -> x` would match `a -> a`, which says
+    /// nothing about it.
     ///
     /// Why an instance, not only an equal pattern. Walking a failed use in
     /// place makes the unifications its fresh inference made, with the
@@ -2130,11 +2136,7 @@ impl TypeChecker {
     /// the walk is exponential again.
     fn note_failure(&mut self, cp: &Checkpoint) {
         self.spent += 1;
-        let Some(fv) = self.free_vars.get(&cp.id) else {
-            unreachable!("a tried use has its free variables found");
-        };
-        let indices = fv.indices();
-        let pattern = self.pattern(&cp.key.1, &indices);
+        let pattern = self.pattern(&cp.key.1);
         self.spent += 1 + pattern.len() as u64;
         count_probes(2);
         let known = self.failed.entry(cp.id).or_default();
@@ -2148,8 +2150,7 @@ impl TypeChecker {
         }
     }
 
-    /// The failure pattern of a use with `scope` (for the de Bruijn
-    /// `indices`) in the current state. A polymorphic binding whose type has
+    /// The failure pattern of a use with `scope` in the current state. A polymorphic binding whose type has
     /// free variables is written as its [`Canon`] id with what those
     /// variables resolve to now, as [`Canon`] ids whose unbound variables
     /// that are not quantified are numbered across the whole scope
@@ -2157,10 +2158,10 @@ impl TypeChecker {
     /// before the walk and never changes. So the pattern costs time in what
     /// the free variables have become, not in the size of the bindings'
     /// types; a unit is paid for each node met.
-    fn pattern(&mut self, scope: &Scope, indices: &[u32]) -> Pattern {
+    fn pattern(&mut self, scope: &Scope) -> Pattern {
         let mut open: FxHashMap<Ty, u32> = FxHashMap::default();
         let mut out = Vec::with_capacity(scope.len());
-        for (slot, _) in scope.iter().zip(indices) {
+        for slot in scope {
             out.push(match *slot {
                 Slot::Mono => Bound::Mono,
                 Slot::Poly(c) if self.canon_closed[c as usize] => Bound::Closed(c),
@@ -2215,18 +2216,17 @@ impl TypeChecker {
         free
     }
 
-    /// Whether a use of shared subterm `id` with `scope` (for the de Bruijn
-    /// `indices`) is known to fail in the current state: its pattern is an
+    /// Whether a use of shared subterm `id` with `scope` is known to fail in the current state: its pattern is an
     /// instance of a pattern `id` failed in (see
     /// [`TypeChecker::note_failure`]). Only a subterm that has failed pays
     /// for writing its pattern out.
-    fn known_to_fail(&mut self, id: TermId, scope: &Scope, indices: &[u32]) -> bool {
+    fn known_to_fail(&mut self, id: TermId, scope: &Scope) -> bool {
         self.spent += 1;
         count_probes(1);
         if !self.failed.contains_key(&id) {
             return false;
         }
-        let now = self.pattern(scope, indices);
+        let now = self.pattern(scope);
         let known = self.failed.remove(&id).expect("checked");
         let mut found = false;
         for p in &known {
@@ -2274,8 +2274,17 @@ impl TypeChecker {
             image.insert(x, y);
             let matched = match (self.canon_nodes[x as usize], self.canon_nodes[y as usize]) {
                 // A variable stands for a type, never for a quantified
-                // variable of the current binding.
+                // variable of a binding, which would capture it. `y` is part
+                // of what a binding's free node resolves to, and a node free
+                // in a binding is not generalised while a use of it is in
+                // scope, so this does not happen; the debug assertion lets
+                // the differential tests check that, and the guard keeps a
+                // match sound if it ever did.
                 (Canon::Open { key, .. }, _) => {
+                    debug_assert!(
+                        !self.canon_bound[y as usize],
+                        "a free node resolves to a quantified variable"
+                    );
                     !self.canon_bound[y as usize] && (!key || self.key_safe(y))
                 }
                 (Canon::Con(h, a, b), Canon::Con(g, c, d)) if h == g => {

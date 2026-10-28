@@ -1670,45 +1670,93 @@ fn refining_scope_failures_are_located_in_polynomial_steps_m() {
     assert_refining_failure_located(2, |n| 100 * n * n);
 }
 
-/// `lam x. (pair U U)`, with `U = (pair (let (lam $0) t_n) (let (lam x) t_n))`,
-/// `t_(k+1) = (if true t_k t_k)` and `t_0 = (pair (add ($0 1) 1) (if ($0
-/// true) 1 1))`: the chain is shared under two helpers, `a -> a`, under
-/// which it is well typed, and `a -> x`, under which it fails. A failure
-/// under the second says nothing about the first, whose type quantifies the
-/// variable that the second leaves free.
-fn chain_under_two_helpers(a: &mut Arena, n: usize) -> TermId {
-    let mut t = parse_term(a, "(pair (add ($0 1) 1) (if ($0 true) 1 1))");
+/// `lam x. (pair U U)`, with `U = (pair (let first t_n) (let second t_n))`,
+/// `t_(k+1) = (if true t_k t_k)` and `t_0 = leaf`: a chain shared under two
+/// helpers, well typed under the first and ill typed under the second. The
+/// second `U` is walked in place once the first has failed, so a failure
+/// under the second helper that wrongly matched the first would walk the
+/// first's chain as a tree.
+fn chain_under_two_helpers_from(
+    a: &mut Arena,
+    n: usize,
+    leaf: &str,
+    first: &str,
+    second: &str,
+) -> TermId {
+    let mut t = parse_term(a, leaf);
     let yes = a.bool(true);
     for _ in 0..n {
         t = a.if_(yes, t, t);
     }
-    let (id, konst) = (parse_term(a, "(lam $0)"), parse_term(a, "(lam $1)"));
-    let (first, second) = (a.let_(id, t), a.let_(konst, t));
+    let (first, second) = (parse_term(a, first), parse_term(a, second));
+    let (first, second) = (a.let_(first, t), a.let_(second, t));
     let pair = a.prim(Prim::Pair);
     let u = a.apps(pair, &[first, second]);
     let body = a.apps(pair, &[u, u]);
     a.lam(body)
 }
 
-#[test]
-fn a_failure_under_one_helper_does_not_match_another() {
+/// Builds [`chain_under_two_helpers_from`] at `n = 8` and `n = N`, and checks
+/// that inferring and checking both report the error at `leaves` (the
+/// leaf's failing part when inferring, then when checking, where `x` is
+/// rigid) in at most `20 N^2` steps. That is g9's bound: walking each failing
+/// level in place tries the level below it afresh, so the walk is quadratic
+/// in `n` (9,156 steps at `N = 40` for the first shape below), while a
+/// failure that wrongly matched the well-typed helper makes it `2^n`. Walked
+/// as a tree, the big chain is `2^N` too, so both chains are compared with
+/// the small one's tree walk: terms are shared in the arena, so the error is
+/// at the same leaf.
+fn assert_two_helpers_located(leaf: &str, first: &str, second: &str, leaves: [&str; 2]) {
     const N: usize = 40;
+    let limit = 20 * (N * N) as u64;
     let mut a = Arena::new();
-    let small = chain_under_two_helpers(&mut a, 8);
-    let big = chain_under_two_helpers(&mut a, N);
+    let small = chain_under_two_helpers_from(&mut a, 8, leaf, first, second);
+    let big = chain_under_two_helpers_from(&mut a, N, leaf, first, second);
     let mut tree = TypeChecker::new();
     tree.tree_walk = true;
-    let expected = sch("a -> b");
-    for t in [small, big] {
-        let want = tree.infer(&a, t, NO_LIBS);
-        assert!(want.is_err());
-        assert_eq!(bounded(100 * N as u64).infer(&a, t, NO_LIBS), want);
-        let want = tree.check(&a, t, NO_LIBS, &expected);
-        assert_eq!(
-            bounded(100 * N as u64).check(&a, t, NO_LIBS, &expected),
-            want
-        );
+    // The type the term would have if the chain were well typed under both
+    // helpers, so that checking fails at a leaf too, not at the body.
+    let expected = sch("a -> (((Int, Int), (Int, Int)), ((Int, Int), (Int, Int)))");
+    let want_infer = tree.infer(&a, small, NO_LIBS);
+    let want_check = tree.check(&a, small, NO_LIBS, &expected);
+    let got = [want_infer.as_ref().err(), want_check.as_ref().err()];
+    for (e, leaf) in got.into_iter().zip(leaves) {
+        let e = e.expect("ill typed under the second helper");
+        assert_eq!(e.term_text, leaf, "{e}");
     }
+    for t in [small, big] {
+        assert_eq!(bounded(limit).infer(&a, t, NO_LIBS), want_infer);
+        assert_eq!(bounded(limit).check(&a, t, NO_LIBS, &expected), want_check);
+    }
+}
+
+/// The helpers are `a -> a`, closed, and `a -> x`. A failure under the
+/// second says nothing about the first, whose type quantifies the variable
+/// that the second leaves free. Inferring, `x` becomes `Int` at `(add ($0 1)
+/// 1)`, so `($0 true)` fails; checking, `x` is rigid, so `($0 1)` does.
+#[test]
+fn a_failure_under_one_helper_does_not_match_another() {
+    assert_two_helpers_located(
+        "(pair (add ($0 1) 1) (if ($0 true) 1 1))",
+        "(lam $0)",
+        "(lam $1)",
+        ["($0 true)", "($0 1)"],
+    );
+}
+
+/// The helpers are `a -> (x, a)` and `a -> (a, x)`: both open, over the same
+/// free variable, so their patterns write out the same types for it and
+/// differ only in the binding's own type. Inferring, `x` becomes `Int` at
+/// the `add`, so the condition of `if` fails; checking, `x` is rigid, so
+/// the argument of `add` does.
+#[test]
+fn a_failure_under_one_open_helper_does_not_match_another_of_another_shape() {
+    assert_two_helpers_located(
+        "(pair (add (snd ($0 1)) 1) (if (snd ($0 true)) 1 1))",
+        "(lam (pair $1 $0))",
+        "(lam (pair $0 $1))",
+        ["(snd ($0 true))", "(snd ($0 1))"],
+    );
 }
 
 /// `lam x. let h = (lam (let (pair x x) (let (pair $0 $0) ... (pair $0
