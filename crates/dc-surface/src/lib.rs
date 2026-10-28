@@ -59,6 +59,7 @@ mod lexer;
 mod parser;
 pub mod prelude;
 pub mod pretty;
+mod stack;
 
 use dc_core::Arena;
 
@@ -72,10 +73,15 @@ pub use pretty::pretty;
 ///
 /// Brackets, operators, `let`/`fun`/`if`/`match`, and each element of a list,
 /// tuple, argument list or parameter list count towards it (see the parser's
-/// module docs for the exact measure). Anything within the limit parses,
-/// desugars and pretty-prints on a 1 MiB stack in a debug build. Hand-written
-/// programs nest far less deeply than this; a long list literal is the case most
-/// likely to reach it.
+/// module docs for the exact measure). Hand-written programs nest far less deeply
+/// than this; a long list literal is the case most likely to reach it.
+///
+/// Anything within the limit parses, desugars and pretty-prints on a 1 MiB stack
+/// in a debug build, and deeper input is rejected on that stack too (measured: at
+/// most about 300 KiB, for every construct that nests). This holds because the
+/// parser, the desugarer and the pretty-printer each do the deeply nested part of
+/// their work on a thread of their own, with a stack of its own; they panic if
+/// the system cannot start that thread.
 pub const MAX_DEPTH: usize = 100;
 
 /// Parses a program into its surface definitions without desugaring them.
