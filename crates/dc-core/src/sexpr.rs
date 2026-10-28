@@ -11,7 +11,7 @@
 //!     | lib_3                   library abstraction 3
 //! ```
 //!
-//! [`print`] always flattens application spines, so `parse(print(t)) == t` for every
+//! [`print`](fn@print) always flattens application spines, so `parse(print(t)) == t` for every
 //! term `t`.
 
 use std::fmt::{self, Write as _};
