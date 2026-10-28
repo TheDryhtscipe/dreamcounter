@@ -118,13 +118,14 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 /// otherwise; more is a [`TypeErrorKind::TooMuchWork`] error.
 ///
 /// A unit is a step of the term walk, an argument collected from an
-/// application spine, a type node made, a node looked up in the store, a node
-/// or child visited in the search for shared subterms, an index gathered while
-/// finding a subterm's free variables, or a slot of the key a use of a shared
-/// subterm is looked up by. The text of an error is written only when the
-/// error is made: a term in it is cut to 200 bytes at a cost
-/// linear in that, whatever the size of the term, and a type in it is written
-/// out a unit a node.
+/// application spine, a type node made, a node looked up in the store, a link
+/// followed to find a variable's representative, a node saved so that going
+/// back to a checkpoint can restore it, a node or child visited in the search
+/// for shared subterms, an index gathered while finding a subterm's free
+/// variables, or a slot of the key a use of a shared subterm is looked up by.
+/// The text of an error is written only when the error is made: a term in it
+/// is cut to 200 bytes at a cost linear in that, whatever the size of the
+/// term, and a type in it is written out a unit a node.
 ///
 /// The budget is checked between steps of the term walk, between nodes of the
 /// search, between the arguments of a spine and between the pairs of nodes a
@@ -141,12 +142,13 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 /// unification, an instantiation or a call has grown are released when it
 /// ends, and the next one starts with small tables: one large call or
 /// unification does not slow later ones. The tests check that each unit
-/// stands for at most four reads of the term, the store, a scheme (a type node
-/// imported or a key looked up) or a table slot visited while emptying or
-/// freeing a table, on terms built to find
-/// work that is not charged. On those terms, one unit
-/// takes 2 to 50 ns in a release build, most often 10 to 20 (October 2026), so
-/// a call that uses the whole default budget takes about 0.15 to 0.35 s.
+/// stands for at most four reads of the term, the store (or its trail), a
+/// scheme (a type node imported or a key looked up) or a table slot visited
+/// while emptying or freeing a table, on terms built to find work that is not
+/// charged. On those terms, scaled up until a call uses
+/// millions of units, one unit takes 6 to 60 ns in a release build, most
+/// often 10 to 40 (October 2026), so a call that uses the whole default budget
+/// takes about 0.1 to 0.6 s.
 ///
 /// Well-typed terms can need work exponential in their size: a shared subterm
 /// is inferred once for each different set of bindings its free variables see
@@ -158,7 +160,7 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 /// program in the test suites outside the checker's own stress tests take at
 /// most about 9 400 units, and the stress tests at most 7.2 million (a
 /// 200 000-deep nest of `let` and `if`; the tree walk of a shared `if` nest 18
-/// deep takes 6.8 million). The default of 16 million admits all of those, the
+/// deep takes 7.1 million). The default of 16 million admits all of those, the
 /// realistic programs by a factor of over 1 000, and refuses a well-typed
 /// 151-node term that takes about 10 s without it (450 million units) in about
 /// 0.35 s.
@@ -251,7 +253,10 @@ enum Node {
     /// Unified with another node.
     Link(Ty),
     /// An unbound variable at a `let` depth, or [`GENERIC`] when quantified.
-    Var { level: u32, key: bool },
+    /// `rank` is at most the base-2 log of the number of variables linked to
+    /// it, so the paths [`TypeChecker::resolve`] follows stay short (see
+    /// [`TypeChecker::unify`]).
+    Var { level: u32, key: bool, rank: u8 },
     /// A rigid variable from an expected type in [`TypeChecker::check`]. It equals
     /// only itself.
     Rigid { key: bool },
@@ -827,6 +832,7 @@ impl TypeChecker {
                 Node::Var {
                     level: GENERIC,
                     key,
+                    ..
                 } => {
                     vars += 1;
                     Canon::Var {
@@ -937,9 +943,12 @@ impl TypeChecker {
         self.nodes[t as usize]
     }
 
+    /// Changes node `t` to `n`. If a checkpoint may go back to the old node, it
+    /// is saved on the trail, at a unit for saving it and putting it back.
     fn set(&mut self, t: Ty, n: Node) {
         let i = t as usize;
         if self.checkpoints.last().is_some_and(|cp| i < cp.nodes) {
+            self.spent += 1;
             #[cfg(test)]
             STORE_READS.with(|r| r.set(r.get() + 1));
             self.trail.push((t, self.nodes[i]));
@@ -951,6 +960,7 @@ impl TypeChecker {
         self.push(Node::Var {
             level: self.level,
             key: false,
+            rank: 0,
         })
     }
 
@@ -990,11 +1000,14 @@ impl TypeChecker {
         self.con2(Head::Pair, a, b)
     }
 
-    /// Follows links to the representative node, compressing the path.
+    /// Follows links to the representative node, compressing the path. Each
+    /// link followed costs a unit: going back to a checkpoint undoes the
+    /// compression, so a long path can be walked again after each failed use.
     fn resolve(&mut self, t: Ty) -> Ty {
         self.spent += 1;
         let mut root = t;
         while let Node::Link(next) = self.node(root) {
+            self.spent += 1;
             root = next;
         }
         let mut cur = t;
@@ -1065,19 +1078,35 @@ impl TypeChecker {
                 continue;
             }
             let step = match (self.node(a), self.node(b)) {
-                (Node::Var { level: la, key: ka }, Node::Var { level: lb, key: kb }) => {
-                    self.set(a, Node::Link(b));
+                (
+                    Node::Var {
+                        level: la,
+                        key: ka,
+                        rank: ra,
+                    },
+                    Node::Var {
+                        level: lb,
+                        key: kb,
+                        rank: rb,
+                    },
+                ) => {
+                    // The variable of lower rank is linked to the other, so a
+                    // path of links is no longer than the log of the number of
+                    // variables (union by rank).
+                    let (child, root) = if ra > rb { (b, a) } else { (a, b) };
+                    self.set(child, Node::Link(root));
                     self.set(
-                        b,
+                        root,
                         Node::Var {
                             level: la.min(lb),
                             key: ka || kb,
+                            rank: if ra == rb { ra + 1 } else { ra.max(rb) },
                         },
                     );
                     Ok(())
                 }
-                (Node::Var { level, key }, _) => self.bind(a, level, key, b),
-                (_, Node::Var { level, key }) => self.bind(b, level, key, a),
+                (Node::Var { level, key, .. }, _) => self.bind(a, level, key, b),
+                (_, Node::Var { level, key, .. }) => self.bind(b, level, key, a),
                 (Node::Con(ha, a1, a2), Node::Con(hb, b1, b2)) if ha == hb => {
                     // Constructor nodes are not linked to each other (that would
                     // change how the expected side prints in an error), so a pair
@@ -1128,13 +1157,17 @@ impl TypeChecker {
             }
             let n = self.node(r);
             match n {
-                Node::Var { level: l, key } => {
+                Node::Var {
+                    level: l,
+                    key,
+                    rank,
+                } => {
                     if r == v {
                         result = Err(UnifyError::Occurs(v, t));
                         break;
                     }
                     if l > level {
-                        self.set(r, Node::Var { level, key });
+                        self.set(r, Node::Var { level, key, rank });
                     }
                 }
                 Node::Con(..) => Self::push_children(&mut work, n),
@@ -1159,7 +1192,14 @@ impl TypeChecker {
             }
             let n = self.node(r);
             match n {
-                Node::Var { level, .. } => self.set(r, Node::Var { level, key: true }),
+                Node::Var { level, rank, .. } => self.set(
+                    r,
+                    Node::Var {
+                        level,
+                        key: true,
+                        rank,
+                    },
+                ),
                 Node::Rigid { key: true } | Node::Con(Head::Int | Head::Bool | Head::Unit, ..) => {}
                 Node::Con(Head::Pair, ..) => Self::push_children(&mut work, n),
                 _ => {
@@ -1189,13 +1229,14 @@ impl TypeChecker {
             }
             let n = self.node(r);
             match n {
-                Node::Var { level, key } if level > self.level => {
+                Node::Var { level, key, rank } if level > self.level => {
                     poly = true;
                     self.set(
                         r,
                         Node::Var {
                             level: GENERIC,
                             key,
+                            rank,
                         },
                     );
                 }
@@ -1227,10 +1268,12 @@ impl TypeChecker {
                     Node::Var {
                         level: GENERIC,
                         key,
+                        ..
                     } => {
                         let n = self.push(Node::Var {
                             level: self.level,
                             key,
+                            rank: 0,
                         });
                         map.insert(r, n);
                     }
@@ -1316,6 +1359,7 @@ impl TypeChecker {
                 this.push(Node::Var {
                     level: this.level,
                     key: keys.contains(v),
+                    rank: 0,
                 })
             })
         })
@@ -1552,6 +1596,7 @@ impl TypeChecker {
                 let k = self.push(Node::Var {
                     level: self.level,
                     key: true,
+                    rank: 0,
                 });
                 let v = self.fresh();
                 let kv = self.arrow(k, v);
@@ -1823,10 +1868,12 @@ impl TypeChecker {
                     Node::Var {
                         level: GENERIC,
                         key,
+                        ..
                     } => {
                         let n = self.push(Node::Var {
                             level: GENERIC,
                             key,
+                            rank: 0,
                         });
                         map.insert(r, n);
                     }

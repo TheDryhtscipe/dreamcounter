@@ -2124,28 +2124,52 @@ fn many_shared(a: &mut Arena, n: usize) -> TermId {
     t
 }
 
+/// `(let (lam (pair $0 (pair $0 ... (pair $0 $0)))) 0)` with `k` pairs: a
+/// polymorphic binding whose type has `k` different subtrees, each of which
+/// the checker gives a [`Canon`](super::infer) id.
+fn deep_polymorphic_let(a: &mut Arena, k: usize) -> TermId {
+    let pair = a.prim(Prim::Pair);
+    let v0 = a.var(0);
+    let mut t = v0;
+    for _ in 0..k {
+        t = a.apps(pair, &[v0, t]);
+    }
+    let f = a.lam(t);
+    let zero = a.int(0);
+    a.let_(f, zero)
+}
+
 #[test]
 fn a_large_call_does_not_slow_later_calls() {
     // A call fills the tables that the next call empties. Clearing a full
     // table costs time in its capacity, and so does freeing a large empty
     // one, so the small calls after a large one must not inherit its tables.
+    // Each large call fills a different table: the memo and the shared
+    // subterms, the ids of the types of polymorphic bindings, and the keys
+    // whose fresh inference failed.
     let mut a = Arena::new();
-    let big = many_shared(&mut a, 20_000);
+    let bigs = [
+        ("many shared", many_shared(&mut a, 20_000)),
+        ("deep polymorphic let", deep_polymorphic_let(&mut a, 1_000)),
+        ("failed keys", ill_typed_leaf_chain(&mut a, 1_000, false)),
+    ];
     let (add, one, two) = (a.prim(Prim::Add), a.int(1), a.int(2));
     let small = a.apps(add, &[one, two]);
-    let mut tc = TypeChecker::new();
-    let (reads, units) = reads_and_units(&mut tc, &a, big);
-    assert!(
-        reads <= READS_PER_UNIT * units + 1_000,
-        "large call: {reads} reads for {units} units"
-    );
-    tc.set_work_budget(100);
-    for call in 1..=2 {
-        let (reads, units) = reads_and_units(&mut tc, &a, small);
+    for (name, big) in bigs {
+        let mut tc = TypeChecker::new();
+        let (reads, units) = reads_and_units(&mut tc, &a, big);
         assert!(
             reads <= READS_PER_UNIT * units + 1_000,
-            "small call {call}: {reads} reads for {units} units"
+            "{name}, large call: {reads} reads for {units} units"
         );
+        tc.set_work_budget(100);
+        for call in 1..=2 {
+            let (reads, units) = reads_and_units(&mut tc, &a, small);
+            assert!(
+                reads <= READS_PER_UNIT * units + 1_000,
+                "{name}, small call {call}: {reads} reads for {units} units"
+            );
+        }
     }
 }
 
@@ -2251,4 +2275,20 @@ fn finding_free_variables_is_charged_to_the_budget() {
     };
     let (wide, narrow) = (spent(wide), spent(narrow));
     assert!(wide >= narrow + 120 * n, "{wide} against {narrow}");
+}
+
+#[test]
+fn a_long_chain_of_links_keeps_the_error_located() {
+    // The conditions link the variables of the lambdas one to the next. If
+    // each new link made the chain longer, the second walk would follow the
+    // whole chain again after each failed use, and run out of work long before
+    // naming the clash; linking by rank keeps each path short.
+    let n = 2_000;
+    let mut a = Arena::new();
+    let t = chain_rollback(&mut a, n, n as usize);
+    let mut tc = TypeChecker::with_work_budget(2_000_000);
+    let e = tc.infer(&a, t, NO_LIBS).unwrap_err();
+    assert_eq!(tc.walks, 2);
+    assert_eq!(e.term_text, "$0", "{e}");
+    assert!(tc.spent() <= 300 * u64::from(n), "{} units", tc.spent());
 }
