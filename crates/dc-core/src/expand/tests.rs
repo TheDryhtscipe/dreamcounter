@@ -29,8 +29,8 @@ fn check(libs: &[(&str, u32)], prog: &str, expected: &str) {
     let want = parse(&mut a, expected);
     let got = expand(&mut a, &libs, p).unwrap_or_else(|e| panic!("{prog}: {e}"));
     assert_eq!(
-        sexpr::print(&a, got),
-        sexpr::print(&a, want),
+        sexpr::print(&a, got).unwrap(),
+        sexpr::print(&a, want).unwrap(),
         "expansion of {prog}"
     );
     assert_eq!(got, want);
@@ -668,7 +668,7 @@ proptest! {
         let (lib, rewritten) = abstract_at(&mut a, prog, pos, extra);
         prop_assert!(a.is_closed(lib.term));
         let got = expand(&mut a, &[lib], rewritten).expect("expand");
-        prop_assert_eq!(sexpr::print(&a, got), sexpr::print(&a, prog));
+        prop_assert_eq!(sexpr::print(&a, got).unwrap(), sexpr::print(&a, prog).unwrap());
         prop_assert_eq!(got, prog);
     }
 
@@ -704,7 +704,7 @@ proptest! {
         });
         let twice = replace_at(&mut a, twice, at, renamed);
         let got = expand(&mut a, &[lib0, lib1], twice).expect("expand");
-        prop_assert_eq!(sexpr::print(&a, got), sexpr::print(&a, prog));
+        prop_assert_eq!(sexpr::print(&a, got).unwrap(), sexpr::print(&a, prog).unwrap());
         prop_assert_eq!(got, prog);
     }
 }
@@ -983,10 +983,10 @@ proptest! {
         let want = naive_expand(&mut a, &libs, prog);
         let got = expand(&mut a, &libs, prog).expect("expand");
         prop_assert_eq!(
-            sexpr::print(&a, got),
-            sexpr::print(&a, want),
+            sexpr::print(&a, got).unwrap(),
+            sexpr::print(&a, want).unwrap(),
             "{}",
-            sexpr::print(&a, prog)
+            sexpr::print(&a, prog).unwrap()
         );
         prop_assert_eq!(got, want);
     }

@@ -35,7 +35,11 @@ fn round_trip(abstractions: &[(&str, u32)], rewritten: &str, original: &str) {
     let p = decode(&mut a, rewritten, &n).unwrap_or_else(|e| panic!("{rewritten}: {e}"));
     let want = sexpr::parse(&mut a, original).unwrap_or_else(|e| panic!("{original}: {e}"));
     let got = expand(&mut a, &libs, p).unwrap_or_else(|e| panic!("{rewritten}: {e}"));
-    assert_eq!(sexpr::print(&a, got), sexpr::print(&a, want), "{rewritten}");
+    assert_eq!(
+        sexpr::print(&a, got).unwrap(),
+        sexpr::print(&a, want).unwrap(),
+        "{rewritten}"
+    );
     assert_eq!(got, want);
 }
 
@@ -292,8 +296,8 @@ fn stitch_rewritten_programs_expand_to_the_original() {
         let got = expand(&mut a, &[LibDef { arity, term: lib }], p)
             .map_err(|e| TestCaseError::fail(format!("{rewritten}: {e}")))?;
         prop_assert_eq!(
-            sexpr::print(&a, got),
-            sexpr::print(&a, prog),
+            sexpr::print(&a, got).unwrap(),
+            sexpr::print(&a, prog).unwrap(),
             "abstraction {} / {}, program {}",
             body,
             arity,

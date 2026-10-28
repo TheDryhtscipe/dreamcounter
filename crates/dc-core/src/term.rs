@@ -224,6 +224,49 @@ impl Arena {
         }
     }
 
+    /// The number of nodes in `id` written out as a tree, counting a shared
+    /// subterm at every use, if that is at most `limit`; `None` if it is more.
+    ///
+    /// Terms are DAGs, so this can be exponential in the number of distinct
+    /// nodes: `(if c t t)` nested `n` deep has `3 * 2^n - 2`. It walks with an
+    /// explicit stack and visits each distinct node once, and every distinct node
+    /// counts at least one, so it stops after at most `limit + 1` of them. Its
+    /// cost is linear in the smaller of `limit` and the number of distinct nodes
+    /// under `id`.
+    pub fn tree_size(&self, id: TermId, limit: usize) -> Option<usize> {
+        let mut memo: FxHashMap<TermId, usize> = FxHashMap::default();
+        let mut expanded = 0usize;
+        // A node is pushed with `false` to be expanded, and again with `true` to be
+        // summed once its children are done.
+        let mut stack = vec![(id, false)];
+        while let Some((t, children_done)) = stack.pop() {
+            if memo.contains_key(&t) {
+                continue;
+            }
+            let node = self.get(t);
+            if !children_done {
+                expanded += 1;
+                if expanded > limit {
+                    return None;
+                }
+                stack.push((t, true));
+                stack.extend(
+                    children(&node)
+                        .into_iter()
+                        .filter(|c| !memo.contains_key(c))
+                        .map(|c| (c, false)),
+                );
+                continue;
+            }
+            let size = children(&node)
+                .into_iter()
+                .try_fold(1usize, |n, c| n.checked_add(memo[&c]))
+                .filter(|&n| n <= limit)?;
+            memo.insert(t, size);
+        }
+        Some(memo[&id])
+    }
+
     /// Whether `id` has no free variables.
     pub fn is_closed(&self, id: TermId) -> bool {
         self.free_depth(id) == 0
@@ -334,6 +377,59 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(a.free_depth(t), 4);
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// `(if $1 t t)` nested `n` deep over `$0`: `n + 2` distinct nodes, and
+    /// `3 * 2^n - 2` nodes written out as a tree.
+    fn shared_ifs(a: &mut Arena, n: usize) -> TermId {
+        let c = a.var(1);
+        let mut t = a.var(0);
+        for _ in 0..n {
+            t = a.if_(c, t, t);
+        }
+        t
+    }
+
+    fn gets() -> u64 {
+        GETS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn tree_size_counts_shared_subterms_at_every_use() {
+        let mut a = Arena::new();
+        for n in 0..20 {
+            let t = shared_ifs(&mut a, n);
+            let size = 3 * (1usize << n) - 2;
+            assert_eq!(a.tree_size(t, usize::MAX), Some(size), "n = {n}");
+            assert_eq!(a.tree_size(t, size), Some(size), "n = {n}");
+            assert_eq!(a.tree_size(t, size - 1), None, "n = {n}");
+        }
+        // Every kind of node counts one: 16 here.
+        let t = crate::sexpr::parse(
+            &mut a,
+            "(let 5 (if (lt $0 3) true (and false (or true (lib_2 unit)))))",
+        )
+        .unwrap();
+        assert_eq!(a.tree_size(t, 100), Some(16));
+        assert_eq!(a.tree_size(t, 0), None);
+    }
+
+    #[test]
+    fn tree_size_of_a_huge_dag_is_linear_in_its_distinct_nodes() {
+        // 102 distinct nodes, 3 * 2^100 - 2 written out: more than a usize holds.
+        let mut a = Arena::new();
+        let t = shared_ifs(&mut a, 100);
+        for limit in [1 << 20, usize::MAX] {
+            let before = gets();
+            assert_eq!(a.tree_size(t, limit), None);
+            let reads = gets() - before;
+            assert!(reads <= 2 * 102, "{reads} reads for limit {limit}");
+        }
+        // With a limit below the number of distinct nodes, the walk stops early.
+        let before = gets();
+        assert_eq!(a.tree_size(t, 10), None);
+        let reads = gets() - before;
+        assert!(reads <= 2 * 11, "{reads} reads for limit 10");
     }
 
     #[test]

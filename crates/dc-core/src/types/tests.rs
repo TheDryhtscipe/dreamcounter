@@ -1795,7 +1795,7 @@ proptest! {
     fn bounded_printing_is_a_prefix_of_sexpr_print(src in arb_src()) {
         let mut a = Arena::new();
         let id = parse_term(&mut a, &src);
-        let full = sexpr::print(&a, id);
+        let full = sexpr::print(&a, id).unwrap();
         let short = super::infer::short(&a, id);
         if full.len() <= 200 {
             prop_assert_eq!(short, full);
@@ -2612,10 +2612,10 @@ fn bounded_printing_of_a_long_spine_stops_early() {
     let gets = crate::term::GETS.with(std::cell::Cell::get) - before;
     assert!(gets <= 1_000, "{gets} reads");
     let kept = text.strip_suffix(" ...").expect("long text ends with ...");
-    assert!(sexpr::print(&a, t).starts_with(kept), "{text}");
+    assert!(sexpr::print(&a, t).unwrap().starts_with(kept), "{text}");
     // Under the limit, a spine prints whole.
     let short_spine = a.apps(zero, &[one; 50]);
-    let full = sexpr::print(&a, short_spine);
+    let full = sexpr::print(&a, short_spine).unwrap();
     assert_eq!(super::infer::short(&a, short_spine), full);
 }
 

@@ -490,7 +490,7 @@ mod tests {
         assert_eq!(encode(&a, id, &n).unwrap(), stitch, "encoding {src}");
         let ctx = a.free_depth(id);
         let back = decode_open(&mut a, stitch, &n, ctx).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(sexpr::print(&a, back), src, "decoding {stitch}");
+        assert_eq!(sexpr::print(&a, back).unwrap(), src, "decoding {stitch}");
         assert_eq!(back, id);
     }
 
@@ -553,10 +553,13 @@ mod tests {
         let mut a = Arena::new();
         // The abstraction fn_0 = (add #0 int_1) used inside a let body.
         let got = decode(&mut a, "(let_ int_5 (lam_0 (fn_0 $0)))", &n).unwrap();
-        assert_eq!(sexpr::print(&a, got), "(let 5 (lib_0 $0))");
+        assert_eq!(sexpr::print(&a, got).unwrap(), "(let 5 (lib_0 $0))");
         // An abstraction that contains a whole let, with parameters around the binder.
         let got = decode_abstraction(&mut a, "(let_ #0 (lam_0 (add $0 #1)))", 2, &n).unwrap();
-        assert_eq!(sexpr::print(&a, got), "(lam (lam (let $1 (add $0 $1))))");
+        assert_eq!(
+            sexpr::print(&a, got).unwrap(),
+            "(lam (lam (let $1 (add $0 $1))))"
+        );
         // The shapes the flag rules out are errors, not guesses: an abstraction
         // rooted at the binder, and a use of one in the binder's place.
         for (src, arity) in [("(lam_0 (add $0 int_1))", 0), ("(lam_0 (add $0 #0))", 1)] {
@@ -586,7 +589,7 @@ mod tests {
         let nested = decode(&mut a, "((if_ true int_1 int_2) int_3)", &n).unwrap();
         let flat = decode(&mut a, "(if_ true int_1 int_2 int_3)", &n).unwrap();
         assert_eq!(nested, flat);
-        assert_eq!(sexpr::print(&a, flat), "((if true 1 2) 3)");
+        assert_eq!(sexpr::print(&a, flat).unwrap(), "((if true 1 2) 3)");
     }
 
     #[test]
@@ -728,16 +731,22 @@ mod tests {
         let mut a = Arena::new();
         // #0 is bound by the outer lambda, #1 by the inner one.
         let got = decode_abstraction(&mut a, "(sub #0 #1)", 2, &n).unwrap();
-        assert_eq!(sexpr::print(&a, got), "(lam (lam (sub $1 $0)))");
+        assert_eq!(sexpr::print(&a, got).unwrap(), "(lam (lam (sub $1 $0)))");
         // Under a let binder the indices shift by one.
         let got = decode_abstraction(&mut a, "(let_ #1 (lam_0 (add $0 #0)))", 2, &n).unwrap();
-        assert_eq!(sexpr::print(&a, got), "(lam (lam (let $0 (add $0 $2))))");
+        assert_eq!(
+            sexpr::print(&a, got).unwrap(),
+            "(lam (lam (let $0 (add $0 $2))))"
+        );
         // A parameter in function position, and a reference to an earlier abstraction.
         let got = decode_abstraction(&mut a, "(fn_1 (lam (#0 $0)))", 1, &n).unwrap();
-        assert_eq!(sexpr::print(&a, got), "(lam (lib_1 (lam ($1 $0))))");
+        assert_eq!(
+            sexpr::print(&a, got).unwrap(),
+            "(lam (lib_1 (lam ($1 $0))))"
+        );
         // Arity 0: the body itself.
         let got = decode_abstraction(&mut a, "(mul int_2 int_3)", 0, &n).unwrap();
-        assert_eq!(sexpr::print(&a, got), "(mul 2 3)");
+        assert_eq!(sexpr::print(&a, got).unwrap(), "(mul 2 3)");
     }
 
     /// Applying the decoded abstraction to arguments and β-reducing gives the body
@@ -751,7 +760,10 @@ mod tests {
         let x = a.int(10);
         let y = a.int(20);
         let reduced = beta_apply(&mut a, abs, &[x, y]);
-        assert_eq!(sexpr::print(&a, reduced), "(lam (cons 20 (cons 10 $0)))");
+        assert_eq!(
+            sexpr::print(&a, reduced).unwrap(),
+            "(lam (cons 20 (cons 10 $0)))"
+        );
     }
 
     /// Substitutes closed `args` for the outer lambdas of `f`, outermost first.
@@ -970,8 +982,8 @@ mod tests {
                 let back = decode_open(&mut fresh, &text, &n, ctx)
                     .map_err(|e| TestCaseError::fail(format!("{text}: {e}")))?;
                 prop_assert_eq!(
-                    sexpr::print(&fresh, back),
-                    sexpr::print(&arena.borrow(), id)
+                    sexpr::print(&fresh, back).unwrap(),
+                    sexpr::print(&arena.borrow(), id).unwrap()
                 );
                 // The text is a fixed point of Stitch's parse-then-print.
                 let e = expr::parse(&text).map_err(|e| TestCaseError::fail(e.to_string()))?;

@@ -15,7 +15,7 @@ fn compile_within(src: String, limit: Duration) -> Result<String, SurfaceError> 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut arena = Arena::new();
-        let r = compile_expression(&mut arena, &src).map(|t| sexpr::print(&arena, t));
+        let r = compile_expression(&mut arena, &src).map(|t| sexpr::print(&arena, t).unwrap());
         let _ = tx.send(r);
     });
     rx.recv_timeout(limit)
@@ -44,9 +44,12 @@ fn greater_than_with_a_trivial_right_operand_swaps_without_a_let() {
     // index must be shifted back out.
     let mut arena = Arena::new();
     let t = compile_expression(&mut arena, "fun y -> fun x -> (x + 1) > y").unwrap();
-    assert_eq!(sexpr::print(&arena, t), "(lam (lam (lt $1 (add $0 1))))");
+    assert_eq!(
+        sexpr::print(&arena, t).unwrap(),
+        "(lam (lam (lt $1 (add $0 1))))"
+    );
     let t = compile_expression(&mut arena, "fun x -> (x + 1) >= 3").unwrap();
-    assert_eq!(sexpr::print(&arena, t), "(lam (le 3 (add $0 1)))");
+    assert_eq!(sexpr::print(&arena, t).unwrap(), "(lam (le 3 (add $0 1)))");
 }
 
 /// Builds an input nested `n` deep, of one of several shapes.
@@ -126,7 +129,7 @@ fn input_just_inside_the_limit_compiles_and_pretty_prints() {
         let t = compile_expression(&mut arena, &nested(shape, lo)).unwrap();
         let printed = pretty(&arena, t, |l: LibId| format!("lib_{}", l.0)).unwrap();
         assert!(!printed.is_empty(), "{shape}");
-        let s = sexpr::print(&arena, t);
+        let s = sexpr::print(&arena, t).unwrap();
         assert_eq!(sexpr::parse(&mut arena, &s).ok(), Some(t), "{shape}");
     }
 }
@@ -148,11 +151,11 @@ fn inline_names_work_with_a_different_arena() {
         a2.int(1000 + i);
     }
     let e = env.close_expression(&mut a2, "e", "k 1").unwrap();
-    assert_eq!(sexpr::print(&a2, e), "((lam (lib_4 $0)) 1)");
+    assert_eq!(sexpr::print(&a2, e).unwrap(), "((lam (lib_4 $0)) 1)");
     let f = env.close_definition(&mut a2, "f").unwrap();
-    assert_eq!(sexpr::print(&a2, f), "(lam ((lam (lib_4 $0)) $0))");
+    assert_eq!(sexpr::print(&a2, f).unwrap(), "(lam ((lam (lib_4 $0)) $0))");
     let k2 = env.close_definition(&mut a2, "k").unwrap();
-    assert_eq!(sexpr::print(&a2, k2), "(lam (lib_4 $0))");
+    assert_eq!(sexpr::print(&a2, k2).unwrap(), "(lam (lib_4 $0))");
 }
 
 /// A core term with `n` levels of one shape around `1`, built directly (the

@@ -23,7 +23,11 @@
 //!
 //! Inference lives in [`infer`], [`check`] and [`TypeChecker`].
 
+use std::collections::hash_map::Entry;
 use std::fmt;
+use std::hash::{Hash, Hasher};
+
+use rustc_hash::FxHashMap;
 
 mod error;
 mod infer;
@@ -39,8 +43,26 @@ pub use infer::{
 pub use parse::TypeParseError;
 
 /// A type variable. It prints as `a`, `b`, ..., `z`, `a1`, `b1`, ...
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Eq, PartialOrd, Ord)]
 pub struct TyVar(pub u32);
+
+/// Equality on the number. In test builds each comparison is counted in `probes`,
+/// so the tests can measure the work of a lookup whether it is a hash-map probe or a
+/// scan of a list.
+impl PartialEq for TyVar {
+    fn eq(&self, other: &TyVar) -> bool {
+        #[cfg(test)]
+        probes::add(1);
+        self.0 == other.0
+    }
+}
+
+/// Hashes the number, as a derived `Hash` would; it agrees with [`PartialEq`].
+impl Hash for TyVar {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
 
 impl fmt::Display for TyVar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -132,25 +154,36 @@ impl Type {
     }
 
     /// The type variables in order of first occurrence, left to right, without
-    /// repeats.
+    /// repeats. It takes one hash-map lookup per variable occurrence, so time linear
+    /// in the size of the type for a well-spread hash.
     pub fn vars(&self) -> Vec<TyVar> {
-        let mut out = vec![];
-        self.collect_vars(&mut out);
-        out
+        self.numbered_vars().0
     }
 
-    fn collect_vars(&self, out: &mut Vec<TyVar>) {
+    /// The type variables in order of first occurrence, and each variable's position
+    /// in that order.
+    fn numbered_vars(&self) -> (Vec<TyVar>, FxHashMap<TyVar, u32>) {
+        let mut order = vec![];
+        let mut index = FxHashMap::default();
+        self.collect_vars(&mut order, &mut index);
+        (order, index)
+    }
+
+    fn collect_vars(&self, order: &mut Vec<TyVar>, index: &mut FxHashMap<TyVar, u32>) {
         match self {
             Type::Int | Type::Bool | Type::Unit => {}
             Type::Var(v) => {
-                if !out.contains(v) {
-                    out.push(*v);
+                if let Entry::Vacant(e) = index.entry(*v) {
+                    e.insert(u32::try_from(order.len()).expect("fewer than 2^32 type variables"));
+                    order.push(*v);
                 }
             }
-            Type::List(a) | Type::Option(a) | Type::Array(a) | Type::Tree(a) => a.collect_vars(out),
+            Type::List(a) | Type::Option(a) | Type::Array(a) | Type::Tree(a) => {
+                a.collect_vars(order, index)
+            }
             Type::Pair(a, b) | Type::Arrow(a, b) => {
-                a.collect_vars(out);
-                b.collect_vars(out);
+                a.collect_vars(order, index);
+                b.collect_vars(order, index);
             }
         }
     }
@@ -261,22 +294,16 @@ impl Scheme {
     }
 
     /// Quantifies every variable of `ty` and puts a `Key` constraint on each variable
-    /// in `keys`. Entries of `keys` that do not occur in `ty` are dropped.
+    /// in `keys`. Entries of `keys` that do not occur in `ty` are dropped. It takes one
+    /// hash-map lookup per variable occurrence and per key, plus a sort of the keys
+    /// that occur.
     pub fn with_keys(ty: Type, keys: &[TyVar]) -> Scheme {
-        let order = ty.vars();
-        let rename = |v: TyVar| {
-            let i = order
-                .iter()
-                .position(|&w| w == v)
-                .expect("every variable of the type is in its own variable list");
-            TyVar(u32::try_from(i).expect("fewer than 2^32 type variables"))
-        };
-        let ty = ty.map_vars(&mut |v| rename(v));
-        let mut keys: Vec<TyVar> = keys
-            .iter()
-            .filter(|v| order.contains(v))
-            .map(|&v| rename(v))
-            .collect();
+        let (_, index) = ty.numbered_vars();
+        let rename = |v: TyVar| index.get(&v).map(|&i| TyVar(i));
+        let ty = ty.map_vars(&mut |v| {
+            rename(v).expect("every variable of the type is in its own variable index")
+        });
+        let mut keys: Vec<TyVar> = keys.iter().filter_map(|&v| rename(v)).collect();
         keys.sort();
         keys.dedup();
         Scheme { ty, keys }
@@ -318,3 +345,33 @@ impl fmt::Display for Scheme {
         write!(f, "{}", self.ty)
     }
 }
+
+/// A count of the equality comparisons made on type variables ([`TyVar`]) and on
+/// variable names in the type parser, a measure of lookup work that the tests check
+/// without a timer.
+///
+/// A hash-map lookup that finds its key makes about one comparison and a scan of a
+/// list makes one per element passed, so lookup work that grows faster than linear
+/// shows up in the count. Ordered comparisons (sorting, binary search) are not
+/// counted, and neither is work that compares the bare numbers or strings.
+#[cfg(test)]
+pub(crate) mod probes {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PROBES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Records `n` comparisons.
+    pub(crate) fn add(n: usize) {
+        PROBES.with(|p| p.set(p.get() + n as u64));
+    }
+
+    /// The comparisons made on this thread since the last call.
+    pub(crate) fn take() -> u64 {
+        PROBES.with(|p| p.replace(0))
+    }
+}
+
+#[cfg(test)]
+mod var_tests;

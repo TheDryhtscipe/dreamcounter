@@ -77,13 +77,13 @@ fn program(src: &str, entry: &str) -> String {
         .unwrap_or_else(|e| panic!("{e}"));
     let (arena, id) = close(&env, entry);
     assert!(arena.is_closed(id), "{entry} is not closed");
-    sexpr::print(&arena, id)
+    sexpr::print(&arena, id).unwrap()
 }
 
 fn expr(src: &str) -> String {
     let mut arena = Arena::new();
     let id = compile_expression(&mut arena, src).unwrap_or_else(|e| panic!("{src}: {e}"));
-    sexpr::print(&arena, id)
+    sexpr::print(&arena, id).unwrap()
 }
 
 /// Counts the `let`s wrapped around the entry: one per top-level definition kept.
@@ -101,7 +101,7 @@ fn spec_sum_desugars_to_expected_core() {
     let env = spec_env();
     let (arena, id) = close(&env, "sum");
     assert_eq!(
-        sexpr::print(&arena, id),
+        sexpr::print(&arena, id).unwrap(),
         "(lam (foldl (lam (lam (add $1 $0))) 0 $0))"
     );
 }
@@ -111,7 +111,7 @@ fn spec_merge_desugars_to_expected_core() {
     let env = spec_env();
     let (arena, id) = close(&env, "merge");
     assert_eq!(
-        sexpr::print(&arena, id),
+        sexpr::print(&arena, id).unwrap(),
         "(lam (bfix (add (add (length (fst $0)) (length (snd $0))) 1) \
          (lam (lam (let (fst $0) (let (snd $1) \
          (list_case $1 (lam $1) (lam (lam \
@@ -126,7 +126,7 @@ fn spec_fib_desugars_to_expected_core() {
     let env = spec_env();
     let (arena, id) = close(&env, "fib");
     assert_eq!(
-        sexpr::print(&arena, id),
+        sexpr::print(&arena, id).unwrap(),
         "(lam (memorec (add $0 1) \
          (lam (lam (if (lt $0 2) $0 (add ($1 (sub $0 1)) ($1 (sub $0 2)))))) $0))"
     );
@@ -139,7 +139,7 @@ fn spec_max_subarray_keeps_only_its_dependencies() {
     assert!(arena.is_closed(id));
     // max and min_int, in that order, wrapped around the definition itself.
     assert_eq!(outer_lets(&arena, id), 2);
-    let text = sexpr::print(&arena, id);
+    let text = sexpr::print(&arena, id).unwrap();
     assert!(
         text.starts_with("(let (lam (lam (if (lt $1 $0) $0 $1))) (let -9223372036854775808 (lam "),
         "{text}"
@@ -388,7 +388,7 @@ fn close_expression_sees_definitions_and_prelude() {
         .close_expression(&mut arena, "query", "sum [1; 2; 3]")
         .unwrap();
     assert_eq!(
-        sexpr::print(&arena, id),
+        sexpr::print(&arena, id).unwrap(),
         "(let (lam (foldl (lam (lam (add $1 $0))) 0 $0)) ($0 (cons 1 (cons 2 (cons 3 nil)))))"
     );
 }
@@ -401,7 +401,7 @@ fn inline_names_are_substituted_without_a_binder() {
     env.define_inline(&arena, "twice", lib).unwrap();
     env.add_source("p", "let f x = twice x x").unwrap();
     let id = env.close_definition(&mut arena, "f").unwrap();
-    assert_eq!(sexpr::print(&arena, id), "(lam (lib_4 $0 $0))");
+    assert_eq!(sexpr::print(&arena, id).unwrap(), "(lam (lib_4 $0 $0))");
 }
 
 #[test]

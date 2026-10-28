@@ -19,7 +19,7 @@
 //! let mut arena = Arena::new();
 //! let main = env.close_definition(&mut arena, "main").unwrap();
 //! assert_eq!(
-//!     sexpr::print(&arena, main),
+//!     sexpr::print(&arena, main).unwrap(),
 //!     "(let (lam (lam ($1 ($1 $0)))) ($0 (lam (mul $0 2)) 5))"
 //! );
 //! ```
