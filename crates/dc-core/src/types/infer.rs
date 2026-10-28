@@ -471,6 +471,16 @@ enum Bound {
 /// means the same in every state of the store.
 type Pattern = Vec<Bound>;
 
+/// The units paid to read `p` once: one for each binding and each image.
+fn pattern_size(p: &Pattern) -> u64 {
+    p.iter()
+        .map(|b| match b {
+            Bound::Open(_, images) => 1 + images.len() as u64,
+            Bound::Mono | Bound::Closed(_) => 1,
+        })
+        .sum()
+}
+
 /// A shared subterm being inferred for the memo.
 #[derive(Debug)]
 struct Pending {
@@ -2145,7 +2155,10 @@ impl TypeChecker {
     fn note_failure(&mut self, cp: &Checkpoint) {
         self.spent += 1;
         let pattern = self.pattern(&cp.key.1);
-        self.spent += 1 + pattern.len() as u64;
+        // Comparing with each pattern already noted reads at most this one.
+        let size = pattern_size(&pattern);
+        let noted = self.failed.get(&cp.id).map_or(0, Vec::len) as u64;
+        self.spent += 1 + size + noted * size;
         count_probes(2);
         let known = self.failed.entry(cp.id).or_default();
         if known.contains(&pattern) {
@@ -2264,7 +2277,7 @@ impl TypeChecker {
         let known = self.failed.remove(&id).expect("checked");
         let mut found = false;
         for p in &known {
-            self.spent += 1 + p.len() as u64;
+            self.spent += 1 + pattern_size(p);
             if *p == now || self.is_instance(p, &now) {
                 found = true;
                 break;

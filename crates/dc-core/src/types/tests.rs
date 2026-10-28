@@ -2556,6 +2556,14 @@ fn adversarial_shapes(a: &mut Arena) -> Vec<(&'static str, TermId)> {
         ("if nest", if_nest(a, 100_000)),
         ("large scheme uses", large_scheme_uses(a, 20)),
         ("chain rollback", chain_rollback(a, 2_000, 2_000)),
+        (
+            "helpers made over a monomorphic variable",
+            chain_making_helpers_over_mono(a, 2_000, S2_LEAF, "(fst (pair true ($2 1)))"),
+        ),
+        (
+            "helpers of one shape",
+            chain_under_helpers_of_one_shape(a, 2_000),
+        ),
     ]
     .into_iter()
     .chain(open_scope_failures(a, 2_000))
