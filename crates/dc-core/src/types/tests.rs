@@ -1307,13 +1307,23 @@ fn only_failed_fresh_inference_marks_a_key_failed() {
     tree.tree_walk = true;
     assert_eq!(tc.infer(&a, f, NO_LIBS), tree.infer(&a, f, NO_LIBS));
     assert_eq!(tc.failed_keys(), 0);
+    // A subterm ill typed on its own is marked, so the count is not always 0.
+    let f = parse_term(&mut a, "(lam (if $0 (add true 1) (add true 1)))");
+    assert_eq!(tc.infer(&a, f, NO_LIBS), tree.infer(&a, f, NO_LIBS));
+    assert_eq!(tc.failed_keys(), 1);
 }
 
 /// `lam x. let (lam (pair x $0)) in t_n`, with `t_0 = ($0 1)` and `t_(k+1) =
 /// (if true t_k (let (lam (pair (fst ($1 0)) $0)) t_k))`: every level binds a new
 /// polymorphic helper whose type has the free variable `x`.
 fn helpers_over_a_lambda_variable(a: &mut Arena, n: usize) -> TermId {
-    let (v0, v1, zero, one, yes) = (a.var(0), a.var(1), a.int(0), a.int(1), a.bool(true));
+    let leaf = parse_term(a, "($0 1)");
+    helpers_over_a_lambda_variable_from(a, n, leaf)
+}
+
+/// [`helpers_over_a_lambda_variable`] with `t_0 = leaf`.
+fn helpers_over_a_lambda_variable_from(a: &mut Arena, n: usize, leaf: TermId) -> TermId {
+    let (v0, v1, zero, yes) = (a.var(0), a.var(1), a.int(0), a.bool(true));
     let (pair, fst) = (a.prim(Prim::Pair), a.prim(Prim::Fst));
     let b0 = a.apps(pair, &[v1, v0]);
     let b0 = a.lam(b0);
@@ -1321,7 +1331,7 @@ fn helpers_over_a_lambda_variable(a: &mut Arena, n: usize) -> TermId {
     let x = a.app(fst, prev);
     let b = a.apps(pair, &[x, v0]);
     let b = a.lam(b);
-    let mut t = a.app(v0, one);
+    let mut t = leaf;
     for _ in 0..n {
         let l = a.let_(b, t);
         t = a.if_(yes, t, l);
@@ -1343,6 +1353,101 @@ fn shared_subterms_under_new_helpers_with_free_type_variables_are_reused() {
     assert_eq!(bounded(STEPS).infer(&a, small, NO_LIBS), want);
     let big = helpers_over_a_lambda_variable(&mut a, N);
     assert_eq!(bounded(STEPS).infer(&a, big, NO_LIBS), want);
+}
+
+/// `lam x. let h = (lam (pair x $0)) in body`, where `body` is `t_n`, or
+/// `(pair first t_n)` if `first` is given, with `t_(k+1) = (if true t_k t_k)`
+/// and `t_0 = leaf`, both read with `h` as `$0` and `x` as `$1`: every shared
+/// subterm uses the polymorphic helper `h`, whose type has the free variable
+/// `x`.
+fn chain_under_an_open_helper(a: &mut Arena, n: usize, leaf: &str, first: Option<&str>) -> TermId {
+    let yes = a.bool(true);
+    let mut t = parse_term(a, leaf);
+    for _ in 0..n {
+        t = a.if_(yes, t, t);
+    }
+    if let Some(first) = first {
+        let (pair, first) = (a.prim(Prim::Pair), parse_term(a, first));
+        t = a.apps(pair, &[first, t]);
+    }
+    let h = parse_term(a, "(lam (pair $1 $0))");
+    let l = a.let_(h, t);
+    a.lam(l)
+}
+
+/// Shapes whose error is in shared subterms that use a polymorphic helper
+/// with a free type variable, so the scope of their keys is open.
+fn open_scope_failures(a: &mut Arena, n: usize) -> Vec<(&'static str, TermId)> {
+    let s7_leaf = parse_term(a, "(add ($0 1) 1)");
+    vec![
+        (
+            "s2: ill typed whatever the helper's free variable is",
+            chain_under_an_open_helper(a, n, "(add (snd ($0 1)) true)", None),
+        ),
+        (
+            "s7: a new helper at every level",
+            helpers_over_a_lambda_variable_from(a, n, s7_leaf),
+        ),
+        (
+            "s8: ill typed only once the helper's free variable is Int",
+            chain_under_an_open_helper(
+                a,
+                n,
+                "(if (fst ($0 1)) true true)",
+                Some("(add (fst ($0 1)) 1)"),
+            ),
+        ),
+    ]
+}
+
+/// Checks that the error of shape `which` of [`open_scope_failures`] is the
+/// tree walk's, and is found in a number of steps linear in the depth of
+/// sharing. The keys of its shared subterms have a polymorphic slot whose
+/// type has a free variable, so a failure seen once is not known to hold in
+/// every state of the store.
+fn assert_open_scope_failure_located(which: usize) {
+    const SMALL: usize = 10;
+    const N: usize = 40;
+    // About 50 steps a level are taken; the tree walk takes 2^N.
+    const STEPS: u64 = 100 * N as u64;
+    let mut a = Arena::new();
+    let (name, small) = open_scope_failures(&mut a, SMALL)[which];
+    let (_, big) = open_scope_failures(&mut a, N)[which];
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, small, NO_LIBS);
+    assert!(want.is_err(), "{name}");
+    assert_eq!(TypeChecker::new().infer(&a, small, NO_LIBS), want, "{name}");
+    // The error is in the leaf, so it is the same at every depth.
+    assert_eq!(bounded(STEPS).infer(&a, big, NO_LIBS), want, "{name}");
+    let expected = sch("Int -> (Int, Bool)");
+    let want = tree.check(&a, small, NO_LIBS, &expected);
+    assert!(want.is_err(), "{name}");
+    assert_eq!(
+        TypeChecker::new().check(&a, small, NO_LIBS, &expected),
+        want,
+        "{name}"
+    );
+    assert_eq!(
+        bounded(STEPS).check(&a, big, NO_LIBS, &expected),
+        want,
+        "{name}"
+    );
+}
+
+#[test]
+fn open_scope_failures_are_located_in_polynomial_steps_s2() {
+    assert_open_scope_failure_located(0);
+}
+
+#[test]
+fn open_scope_failures_are_located_in_polynomial_steps_s7() {
+    assert_open_scope_failure_located(1);
+}
+
+#[test]
+fn open_scope_failures_are_located_in_polynomial_steps_s8() {
+    assert_open_scope_failure_located(2);
 }
 
 #[test]
@@ -1461,6 +1566,73 @@ fn reusing_shared_subterms_agrees_with_walking_the_tree() {
                 }
             } else {
                 untyped.set(untyped.get() + 1);
+            }
+            Ok(())
+        })
+        .unwrap();
+    // Both outcomes must be exercised for the comparison to mean anything.
+    assert!(typed.get() > 400, "only {} well typed", typed.get());
+    assert!(untyped.get() > 400, "only {} ill typed", untyped.get());
+}
+
+/// Random terms under `lam x. let h = (lam (pair x $0)) in ...`, whose
+/// shared subterms use polymorphic helpers whose types have the free variable
+/// `x`, and constrain `x` in different ways, so that whether a shared subterm
+/// is typable depends on what `x` has been found to be.
+fn arb_open_helper_src() -> impl Strategy<Value = String> {
+    let leaf = prop_oneof![
+        (0u32..3).prop_map(|i| format!("${i}")),
+        (-1i64..2).prop_map(|n| n.to_string()),
+        Just("true".to_string()),
+        Just("(fst ($0 1))".to_string()),
+        Just("(snd ($0 true))".to_string()),
+        Just("(add (fst ($0 1)) 1)".to_string()),
+        Just("(if (fst ($0 1)) true true)".to_string()),
+        Just("(add (snd ($0 1)) true)".to_string()),
+        Just("($0 (fst ($0 1)))".to_string()),
+        proptest::sample::select(Prim::ALL).prop_map(|p| p.name().to_string()),
+    ];
+    let body = leaf.prop_recursive(6, 64, 3, |inner| {
+        prop_oneof![
+            2 => inner.clone().prop_map(|b| format!("(lam {b})")),
+            2 => (inner.clone(), inner.clone()).prop_map(|(f, a)| format!("({f} {a})")),
+            3 => (inner.clone(), inner.clone()).prop_map(|(c, t)| format!("(if {c} {t} {t})")),
+            2 => (inner.clone(), inner.clone()).prop_map(|(u, t)| format!("(pair {u} {t})")),
+            2 => inner.clone().prop_map(|t| format!("(if true {t} (let (lam (pair (fst ($0 0)) $0)) {t}))")),
+            1 => inner.clone().prop_map(|t| format!("(let (lam (pair $1 $0)) {t})")),
+            1 => (inner.clone(), inner).prop_map(|(x, b)| format!("(let {x} (pair {b} {b}))")),
+        ]
+    });
+    body.prop_map(|b| format!("(lam (let (lam (pair $1 $0)) {b}))"))
+}
+
+#[test]
+fn shared_subterms_under_open_helpers_agree_with_walking_the_tree() {
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(4000));
+    let (typed, untyped) = (std::cell::Cell::new(0u32), std::cell::Cell::new(0u32));
+    runner
+        .run(&arb_open_helper_src(), |src| {
+            let mut a = Arena::new();
+            let id = sexpr::parse(&mut a, &src).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let mut memo = TypeChecker::new();
+            let mut tree = TypeChecker::new();
+            tree.tree_walk = true;
+            let want = tree.infer(&a, id, NO_LIBS);
+            prop_assert_eq!(&memo.infer(&a, id, NO_LIBS), &want, "{}", src);
+            if want.is_ok() {
+                typed.set(typed.get() + 1);
+            } else {
+                untyped.set(untyped.get() + 1);
+            }
+            for t in ["Int -> (Int, Bool)", "Bool -> Bool", "a -> a"] {
+                let s = sch(t);
+                prop_assert_eq!(
+                    memo.check(&a, id, NO_LIBS, &s),
+                    tree.check(&a, id, NO_LIBS, &s),
+                    "{} against {}",
+                    src,
+                    t
+                );
             }
             Ok(())
         })
@@ -1932,6 +2104,9 @@ fn adversarial_shapes(a: &mut Arena) -> Vec<(&'static str, TermId)> {
         ("large scheme uses", large_scheme_uses(a, 20)),
         ("chain rollback", chain_rollback(a, 2_000, 2_000)),
     ]
+    .into_iter()
+    .chain(open_scope_failures(a, 2_000))
+    .collect()
 }
 
 #[test]

@@ -521,10 +521,15 @@ pub struct TypeChecker {
     trail: Vec<(Ty, Node)>,
     /// The memo keys added since the oldest checkpoint, in the order added.
     memo_log: Vec<MemoKey>,
-    /// The keys with a closed scope whose fresh inference failed while uses were
-    /// being tried. It fails whatever the state of the store, so their uses are
-    /// walked in place at once (see [`TypeChecker::shared_subterm`]).
+    /// The keys whose fresh inference failed while uses were being tried, and
+    /// would fail in the current state of the store too: their uses are
+    /// walked in place at once (see [`TypeChecker::shared_subterm`], and
+    /// [`TypeChecker::note_failure`] for why they would fail).
     failed: FxHashSet<MemoKey>,
+    /// The keys with an open scope added to `failed` since the oldest
+    /// checkpoint, in the order added, each with the length of the trail at
+    /// the checkpoint of the use that failed.
+    failed_log: Vec<(MemoKey, usize)>,
     /// Steps taken by the term walk of the current call.
     steps: u64,
     /// Units of work done by the current call (see [`DEFAULT_WORK_BUDGET`]).
@@ -538,6 +543,10 @@ pub struct TypeChecker {
     /// Walks of the term the last call started (see [`TypeChecker::run`]).
     #[cfg(test)]
     pub(super) walks: u32,
+    /// Keys the last call added to `failed`, which is emptied when the call
+    /// ends.
+    #[cfg(test)]
+    failures_noted: usize,
 }
 
 /// The work budget of a [`TypeChecker`]; [`DEFAULT_WORK_BUDGET`] unless set.
@@ -557,8 +566,9 @@ struct Checkpoint {
     /// The shared subterm and the expected type of its position.
     id: TermId,
     want: Option<Want>,
-    /// The use's memo key, if its scope is closed.
-    closed_key: Option<MemoKey>,
+    /// The use's memo key, and whether its scope is closed.
+    key: MemoKey,
+    closed: bool,
     nodes: usize,
     trail: usize,
     frames: usize,
@@ -566,6 +576,7 @@ struct Checkpoint {
     env: usize,
     pending: usize,
     memo_log: usize,
+    failed_log: usize,
     level: u32,
 }
 
@@ -713,10 +724,13 @@ impl TypeChecker {
     /// the same unifications as the tree walk, up to the one that fails, and
     /// reports the same error. An error unwinds to the innermost use being
     /// tried, so every use is walked in place at most once for each use being
-    /// tried around it. A use whose subterm, inferred afresh for a closed scope,
-    /// fails is walked in place at once from then on, since it fails in every
-    /// state of the store; without that, a chain of shared subterms over a leaf
-    /// that is ill typed on its own takes time exponential in its length.
+    /// tried around it. A use whose subterm, inferred afresh, fails is walked
+    /// in place at once from then on, for as long as the subterm is known to
+    /// fail in that scope (see [`TypeChecker::note_failure`]): always if no
+    /// binding in its scope has a type with free variables, else until the
+    /// walk goes back past the state it failed in. Without that, a chain of
+    /// shared subterms over a leaf that is ill typed takes time exponential in
+    /// its length.
     ///
     /// Both walks share the call's work budget. If the first runs out, that is
     /// the error. If only the second does, the first walk's error is returned:
@@ -747,6 +761,7 @@ impl TypeChecker {
         #[cfg(test)]
         {
             self.walks = 0;
+            self.failures_noted = 0;
         }
         let first = self.walk_from_scratch(arena, libs, term, expected);
         let Err(e) = first else {
@@ -823,6 +838,7 @@ impl TypeChecker {
         release_vec(&mut self.checkpoints);
         release_vec(&mut self.trail);
         release_vec(&mut self.memo_log);
+        release_vec(&mut self.failed_log);
     }
 
     fn reset(&mut self) {
@@ -835,7 +851,8 @@ impl TypeChecker {
                 + self.canon_closed.capacity()
                 + self.checkpoints.capacity()
                 + self.trail.capacity()
-                + self.memo_log.capacity(),
+                + self.memo_log.capacity()
+                + self.failed_log.capacity(),
         );
         self.nodes.clear();
         self.nodes.push(Node::Con(Head::Int, 0, 0));
@@ -855,6 +872,7 @@ impl TypeChecker {
         self.checkpoints.clear();
         self.trail.clear();
         self.memo_log.clear();
+        self.failed_log.clear();
         empty_set(&mut self.failed);
     }
 
@@ -1760,15 +1778,7 @@ impl TypeChecker {
                 Err(e) => match self.checkpoints.pop() {
                     None => return Err(e),
                     Some(cp) => {
-                        // A use whose key is not in the memo failed while its
-                        // subterm was being inferred afresh.
-                        if let Some(key) = &cp.closed_key {
-                            self.spent += 2;
-                            count_probes(2);
-                            if !self.memo.contains_key(key) {
-                                self.failed.insert(key.clone());
-                            }
-                        }
+                        self.note_failure(&cp);
                         self.back_to(cp)
                     }
                 },
@@ -1833,14 +1843,16 @@ impl TypeChecker {
             self.spent += 1;
             count_probes(1);
             if self.failed.contains(&key) {
-                // Fresh inference fails in every context, so this use fails too:
-                // trying it again would redo that work at every level of sharing.
+                // Fresh inference would fail in this state, so this use fails
+                // too: trying it again would redo that work at every level of
+                // sharing.
                 return Ok(Step::InPlace(id, want));
             }
             self.checkpoints.push(Checkpoint {
                 id,
                 want,
-                closed_key: self.scope_closed(&key.1).then(|| key.clone()),
+                key: key.clone(),
+                closed: self.scope_closed(&key.1),
                 nodes: self.nodes.len(),
                 trail: self.trail.len(),
                 frames: self.frames.len(),
@@ -1848,6 +1860,7 @@ impl TypeChecker {
                 env: self.env.len(),
                 pending: self.pending.len(),
                 memo_log: self.memo_log.len(),
+                failed_log: self.failed_log.len(),
                 level: self.level,
             });
         }
@@ -1893,7 +1906,7 @@ impl TypeChecker {
     /// How many keys the last call marked as failed.
     #[cfg(test)]
     pub(super) fn failed_keys(&self) -> usize {
-        self.failed.len()
+        self.failures_noted
     }
 
     /// The units of work the last call did.
@@ -1917,6 +1930,7 @@ impl TypeChecker {
         if self.checkpoints.is_empty() {
             self.trail.clear();
             self.memo_log.clear();
+            self.failed_log.clear();
         }
     }
 
@@ -2001,6 +2015,85 @@ impl TypeChecker {
         map.get(&root).copied()
     }
 
+    /// Notes that the use tried from `cp`, which has been popped, has failed.
+    /// If its key is not in the memo, the failure came from inferring its
+    /// subterm afresh (a key goes into the memo as soon as that works, before
+    /// the use is fitted to its position), and the key goes into `failed`, so
+    /// that later uses of it are walked in place at once.
+    ///
+    /// Which uses are walked in place changes the work done, not the error
+    /// reported: a use walked in place is walked as the tree walk walks it
+    /// (see [`TypeChecker::run`]). What the argument below ensures is that a
+    /// key in `failed` would fail if it were tried, so walking its uses in
+    /// place at once only skips work that would be undone. A key wrongly in
+    /// `failed` would have its uses walked as a tree, which takes time
+    /// exponential in the depth of sharing below it.
+    ///
+    /// Why a failed key fails later too. Inferring a subterm afresh does not
+    /// depend on the types of its monomorphic bindings, which are replaced by
+    /// fresh variables, nor on the memo, whose reuse agrees with the tree walk
+    /// (see [`TypeChecker::walk`]); its polymorphic bindings are given by the
+    /// key, each slot by a [`Canon`] fixed when the binding was made: a type
+    /// up to renaming of its quantified variables, whose free variables are
+    /// nodes of the store. The tree walk is Algorithm J, which unifies in any
+    /// order and is complete (Damas and Milner 1982), so inferring the subterm
+    /// fails in a state of the store exactly when no substitution for the
+    /// store's unbound variables (keeping rigid variables, and sending `Key`
+    /// variables to key types) types it under those bindings. Going forward,
+    /// the walk only refines the variables a slot names: it links them, lowers
+    /// their levels or flags them `Key`. It never generalises them: a use of
+    /// the key has a binding of that slot in scope, which has been in scope
+    /// since it was made, when the variable was not generalised (a slot made
+    /// later from the same type would quantify it). A substitution that works
+    /// in a refined state, composed with the refinement, works in the earlier
+    /// one. So a key that fails in a state fails in every state reached from
+    /// it going forward. A key with a closed scope names no node of the store,
+    /// so it fails in every state; it stays in `failed` until the end of the
+    /// walk.
+    ///
+    /// Going back to a checkpoint undoes refinements, so a key with an open
+    /// scope is also logged with `t`, the length of the trail at `cp`, whose
+    /// state the walk goes back to now. [`TypeChecker::back_to`] some
+    /// checkpoint `p` keeps it if `t <= p.trail`, else removes it. Each logged
+    /// key fails in the state at some moment `m` when the trail had length
+    /// `t`, from which the walk has gone forward, except back to checkpoints
+    /// made after `m`; at first, `m` is when `cp` was made. Going back to `p`
+    /// keeps that true:
+    ///
+    /// - If `p` was made after `m`, its state was reached from `m`'s.
+    /// - Else `p.trail <= t`, as the trail does not shrink past a checkpoint
+    ///   still on the stack. If they are equal, every change since `p` to a
+    ///   node made before `p` had been undone by `m`, since each is on the
+    ///   trail past `p.trail` until undone. If the key's slots name only such
+    ///   nodes, they hold at `p` what they held at `m`, and the key fails at
+    ///   `p`, which becomes its `m`. If a slot names a node made after `p`,
+    ///   nothing the walk can reach refers to that node once it is back at
+    ///   `p`: links to it from nodes made before `p` are changes on the trail,
+    ///   the bindings, frames and memo entries made since are gone, and kept
+    ///   types frozen past checkpoints are copies whose only variables are
+    ///   quantified. A slot is made from a type the walk reaches, so no later
+    ///   binding has that slot, and the key is never looked up again.
+    ///
+    /// Once no checkpoint is left, nothing can be undone, so the log is
+    /// cleared and its keys stay in `failed` until the end of the walk.
+    fn note_failure(&mut self, cp: &Checkpoint) {
+        self.spent += 2;
+        count_probes(2);
+        if self.memo.contains_key(&cp.key) || !self.failed.insert(cp.key.clone()) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.failures_noted += 1;
+        }
+        if !cp.closed && !self.checkpoints.is_empty() {
+            // Paid now: the unit of its removal, or of its drop when the log
+            // is cleared.
+            self.spent += 1;
+            self.failed_log.push((cp.key.clone(), cp.trail));
+        }
+    }
+
     /// Puts the checker back as it was at `cp`, which has been popped, and walks
     /// its shared subterm in place.
     fn back_to(&mut self, cp: Checkpoint) -> Step {
@@ -2023,10 +2116,25 @@ impl TypeChecker {
             count_probes(1);
             self.memo.remove(&key);
         }
+        // Failures noted at this checkpoint's position of the trail hold here
+        // too (see [`TypeChecker::note_failure`]); those noted further on go.
+        let mut kept = cp.failed_log;
+        for i in cp.failed_log..self.failed_log.len() {
+            self.spent += 1;
+            if self.failed_log[i].1 <= cp.trail {
+                self.failed_log.swap(kept, i);
+                kept += 1;
+            } else {
+                count_probes(1);
+                self.failed.remove(&self.failed_log[i].0);
+            }
+        }
+        self.failed_log.truncate(kept);
         self.level = cp.level;
         if self.checkpoints.is_empty() {
             self.trail.clear();
             self.memo_log.clear();
+            self.failed_log.clear();
         }
         Step::InPlace(cp.id, cp.want)
     }
