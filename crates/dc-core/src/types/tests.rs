@@ -1576,9 +1576,9 @@ fn too_much_work(limit: u64) -> TypeErrorKind {
 
 #[test]
 fn exponential_work_is_refused_quickly() {
-    // 151 distinct nodes. Without a budget this takes about 10 s in a release
+    // 151 distinct nodes. Without a budget this takes about 8 s in a release
     // build and minutes in a debug one; the default budget stops it in about
-    // 0.35 s in a release build (debug builds are about 13 times slower).
+    // 0.2 s in a release build (debug builds are about 18 times slower).
     let mut a = Arena::new();
     let t = helper_choices(&mut a, 18);
     let start = std::time::Instant::now();
@@ -1728,12 +1728,14 @@ fn running_out_while_locating_returns_the_first_error() {
     assert!(first.context.contains("shared subterm"), "{first}");
 }
 
-/// Reads of the term arena, the type store and schemes on this thread so far.
+/// Reads of the term arena, the type store and schemes, table slots visited
+/// and hash-table probes on this thread so far.
 fn reads() -> u64 {
     crate::term::GETS.with(std::cell::Cell::get)
         + super::infer::STORE_READS.with(std::cell::Cell::get)
         + super::infer::SCHEME_READS.with(std::cell::Cell::get)
         + super::infer::TABLE_SLOTS.with(std::cell::Cell::get)
+        + super::infer::PROBES.with(std::cell::Cell::get)
 }
 
 /// Infers `t` with `tc` against [`adversarial_libs`] and returns the reads it
@@ -1851,6 +1853,36 @@ fn if_nest(a: &mut Arena, d: usize) -> TermId {
     c
 }
 
+/// `(lam c_d)`, where `c_0 = (add $0 1)` and `c_{k+1} = (if true c_k c_k)`:
+/// each shared subterm has a free variable.
+fn open_if_nest(a: &mut Arena, d: usize) -> TermId {
+    let add = a.prim(Prim::Add);
+    let (v0, one, t) = (a.var(0), a.int(1), a.bool(true));
+    let mut c = a.apps(add, &[v0, one]);
+    for _ in 0..d {
+        c = a.if_(t, c, c);
+    }
+    a.lam(c)
+}
+
+/// `c_{n-1}`, where `c_0 = 0` and `c_i = (if true c_{i-1} c_r)` for an `r < i`
+/// drawn from a fixed pseudo-random sequence: a DAG whose shared nodes are
+/// reached in no particular order.
+fn random_if_dag(a: &mut Arena, n: usize) -> TermId {
+    let t = a.bool(true);
+    let mut cs = vec![a.int(0)];
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for i in 1..n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let r = (x % i as u64) as usize;
+        let c = a.if_(t, cs[i - 1], cs[r]);
+        cs.push(c);
+    }
+    cs[n - 1]
+}
+
 /// Under `n` lambdas, `(if (eq $0 $1) (if (eq $1 $2) ... (if $(n-1) c_d 0) ...
 /// 0) 0)`, where `c_0 = (add $0 1)` and `c_{k+1} = (if true c_k c_k)`: the
 /// conditions link the variables of the lambdas in a chain, the last fixes
@@ -1947,6 +1979,48 @@ fn a_small_budget_bounds_the_work_on_any_term() {
                 reads <= READS_PER_UNIT * units + 1_000,
                 "{name} (tree walk {tree_walk}): {reads} reads for {units} units"
             );
+        }
+    }
+}
+
+#[test]
+fn the_search_and_free_variables_are_charged_at_any_budget() {
+    // The search for shared subterms and the finding of the free variables of
+    // a shared subterm each probe hash tables a few times per node. A budget
+    // that stops the call soon after them leaves their reads to be paid by
+    // their own units, not by those of the term walk after them. Both stop
+    // between nodes, so the reads and units a larger budget adds are those of
+    // the passes it reaches, and each pass must pay for its own reads. Table
+    // and stack slots freed at the end are left out of what is added: a table
+    // doubles at once, and is paid for by all the units that filled it.
+    let slots = || super::infer::TABLE_SLOTS.with(std::cell::Cell::get);
+    let mut a = Arena::new();
+    let shapes = [
+        ("if nest", if_nest(&mut a, 20_000)),
+        ("open if nest", open_if_nest(&mut a, 20_000)),
+        ("random if DAG", random_if_dag(&mut a, 20_000)),
+    ];
+    for (name, t) in shapes {
+        let mut tc = TypeChecker::new();
+        let _ = reads_and_units(&mut tc, &a, t);
+        let full = tc.spent();
+        let mut last = (0, 0);
+        for i in 1..=60 {
+            let budget = full * i / 60;
+            let mut tc = TypeChecker::with_work_budget(budget);
+            let before = slots();
+            let (reads, units) = reads_and_units(&mut tc, &a, t);
+            assert!(
+                reads <= READS_PER_UNIT * units + 1_000,
+                "{name}, budget {budget}: {reads} reads for {units} units"
+            );
+            let reads = reads - (slots() - before);
+            let (more_reads, more_units) = (reads.saturating_sub(last.0), units - last.1);
+            assert!(
+                more_reads <= READS_PER_UNIT * more_units + 1_000,
+                "{name}, budget {budget}: {more_reads} more reads for {more_units} more units"
+            );
+            last = (reads, units);
         }
     }
 }
@@ -2146,17 +2220,36 @@ fn a_large_call_does_not_slow_later_calls() {
     // one, so the small calls after a large one must not inherit its tables.
     // Each large call fills a different table: the memo and the shared
     // subterms, the ids of the types of polymorphic bindings, and the keys
-    // whose fresh inference failed.
+    // whose fresh inference failed. A call that runs out deep in the walk
+    // leaves its stacks full instead: the pending shared subterms, the frames
+    // and the bindings, whose elements the next call would drop.
     let mut a = Arena::new();
     let bigs = [
-        ("many shared", many_shared(&mut a, 20_000)),
-        ("deep polymorphic let", deep_polymorphic_let(&mut a, 1_000)),
-        ("failed keys", ill_typed_leaf_chain(&mut a, 1_000, false)),
+        (
+            "many shared",
+            many_shared(&mut a, 20_000),
+            DEFAULT_WORK_BUDGET,
+        ),
+        (
+            "deep polymorphic let",
+            deep_polymorphic_let(&mut a, 1_000),
+            DEFAULT_WORK_BUDGET,
+        ),
+        (
+            "failed keys",
+            ill_typed_leaf_chain(&mut a, 1_000, false),
+            DEFAULT_WORK_BUDGET,
+        ),
+        (
+            "deep open if nest",
+            open_if_nest(&mut a, 100_000),
+            1_000_000,
+        ),
     ];
     let (add, one, two) = (a.prim(Prim::Add), a.int(1), a.int(2));
     let small = a.apps(add, &[one, two]);
-    for (name, big) in bigs {
-        let mut tc = TypeChecker::new();
+    for (name, big, budget) in bigs {
+        let mut tc = TypeChecker::with_work_budget(budget);
         let (reads, units) = reads_and_units(&mut tc, &a, big);
         assert!(
             reads <= READS_PER_UNIT * units + 1_000,
@@ -2275,6 +2368,26 @@ fn finding_free_variables_is_charged_to_the_budget() {
     };
     let (wide, narrow) = (spent(wide), spent(narrow));
     assert!(wide >= narrow + 120 * n, "{wide} against {narrow}");
+}
+
+#[test]
+fn finding_free_variables_stops_at_the_budget() {
+    // Each node of the chain has 64 free variables, so finding them costs
+    // about twenty times what the search for shared subterms does. A budget
+    // the search just fits in must stop the finding too.
+    let n = 3_000;
+    let mut a = Arena::new();
+    let t = chain_over_variables(&mut a, n, |i| i);
+    // The search takes about 18 000 units.
+    for budget in (1..=60).map(|i| i * 1_000) {
+        let mut tc = TypeChecker::with_work_budget(budget);
+        let _ = tc.infer(&a, t, NO_LIBS);
+        assert!(
+            tc.spent() <= 2 * budget + OVERRUN,
+            "budget {budget}: {} units",
+            tc.spent()
+        );
+    }
 }
 
 #[test]

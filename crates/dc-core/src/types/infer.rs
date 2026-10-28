@@ -71,7 +71,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{Scheme, TyVar, Type, TypeError, TypeErrorKind};
 use crate::prim::Prim;
-use crate::term::{children, Arena, LibId, Term, TermId};
+use crate::term::{Arena, LibId, Term, TermId};
 
 /// The types of library abstractions (spec §8), looked up by [`LibId`].
 ///
@@ -119,10 +119,12 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 ///
 /// A unit is a step of the term walk, an argument collected from an
 /// application spine, a type node made, a node looked up in the store, a link
-/// followed to find a variable's representative, a node saved so that going
-/// back to a checkpoint can restore it, a node or child visited in the search
-/// for shared subterms, an index gathered while finding a subterm's free
-/// variables, or a slot of the key a use of a shared subterm is looked up by.
+/// followed to find a variable's representative, a node, link or child visited
+/// in the search for shared subterms, a child found again there, a node
+/// recorded or a lookup of a child while finding a subterm's free variables,
+/// an index gathered there, a lookup of a shared subterm in the tables of free
+/// variables, kept types or failed keys, or a slot of the key a use of a
+/// shared subterm is looked up by.
 /// The text of an error is written only when the error is made: a term in it
 /// is cut to 200 bytes at a cost linear in that, whatever the size of the
 /// term, and a type in it is written out a unit a node.
@@ -135,20 +137,23 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 /// next pair, a check for occurrence or for a key type visits each node of the
 /// store once (no more than the units already spent), a scope key has no more
 /// slots than there are bindings (no more than the steps taken), finding free
-/// variables visits no more nodes than the search has paid for, and an error
-/// writes out at most four types of at most [`MAX_TYPE_NODES`] nodes. So a
-/// call does at most about twice its budget, plus a constant. Emptying or
-/// freeing a hash table costs time in its capacity, so the tables a
-/// unification, an instantiation or a call has grown are released when it
-/// ends, and the next one starts with small tables: one large call or
-/// unification does not slow later ones. The tests check that each unit
-/// stands for at most four reads of the term, the store (or its trail), a
-/// scheme (a type node imported or a key looked up) or a table slot visited
-/// while emptying or freeing a table, on terms built to find work that is not
-/// charged. On those terms, scaled up until a call uses
-/// millions of units, one unit takes 6 to 60 ns in a release build, most
-/// often 10 to 40 (October 2026), so a call that uses the whole default budget
-/// takes about 0.1 to 0.6 s.
+/// variables stops between nodes, and an error writes out at most four types
+/// of at most [`MAX_TYPE_NODES`] nodes. So a call does at most about twice its
+/// budget, plus a constant. Emptying or freeing a hash table costs time in
+/// its capacity, and clearing a stack drops its elements, so the tables a
+/// unification, an instantiation or a call has grown, and the stacks a call
+/// has grown, are released when it ends, and the next one starts small: one
+/// large call or unification does not slow later ones. The tests check that
+/// each unit stands for at most four reads of the term, the store (or its
+/// trail), a scheme (a type node imported or a key looked up), a slot of a
+/// table or stack visited while emptying or freeing it, or a lookup,
+/// insertion or removal in a hash table, on terms built to find work that is
+/// not charged, and at budgets that stop a call at any point. On those terms,
+/// scaled up until a call uses millions of units, one unit takes 3 to 45 ns
+/// in a release build, most often 6 to 40 (October 2026); the slowest are
+/// terms of hundreds of thousands of shared nodes or more, whose tables no
+/// longer fit in the cache. So a call that uses the whole default budget
+/// takes about 0.05 to 0.7 s.
 ///
 /// Well-typed terms can need work exponential in their size: a shared subterm
 /// is inferred once for each different set of bindings its free variables see
@@ -158,12 +163,12 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 ///
 /// Measured (October 2026): the reference programs, the prelude and every
 /// program in the test suites outside the checker's own stress tests take at
-/// most about 9 400 units, and the stress tests at most 7.2 million (a
+/// most about 9 400 units, and the stress tests at most 8.0 million (a
 /// 200 000-deep nest of `let` and `if`; the tree walk of a shared `if` nest 18
 /// deep takes 7.1 million). The default of 16 million admits all of those, the
 /// realistic programs by a factor of over 1 000, and refuses a well-typed
-/// 151-node term that takes about 10 s without it (450 million units) in about
-/// 0.35 s.
+/// 151-node term that takes about 8 s without it (580 million units) in about
+/// 0.2 s.
 pub const DEFAULT_WORK_BUDGET: u64 = 16_000_000;
 
 #[cfg(test)]
@@ -175,15 +180,27 @@ thread_local! {
     /// Reads of library and expected schemes on this thread: one per type
     /// constructor or variable visited and one per key looked at.
     pub(super) static SCHEME_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Slots of hash tables kept between uses visited when they are emptied:
-    /// the capacity of a table cleared or dropped.
+    /// Slots of hash tables and stacks kept between uses visited when they
+    /// are emptied: the capacity of a table or stack cleared or dropped.
     pub(super) static TABLE_SLOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Lookups, insertions and removals in the checker's hash tables on this
+    /// thread. On a large table each is likely a cache miss, so it costs more
+    /// than a read of the term or the store.
+    pub(super) static PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Counts one read of a scheme, in tests.
 fn count_scheme_read() {
     #[cfg(test)]
     SCHEME_READS.with(|r| r.set(r.get() + 1));
+}
+
+/// Counts `n` probes of hash tables, in tests.
+fn count_probes(n: u64) {
+    #[cfg(test)]
+    PROBES.with(|r| r.set(r.get() + n));
+    #[cfg(not(test))]
+    let _ = n;
 }
 
 /// The variables of a scheme that carry a `Key` constraint. A lookup takes the
@@ -710,6 +727,7 @@ impl TypeChecker {
     ) -> Result<Ty, TypeError> {
         let result = self.run_walks(arena, libs, term, expected);
         self.release_tables();
+        self.release_stacks();
         result
     }
 
@@ -760,6 +778,7 @@ impl TypeChecker {
             let keys = KeySet::of(expected);
             let mut rigid: FxHashMap<TyVar, Ty> = FxHashMap::default();
             let want = self.import(expected.ty(), &mut |this, v| {
+                count_probes(1);
                 *rigid.entry(v).or_insert_with(|| {
                     this.push(Node::Rigid {
                         key: keys.contains(v),
@@ -787,7 +806,33 @@ impl TypeChecker {
         release_map(&mut self.inst);
     }
 
+    /// Frees the stacks of the walk at the end of a call, as
+    /// [`TypeChecker::release_tables`] does the tables. A call that stops deep
+    /// in the walk leaves them long, and clearing one drops its elements, some
+    /// of which own allocations.
+    fn release_stacks(&mut self) {
+        release_vec(&mut self.env);
+        release_vec(&mut self.frames);
+        release_vec(&mut self.spine);
+        release_vec(&mut self.pending);
+        release_vec(&mut self.canon_closed);
+        release_vec(&mut self.checkpoints);
+        release_vec(&mut self.trail);
+        release_vec(&mut self.memo_log);
+    }
+
     fn reset(&mut self) {
+        // Clearing a stack drops its elements, some of which own allocations.
+        count_table_slots(
+            self.env.capacity()
+                + self.frames.capacity()
+                + self.spine.capacity()
+                + self.pending.capacity()
+                + self.canon_closed.capacity()
+                + self.checkpoints.capacity()
+                + self.trail.capacity()
+                + self.memo_log.capacity(),
+        );
         self.nodes.clear();
         self.nodes.push(Node::Con(Head::Int, 0, 0));
         self.nodes.push(Node::Con(Head::Bool, 0, 0));
@@ -825,6 +870,7 @@ impl TypeChecker {
         let root = self.resolve(t);
         let mut stack = vec![(root, false)];
         while let Some((r, children_done)) = stack.pop() {
+            count_probes(1);
             if ids.contains_key(&r) {
                 continue;
             }
@@ -854,11 +900,13 @@ impl TypeChecker {
                         }
                         continue;
                     }
+                    count_probes(h.arity() as u64);
                     let id = |c: Ty, used: bool| if used { ids[&c] } else { 0 };
                     Canon::Con(h, id(a, h.arity() >= 1), id(b, h.arity() >= 2))
                 }
             };
             let next = u32::try_from(self.canon.len()).expect("fewer than 2^32 types");
+            count_probes(2);
             let id = *self.canon.entry(canon).or_insert(next);
             if id == next {
                 let closed = match canon {
@@ -873,6 +921,7 @@ impl TypeChecker {
             }
             ids.insert(r, id);
         }
+        count_probes(1);
         ids[&root]
     }
 
@@ -884,14 +933,18 @@ impl TypeChecker {
     /// node `(add t)`.
     ///
     /// A spine is walked whole each time it is reached, so the search pays a unit
-    /// for each node it pops and each child it finds. It returns false, having
-    /// stopped, once that runs past the budget; it checks between nodes and
-    /// between the links of a spine, which can be as long as the term.
+    /// for each node it pops, each link of a spine it follows, each child it
+    /// looks up in the set of nodes seen and each child it finds again. It
+    /// returns false, having stopped, once that runs past the budget; it checks
+    /// between nodes and between the links of a spine, which can be as long as
+    /// the term.
     fn find_shared(&mut self, arena: &Arena, root: TermId) -> bool {
+        // The root has no parent, so a node other than it is seen once some
+        // edge reaches it, and shared once another edge does.
         let mut seen: FxHashSet<TermId> = FxHashSet::default();
-        let mut edges: FxHashSet<TermId> = FxHashSet::default();
         let mut stack = vec![root];
         let mut kids = Vec::new();
+        count_probes(1);
         seen.insert(root);
         while let Some(id) = stack.pop() {
             if self.spent > self.budget.0 {
@@ -911,17 +964,18 @@ impl TypeChecker {
                     head = f;
                 }
                 kids.push(head);
-                self.spent += 1;
             } else {
-                kids.extend(children(&node));
-                self.spent += kids.len() as u64;
+                push_term_children(&mut kids, &node);
             }
             for &c in &kids {
-                if !edges.insert(c) && !children(&arena.get(c)).is_empty() {
-                    self.shared.insert(c);
-                }
+                self.spent += 1;
+                count_probes(1);
                 if seen.insert(c) {
                     stack.push(c);
+                } else if !is_term_leaf(&arena.get(c)) {
+                    self.spent += 1;
+                    count_probes(1);
+                    self.shared.insert(c);
                 }
             }
         }
@@ -944,11 +998,12 @@ impl TypeChecker {
     }
 
     /// Changes node `t` to `n`. If a checkpoint may go back to the old node, it
-    /// is saved on the trail, at a unit for saving it and putting it back.
+    /// is saved on the trail. That is not charged on its own: every change
+    /// follows a charged step on the same node (a link followed, a node visited
+    /// or a pair unified), and a step makes at most two changes.
     fn set(&mut self, t: Ty, n: Node) {
         let i = t as usize;
         if self.checkpoints.last().is_some_and(|cp| i < cp.nodes) {
-            self.spent += 1;
             #[cfg(test)]
             STORE_READS.with(|r| r.set(r.get() + 1));
             self.trail.push((t, self.nodes[i]));
@@ -1111,6 +1166,7 @@ impl TypeChecker {
                     // Constructor nodes are not linked to each other (that would
                     // change how the expected side prints in an error), so a pair
                     // met again through shared structure is skipped here instead.
+                    count_probes(1);
                     if ha.arity() > 0 && seen.insert((a, b)) {
                         if ha.arity() >= 2 {
                             pairs.push((a2, b2));
@@ -1260,6 +1316,7 @@ impl TypeChecker {
         // resolved roots.
         let mut expand: Vec<(Ty, bool)> = vec![(root, true)];
         while let Some((r, first)) = expand.pop() {
+            count_probes(2);
             if first {
                 if map.contains_key(&r) {
                     continue;
@@ -1291,6 +1348,7 @@ impl TypeChecker {
                     }
                 }
             } else if let Node::Con(h, a, b) = self.node(r) {
+                count_probes(2);
                 let ra = self.resolve(a);
                 let na = map.get(&ra).copied().unwrap_or(ra);
                 let (rb, nb) = if h.arity() >= 2 {
@@ -1307,6 +1365,7 @@ impl TypeChecker {
                 map.insert(r, out);
             }
         }
+        count_probes(1);
         let out = map.get(&root).copied().unwrap_or(root);
         release_map(&mut map);
         self.inst = map;
@@ -1355,6 +1414,7 @@ impl TypeChecker {
         let keys = KeySet::of(s);
         let mut map: FxHashMap<TyVar, Ty> = FxHashMap::default();
         self.import(s.ty(), &mut |this, v| {
+            count_probes(1);
             *map.entry(v).or_insert_with(|| {
                 this.push(Node::Var {
                     level: this.level,
@@ -1389,6 +1449,7 @@ impl TypeChecker {
                             let next = TyVar(
                                 u32::try_from(names.len()).expect("fewer than 2^32 variables"),
                             );
+                            count_probes(1);
                             out.push(Type::Var(*names.entry(r).or_insert(next)));
                         }
                         Node::Con(h, a, b) => match h {
@@ -1435,6 +1496,7 @@ impl TypeChecker {
     fn export_scheme(&mut self, t: Ty) -> Result<Scheme, TooLarge> {
         let mut names = FxHashMap::default();
         let ty = self.export(t, &mut names)?;
+        count_probes(names.len() as u64);
         let keys: Vec<TyVar> = names
             .iter()
             .filter(|(&node, _)| {
@@ -1669,6 +1731,7 @@ impl TypeChecker {
             }
             let next = match step {
                 Step::Eval(id, want) => {
+                    count_probes(1);
                     if self.shared.contains(&id) {
                         self.shared_subterm(arena, id, want)
                     } else {
@@ -1696,6 +1759,8 @@ impl TypeChecker {
                         // A use whose key is not in the memo failed while its
                         // subterm was being inferred afresh.
                         if let Some(key) = &cp.closed_key {
+                            self.spent += 2;
+                            count_probes(2);
                             if !self.memo.contains_key(key) {
                                 self.failed.insert(key.clone());
                             }
@@ -1722,10 +1787,23 @@ impl TypeChecker {
         id: TermId,
         want: Option<Want>,
     ) -> Result<Step, TypeError> {
+        // A unit for each lookup in a table that grows with the term: on a
+        // large term each is likely a cache miss.
+        self.spent += 2;
+        count_probes(2);
         if !self.free_vars.contains_key(&id) {
-            self.spent += free_vars(arena, id, &mut self.free_vars);
+            free_vars(
+                arena,
+                id,
+                &mut self.free_vars,
+                &mut self.spent,
+                self.budget.0,
+            );
         }
-        let fv = &self.free_vars[&id];
+        let Some(fv) = self.free_vars.get(&id) else {
+            // Finding them ran past the budget, which ends the call.
+            return Err(plain_error(arena, id, too_much_work(self.budget.0)));
+        };
         let len = self.env.len();
         if fv.depth as usize > len {
             // A free variable is unbound: walk it as a tree to report it.
@@ -1748,6 +1826,8 @@ impl TypeChecker {
         }
         let key = (id, scope);
         if self.locate {
+            self.spent += 1;
+            count_probes(1);
             if self.failed.contains(&key) {
                 // Fresh inference fails in every context, so this use fails too:
                 // trying it again would redo that work at every level of sharing.
@@ -1767,6 +1847,8 @@ impl TypeChecker {
                 level: self.level,
             });
         }
+        self.spent += 1;
+        count_probes(1);
         if let Some(&kept) = self.memo.get(&key) {
             let t = self.instantiate(kept);
             let t = self.apply_scope(arena, id, &key.1, &indices, t)?;
@@ -1860,6 +1942,7 @@ impl TypeChecker {
         // As in `instantiate`: `true` to expand, `false` to rebuild.
         let mut stack: Vec<(Ty, bool)> = vec![(root, true)];
         while let Some((r, first)) = stack.pop() {
+            count_probes(2);
             if first {
                 if map.contains_key(&r) {
                     continue;
@@ -1897,6 +1980,7 @@ impl TypeChecker {
             } else if let Node::Con(h, a, b) = self.node(r) {
                 let copy = |this: &mut Self, c: Ty, used: bool| {
                     if used {
+                        count_probes(1);
                         let rc = this.resolve(c);
                         map[&rc]
                     } else {
@@ -1909,6 +1993,7 @@ impl TypeChecker {
                 map.insert(r, out);
             }
         }
+        count_probes(1);
         map.get(&root).copied()
     }
 
@@ -1931,6 +2016,7 @@ impl TypeChecker {
         }
         self.env.truncate(cp.env);
         for key in self.memo_log.drain(cp.memo_log..) {
+            count_probes(1);
             self.memo.remove(&key);
         }
         self.level = cp.level;
@@ -2183,6 +2269,8 @@ impl TypeChecker {
                 // Kept before the scope is applied: a key in the memo is one
                 // whose fresh inference worked, which is how a failed use tells
                 // a failed fresh inference from a binder that does not fit.
+                self.spent += 2;
+                count_probes(2);
                 self.memo.insert(key, kept);
                 let indices = self.free_vars[&id].indices();
                 let t = self.apply_scope(arena, id, &scope, &indices, t)?;
@@ -2400,47 +2488,61 @@ impl TypeChecker {
 /// Records in `memo` the [`FreeVars`] of `id` and of every node under it that
 /// `memo` does not already hold. It walks with an explicit stack and visits each
 /// distinct node once; a node's list is at most [`MAX_FREE_VARS`] long, so the
-/// cost is linear in the number of distinct nodes. Returns the units of work it
-/// did: one for each node it records, and one for each index it gathers from
-/// the node's children.
-fn free_vars(arena: &Arena, id: TermId, memo: &mut FxHashMap<TermId, FreeVars>) -> u64 {
-    let mut spent = 0u64;
+/// cost is linear in the number of distinct nodes. It adds to `spent` the units
+/// of work it does: one for each node it pops to expand (a lookup in `memo`),
+/// one for each node it records, and for each child of such a node, one for
+/// reading the child's list and one for each index it gathers from that list.
+/// It stops between nodes once `spent` is past `budget`, leaving `id` out of
+/// `memo` unless it was done.
+fn free_vars(
+    arena: &Arena,
+    id: TermId,
+    memo: &mut FxHashMap<TermId, FreeVars>,
+    spent: &mut u64,
+    budget: u64,
+) {
+    let mut kids = Vec::with_capacity(3);
     // A node is pushed with `false` to be expanded, and again with `true` to be
-    // computed once its children are done.
+    // computed once its children are done. A node is expanded at most once: one
+    // pushed again before it is computed is popped after it is.
     let mut stack = vec![(id, false)];
     while let Some((t, children_done)) = stack.pop() {
-        if memo.contains_key(&t) {
+        if *spent > budget {
+            return;
+        }
+        if !children_done {
+            *spent += 1;
+            count_probes(1);
+            if !memo.contains_key(&t) {
+                stack.push((t, true));
+                kids.clear();
+                push_term_children(&mut kids, &arena.get(t));
+                stack.extend(kids.iter().map(|&c| (c, false)));
+            }
             continue;
         }
         let node = arena.get(t);
-        if !children_done {
-            stack.push((t, true));
-            stack.extend(
-                children(&node)
-                    .into_iter()
-                    .filter(|c| !memo.contains_key(c))
-                    .map(|c| (c, false)),
-            );
-            continue;
-        }
-        // The free variables of each child, shifted out of the binders between
-        // `t` and the child.
-        let parts: Vec<(TermId, u32)> = match node {
-            Term::Lam(b) => vec![(b, 1)],
-            Term::Let(x, b) => vec![(x, 0), (b, 1)],
-            ref other => children(other).into_iter().map(|c| (c, 0)).collect(),
-        };
         let fv = match node {
             Term::Var(i) => FreeVars {
                 depth: i.saturating_add(1),
                 vars: Some(Box::new([i])),
             },
             _ => {
+                kids.clear();
+                push_term_children(&mut kids, &node);
                 let mut depth = 0u32;
                 let mut vars: Option<Vec<u32>> = Some(Vec::new());
-                for (c, shift) in parts {
+                for (k, &c) in kids.iter().enumerate() {
+                    // The binders between `t` and the child: a lambda binds
+                    // over its body, a `let` over its second child.
+                    let shift = match node {
+                        Term::Lam(_) => 1,
+                        Term::Let(..) => k as u32,
+                        _ => 0,
+                    };
+                    count_probes(1);
                     let child = &memo[&c];
-                    spent += child.vars.as_ref().map_or(1, |v| v.len() as u64);
+                    *spent += 1 + child.vars.as_ref().map_or(0, |v| v.len() as u64);
                     depth = depth.max(child.depth.saturating_sub(shift));
                     match (&mut vars, &child.vars) {
                         (Some(acc), Some(cv)) => {
@@ -2457,10 +2559,32 @@ fn free_vars(arena: &Arena, id: TermId, memo: &mut FxHashMap<TermId, FreeVars>) 
                 FreeVars { depth, vars }
             }
         };
-        spent += 1;
+        *spent += 1;
+        count_probes(1);
         memo.insert(t, fv);
     }
-    spent
+}
+
+/// Pushes the children of `node` onto `out` in the order of
+/// [`children`](crate::term::children), without allocating.
+fn push_term_children(out: &mut Vec<TermId>, node: &Term) {
+    match *node {
+        Term::Var(_) | Term::Int(_) | Term::Bool(_) | Term::Unit | Term::Prim(_) | Term::Lib(_) => {
+        }
+        Term::Lam(b) => out.push(b),
+        Term::App(a, b) | Term::Let(a, b) | Term::And(a, b) | Term::Or(a, b) => {
+            out.extend([a, b]);
+        }
+        Term::If(a, b, c) => out.extend([a, b, c]),
+    }
+}
+
+/// Whether `node` has no children (see [`children`](crate::term::children)).
+fn is_term_leaf(node: &Term) -> bool {
+    matches!(
+        node,
+        Term::Var(_) | Term::Int(_) | Term::Bool(_) | Term::Unit | Term::Prim(_) | Term::Lib(_)
+    )
 }
 
 /// Empties a hash table kept between uses (see [`empty_set`]).
@@ -2503,6 +2627,14 @@ fn release_set<K, S: Default>(t: &mut std::collections::HashSet<K, S>) {
         *t = std::collections::HashSet::default();
     } else {
         empty_set(t);
+    }
+}
+
+/// Drops a stack kept between calls if it is larger than [`KEPT_CAPACITY`].
+fn release_vec<T>(v: &mut Vec<T>) {
+    if v.capacity() > KEPT_CAPACITY {
+        count_table_slots(v.capacity());
+        *v = Vec::new();
     }
 }
 
