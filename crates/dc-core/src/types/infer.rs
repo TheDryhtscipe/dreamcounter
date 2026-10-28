@@ -2129,13 +2129,15 @@ impl TypeChecker {
     /// substitution for the unbound variables of those types, keeping rigid
     /// variables and sending `Key` variables to key types, types the subterm
     /// under them. That is a property of the pattern. It writes each
-    /// polymorphic binding's type as the [`Canon`] id it had when bound,
-    /// which fixes its shape and its quantified variables, with what that
-    /// type's free variables resolve to now, their unbound variables
-    /// numbered. It names no node that can change: it means the same in
-    /// every state of the store, and going back to a checkpoint cannot make
-    /// it untrue. If a pattern `P` fails and the current pattern is `σ(P)`,
-    /// with the same [`Canon`] id for each binding, where `σ` keeps rigid
+    /// polymorphic binding's type as the shape it had when bound (see
+    /// [`TypeChecker::shape_of_class`]), which fixes its quantified
+    /// variables and where its free variables occur, with what those free
+    /// variables resolve to now, their unbound variables numbered. That is
+    /// the binding's type now, up to renaming its unbound variables. It
+    /// names no node that can change: it means the same in every state of
+    /// the store, and going back to a checkpoint cannot make it untrue. If a
+    /// pattern `P` fails and the current pattern is `σ(P)`, with the same
+    /// shape for each binding, where `σ` keeps rigid
     /// variables and sends `Key` variables to key-safe types, a substitution
     /// `S` that typed the subterm now would make `S ∘ σ` type it under `P`.
     /// So the use fails now too. `σ` must not send a numbered variable to a
@@ -2146,12 +2148,21 @@ impl TypeChecker {
     /// Why an instance, not only an equal pattern. Walking a failed use in
     /// place makes the unifications its fresh inference made, with the
     /// types actually bound in place of the fresh variables for its
-    /// monomorphic bindings, so every state it meets is an instance of the
-    /// state the failed inference met at the same point: an inner use that
+    /// monomorphic bindings, so every type it meets is an instance of the
+    /// type the failed inference met at the same point: an inner use that
     /// failed there matches here. With equal patterns only, a part of a
     /// helper's type that a monomorphic binding fixes in place, but leaves a
     /// variable when tried afresh, makes a new pattern at every level, and
     /// the walk is exponential again.
+    ///
+    /// Why the shape, not the [`Canon`] id. The instance relation holds
+    /// between types, not between nodes. A helper bound inside the subterm
+    /// over one of its monomorphic bindings is built over the fresh variable
+    /// that stands for that binding when tried afresh, and over the
+    /// binding's own node when walked in place. Its two types are of one
+    /// shape, but its [`Canon`] ids name different free nodes, so a pattern
+    /// keyed by the id would never match in place, and every level would be
+    /// tried afresh again under each level walked in place.
     fn note_failure(&mut self, cp: &Checkpoint) {
         self.spent += 1;
         let pattern = self.pattern(&cp.key.1);
