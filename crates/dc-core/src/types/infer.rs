@@ -135,8 +135,10 @@ pub const MAX_TYPE_DEPTH: usize = 500;
 /// search has paid for, and an error writes out at most four types of at most
 /// [`MAX_TYPE_NODES`] nodes. So a call does at most about twice its budget, plus
 /// a constant. The tests check that each unit stands for at most four reads of
-/// the term or the store, on terms built to find work that is not charged.
-/// One unit takes 20 to 60 ns in a release build, most often 20 to 40.
+/// the term, the store or a scheme (a type node imported or a key looked up),
+/// on terms built to find work that is not charged. On those terms, one unit
+/// takes 2 to 50 ns in a release build, most often 10 to 20 (October 2026), so
+/// a call that uses the whole default budget takes about 0.15 to 0.35 s.
 ///
 /// Well-typed terms can need work exponential in their size: a shared subterm
 /// is inferred once for each different set of bindings its free variables see
@@ -159,6 +161,39 @@ thread_local! {
     /// Reads of the type store on this thread: the tests compare it with the
     /// units of work charged.
     pub(super) static STORE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Reads of library and expected schemes on this thread: one per type
+    /// constructor or variable visited and one per key looked at.
+    pub(super) static SCHEME_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one read of a scheme, in tests.
+fn count_scheme_read() {
+    #[cfg(test)]
+    SCHEME_READS.with(|r| r.set(r.get() + 1));
+}
+
+/// The variables of a scheme that carry a `Key` constraint. A lookup takes the
+/// same time however many there are; making the set reads each key once, and a
+/// scheme has no more keys than variables, each of which costs a unit to make.
+struct KeySet(FxHashSet<TyVar>);
+
+impl KeySet {
+    fn of(s: &Scheme) -> KeySet {
+        KeySet(
+            s.keys()
+                .iter()
+                .map(|&k| {
+                    count_scheme_read();
+                    k
+                })
+                .collect(),
+        )
+    }
+
+    fn contains(&self, v: TyVar) -> bool {
+        count_scheme_read();
+        self.0.contains(&v)
+    }
 }
 
 /// Index of a node in the type store.
@@ -460,6 +495,9 @@ pub struct TypeChecker {
     /// the tests bound the work without a timer.
     #[cfg(test)]
     pub(super) step_limit: Option<u64>,
+    /// Walks of the term the last call started (see [`TypeChecker::run`]).
+    #[cfg(test)]
+    pub(super) walks: u32,
 }
 
 /// The work budget of a [`TypeChecker`]; [`DEFAULT_WORK_BUDGET`] unless set.
@@ -652,6 +690,10 @@ impl TypeChecker {
         expected: Option<&Scheme>,
     ) -> Result<Ty, TypeError> {
         self.spent = 0;
+        #[cfg(test)]
+        {
+            self.walks = 0;
+        }
         let first = self.walk_from_scratch(arena, libs, term, expected);
         let Err(e) = first else {
             return first;
@@ -677,14 +719,21 @@ impl TypeChecker {
         term: TermId,
         expected: Option<&Scheme>,
     ) -> Result<Ty, TypeError> {
+        #[cfg(test)]
+        {
+            self.walks += 1;
+        }
         self.reset();
         let want = expected.map(|expected| {
+            let keys = KeySet::of(expected);
             let mut rigid: FxHashMap<TyVar, Ty> = FxHashMap::default();
-            for v in expected.vars() {
-                let key = expected.keys().contains(&v);
-                rigid.insert(v, self.push(Node::Rigid { key }));
-            }
-            let want = self.import(expected.ty(), &mut |_, v| rigid[&v]);
+            let want = self.import(expected.ty(), &mut |this, v| {
+                *rigid.entry(v).or_insert_with(|| {
+                    this.push(Node::Rigid {
+                        key: keys.contains(v),
+                    })
+                })
+            });
             Want::at(want, "the whole term, checked against its expected type")
         });
         self.walk(arena, libs, term, want)
@@ -1170,6 +1219,7 @@ impl TypeChecker {
 
     /// Builds a public type into the store; `var` supplies the node for a variable.
     fn import(&mut self, t: &Type, var: &mut impl FnMut(&mut Self, TyVar) -> Ty) -> Ty {
+        count_scheme_read();
         match t {
             Type::Int => INT,
             Type::Bool => BOOL,
@@ -1206,12 +1256,13 @@ impl TypeChecker {
 
     /// A fresh instance of `s` at the current level.
     fn instantiate_scheme(&mut self, s: &Scheme) -> Ty {
+        let keys = KeySet::of(s);
         let mut map: FxHashMap<TyVar, Ty> = FxHashMap::default();
         self.import(s.ty(), &mut |this, v| {
             *map.entry(v).or_insert_with(|| {
                 this.push(Node::Var {
                     level: this.level,
-                    key: s.keys().contains(&v),
+                    key: keys.contains(v),
                 })
             })
         })

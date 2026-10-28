@@ -1728,18 +1728,74 @@ fn running_out_while_locating_returns_the_first_error() {
     assert!(first.context.contains("shared subterm"), "{first}");
 }
 
-/// Reads of the term arena and the type store on this thread so far.
+/// Reads of the term arena, the type store and schemes on this thread so far.
 fn reads() -> u64 {
     crate::term::GETS.with(std::cell::Cell::get)
         + super::infer::STORE_READS.with(std::cell::Cell::get)
+        + super::infer::SCHEME_READS.with(std::cell::Cell::get)
 }
 
-/// Infers `t` with `tc` and returns the reads it took and the units it was
-/// charged.
+/// Infers `t` with `tc` against [`adversarial_libs`] and returns the reads it
+/// took and the units it was charged.
 fn reads_and_units(tc: &mut TypeChecker, a: &Arena, t: TermId) -> (u64, u64) {
     let before = reads();
-    let _ = tc.infer(a, t, NO_LIBS);
+    let _ = tc.infer(a, t, &adversarial_libs());
     (reads() - before, tc.spent())
+}
+
+/// Checks `t` with `tc` against `expected` and returns the reads it took and
+/// the units it was charged.
+fn check_reads_and_units(
+    tc: &mut TypeChecker,
+    a: &Arena,
+    t: TermId,
+    expected: &Scheme,
+) -> (u64, u64) {
+    let libs = adversarial_libs();
+    let before = reads();
+    let _ = tc.check(a, t, &libs, expected);
+    (reads() - before, tc.spent())
+}
+
+/// A balanced tree of pairs over the variables `lo..hi`.
+fn pair_tree(lo: u32, hi: u32) -> Type {
+    if hi - lo == 1 {
+        Type::Var(TyVar(lo))
+    } else {
+        let mid = lo + (hi - lo) / 2;
+        Type::pair(pair_tree(lo, mid), pair_tree(mid, hi))
+    }
+}
+
+/// The number of variables of [`large_key_scheme`]: its type has `2v - 1`
+/// nodes, under [`MAX_TYPE_NODES`].
+const LARGE_SCHEME_VARS: u32 = 4_096;
+
+/// A scheme of [`LARGE_SCHEME_VARS`] variables, each with a `Key` constraint,
+/// in a balanced tree of pairs.
+fn large_key_scheme() -> Scheme {
+    let keys: Vec<TyVar> = (0..LARGE_SCHEME_VARS).map(TyVar).collect();
+    Scheme::with_keys(pair_tree(0, LARGE_SCHEME_VARS), &keys)
+}
+
+/// The library the adversarial shapes may use: `lib0` has
+/// [`large_key_scheme`].
+fn adversarial_libs() -> Vec<Scheme> {
+    vec![large_key_scheme()]
+}
+
+/// `c_n`, where `c_0 = unit` and `c_{k+1} = (snd (pair lib0 c_k))`: `n` uses of
+/// a library with a large scheme. Type `Unit`.
+fn large_scheme_uses(a: &mut Arena, n: usize) -> TermId {
+    let lib = a.lib(LibId(0));
+    let pair = a.prim(Prim::Pair);
+    let snd = a.prim(Prim::Snd);
+    let mut c = a.unit();
+    for _ in 0..n {
+        let p = a.apps(pair, &[lib, c]);
+        c = a.app(snd, p);
+    }
+    c
 }
 
 /// `((lam ($0 0 ... 0)) k)` with `l` arguments, where `k = (lam (lam ... 0))` is
@@ -1813,6 +1869,7 @@ fn adversarial_shapes(a: &mut Arena) -> Vec<(&'static str, TermId)> {
         ("wide scope uses", wide_scope_uses(a, 2_000, 20)),
         ("helper choices", helper_choices(a, 10)),
         ("if nest", if_nest(a, 100_000)),
+        ("large scheme uses", large_scheme_uses(a, 20)),
     ]
 }
 
@@ -1861,6 +1918,94 @@ fn a_small_budget_bounds_the_work_on_any_term() {
                 reads <= READS_PER_UNIT * units + 1_000,
                 "{name} (tree walk {tree_walk}): {reads} reads for {units} units"
             );
+        }
+    }
+}
+
+#[test]
+fn checking_against_a_large_key_scheme_is_charged() {
+    // Each variable of the expected type and of a library's scheme is made
+    // once per walk or use, and whether it has a `Key` constraint is looked
+    // up: the lookup must cost a bounded number of reads per unit charged,
+    // whatever the number of keys.
+    let mut a = Arena::new();
+    let t = a.lib(LibId(0));
+    let expected = large_key_scheme();
+    for budget in [1_000, DEFAULT_WORK_BUDGET] {
+        let mut tc = TypeChecker::with_work_budget(budget);
+        let (reads, units) = check_reads_and_units(&mut tc, &a, t, &expected);
+        assert!(
+            reads <= READS_PER_UNIT * units + 1_000,
+            "budget {budget}: {reads} reads for {units} units"
+        );
+        assert!(
+            units <= 2 * budget + OVERRUN,
+            "{units} units against a budget of {budget}"
+        );
+    }
+    let libs = adversarial_libs();
+    assert_eq!(TypeChecker::new().check(&a, t, &libs, &expected), Ok(()));
+}
+
+/// A balanced tree of `n` pairs of `Int`, whose last leaf is `last`.
+fn closed_pair_tree(n: u32, last: &Type) -> Type {
+    fn go(lo: u32, hi: u32, n: u32, last: &Type) -> Type {
+        if hi - lo == 1 {
+            if hi == n {
+                last.clone()
+            } else {
+                Type::Int
+            }
+        } else {
+            let mid = lo + (hi - lo) / 2;
+            Type::pair(go(lo, mid, n, last), go(mid, hi, n, last))
+        }
+    }
+    go(0, n, n, last)
+}
+
+#[test]
+fn a_step_that_errors_past_the_budget_reports_too_much_work() {
+    // The unification of the branches of the `if` is one step that visits
+    // both large types and fails at their last leaves. Under a budget it runs
+    // past, the call is out of work, not ill typed.
+    let libs = vec![
+        Scheme::new(closed_pair_tree(4_096, &Type::Int)),
+        Scheme::new(closed_pair_tree(4_096, &Type::Bool)),
+    ];
+    let mut a = Arena::new();
+    let t = parse_term(&mut a, "(if true lib_0 lib_1)");
+    let mut tc = TypeChecker::new();
+    let e = tc.infer(&a, t, &libs).unwrap_err();
+    assert!(!matches!(*e.kind, TypeErrorKind::TooMuchWork { .. }), "{e}");
+    let full = tc.spent();
+    let mut past = 0;
+    for budget in (1..full).step_by(101) {
+        let mut tc = TypeChecker::with_work_budget(budget);
+        let e = tc.infer(&a, t, &libs).unwrap_err();
+        if tc.spent() > budget {
+            past += 1;
+            assert_eq!(*e.kind, too_much_work(budget), "budget {budget}");
+        }
+    }
+    assert!(past > 0);
+}
+
+#[test]
+fn running_out_in_the_first_walk_does_not_start_the_second() {
+    // The second walk only names the clash the first one found; if the first
+    // ran out of work there is no clash to name.
+    let mut a = Arena::new();
+    let t = parse_term(&mut a, "(lam (if $0 (add $0 1) (add $0 1)))");
+    let mut tc = TypeChecker::new();
+    assert!(tc.infer(&a, t, NO_LIBS).is_err());
+    assert_eq!(tc.walks, 2);
+    let full = tc.spent();
+    for budget in 1..=full {
+        let mut tc = TypeChecker::with_work_budget(budget);
+        let e = tc.infer(&a, t, NO_LIBS).unwrap_err();
+        if *e.kind == too_much_work(budget) {
+            assert_eq!(tc.walks, 1, "budget {budget}");
         }
     }
 }
