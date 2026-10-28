@@ -710,7 +710,9 @@ pub enum ClassVerdict {
     Class(GrowthClass),
     /// Some class is within the tolerance plus the noise margin, but not as
     /// [`ClassVerdict::Class`] requires: the medians are too noisy to say
-    /// which class, or whether any.
+    /// which class, or whether any. Either two classes are within reach, or
+    /// the one class within reach is outside the tolerance by no more than
+    /// the noise margin.
     TooNoisy,
     /// Every size in the window has one seed, so the noise is unknown, and
     /// the [`NoiseModel`] does not supply it.
