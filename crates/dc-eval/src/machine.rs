@@ -16,9 +16,7 @@ use std::rc::Rc;
 use dc_core::{Arena, LibId, Prim, Term, TermId};
 
 use crate::cost;
-use crate::value::{
-    structural_eq, Env, EqResult, Fun, KeyBuild, List, MemoKey, MemoTable, Tree, Value,
-};
+use crate::value::{structural_eq, Env, EqResult, Fun, List, MemoKey, MemoTable, Tree, Value};
 
 /// The result of one evaluation (spec §4). The `u64` is the number of steps taken.
 #[derive(Clone, Debug)]
@@ -27,7 +25,8 @@ pub enum Outcome {
     Value(Value, u64),
     /// Evaluation stopped with a runtime error.
     Error(ErrorKind, u64),
-    /// The global fuel ran out. The count is the first one above the fuel.
+    /// The global fuel ran out. The count is the first one above the fuel, or
+    /// `u64::MAX` if that count does not fit in a `u64`.
     Timeout(u64),
 }
 
@@ -294,13 +293,18 @@ impl<'a> Machine<'a> {
     }
 
     /// Charges `n` steps. Stops with a timeout at the first charge that takes the
-    /// count above the fuel.
+    /// count above the fuel. A count that does not fit in a `u64` is above every fuel and is kept as
+    /// `u64::MAX`.
     fn charge(&mut self, n: u64) -> Result<(), Halt> {
-        self.steps = self.steps.saturating_add(n);
-        if self.steps > self.fuel {
-            Err(Halt::Timeout)
-        } else {
-            Ok(())
+        match self.steps.checked_add(n) {
+            Some(s) if s <= self.fuel => {
+                self.steps = s;
+                Ok(())
+            }
+            s => {
+                self.steps = s.unwrap_or(u64::MAX);
+                Err(Halt::Timeout)
+            }
         }
     }
 
@@ -759,15 +763,16 @@ impl<'a> Machine<'a> {
     /// `f self x` and stores the result.
     fn memo_call(&mut self, table: &Rc<RefCell<MemoTable>>, f: &Value, x: Value) -> Step {
         // A key of k nodes is charged 1 + k, so a key with more nodes than the fuel
-        // left is sized but never built: the call can only time out, unless it is
-        // a miss with no misses left, which raises FuelExhausted without charging.
-        // Sizing first keeps the memory of a call in proportion to its key, not to
-        // the fuel left.
+        // left can only time out, unless it is a miss with no misses left, which
+        // raises FuelExhausted without charging. Sizing and building take work and
+        // memory in proportion to the key's distinct pairs, not to its size, which
+        // sharing can make exponentially larger.
         let size = MemoKey::size_of(&x).ok_or(error(ErrorKind::InvalidMemoKey))?;
+        // Not reached: `size_of` accepted the key.
+        let build = || MemoKey::build(&x, size).ok_or(error(ErrorKind::InvalidMemoKey));
         if size > self.fuel_left() {
             let t = table.borrow();
-            let hit = t.entries.keys().any(|k| k.size() == size && k.matches(&x));
-            if t.misses_left <= 0 && !hit {
+            if t.misses_left <= 0 && !t.entries.contains_key(&build()?) {
                 return Err(error(ErrorKind::FuelExhausted));
             }
             drop(t);
@@ -775,13 +780,7 @@ impl<'a> Machine<'a> {
             // Not reached: the charge is above the fuel left.
             return Err(Halt::Timeout);
         }
-        let key = match MemoKey::build_within(&x, size) {
-            KeyBuild::Key(key) => key,
-            // Not reached: `size_of` accepted the key and measured `size` nodes.
-            KeyBuild::Invalid | KeyBuild::OverLimit => {
-                return Err(error(ErrorKind::InvalidMemoKey))
-            }
-        };
+        let key = build()?;
         let hit = table.borrow().entries.get(&key).cloned();
         if let Some(v) = hit {
             self.charge(cost::memo_call(size))?;
@@ -835,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn an_over_limit_memo_key_is_sized_without_being_built() {
+    fn an_over_limit_memo_key_is_sized_and_built_only_to_look_for_a_hit() {
         // A key of 2^41 - 1 nodes built in 40 × (1 + β 2 + pair 1) = 160 steps, with
         // a million steps of fuel. The call times out at 160 + 2^41 without
         // building any of the key.
@@ -848,18 +847,65 @@ mod tests {
             "{o}"
         );
         assert_eq!(KEY_ATOMS_BUILT.with(Cell::get), 0);
-        // The same with no misses left: FuelExhausted, still without building.
+        // The same with no misses left: FuelExhausted. The key is built to look
+        // for a hit, one node per distinct value: 0 and 40 pairs.
         let q = "(memorec 0 (lam (lam 0)) (loop 40 0 (lam (lam (pair $0 $0)))))";
         let (o, _) = run_machine(&mut arena, q, 1_000_000);
         assert!(
             matches!(o, Outcome::Error(ErrorKind::FuelExhausted, 160)),
             "{o}"
         );
-        assert_eq!(KEY_ATOMS_BUILT.with(Cell::get), 0);
+        assert_eq!(KEY_ATOMS_BUILT.with(Cell::get), 41);
+        KEY_ATOMS_BUILT.with(|n| n.set(0));
         // A key within the fuel is built once: 3 atoms for (pair 1 2).
         let (o, _) = run_machine(&mut arena, "(memorec 1 (lam (lam 0)) (pair 1 2))", 100);
         assert!(matches!(o, Outcome::Value(Value::Int(0), 7)), "{o}");
         assert_eq!(KEY_ATOMS_BUILT.with(Cell::get), 3);
+    }
+
+    #[test]
+    fn a_shared_memo_key_within_the_fuel_is_built_in_its_distinct_pairs() {
+        // A key of 2^21 - 1 nodes from 20 distinct pairs, with fuel to spare: the
+        // call is charged its full size but builds one node per distinct value.
+        let mut arena = Arena::new();
+        KEY_ATOMS_BUILT.with(|n| n.set(0));
+        let p = "(memorec 1 (lam (lam 0)) (loop 20 0 (lam (lam (pair $0 $0)))))";
+        let (o, _) = run_machine(&mut arena, p, UNLIMITED);
+        // 80 steps to build, 1 + (2^21 - 1) for the call, 2 β.
+        assert!(
+            matches!(o, Outcome::Value(Value::Int(0), s) if s == 80 + (1u64 << 21) + 2),
+            "{o}"
+        );
+        assert!(KEY_ATOMS_BUILT.with(Cell::get) <= 21);
+    }
+
+    #[test]
+    fn a_huge_shared_memo_key_runs_under_unlimited_fuel() {
+        // 2^41 - 1 nodes from 40 distinct pairs.
+        let mut arena = Arena::new();
+        let k = "(loop 40 0 (lam (lam (pair $0 $0))))";
+        let p = format!("(memorec 2 (lam (lam 7)) {k})");
+        let (o, _) = run_machine(&mut arena, &p, UNLIMITED);
+        assert!(
+            matches!(o, Outcome::Value(Value::Int(7), s) if s == 160 + (1u64 << 41) + 2),
+            "{o}"
+        );
+        // F returns `self`. Two misses are allowed (5, then the first huge key),
+        // so the second huge key, built separately and equal but not
+        // pointer-equal, must be a hit: a miss would raise FuelExhausted.
+        let q = format!("(let (memorec 2 (lam (lam $1)) 5) (let ($0 {k}) ($1 {k})))");
+        let (o, _) = run_machine(&mut arena, &q, UNLIMITED);
+        assert!(matches!(o, Outcome::Value(Value::Fun(_), _)), "{o}");
+    }
+
+    #[test]
+    fn a_charge_that_saturates_the_count_times_out_even_at_unlimited_fuel() {
+        let arena = Arena::new();
+        let mut m = Machine::new(&arena, u64::MAX);
+        m.steps = u64::MAX - 1;
+        assert!(matches!(m.charge(1), Ok(())));
+        assert!(matches!(m.charge(1), Err(Halt::Timeout)));
+        assert_eq!(m.steps, u64::MAX);
     }
 
     #[test]

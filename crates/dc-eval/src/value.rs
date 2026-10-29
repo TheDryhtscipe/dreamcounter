@@ -99,7 +99,7 @@ pub struct MemoTable {
     pub misses_left: i64,
 }
 
-/// One atom of a [`MemoKey`]'s pre-order encoding.
+/// One atom of a small [`MemoKey`]'s pre-order encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeyAtom {
     /// An integer.
@@ -112,58 +112,78 @@ pub enum KeyAtom {
     Pair,
 }
 
+/// One distinct subvalue of a large [`MemoKey`]: a scalar, or a pair of earlier
+/// nodes given by their positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum KeyNode {
+    Int(i64),
+    Bool(bool),
+    Unit,
+    Pair(usize, usize),
+}
+
+/// The stored form of a [`MemoKey`]. Which form a key takes depends only on its
+/// size, so two equal keys always have the same form.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum KeyRepr {
+    /// The pre-order atoms of a key of at most [`FLAT_KEY_MAX`] nodes. Every atom
+    /// has a fixed arity, so the encoding is injective.
+    Flat(Vec<KeyAtom>),
+    /// The distinct subvalues of a larger key, each once, in the order a
+    /// left-to-right post-order walk of the key as a tree first completes them;
+    /// the last is the key. Equal subvalues share a node, so the sequence depends
+    /// only on the key as a tree, and its length on the distinct subvalues.
+    Dag(Vec<KeyNode>),
+}
+
+/// The largest key, in value nodes, stored in the flat form.
+const FLAT_KEY_MAX: u64 = 64;
+
 /// A memo-table key: `Int`, `Bool`, `Unit` or pairs of those (spec §6).
 ///
-/// Stored as the pre-order sequence of its value nodes. Every atom has a fixed
-/// arity, so the encoding is injective, and the key size of the cost model is the
-/// length of the sequence.
+/// Small keys are stored as the pre-order sequence of their value nodes. Larger
+/// keys are stored with each distinct subvalue once, so a key whose pairs share
+/// components (2^n nodes from n distinct pairs) takes memory and work in
+/// proportion to its distinct pairs. The key size of the cost model is the size
+/// of the key as a tree, whichever form it takes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct MemoKey(Vec<KeyAtom>);
-
-/// The result of [`MemoKey::build_within`].
-pub(crate) enum KeyBuild {
-    /// The key, of at most the limit's size.
-    Key(MemoKey),
-    /// The value is not a valid key.
-    Invalid,
-    /// The key has more nodes than the limit; nothing was kept.
-    OverLimit,
+pub struct MemoKey {
+    repr: KeyRepr,
+    size: u64,
 }
 
 impl MemoKey {
     /// Converts a value to a key. Returns `None` for a value that is not a valid key.
     pub fn from_value(v: &Value) -> Option<MemoKey> {
-        match MemoKey::build_within(v, u64::MAX) {
-            KeyBuild::Key(k) => Some(k),
-            KeyBuild::Invalid | KeyBuild::OverLimit => None,
-        }
+        MemoKey::build(v, MemoKey::size_of(v)?)
     }
 
-    /// Converts a value to a key of at most `limit` nodes. Stops as soon as the
-    /// key is invalid or has more than `limit` nodes, so the work done is bounded
-    /// by `limit` even for a key whose pairs share components (2^n nodes from n
-    /// distinct pairs).
-    pub(crate) fn build_within(v: &Value, limit: u64) -> KeyBuild {
-        let mut atoms = Vec::new();
-        let built = MemoKey::fill_within(v, limit, &mut atoms);
+    /// Converts a value of key size `size`, as measured by [`MemoKey::size_of`],
+    /// to a key. The work is linear in the number of distinct pairs of `v`.
+    /// Returns `None` for a value that is not a valid key.
+    pub(crate) fn build(v: &Value, size: u64) -> Option<MemoKey> {
+        let repr = if size <= FLAT_KEY_MAX {
+            KeyRepr::Flat(MemoKey::flat(v)?)
+        } else {
+            KeyRepr::Dag(MemoKey::dag(v)?)
+        };
         #[cfg(test)]
-        KEY_ATOMS_BUILT.with(|n| n.set(n.get() + atoms.len() as u64));
-        match built {
-            Some(true) => KeyBuild::Key(MemoKey(atoms)),
-            Some(false) => KeyBuild::OverLimit,
-            None => KeyBuild::Invalid,
-        }
+        KEY_ATOMS_BUILT.with(|n| {
+            let built = match &repr {
+                KeyRepr::Flat(atoms) => atoms.len(),
+                KeyRepr::Dag(nodes) => nodes.len(),
+            };
+            n.set(n.get() + built as u64)
+        });
+        Some(MemoKey { repr, size })
     }
 
-    /// Pushes the pre-order atoms of `v` to `atoms`. Returns `Some(true)` for a
-    /// complete key, `Some(false)` when it has more than `limit` nodes and `None`
-    /// for an invalid key.
-    fn fill_within(v: &Value, limit: u64, atoms: &mut Vec<KeyAtom>) -> Option<bool> {
+    /// The pre-order atoms of `v`, or `None` for an invalid key. Call it only on a
+    /// value whose size is known to be small.
+    fn flat(v: &Value) -> Option<Vec<KeyAtom>> {
+        let mut atoms = Vec::new();
         let mut work = vec![v];
         while let Some(v) = work.pop() {
-            if atoms.len() as u64 >= limit {
-                return Some(false);
-            }
             match v {
                 Value::Int(n) => atoms.push(KeyAtom::Int(*n)),
                 Value::Bool(b) => atoms.push(KeyAtom::Bool(*b)),
@@ -176,7 +196,51 @@ impl MemoKey {
                 _ => return None,
             }
         }
-        Some(true)
+        Some(atoms)
+    }
+
+    /// The distinct subvalues of `v` in canonical order (see [`KeyRepr::Dag`]), or
+    /// `None` for an invalid key. Each pair in memory is visited once.
+    fn dag(v: &Value) -> Option<Vec<KeyNode>> {
+        let mut nodes: Vec<KeyNode> = Vec::new();
+        let mut ids: FxHashMap<KeyNode, usize> = FxHashMap::default();
+        let mut by_ptr: FxHashMap<*const (Value, Value), usize> = FxHashMap::default();
+        let mut intern = |node: KeyNode, nodes: &mut Vec<KeyNode>| -> usize {
+            *ids.entry(node).or_insert_with(|| {
+                nodes.push(node);
+                nodes.len() - 1
+            })
+        };
+        // `(value, components done)`; `results` holds the finished node ids.
+        let mut work: Vec<(&Value, bool)> = vec![(v, false)];
+        let mut results: Vec<usize> = Vec::new();
+        while let Some((v, done)) = work.pop() {
+            let id = match v {
+                Value::Int(n) => intern(KeyNode::Int(*n), &mut nodes),
+                Value::Bool(b) => intern(KeyNode::Bool(*b), &mut nodes),
+                Value::Unit => intern(KeyNode::Unit, &mut nodes),
+                Value::Pair(p) => {
+                    let ptr = Rc::as_ptr(p);
+                    if done {
+                        let b = results.pop()?;
+                        let a = results.pop()?;
+                        let id = intern(KeyNode::Pair(a, b), &mut nodes);
+                        by_ptr.insert(ptr, id);
+                        id
+                    } else if let Some(&id) = by_ptr.get(&ptr) {
+                        id
+                    } else {
+                        work.push((v, true));
+                        work.push((&p.1, false));
+                        work.push((&p.0, false));
+                        continue;
+                    }
+                }
+                _ => return None,
+            };
+            results.push(id);
+        }
+        Some(nodes)
     }
 
     /// The key size of `v` in value nodes (saturating), or `None` if `v` is not a
@@ -213,32 +277,9 @@ impl MemoKey {
         results.pop()
     }
 
-    /// Whether `v` converts to this key. The work is bounded by this key's size.
-    pub(crate) fn matches(&self, v: &Value) -> bool {
-        let mut atoms = self.0.iter();
-        let mut work = vec![v];
-        while let Some(v) = work.pop() {
-            let same = match (atoms.next(), v) {
-                (Some(KeyAtom::Int(m)), Value::Int(n)) => m == n,
-                (Some(KeyAtom::Bool(m)), Value::Bool(n)) => m == n,
-                (Some(KeyAtom::Unit), Value::Unit) => true,
-                (Some(KeyAtom::Pair), Value::Pair(p)) => {
-                    work.push(&p.1);
-                    work.push(&p.0);
-                    true
-                }
-                _ => false,
-            };
-            if !same {
-                return false;
-            }
-        }
-        atoms.next().is_none()
-    }
-
     /// The key size in value nodes, as the cost model counts it.
     pub fn size(&self) -> u64 {
-        self.0.len() as u64
+        self.size
     }
 }
 
@@ -539,8 +580,8 @@ fn detach_env(env: &mut Env, out: &mut Vec<Value>) {
 
 #[cfg(test)]
 thread_local! {
-    /// Key atoms built on this thread, so tests can check that an over-limit key
-    /// is never built.
+    /// Key atoms or distinct key nodes built on this thread, so tests can check
+    /// how much of a key is built.
     pub(crate) static KEY_ATOMS_BUILT: Cell<u64> = const { Cell::new(0) };
 }
 
