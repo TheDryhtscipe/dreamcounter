@@ -16,11 +16,21 @@
 //!   from the first half of its own slot, then the list is shuffled, so the
 //!   least gap is at least `10⁶ / n` (about 2 000 at 512).
 //!
-//! Half the time the threshold of [`Variant::PairSums`] is the sum of a
-//! random pair of elements, so some pair sums to exactly `t`; otherwise it is
-//! drawn from twice the largest magnitude of an element each side of 0. So a
-//! solution that mishandles ties, or gets only ties or only small gaps right,
-//! fails the sweep. The variants:
+//! Half the time the threshold of [`Variant::PairSums`] is the sum of two
+//! elements, so some pair sums to exactly `t`; otherwise it is drawn from
+//! twice the largest magnitude of an element each side of 0. In a tied input
+//! the two elements are narrow ones (`|x| <= narrow_bound(n)`), chosen so
+//! that at least two pairs sum to `t` and, where the input allows it, two
+//! equal elements are one of those pairs; if no two narrow elements allow
+//! that, and in the other kinds, they are any two elements, and are usually
+//! the only pair that sums to `t`.
+//!
+//! With the default five seeds, the sweep has least gaps of 0, small ones
+//! and large ones, and thresholds that at least one pair sums to and that
+//! several pairs sum to; a unit test checks this. So a solution that is wrong on
+//! every input of one of those kinds fails the sweep, and so do two wrong
+//! pair-sums solutions that are right whenever at most one pair sums to `t`
+//! (`tests/sorted_order.rs`). The variants:
 //!
 //! | variant | answer |
 //! |---|---|
@@ -40,6 +50,9 @@
 //! The oracles do not follow the references: inversions are counted with a
 //! Fenwick tree, pair sums by binary search over the sorted list, and the
 //! rest by Rust's sort and a scan.
+
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use dc_core::Scheme;
 use dc_eval::Value;
@@ -190,6 +203,52 @@ fn pair_sums(xs: &[i64], t: i64) -> i64 {
     count
 }
 
+/// The pairs `i < j` with `xs[i] + xs[j] = t`.
+#[cfg(test)]
+fn exact_pairs(xs: &[i64], t: i64) -> i64 {
+    pair_sums(xs, t) - pair_sums(xs, t - 1)
+}
+
+/// The thresholds a tied input's exact threshold is drawn from: the sums of
+/// two narrow elements (`|x| <= narrow`) to which at least two pairs sum,
+/// and of those, the ones to which a pair of equal elements sums, if any. A
+/// pair with an element from the whole range is almost always the only pair
+/// with its sum, so it cannot tell a right count of exact pairs from "1 if
+/// there is one", nor one that skips pairs of equal elements.
+fn tied_thresholds(xs: &[i64], narrow: i64) -> Vec<i64> {
+    let near = sorted(xs.iter().copied().filter(|x| x.abs() <= narrow).collect());
+    let mut sums: Vec<i64> = near
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &a)| near[i + 1..].iter().map(move |&b| a + b))
+        .collect();
+    sums.sort_unstable();
+    sums.dedup();
+    let mut counts: BTreeMap<i64, i64> = BTreeMap::new();
+    for &x in xs {
+        *counts.entry(x).or_insert(0) += 1;
+    }
+    // Pairs `i < j` with `xs[i] + xs[j] = t`, as `exact_pairs` counts them.
+    let exact = |t: i64| -> i64 {
+        counts
+            .iter()
+            .map(|(&v, &c)| match (t - v).cmp(&v) {
+                Ordering::Greater => c * counts.get(&(t - v)).copied().unwrap_or(0),
+                Ordering::Equal => c * (c - 1) / 2,
+                Ordering::Less => 0,
+            })
+            .sum()
+    };
+    sums.retain(|&t| exact(t) >= 2);
+    let twins = |t: i64| t % 2 == 0 && near.iter().filter(|&&x| 2 * x == t).count() >= 2;
+    let with_twins: Vec<i64> = sums.iter().copied().filter(|&t| twins(t)).collect();
+    if with_twins.is_empty() {
+        sums
+    } else {
+        with_twins
+    }
+}
+
 fn min_gap(xs: &[i64]) -> i64 {
     sorted(xs.to_vec())
         .windows(2)
@@ -311,16 +370,15 @@ impl TaskFamily for SortedOrder {
     }
 
     fn generate(&self, n: u64, rng: &mut TaskRng) -> Inputs {
-        let xs: Vec<i64> = match rng.below(3) {
-            0 => {
-                let narrow = narrow_bound(n);
-                (0..n)
-                    .map(|_| {
-                        let bound = if rng.bool() { narrow } else { VALUE_BOUND };
-                        rng.int_in(-bound, bound)
-                    })
-                    .collect()
-            }
+        let kind = rng.below(3);
+        let narrow = narrow_bound(n);
+        let xs: Vec<i64> = match kind {
+            0 => (0..n)
+                .map(|_| {
+                    let bound = if rng.bool() { narrow } else { VALUE_BOUND };
+                    rng.int_in(-bound, bound)
+                })
+                .collect(),
             1 => {
                 let spread = spread_bound(n);
                 (0..n).map(|_| rng.int_in(-spread, spread)).collect()
@@ -339,9 +397,18 @@ impl TaskFamily for SortedOrder {
         let mut inputs = vec![list(&xs)];
         if self.0 == Variant::PairSums {
             let t = if xs.len() >= 2 && rng.bool() {
-                let i = rng.below(xs.len() as u64) as usize;
-                let j = (i + 1 + rng.below(xs.len() as u64 - 1) as usize) % xs.len();
-                xs[i] + xs[j]
+                let tied = if kind == 0 {
+                    tied_thresholds(&xs, narrow)
+                } else {
+                    Vec::new()
+                };
+                if tied.is_empty() {
+                    let i = rng.below(xs.len() as u64) as usize;
+                    let j = (i + 1 + rng.below(xs.len() as u64 - 1) as usize) % xs.len();
+                    xs[i] + xs[j]
+                } else {
+                    tied[rng.below(tied.len() as u64) as usize]
+                }
             } else {
                 let top = xs.iter().map(|x| x.abs()).max().unwrap_or(0).max(1);
                 rng.int_in(-2 * top, 2 * top)
@@ -426,15 +493,30 @@ mod tests {
         let small = gaps.iter().filter(|&&g| 0 < g && g <= 64).count();
         let large = gaps.iter().filter(|&&g| g > 1_000).count();
         assert!(zero >= 5 && small >= 5 && large >= 5, "least gaps {gaps:?}");
-        // The threshold is often an exact pair sum, where <= and < differ.
-        let exact = generated(Variant::PairSums)
+        // The threshold is often an exact pair sum, where <= and < differ;
+        // some thresholds are the sum of several pairs, so a count of exact
+        // pairs is tested and not only whether there is one; and in some of
+        // those, two equal elements are an exact pair.
+        let pair_sums_inputs: Vec<(Vec<i64>, i64)> = generated(Variant::PairSums)
             .iter()
-            .filter(|i| {
-                let (xs, t) = (ints_of(&i[0]), int_of(&i[1]));
-                pair_sums(&xs, t) != pair_sums(&xs, t - 1)
-            })
+            .map(|i| (ints_of(&i[0]), int_of(&i[1])))
+            .collect();
+        let exact: Vec<i64> = pair_sums_inputs
+            .iter()
+            .map(|(xs, t)| exact_pairs(xs, *t))
+            .collect();
+        let some = exact.iter().filter(|&&e| e >= 1).count();
+        let several = exact.iter().filter(|&&e| e >= 2).count();
+        let twins = pair_sums_inputs
+            .iter()
+            .zip(&exact)
+            .filter(|((xs, t), &e)| e >= 2 && xs.iter().filter(|&&x| 2 * x == *t).count() >= 2)
             .count();
-        assert!(exact >= 6, "{exact} of 30 thresholds are a pair sum");
+        assert!(
+            some >= 6 && several >= 5 && twins >= 3,
+            "exact pairs per threshold {exact:?}: {some} with one or more, {several} with \
+             two or more, {twins} of those with two equal elements"
+        );
     }
 
     proptest::proptest! {

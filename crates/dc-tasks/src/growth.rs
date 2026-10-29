@@ -88,10 +88,11 @@
 //! sweeps at `σ = 0.01`, about 30 % at `σ = 0.02` and under 1 % at
 //! `σ = 0.05`, and refused the rest as `TooNoisy`.
 //!
-//! With one seed per size the seeds say nothing about the noise. Then, under
-//! the default [`NoiseModel::FromSeeds`], C refuses with
-//! [`ClassVerdict::NoiseUnknown`]: a single noisy seed can sit closer to a
-//! neighbouring class than to its own. A caller whose step counts are exact
+//! One seed at a size says nothing about the noise there. If any size in the
+//! window has one seed, then under the default [`NoiseModel::FromSeeds`] C
+//! refuses with [`ClassVerdict::NoiseUnknown`]: a single noisy seed can sit
+//! closer to a neighbouring class than to its own, and the spread at other
+//! sizes does not bound its noise. A caller whose step counts are exact
 //! says so with [`NoiseModel::Exact`]; one that knows the noise from
 //! elsewhere (for example, one seed of a sweep whose other seeds measured
 //! it) passes [`NoiseModel::Known`].
@@ -104,10 +105,11 @@
 //! proof of asymptotic growth. Over the default sweep `16..1024`, exact
 //! `n^a` is named `n` for `a` from 0.99 to 1.01, `n²` from 1.99 to 2.01 and
 //! `n³` from 2.99 to 3.01, and never `n log n`: the closest, `n^1.135`, has
-//! misfit 0.019 against it, about twice `τ`. These bands are for exact
-//! series. Under seed noise a power near a class is occasionally named that
-//! class: with two to five seeds per size and `σ` from 0.01 to 0.02,
-//! `n^1.135` was named `n log n` in up to 12 of 3000 random sweeps.
+//! misfit 0.019 against it, about twice `τ`. Exact `n · (ln n)^b` is named
+//! `n log n` for `b` from 0.74 to 1.16. These bands are for exact series.
+//! Under seed noise a power near a class is occasionally named that class:
+//! with two to five seeds per size and `σ` from 0.01 to 0.02, `n^1.135` was
+//! named `n log n` in up to 12 of 3000 random sweeps.
 //!
 //! The tolerance is below the noise of programs whose step counts vary much
 //! with their inputs. Insertion sort's seeds vary by about 12 % in steps,
@@ -768,7 +770,7 @@ pub enum ClassVerdict {
     /// the one class within reach is outside the tolerance by no more than
     /// the noise margin.
     TooNoisy,
-    /// Every size in the window has one seed, so the noise is unknown, and
+    /// Some size in the window has one seed, so the noise is unknown, and
     /// the [`NoiseModel`] does not supply it.
     NoiseUnknown,
     /// No class is within the tolerance plus the noise margin: the growth
@@ -821,8 +823,8 @@ impl ClassFit {
 /// How estimator C finds the noise in the median step counts.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NoiseModel {
-    /// From the spread between seeds, at the sizes in the window with at
-    /// least two. If there are none, C refuses with
+    /// From the spread between seeds at the sizes in the window. If some
+    /// size in the window has one seed, C refuses with
     /// [`ClassVerdict::NoiseUnknown`].
     FromSeeds,
     /// The step counts are exact: noise 0. For deterministic programs on
@@ -1080,11 +1082,13 @@ fn min_max(v: &[f64]) -> (f64, f64) {
 
 /// The largest standard error of a median `ln` step count over the completed
 /// sizes from `n_min` up: `√(π/2) · s / √k` for `k ≥ 2` seeds whose `ln`
-/// steps have sample standard deviation `s`. Sizes with one seed say nothing
-/// about the noise and are skipped; `None` if every size has one seed.
-/// The caller has already checked that those sizes completed.
+/// steps have sample standard deviation `s`. `None` if some size has one
+/// seed, which says nothing about its noise: the spread at other sizes
+/// does not bound it. The caller has already checked that those sizes
+/// completed.
 fn seed_noise(sweep: &Sweep, n_min: u64) -> Result<Option<f64>, GrowthError> {
     let mut noise: Option<f64> = None;
+    let mut single_seed = false;
     for o in sweep.observations().iter().filter(|o| o.n >= n_min) {
         let SizeOutcome::Completed { steps } = &o.outcome else {
             continue;
@@ -1093,6 +1097,7 @@ fn seed_noise(sweep: &Sweep, n_min: u64) -> Result<Option<f64>, GrowthError> {
             return Err(GrowthError::ZeroSteps { n: o.n });
         }
         if steps.len() < 2 {
+            single_seed = true;
             continue;
         }
         let ys: Vec<f64> = steps.iter().map(|&s| ln_u64(s)).collect();
@@ -1102,7 +1107,7 @@ fn seed_noise(sweep: &Sweep, n_min: u64) -> Result<Option<f64>, GrowthError> {
         let se = (std::f64::consts::FRAC_PI_2 * var / k).sqrt();
         noise = Some(noise.map_or(se, |m| m.max(se)));
     }
-    Ok(noise)
+    Ok(if single_seed { None } else { noise })
 }
 
 /// The candidate with the smallest RSS; on a tie, the earliest (smallest `γ`,
