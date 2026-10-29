@@ -27,7 +27,8 @@
 //! sees no seed noise. The price is that the sweep meets only the shapes of
 //! that schedule: a redex alone, a rewrite whose result makes a new redex
 //! with the element before it, and two redexes sharing an element. The
-//! examples cover longer chains of rewrites.
+//! examples cover chains of up to four rewrites from one element and
+//! merge results above 4; nothing checks longer chains.
 //!
 //! The oracle simulates the rewriting literally: find the leftmost redex,
 //! splice in its replacement, repeat. This module's tests check it against a
@@ -360,7 +361,7 @@ impl TaskFamily for Collapse {
         let to_int = |xs: &[i64], out: i64| Example::new(vec![list(xs)], Value::Int(out));
         // The absorb examples, with the final list and the number of
         // rewrites.
-        let absorb: [(&[i64], &[i64], i64); 10] = [
+        let absorb: [(&[i64], &[i64], i64); 11] = [
             (&[], &[], 0),
             (&[7], &[7], 0),
             (&[5, 3], &[8], 1),
@@ -372,6 +373,9 @@ impl TaskFamily for Collapse {
             (&[1, 9, 8, 5, 2], &[1, 2, 2], 2),
             (&[8, 8, 7, 2, 5, 0], &[0, 0], 4),
             (&[0, 1, 2, 3, 2, 1, 0], &[0, 1, 2, 3, 2, 1, 0], 0),
+            // A chain of four rewrites from one element: 9, 7 gives 6, which
+            // 8 absorbs, then 6, then 2.
+            (&[2, 6, 8, 9, 7], &[2], 4),
             (&[3, 4, 5, 6, 7, 8, 9, 2, 0, 9, 1, 4, 3], &[3, 4, 5, 9], 9),
         ];
         match self.0 {
@@ -384,6 +388,10 @@ impl TaskFamily for Collapse {
                 to_list(&[2, 1, 1], &[3]),
                 to_list(&[0, 0, 0, 0], &[2]),
                 to_list(&[1, 0, 0, 2], &[3]),
+                // A chain of four merges from the last element, and a result
+                // above 4, which the generated inputs never reach.
+                to_list(&[3, 2, 1, 0, 0], &[4]),
+                to_list(&[3, 3, 3, 3], &[5]),
                 to_list(&[3, 2, 2, 1, 1, 0, 0], &[4, 2, 1]),
                 to_list(&[0, 1, 0, 1, 0, 1], &[0, 1, 0, 1, 0, 1]),
                 to_list(&[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3], &[6, 5]),
