@@ -1253,6 +1253,7 @@ fn c_noise_is_unknown_if_a_size_in_the_window_has_one_seed() {
     let mut obs = seeded_sweep(|n| 1000 * n, 0.15).observations().to_vec();
     obs[6] = SizeObservation::completed(1024, vec![1000 * 1024]);
     let fit = c_seeded(&Sweep::new(obs).expect("valid"));
+    assert_eq!(fit.noise, None, "{fit:?}");
     assert_eq!(fit.verdict, ClassVerdict::NoiseUnknown, "{fit:?}");
 
     // A single seed below the window does not matter.
@@ -1291,7 +1292,7 @@ fn c_noise_comes_only_from_sizes_in_the_window() {
     let z = ClassSelect::default().noise_z;
     let narrow_noise = seeded_noise(|n| 1000 * n, 0.001);
     assert!(
-        fit.noise_margin <= z * narrow_noise + EXACT,
+        (fit.noise_margin - z * narrow_noise).abs() <= EXACT,
         "noise margin {} from seeds outside the window: {fit:?}",
         fit.noise_margin
     );
