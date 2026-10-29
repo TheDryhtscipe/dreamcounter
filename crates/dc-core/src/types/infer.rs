@@ -2000,7 +2000,7 @@ impl TypeChecker {
         kept
     }
 
-    /// A copy of `t` in new nodes, with no links, or `None` if `t` has a
+    /// A copy of `t` in frozen nodes, with no links, or `None` if `t` has a
     /// variable that is not quantified. No unification changes the copy: it has
     /// only quantified variables, which instantiation replaces, and constructor
     /// nodes, which unification never changes. For the same reason a node an
