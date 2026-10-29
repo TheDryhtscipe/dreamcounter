@@ -6,9 +6,12 @@
 //! solutions in dc: a naive one, which sets the fuel plan, and a good one of
 //! a lower growth class.
 //!
+//! * [`collapse`]: rewriting a list at the leftmost redex until none is
+//!   left.
 //! * [`sorted_order`]: queries answered by sorting first.
 //! * [`subsequence_count`]: counting the subsets of positions that keep a
 //!   local rule.
 
+pub mod collapse;
 pub mod sorted_order;
 pub mod subsequence_count;
