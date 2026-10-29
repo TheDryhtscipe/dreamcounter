@@ -528,6 +528,9 @@ pub struct TypeChecker {
     trail: Vec<(Ty, Node)>,
     /// The memo keys added since the oldest checkpoint, in the order added.
     memo_log: Vec<MemoKey>,
+    /// The ranges of nodes made by [`TypeChecker::freeze`], ascending: a node in
+    /// one is a copy that never changes, so a later freeze shares it.
+    frozen: Vec<(Ty, Ty)>,
     /// The keys with a closed scope whose fresh inference failed while uses were
     /// being tried. It fails whatever the state of the store, so their uses are
     /// walked in place at once (see [`TypeChecker::shared_subterm`]).
@@ -876,6 +879,7 @@ impl TypeChecker {
         release_vec(&mut self.checkpoints);
         release_vec(&mut self.trail);
         release_vec(&mut self.memo_log);
+        release_vec(&mut self.frozen);
     }
 
     fn reset(&mut self) {
@@ -908,6 +912,7 @@ impl TypeChecker {
         self.checkpoints.clear();
         self.trail.clear();
         self.memo_log.clear();
+        self.frozen.clear();
         empty_set(&mut self.failed);
     }
 
@@ -1995,19 +2000,27 @@ impl TypeChecker {
         kept
     }
 
-    /// A copy of `t` in new nodes, with no links, or `None` if `t` has a
+    /// A copy of `t` in frozen nodes, with no links, or `None` if `t` has a
     /// variable that is not quantified. No unification changes the copy: it has
     /// only quantified variables, which instantiation replaces, and constructor
-    /// nodes, which unification never changes.
+    /// nodes, which unification never changes. For the same reason a node an
+    /// earlier freeze made is shared, not copied: a kept type over two closed
+    /// shared subterms holds both their frozen copies, and copying those would
+    /// double the store at each level of a DAG of such subterms.
     fn freeze(&mut self, t: Ty) -> Option<Ty> {
         let mut map: FxHashMap<Ty, Ty> = FxHashMap::default();
         let root = self.resolve(t);
+        let start = Ty::try_from(self.nodes.len()).expect("fewer than 2^32 type nodes");
         // As in `instantiate`: `true` to expand, `false` to rebuild.
         let mut stack: Vec<(Ty, bool)> = vec![(root, true)];
         while let Some((r, first)) = stack.pop() {
             count_probes(2);
             if first {
                 if map.contains_key(&r) {
+                    continue;
+                }
+                if self.is_frozen(r) {
+                    map.insert(r, r);
                     continue;
                 }
                 match self.node(r) {
@@ -2057,7 +2070,19 @@ impl TypeChecker {
             }
         }
         count_probes(1);
+        let end = Ty::try_from(self.nodes.len()).expect("fewer than 2^32 type nodes");
+        if end > start {
+            self.frozen.push((start, end));
+        }
         map.get(&root).copied()
+    }
+
+    /// Whether node `t` was made by [`TypeChecker::freeze`]. Charged a unit: a
+    /// binary search over the ranges.
+    fn is_frozen(&mut self, t: Ty) -> bool {
+        self.spent += 1;
+        let i = self.frozen.partition_point(|&(start, _)| start <= t);
+        i > 0 && t < self.frozen[i - 1].1
     }
 
     /// Goes back to the outermost use being tried, after an error, and walks
@@ -2364,13 +2389,18 @@ impl TypeChecker {
                 self.level -= 1;
                 let kept = self.fun(&params, t);
                 self.generalize(kept);
-                let t = self.instantiate(kept);
                 let (id, scope) = key.clone();
                 let kept = if self.checkpoints.is_empty() {
                     kept
                 } else {
                     self.keep_past_checkpoints(&key, kept)
                 };
+                // Instantiated from the kept type as it goes into the memo, so
+                // this use and later reuses get the same closed nodes. If this
+                // use got the type before it was copied by `freeze`, a term
+                // over two uses would hold two distinct copies of one type,
+                // and freezing that would double the store at each level.
+                let t = self.instantiate(kept);
                 // Kept before the scope is applied: a key in the memo is one
                 // whose fresh inference worked, which is how a failed use tells
                 // a failed fresh inference from a binder that does not fit.

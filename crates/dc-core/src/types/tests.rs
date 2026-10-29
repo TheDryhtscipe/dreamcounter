@@ -2344,6 +2344,90 @@ fn shared_subterms_under_open_helpers_agree_with_walking_the_tree() {
     assert!(untyped.get() > 400, "only {} ill typed", untyped.get());
 }
 
+/// `(pair P_n (add true 1))` with `P_0 = 1` and `P_(k+1) = (pair P_k P_k)`: a
+/// well-typed closed DAG, a tree of `2^n` leaves, beside a clash.
+fn closed_pair_dag_beside_a_clash(a: &mut Arena, n: usize) -> TermId {
+    let (pair, add) = (a.prim(Prim::Pair), a.prim(Prim::Add));
+    let (one, tr) = (a.int(1), a.bool(true));
+    let mut p = one;
+    for _ in 0..n {
+        p = a.apps(pair, &[p, p]);
+    }
+    let bad = a.apps(add, &[tr, one]);
+    a.apps(pair, &[p, bad])
+}
+
+/// `(pair P_n (add true 1))` with `P_0 = 1`, `Q_0 = true`, `P_(k+1) = (pair
+/// P_k Q_k)` and `Q_(k+1) = (pair Q_k P_k)`: two closed shared families,
+/// where each level's type holds two distinct kept types.
+fn twisted_pair_dags_beside_a_clash(a: &mut Arena, n: usize) -> TermId {
+    let (pair, add) = (a.prim(Prim::Pair), a.prim(Prim::Add));
+    let (one, tr) = (a.int(1), a.bool(true));
+    let (mut p, mut q) = (one, tr);
+    for _ in 0..n {
+        let next_p = a.apps(pair, &[p, q]);
+        q = a.apps(pair, &[q, p]);
+        p = next_p;
+    }
+    let bad = a.apps(add, &[tr, one]);
+    a.apps(pair, &[p, bad])
+}
+
+/// Infers and checks `build` at depth 8 and at [`CHAIN_DEPTH`]: the second
+/// walk tries each level of the DAG once, never goes back, and costs no more
+/// than the first walk does, within [`locate_cost`].
+fn assert_closed_dag_located(build: impl Fn(&mut Arena, usize) -> TermId) {
+    let n = CHAIN_DEPTH as u64;
+    let limit = 100 * n;
+    let mut a = Arena::new();
+    let small = build(&mut a, 8);
+    let big = build(&mut a, CHAIN_DEPTH);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    // Walked as a tree, the big DAG is `2^N`; the error is at the same leaf
+    // of the small one, since terms are shared in the arena.
+    let want = tree.infer(&a, small, NO_LIBS);
+    let e = want.as_ref().expect_err("`(add true 1)` is ill typed");
+    assert_eq!(e.term_text, "true", "{e}");
+    assert_eq!(e.context, "argument 1 of `add`", "{e}");
+    for t in [small, big] {
+        let mut tc = bounded(limit);
+        assert_eq!(tc.infer(&a, t, NO_LIBS), want);
+        assert_eq!(tc.rollbacks(), 0);
+        assert_eq!(locate_cost(&tc), Ok(()));
+        // Checked against a rigid variable, the DAG clashes as a whole once its
+        // levels are walked; the tree walk of the big one is `2^N`, so only
+        // the small one is compared with it.
+        let expected = sch("(a, Int)");
+        let found = tc.check(&a, t, NO_LIBS, &expected);
+        assert!(found.is_err(), "{expected}");
+        if t == small {
+            assert_eq!(found, tree.check(&a, t, NO_LIBS, &expected));
+        }
+        assert_eq!(tc.rollbacks(), 0);
+        assert_eq!(locate_cost(&tc), Ok(()));
+    }
+}
+
+#[test]
+fn a_well_typed_closed_dag_beside_a_clash_is_located_in_linear_cost() {
+    // Once, the first use of a level got an instance of the unfrozen kept type
+    // and the second use one of its frozen copy, so the level above held two
+    // distinct copies, and freezing that doubled the store at each level:
+    // about 1.4 million units at `n = 16`, against 4 300 for the first walk.
+    assert_closed_dag_located(closed_pair_dag_beside_a_clash);
+}
+
+#[test]
+fn two_closed_families_beside_a_clash_are_located_in_linear_cost() {
+    // Each level's kept type holds two distinct frozen copies, one per
+    // family. Once, `freeze` copied every node it reached, those included, so
+    // the copies doubled at each level: about 1.4 million units at `n = 16`,
+    // against 13 000 for the first walk. A node an earlier freeze made never
+    // changes, so a later freeze shares it.
+    assert_closed_dag_located(twisted_pair_dags_beside_a_clash);
+}
+
 // ---------------------------------------------------------------- check locates errors
 
 #[test]
@@ -2815,6 +2899,8 @@ fn adversarial_shapes(a: &mut Arena) -> Vec<(&'static str, TermId)> {
             "closed scope chain",
             chain_making_helpers_over_mono(a, 2_000, S2_LEAF, "(fst (pair true ($0 1)))"),
         ),
+        ("closed pair dag", closed_pair_dag_beside_a_clash(a, 40)),
+        ("twisted pair dags", twisted_pair_dags_beside_a_clash(a, 40)),
     ]
 }
 
