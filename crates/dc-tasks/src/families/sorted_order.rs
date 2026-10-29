@@ -22,12 +22,12 @@
 //! the two elements are narrow ones (`|x| <= narrow_bound(n)`), chosen so
 //! that at least two pairs sum to `t` and, where the input allows it, two
 //! equal elements are one of those pairs; if no two narrow elements allow
-//! that, and in the other kinds, they are any two elements, and are almost
-//! always the only pair that sums to `t`.
+//! that, and in the other kinds, they are any two elements, and are usually
+//! the only pair that sums to `t`.
 //!
 //! With the default five seeds, the sweep has least gaps of 0, small ones
-//! and large ones, and thresholds that one pair sums to and that several
-//! pairs sum to; a unit test checks this. So a solution that is wrong on
+//! and large ones, and thresholds that at least one pair sums to and that
+//! several pairs sum to; a unit test checks this. So a solution that is wrong on
 //! every input of one of those kinds fails the sweep, and so do two wrong
 //! pair-sums solutions that are right whenever at most one pair sums to `t`
 //! (`tests/sorted_order.rs`). The variants:
@@ -50,6 +50,9 @@
 //! The oracles do not follow the references: inversions are counted with a
 //! Fenwick tree, pair sums by binary search over the sorted list, and the
 //! rest by Rust's sort and a scan.
+
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use dc_core::Scheme;
 use dc_eval::Value;
@@ -201,6 +204,7 @@ fn pair_sums(xs: &[i64], t: i64) -> i64 {
 }
 
 /// The pairs `i < j` with `xs[i] + xs[j] = t`.
+#[cfg(test)]
 fn exact_pairs(xs: &[i64], t: i64) -> i64 {
     pair_sums(xs, t) - pair_sums(xs, t - 1)
 }
@@ -220,7 +224,22 @@ fn tied_thresholds(xs: &[i64], narrow: i64) -> Vec<i64> {
         .collect();
     sums.sort_unstable();
     sums.dedup();
-    sums.retain(|&t| exact_pairs(xs, t) >= 2);
+    let mut counts: BTreeMap<i64, i64> = BTreeMap::new();
+    for &x in xs {
+        *counts.entry(x).or_insert(0) += 1;
+    }
+    // Pairs `i < j` with `xs[i] + xs[j] = t`, as `exact_pairs` counts them.
+    let exact = |t: i64| -> i64 {
+        counts
+            .iter()
+            .map(|(&v, &c)| match (t - v).cmp(&v) {
+                Ordering::Greater => c * counts.get(&(t - v)).copied().unwrap_or(0),
+                Ordering::Equal => c * (c - 1) / 2,
+                Ordering::Less => 0,
+            })
+            .sum()
+    };
+    sums.retain(|&t| exact(t) >= 2);
     let twins = |t: i64| t % 2 == 0 && near.iter().filter(|&&x| 2 * x == t).count() >= 2;
     let with_twins: Vec<i64> = sums.iter().copied().filter(|&t| twins(t)).collect();
     if with_twins.is_empty() {
