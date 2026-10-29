@@ -867,7 +867,13 @@ fn c_refuses_powers_near_a_class() {
 #[test]
 fn c_names_classes_with_a_lower_order_term() {
     for (class, f) in [
-        (GrowthClass::Linear, (|n| 3 * n + 5) as fn(u64) -> u64),
+        // 1000 / ln 2 · (ln n + 2 ln 2): the term is half the main term at
+        // n = 16.
+        (
+            GrowthClass::Log,
+            (|n| 1000 * log2(n) + 2000) as fn(u64) -> u64,
+        ),
+        (GrowthClass::Linear, |n| 3 * n + 5),
         (GrowthClass::NLogN, |n| n * log2(n) + 2 * n),
         // In natural logarithms this is n ln n + 4 ln 2 · n, a lower-order
         // term as large as the main term at n = 16 (ρ = 1).
@@ -1233,14 +1239,68 @@ fn c_names_a_class_only_if_its_true_misfit_is_within_tau_minus_m() {
 }
 
 #[test]
-fn c_noise_ignores_single_seed_sizes_but_not_the_others() {
-    // As in the noisy linear sweep, but n = 1024 has one seed: the other
-    // sizes still show the spread, so C still refuses.
+fn c_noise_is_unknown_if_a_size_in_the_window_has_one_seed() {
+    // Exact n², one seed per size except n = 1024, whose two seeds agree.
+    // Their spread of 0 says nothing about the other sizes' noise, so C
+    // does not treat those single seeds as exact.
+    let mut obs = default_sweep(|n| n * n).observations().to_vec();
+    obs[6] = SizeObservation::completed(1024, vec![1024 * 1024; 2]);
+    let fit = c_seeded(&Sweep::new(obs).expect("valid"));
+    assert_eq!(fit.noise, None, "{fit:?}");
+    assert_eq!(fit.verdict, ClassVerdict::NoiseUnknown, "{fit:?}");
+
+    // As in the noisy linear sweep, but n = 1024 has one seed.
     let mut obs = seeded_sweep(|n| 1000 * n, 0.15).observations().to_vec();
     obs[6] = SizeObservation::completed(1024, vec![1000 * 1024]);
     let fit = c_seeded(&Sweep::new(obs).expect("valid"));
-    assert!(fit.noise.expect("other sizes have seeds") > 0.0);
-    assert_eq!(fit.verdict, ClassVerdict::TooNoisy, "{fit:?}");
+    assert_eq!(fit.verdict, ClassVerdict::NoiseUnknown, "{fit:?}");
+
+    // A single seed below the window does not matter.
+    let mut obs = seeded_sweep(|n| 1000 * n, 0.001).observations().to_vec();
+    obs[0] = SizeObservation::completed(16, vec![1000 * 16]);
+    let upper = ClassSelect {
+        window: Window::UpperHalf,
+        ..ClassSelect::default()
+    };
+    let fit = upper.fit(&Sweep::new(obs).expect("valid")).expect("fits");
+    assert!(fit.noise.is_some(), "{fit:?}");
+    assert_eq!(
+        fit.verdict,
+        ClassVerdict::Class(GrowthClass::Linear),
+        "{fit:?}"
+    );
+}
+
+#[test]
+fn c_noise_comes_only_from_sizes_in_the_window() {
+    // Over the upper half, 128..1024, the seeds are 0.1 % apart; below it
+    // they are 15 % apart. Only the window's seeds set the noise.
+    let wide = seeded_sweep(|n| 1000 * n, 0.15);
+    let narrow = seeded_sweep(|n| 1000 * n, 0.001);
+    let obs: Vec<SizeObservation> = wide.observations()[..3]
+        .iter()
+        .chain(&narrow.observations()[3..])
+        .cloned()
+        .collect();
+    let upper = ClassSelect {
+        window: Window::UpperHalf,
+        ..ClassSelect::default()
+    };
+    let fit = upper.fit(&Sweep::new(obs).expect("valid")).expect("fits");
+    assert_eq!(fit.window.n_min, 128);
+    let z = ClassSelect::default().noise_z;
+    let narrow_noise = seeded_noise(|n| 1000 * n, 0.001);
+    assert!(
+        fit.noise_margin <= z * narrow_noise + EXACT,
+        "noise margin {} from seeds outside the window: {fit:?}",
+        fit.noise_margin
+    );
+    assert!(fit.noise_margin < fit.tolerance, "{fit:?}");
+    assert_eq!(
+        fit.verdict,
+        ClassVerdict::Class(GrowthClass::Linear),
+        "{fit:?}"
+    );
 }
 
 #[test]
