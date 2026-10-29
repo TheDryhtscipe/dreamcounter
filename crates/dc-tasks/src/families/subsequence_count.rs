@@ -525,7 +525,8 @@ mod tests {
         }
     }
 
-    /// The oracle on 40 elements, where every count exceeds the modulus,
+    /// The oracle on 100 elements, where every count exceeds both the
+    /// modulus and `i64` unless it is reduced at every step,
     /// against counts worked out apart from it: every subset is allowed for
     /// sum mod 7 on zeros, close steps on equal values and sign changes on
     /// positive values; no three in a row allows the bit strings with no
@@ -534,7 +535,7 @@ mod tests {
     fn counts_past_the_modulus() {
         // Written out, not `MODULUS`, so a wrong constant fails here.
         let p = 1_000_003_u128;
-        let n = 40;
+        let n = 100;
         let all = (1_u128 << n) % p;
         let mut no_three = [1_u128, 2, 4];
         for _ in 3..=n {

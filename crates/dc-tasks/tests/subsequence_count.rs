@@ -3,8 +3,8 @@
 //! reference; the quadratic and good references pass the examples and the
 //! oracle on every generated input; estimator C names `n²` for the
 //! quadratic reference and `n` for the good one, on the medians and on each
-//! seed alone; and the naive (`2ⁿ`) reference times out on the sweep from
-//! 32 on.
+//! seed alone; and the naive (`2ⁿ`) reference times out under the plan at
+//! 32 and 64.
 //!
 //! The naive reference cannot be fitted on the family's sweep, so it is
 //! checked on a short sweep of its own, where C must name `2ⁿ`. Its timeouts
@@ -103,7 +103,13 @@ fn check_variant(v: Variant) {
     check_examples(&family, &arena, naive, &c).expect("the naive reference passes the examples");
     check_generated(&family, &arena, naive, &[8, 16], &c)
         .expect("the naive reference is correct at 8 and 16");
-    for size in &plan.sizes()[2..4] {
+    let cut_sizes: Vec<_> = plan
+        .sizes()
+        .iter()
+        .filter(|s| s.n == 32 || s.n == 64)
+        .collect();
+    assert_eq!(cut_sizes.len(), 2, "the sweep has 32 and 64");
+    for size in cut_sizes {
         let cut = HarnessConfig {
             seeds: 1,
             max_fuel: size.fuel,
