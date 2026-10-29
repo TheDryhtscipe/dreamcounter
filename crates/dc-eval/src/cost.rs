@@ -79,13 +79,14 @@
 //!   their own node.
 //! - **Timeout steps.** The machine stops with `Timeout(s)` at the first charge that
 //!   takes the count `s` above the fuel. So `s > fuel`, and `s = fuel + 1` when that
-//!   charge is a single step. A program that finishes in `s` steps finishes at every
-//!   fuel `≥ s` with the same outcome (spec §7, invariant 3). An `eq` that would
+//!   charge is a single step; a count above `u64::MAX` is reported as `u64::MAX`.
+//!   A program that finishes in `s` steps finishes at every fuel `≥ s` with the same outcome (spec §7, invariant 3). An `eq` that would
 //!   compare more node pairs than the fuel left stops counting one pair above it,
 //!   so it times out with `s = fuel + 1`: sharing can make a value exponentially
 //!   larger than the steps that built it, and the full count is not computed. A
-//!   `memorec` key larger than the fuel left is sized without being built, so its
-//!   timeout count is exact.
+//!   `memorec` key is sized and stored with each distinct subvalue once, so a key
+//!   larger than the fuel left times out with an exact count, and a key within it
+//!   is charged its full size without being built as a tree.
 //! - **Applying a program to inputs.** [`crate::apply`] evaluates the program term
 //!   (free for a `lam`) and applies it to each input in turn. Each application of a
 //!   closure is one β step; a primitive program is charged as a primitive.
