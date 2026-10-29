@@ -32,8 +32,9 @@
 //! for zigzag, zeros and runs of one sign for sign changes.
 //!
 //! The oracle is a Rust dynamic programme over (position, state), with the
-//! counts of each state in a `BTreeMap`; a brute force over all subsets
-//! checks it in this module's tests.
+//! counts of each state in a `BTreeMap` (for sum mod 7, an array over the
+//! seven residues); a brute force over all subsets checks it in this
+//! module's tests.
 
 use std::collections::BTreeMap;
 
@@ -199,6 +200,7 @@ enum Zig {
 }
 
 fn oracle_count(v: Variant, xs: &[i64], m: i64) -> i64 {
+    debug_assert!(m >= 0, "the bound m is at least 0");
     match v {
         Variant::SumMod7 => {
             // The counts of every residue, then the one of residue 0.
@@ -382,6 +384,8 @@ impl TaskFamily for SubsequenceCount {
                 two(&[1, -1, 1, -1], 2, 15),
                 two(&[3, -2, 0, -1, 2, 0, -3, 1], 3, 244),
                 two(&[1, -1, 1, -1, 1, -1], 10, 64),
+                two(&[1, -1, 1, -1, 1, -1, 1, -1], 5, 253),
+                two(&[1, -1, 1, -1, 1, -1, 1, -1], 6, 255),
                 two(&long, 2, 1_852),
             ],
         }
@@ -518,6 +522,33 @@ mod tests {
                     assert_eq!(e.output, Value::Int(brute(v, &xs, m)), "{v:?} on {xs:?}");
                 }
             }
+        }
+    }
+
+    /// The oracle on 40 elements, where every count exceeds the modulus,
+    /// against counts worked out apart from it: every subset is allowed for
+    /// sum mod 7 on zeros, close steps on equal values and sign changes on
+    /// positive values; no three in a row allows the bit strings with no
+    /// three ones in a row.
+    #[test]
+    fn counts_past_the_modulus() {
+        // Written out, not `MODULUS`, so a wrong constant fails here.
+        let p = 1_000_003_u128;
+        let n = 40;
+        let all = (1_u128 << n) % p;
+        let mut no_three = [1_u128, 2, 4];
+        for _ in 3..=n {
+            no_three = [no_three[1], no_three[2], no_three.iter().sum()];
+        }
+        let no_three = no_three[2] % p;
+        for (v, x, expected) in [
+            (Variant::SumMod7, 0, all),
+            (Variant::CloseSteps, 5, all),
+            (Variant::SignChanges, 2, all),
+            (Variant::NoThreeInARow, 1, no_three),
+        ] {
+            let xs = vec![x; n];
+            assert_eq!(oracle_count(v, &xs, 0) as u128, expected, "{v:?}");
         }
     }
 

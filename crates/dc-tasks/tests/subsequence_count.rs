@@ -7,7 +7,10 @@
 //! 32 on.
 //!
 //! The naive reference cannot be fitted on the family's sweep, so it is
-//! checked on a short sweep of its own, where C must name `2ⁿ`.
+//! checked on a short sweep of its own, where C must name `2ⁿ`. Its timeouts
+//! are checked at 32 and 64 only, one seed each, with the plan's fuel there:
+//! a timeout burns all of that fuel, and from 128 on the fuel is at most the
+//! global cap, far below `2¹²⁸` steps.
 
 mod common;
 
@@ -15,9 +18,10 @@ use common::{check_class, compile, list_len};
 use dc_core::{Arena, Scheme};
 use dc_eval::Value;
 use dc_tasks::families::subsequence_count::{self, SubsequenceCount, Variant};
-use dc_tasks::growth::{GrowthClass, LogLogSlope, SizeOutcome};
+use dc_tasks::growth::GrowthClass;
 use dc_tasks::harness::{
-    check_input_sizes, measure, validate_family, FuelPlan, HarnessConfig, Measurement,
+    check_examples, check_generated, check_input_sizes, validate_family, CheckFailure, FuelPlan,
+    HarnessConfig, RunFailure,
 };
 use dc_tasks::rng::TaskRng;
 use dc_tasks::task::{Example, Inputs, TaskFamily};
@@ -92,26 +96,32 @@ fn check_variant(v: Variant) {
     );
     assert!(good, "C does not name n for {}", v.good());
 
-    // The naive reference passes the examples and gives no wrong answer, and
-    // the plan cuts it off from 32 on at the latest (2^32 subsets).
+    // The naive reference passes the examples and the oracle at the sizes it
+    // finishes, and the plan cuts it off at 32 and 64 (2^32 and 2^64
+    // subsets).
     let naive = compile(&mut arena, src, v.naive());
-    match measure(&family, &arena, naive, &plan, &LogLogSlope::default(), &c)
-        .expect("the sweep runs")
-    {
-        Measurement::Measured { report, .. } => {
-            for o in report.sweep.observations() {
-                if o.n >= 32 {
-                    assert!(
-                        matches!(o.outcome, SizeOutcome::TimedOut),
-                        "{} at {}: {:?}",
-                        v.naive(),
-                        o.n,
-                        o.outcome
-                    );
-                }
-            }
-        }
-        other => panic!("{}: {other:?}", v.naive()),
+    check_examples(&family, &arena, naive, &c).expect("the naive reference passes the examples");
+    check_generated(&family, &arena, naive, &[8, 16], &c)
+        .expect("the naive reference is correct at 8 and 16");
+    for size in &plan.sizes()[2..4] {
+        let cut = HarnessConfig {
+            seeds: 1,
+            max_fuel: size.fuel,
+            ..HarnessConfig::default()
+        };
+        let got = check_generated(&family, &arena, naive, &[size.n], &cut);
+        assert!(
+            matches!(
+                got,
+                Err(CheckFailure::Generated {
+                    failure: RunFailure::Timeout { .. },
+                    ..
+                })
+            ),
+            "{} at {}: {got:?}",
+            v.naive(),
+            size.n
+        );
     }
 
     let short = Short(family);
