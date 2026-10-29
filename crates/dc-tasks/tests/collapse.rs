@@ -240,7 +240,7 @@ fn check_capped(v: Variant, examples_largest: u64, sweep_largest: u64) {
 
 #[test]
 fn capped_merge_is_rejected() {
-    check_capped(Variant::Merge, 8, 5);
+    check_capped(Variant::Merge, 11, 5);
 }
 
 #[test]

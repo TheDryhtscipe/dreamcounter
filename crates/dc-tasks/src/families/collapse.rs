@@ -34,9 +34,11 @@
 //! chain of `k` merges needs at least `2^(k - 3) + 3` elements, as each
 //! element is worth at most `2^3` and a merge keeps the sum of `2^x`, and
 //! 11 is what a cycle has room for. So a merge solution capped at 6 or
-//! more passes the sweep. The examples add merge chains of 7, 8 and 9 and
-//! merge results above 4, so a cap of 9, 10 or 11 is the only one they and
-//! the sweep miss that some input of at most 1024 elements catches.
+//! more passes the sweep. The examples add merge chains of 7 to 12 and
+//! merge results above 4, so they reject every cap below 12; a chain of 13
+//! needs 1027 elements, so a cap of 12 or more is right on every input of at
+//! most 1024 elements. `tests/collapse.rs` pins these limits, so a change to
+//! the cascades or the examples has to update it.
 //!
 //! The oracle simulates the rewriting literally: find the leftmost redex,
 //! splice in its replacement, repeat. This module's tests check it against a
@@ -483,6 +485,9 @@ impl TaskFamily for Collapse {
                 to_list(&[1, 1], &[2]),
                 // Leftmost first: the rightmost pair first would give [1, 2].
                 to_list(&[1, 1, 1], &[2, 1]),
+                // The first merge's 2 merges with the next 2 before the second
+                // pair does: passes over disjoint pairs would give [2, 3].
+                to_list(&[1, 1, 2, 2], &[3, 2]),
                 to_list(&[2, 1, 1], &[3]),
                 to_list(&[0, 0, 0, 0], &[2]),
                 to_list(&[1, 0, 0, 2], &[3]),
@@ -495,7 +500,7 @@ impl TaskFamily for Collapse {
                 to_list(&[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3], &[6, 5]),
                 // Chains of six and seven merges from the last element, onto
                 // 5, 4, 3, 2, 1, 0 and 6, 5, 4, 3, 2, 1, 0 built of threes,
-                // and of eight and nine, in 35 and 67 elements, longer than
+                // and of eight to twelve, in 35 to 515 elements, longer than
                 // the generated inputs make.
                 to_list(&[1, 3, 3, 3, 3, 3, 3, 3, 2, 1, 0, 0], &[1, 6]),
                 to_list(
@@ -504,6 +509,9 @@ impl TaskFamily for Collapse {
                 ),
                 to_list(&merge_cascade(8), &[8]),
                 to_list(&merge_cascade(9), &[9]),
+                to_list(&merge_cascade(10), &[10]),
+                to_list(&merge_cascade(11), &[11]),
+                to_list(&merge_cascade(12), &[12]),
             ],
             Variant::Cancel => vec![
                 to_list(&[], &[]),
