@@ -30,3 +30,12 @@ all = { level = "warn", priority = -1 }
 
 [profile.release]
 debug = 1
+
+# `cargo test` (not `--release`) builds every crate, dependencies included,
+# at opt-level 1 with debug assertions and overflow checks on. The evaluator
+# sweeps in the tests run about four times faster than unoptimised. Stack-depth
+# tests now run with optimised frames.
+[profile.test]
+opt-level = 1
+debug-assertions = true
+overflow-checks = true
