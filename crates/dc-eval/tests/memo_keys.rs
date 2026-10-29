@@ -99,7 +99,10 @@ fn shape() -> impl Strategy<Value = Shape> {
             };
             shapes.push(s);
         }
-        shapes.into_iter().max_by_key(Shape::nodes).unwrap_or(Shape::Unit)
+        shapes
+            .into_iter()
+            .max_by_key(Shape::nodes)
+            .unwrap_or(Shape::Unit)
     })
 }
 
@@ -211,4 +214,3 @@ fn a_value_holding_a_non_key_part_is_not_a_key_small_or_large() {
     }
     assert!(MemoKey::from_value(&large).is_none());
 }
-
