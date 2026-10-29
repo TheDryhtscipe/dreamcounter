@@ -26,9 +26,19 @@
 //! so the references' step counts do not depend on the seed and estimator C
 //! sees no seed noise. The price is that the sweep meets only the shapes of
 //! that schedule: a redex alone, a rewrite whose result makes a new redex
-//! with the element before it, and two redexes sharing an element. The
-//! examples cover chains of up to four rewrites from one element and
-//! merge results above 4; nothing checks longer chains.
+//! with the element before it, two redexes sharing an element, and, except
+//! for cancel, a cascade: a long chain of rewrites from one element. A
+//! solution that stops after `k` rewrites per element pushed is right on
+//! every input without a longer chain. The absorb cascade is a chain of 8,
+//! the longest any absorb input has. The merge cascade is a chain of 6: a
+//! chain of `k` merges needs at least `2^(k - 3) + 3` elements, as each
+//! element is worth at most `2^3` and a merge keeps the sum of `2^x`, and
+//! 11 is what a cycle has room for. So a merge solution capped at 6 or
+//! more passes the sweep. The examples add merge chains of 7 to 12 and
+//! merge results above 4, so they reject every cap below 12; a chain of 13
+//! needs 1027 elements, so a cap of 12 or more is right on every input of at
+//! most 1024 elements. `tests/collapse.rs` pins these limits, so a change to
+//! the cascades or the examples has to update it.
 //!
 //! The oracle simulates the rewriting literally: find the leftmost redex,
 //! splice in its replacement, repeat. This module's tests check it against a
@@ -41,6 +51,7 @@ use std::collections::HashMap;
 use dc_core::Scheme;
 use dc_eval::Value;
 
+use crate::growth::DEFAULT_SIZES;
 use crate::rng::TaskRng;
 use crate::task::{Example, Inputs, TaskFamily};
 
@@ -113,6 +124,12 @@ impl Variant {
         }
     }
 }
+
+/// The sweep of every variant but cancel. It starts at 32 because the
+/// generator's cycle of units with a cascade is 16 elements: at 16 the
+/// second half would hold only part of one, and the references' step
+/// counts there would not follow the `n²` and `n` of the larger sizes.
+pub const CASCADE_SIZES: &[u64] = &[32, 64, 128, 256, 512, 1024];
 
 /// One variant of the collapse family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +211,14 @@ enum Unit {
     /// absorb, two, the second where its result absorbs `z`, because no
     /// absorb unit with one rewrite leaves a top of 8 or 9 in place.
     Overlap,
+    /// A long chain of rewrites from the last element. Merge: the 11
+    /// elements `3, 3, 3, 3, 3, 3, 3, 2, 1, 0, 0`, which build `5, 4, 3, 2,
+    /// 1, 0` and merge the last 0 six times into 6, ten rewrites in all.
+    /// Absorb: `9, 9, 9, 9, 9, 9, 9, 7` on a top `t` of 2 or more: the 7 is
+    /// absorbed down the nines into 6, 5, ..., 0, and `t` absorbs the 0
+    /// into `t` again, a chain of eight rewrites, the longest any absorb
+    /// input has. Not for cancel, whose rewrites leave nothing to chain.
+    Cascade,
 }
 
 impl Unit {
@@ -203,6 +228,8 @@ impl Unit {
             (Unit::Pair, _) => 2,
             (Unit::Nested, Variant::Cancel) => 4,
             (Unit::Nested | Unit::Overlap, _) => 3,
+            (Unit::Cascade, Variant::Merge) => 11,
+            (Unit::Cascade, _) => 8,
         }
     }
 
@@ -210,6 +237,8 @@ impl Unit {
     /// holding only `t`.
     fn rewrites(self, v: Variant) -> &'static [usize] {
         match (self, v) {
+            (Unit::Cascade, Variant::Merge) => &[1, 2, 1, 2, 6, 5, 4, 3, 2, 1],
+            (Unit::Cascade, _) => &[7, 6, 5, 4, 3, 2, 1, 0],
             (Unit::Overlap, Variant::Absorb | Variant::AbsorbCount) => &[1, 1],
             (Unit::Pair | Unit::Overlap, _) => &[1],
             (Unit::Nested, _) => &[2, 1],
@@ -218,19 +247,24 @@ impl Unit {
 
     /// Every unit of this kind on top `t`, with elements from `values`.
     fn options(self, v: Variant, t: i64, values: &[i64]) -> Vec<Vec<i64>> {
-        let mut all: Vec<Vec<i64>> = vec![Vec::new()];
-        for _ in 0..self.len(v) {
-            all = all
-                .into_iter()
-                .flat_map(|u| {
-                    values.iter().map(move |&x| {
-                        let mut u = u.clone();
-                        u.push(x);
-                        u
+        // A cascade is a stack holding no redex and an element absorbed
+        // down it: the merge stack is built of threes, and there are too
+        // many absorb inputs of 8 elements to try each.
+        let all: Vec<Vec<i64>> = match (self, v) {
+            (Unit::Cascade, Variant::Merge) => vec![merge_cascade(6)],
+            (Unit::Cascade, _) => chain_units(v, self.len(v) - 1, values),
+            _ => (0..self.len(v)).fold(vec![Vec::new()], |all, _| {
+                all.into_iter()
+                    .flat_map(|u| {
+                        values.iter().map(move |&x| {
+                            let mut u = u.clone();
+                            u.push(x);
+                            u
+                        })
                     })
-                })
-                .collect();
-        }
+                    .collect()
+            }),
+        };
         all.into_iter()
             .filter(|u| {
                 let (stack, at) = fold(v, &[t], u);
@@ -243,14 +277,21 @@ impl Unit {
 }
 
 impl Variant {
-    /// The units of the second half of a generated input, in turn. Each
-    /// cycle is 8 elements, so it fits a power of two from 16 on exactly.
-    /// Cancel has no overlap unit: its answer does not depend on the order
-    /// of the rewrites, as the cancelled pairs nest like brackets.
+    /// The units of the second half of a generated input, in turn. A cycle
+    /// is 8 elements for cancel and 16 for the others, so it fits every
+    /// size of [`Collapse::sizes`] exactly. Cancel has no overlap unit: its
+    /// answer does not depend on the order of the rewrites, as the
+    /// cancelled pairs nest like brackets. Merge has no nested unit: its
+    /// cascade leaves room for only two units of 2 and 3 elements, and its
+    /// chains already start from results that make a new redex with the
+    /// element before them.
     fn cycle(self) -> &'static [Unit] {
         match self {
             Variant::Cancel => &[Unit::Pair, Unit::Nested, Unit::Pair],
-            _ => &[Unit::Pair, Unit::Nested, Unit::Overlap],
+            Variant::Merge => &[Unit::Pair, Unit::Overlap, Unit::Cascade],
+            Variant::Absorb | Variant::AbsorbCount => {
+                &[Unit::Cascade, Unit::Pair, Unit::Nested, Unit::Overlap]
+            }
         }
     }
 }
@@ -301,6 +342,60 @@ fn unit_table(v: Variant) -> HashMap<(usize, i64), Vec<Vec<i64>>> {
         }
     }
 }
+
+/// The elements whose merges leave the single element `x` on a stack whose
+/// top is no element of them: `x` itself up to 3, and twice the elements
+/// for `x - 1` above.
+fn merge_build(x: i64) -> Vec<i64> {
+    if x <= 3 {
+        vec![x]
+    } else {
+        let half = merge_build(x - 1);
+        [half.clone(), half].concat()
+    }
+}
+
+/// The elements that build the stack `k - 1, ..., 1, 0` (top last) and a 0
+/// that merges `k` times into `k`: `2^(k - 3) + 3` elements from `k = 3`
+/// on.
+fn merge_cascade(k: i64) -> Vec<i64> {
+    (0..k).rev().flat_map(merge_build).chain([0]).collect()
+}
+
+/// The inputs of `m + 1` elements whose last element makes a chain of `m`
+/// rewrites down the `m` before it, which hold no redex. Each element is
+/// from `values`.
+fn chain_units(v: Variant, m: usize, values: &[i64]) -> Vec<Vec<i64>> {
+    // The stack from the top down, the last result and the trigger.
+    fn grow(
+        v: Variant,
+        m: usize,
+        values: &[i64],
+        down: &mut Vec<i64>,
+        r: i64,
+        c: i64,
+        out: &mut Vec<Vec<i64>>,
+    ) {
+        if down.len() == m {
+            out.push(down.iter().rev().copied().chain([c]).collect());
+            return;
+        }
+        for &t in values {
+            let below_last = down.last().is_none_or(|&p| v.rewrite(t, p).is_none());
+            if let (Some(&[r2]), true) = (v.rewrite(t, r).as_deref(), below_last) {
+                down.push(t);
+                grow(v, m, values, down, r2, c, out);
+                down.pop();
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for &c in values {
+        grow(v, m, values, &mut Vec::new(), c, c, &mut out);
+    }
+    out
+}
+
 impl TaskFamily for Collapse {
     fn name(&self) -> &str {
         match self.0 {
@@ -361,7 +456,7 @@ impl TaskFamily for Collapse {
         let to_int = |xs: &[i64], out: i64| Example::new(vec![list(xs)], Value::Int(out));
         // The absorb examples, with the final list and the number of
         // rewrites.
-        let absorb: [(&[i64], &[i64], i64); 11] = [
+        let absorb: [(&[i64], &[i64], i64); 13] = [
             (&[], &[], 0),
             (&[7], &[7], 0),
             (&[5, 3], &[8], 1),
@@ -377,6 +472,11 @@ impl TaskFamily for Collapse {
             // 8 absorbs, then 6, then 2.
             (&[2, 6, 8, 9, 7], &[2], 4),
             (&[3, 4, 5, 6, 7, 8, 9, 2, 0, 9, 1, 4, 3], &[3, 4, 5, 9], 9),
+            // Chains of seven and of eight, the longest there is: the 6 is
+            // absorbed down the nines into 5, 4, 3, 2, 1, 0, and the 4
+            // absorbs the 0; the 7 into 6, ..., 0, and the 3 absorbs the 0.
+            (&[4, 9, 9, 9, 9, 9, 9, 6, 8], &[4, 8], 7),
+            (&[1, 3, 9, 9, 9, 9, 9, 9, 9, 7, 5], &[1, 3, 5], 8),
         ];
         match self.0 {
             Variant::Merge => vec![
@@ -385,16 +485,33 @@ impl TaskFamily for Collapse {
                 to_list(&[1, 1], &[2]),
                 // Leftmost first: the rightmost pair first would give [1, 2].
                 to_list(&[1, 1, 1], &[2, 1]),
+                // The first merge's 2 merges with the next 2 before the second
+                // pair does: passes over disjoint pairs would give [2, 3].
+                to_list(&[1, 1, 2, 2], &[3, 2]),
                 to_list(&[2, 1, 1], &[3]),
                 to_list(&[0, 0, 0, 0], &[2]),
                 to_list(&[1, 0, 0, 2], &[3]),
-                // A chain of four merges from the last element, and a result
-                // above 4, which the generated inputs never reach.
+                // A chain of four merges from the last element, and results
+                // above 4.
                 to_list(&[3, 2, 1, 0, 0], &[4]),
                 to_list(&[3, 3, 3, 3], &[5]),
                 to_list(&[3, 2, 2, 1, 1, 0, 0], &[4, 2, 1]),
                 to_list(&[0, 1, 0, 1, 0, 1], &[0, 1, 0, 1, 0, 1]),
                 to_list(&[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3], &[6, 5]),
+                // Chains of six and seven merges from the last element, onto
+                // 5, 4, 3, 2, 1, 0 and 6, 5, 4, 3, 2, 1, 0 built of threes,
+                // and of eight to twelve, in 35 to 515 elements, longer than
+                // the generated inputs make.
+                to_list(&[1, 3, 3, 3, 3, 3, 3, 3, 2, 1, 0, 0], &[1, 6]),
+                to_list(
+                    &[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 1, 0, 0, 2],
+                    &[7, 2],
+                ),
+                to_list(&merge_cascade(8), &[8]),
+                to_list(&merge_cascade(9), &[9]),
+                to_list(&merge_cascade(10), &[10]),
+                to_list(&merge_cascade(11), &[11]),
+                to_list(&merge_cascade(12), &[12]),
             ],
             Variant::Cancel => vec![
                 to_list(&[], &[]),
@@ -417,12 +534,14 @@ impl TaskFamily for Collapse {
     /// every seed, so that the references' step counts do not depend on the
     /// seed; only the values do. The first `n / 2` elements have no redex,
     /// so the stack of the rewriting holds all of them. The rest are the
-    /// units of a fixed cycle in turn (pair, nested, overlap; for cancel,
-    /// pair, nested, pair), each rewritten on top of the
-    /// stack without reaching below it, so every rewrite is at a depth of
-    /// at least `n / 2`. Elements too few for the next unit have no redex.
-    /// Each element or unit is drawn uniformly from those in
-    /// [`Variant::value_range`] that keep the schedule going.
+    /// units of a fixed cycle in turn (for absorb, cascade, pair, nested,
+    /// overlap; for merge, pair, overlap, cascade; for cancel, pair,
+    /// nested, pair), each rewritten on top of the stack without reaching
+    /// below it (the absorb cascade rewrites the top itself, into its own
+    /// value), so every rewrite is at a depth of at least `n / 2`. Elements
+    /// too few for the next unit have no redex. Each element or unit is
+    /// drawn uniformly from those in [`Variant::value_range`] that keep the
+    /// schedule going.
     fn generate(&self, n: u64, rng: &mut TaskRng) -> Inputs {
         let v = self.0;
         let (lo, hi) = v.value_range();
@@ -465,6 +584,14 @@ impl TaskFamily for Collapse {
         match self.0 {
             Variant::AbsorbCount => Value::Int(rewrites),
             _ => list(&out),
+        }
+    }
+
+    /// [`CASCADE_SIZES`], and for cancel the default sweep.
+    fn sizes(&self) -> Vec<u64> {
+        match self.0 {
+            Variant::Cancel => DEFAULT_SIZES.to_vec(),
+            _ => CASCADE_SIZES.to_vec(),
         }
     }
 }
@@ -542,15 +669,15 @@ mod tests {
 
     /// Every seed's input makes the same rewrites at the same depths, so
     /// the references' step counts do not depend on the seed: at every size
-    /// of the sweep, and at an odd size, each variant's inputs for seeds
-    /// `0..5` make the same number of rewrites, at least `n / 5`, and the
-    /// positions of the redexes the oracle's scan finds sum to the same
-    /// total, at least `n² / 20` from 64 on. The inputs still differ.
+    /// of the variant's sweep, and at an odd size, each variant's inputs
+    /// for seeds `0..5` make the same number of rewrites, at least `n / 5`,
+    /// and the positions of the redexes the oracle's scan finds sum to the
+    /// same total, at least `n² / 20` from 64 on. The inputs still differ.
     #[test]
     fn generated_inputs_keep_one_schedule() {
         for v in Variant::ALL {
             let f = Collapse(v);
-            for n in [16_u64, 32, 64, 128, 256, 512, 1024, 101] {
+            for n in f.sizes().into_iter().chain([101]) {
                 let mut schedules = Vec::new();
                 let mut inputs = Vec::new();
                 for seed in 0..5 {
@@ -581,6 +708,34 @@ mod tests {
                     "{v:?} at {n}"
                 );
             }
+        }
+    }
+
+    /// No absorb chain is longer than 8, and the cascade units end in a
+    /// chain of 6 merges and of 8 absorbs, and are in the unit table.
+    #[test]
+    fn cascades_end_in_long_chains() {
+        let values: Vec<i64> = (0..=9).collect();
+        assert!(!chain_units(Variant::Absorb, 8, &values).is_empty());
+        assert!(chain_units(Variant::Absorb, 9, &values).is_empty());
+        for (v, chain) in [
+            (Variant::Merge, 6),
+            (Variant::Absorb, 8),
+            (Variant::AbsorbCount, 8),
+        ] {
+            // The last rewrites, each one below the one before, are one
+            // chain.
+            let at = Unit::Cascade.rewrites(v);
+            let last = at.windows(2).rev().take_while(|w| w[0] == w[1] + 1).count() + 1;
+            assert_eq!(last, chain, "{v:?}: {at:?}");
+            let i = v.cycle().iter().position(|&u| u == Unit::Cascade);
+            let table = unit_table(v);
+            let tops: Vec<i64> = table
+                .iter()
+                .filter(|(&(j, _), o)| Some(j) == i && !o.is_empty())
+                .map(|(&(_, t), _)| t)
+                .collect();
+            assert!(!tops.is_empty(), "{v:?}: no cascade on any top");
         }
     }
 
