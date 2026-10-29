@@ -214,3 +214,27 @@ fn a_value_holding_a_non_key_part_is_not_a_key_small_or_large() {
     }
     assert!(MemoKey::from_value(&large).is_none());
 }
+
+#[test]
+fn a_pair_and_its_swap_inside_one_key_are_different_parts() {
+    // With A and B distinct doubling keys and P = (A, B), the key (P, (B, A))
+    // must differ from (P, P), small or large: in the shared form, (B, A) must
+    // not be taken for the node of (A, B).
+    let doubling = |n: u32, base: i64| {
+        let mut v = Value::Int(base);
+        for _ in 0..n {
+            v = Value::Pair(Rc::new((v.clone(), v)));
+        }
+        v
+    };
+    for n in [1u32, 2, 3, 4, 5] {
+        let (a, b) = (doubling(n, 0), doubling(n, 1));
+        let p = Value::Pair(Rc::new((a.clone(), b.clone())));
+        let swapped = Value::Pair(Rc::new((p.clone(), Value::Pair(Rc::new((b, a))))));
+        let same = Value::Pair(Rc::new((p.clone(), p)));
+        let ks = MemoKey::from_value(&swapped).expect("valid key");
+        let kp = MemoKey::from_value(&same).expect("valid key");
+        assert_eq!(ks.size(), (1u64 << (n + 3)) - 1);
+        assert_ne!(ks, kp, "n = {n}");
+    }
+}
