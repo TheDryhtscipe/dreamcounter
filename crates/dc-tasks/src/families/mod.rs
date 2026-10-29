@@ -7,5 +7,8 @@
 //! a lower growth class.
 //!
 //! * [`sorted_order`]: queries answered by sorting first.
+//! * [`subsequence_count`]: counting the subsets of positions that keep a
+//!   local rule.
 
 pub mod sorted_order;
+pub mod subsequence_count;
