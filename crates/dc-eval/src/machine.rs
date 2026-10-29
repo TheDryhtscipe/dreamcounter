@@ -880,18 +880,20 @@ mod tests {
     }
 
     #[test]
-    fn a_huge_shared_memo_key_runs_under_unlimited_fuel() {
-        // 2^41 - 1 nodes from 40 distinct pairs.
+    fn a_large_shared_memo_key_runs_under_unlimited_fuel() {
+        // 2^25 - 1 nodes from 24 distinct pairs. Kept this small so that if keys
+        // were built as trees again, the test would use about 0.5 GB, not all
+        // memory; the test above catches that regression directly.
         let mut arena = Arena::new();
-        let k = "(loop 40 0 (lam (lam (pair $0 $0))))";
+        let k = "(loop 24 0 (lam (lam (pair $0 $0))))";
         let p = format!("(memorec 2 (lam (lam 7)) {k})");
         let (o, _) = run_machine(&mut arena, &p, UNLIMITED);
         assert!(
-            matches!(o, Outcome::Value(Value::Int(7), s) if s == 160 + (1u64 << 41) + 2),
+            matches!(o, Outcome::Value(Value::Int(7), s) if s == 96 + (1u64 << 25) + 2),
             "{o}"
         );
-        // F returns `self`. Two misses are allowed (5, then the first huge key),
-        // so the second huge key, built separately and equal but not
+        // F returns `self`. Two misses are allowed (5, then the first large key),
+        // so the second large key, built separately and equal but not
         // pointer-equal, must be a hit: a miss would raise FuelExhausted.
         let q = format!("(let (memorec 2 (lam (lam $1)) 5) (let ($0 {k}) ($1 {k})))");
         let (o, _) = run_machine(&mut arena, &q, UNLIMITED);
