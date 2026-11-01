@@ -5,3 +5,6 @@ surreal.db
 
 # Search indexes
 index/
+
+# SQLite store
+doca.sqlite*

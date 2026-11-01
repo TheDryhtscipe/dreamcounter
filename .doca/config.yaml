@@ -15,3 +15,4 @@ verbose: false
 surreal-url: surrealkv:///home/thedryhtscipe/dev/dreamcounter/.doca/surreal.db
 surreal-ns: doca
 surreal-db: docs
+store-backend: sqlite
