@@ -1,0 +1,6 @@
+{
+  "env": {
+    "CONTEXT_WARN_TOKENS": "300000",
+    "CONTEXT_HANDOFF_TOKENS": "400000"
+  }
+}
