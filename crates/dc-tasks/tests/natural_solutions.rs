@@ -15,10 +15,11 @@
 //! check that natural solutions across the families still get their class.
 //!
 //! Insertion sort and the plain quadratic close-steps solution are the
-//! exceptions (see their tests). Insertion sort is the one the growth module
-//! documents: its cost
-//! varies with each input's order by about `0.7 / √n`, so C may refuse it,
-//! but must not name a class other than `n²`.
+//! exceptions on the medians, and these two, pair sums and the quadratic
+//! zigzag solution on a seed alone (see their tests). Insertion sort is the
+//! one the growth module documents: its cost varies with each input's order
+//! by about `0.7 / √n`, so C may refuse it, but must not name a class other
+//! than `n²`.
 
 #[allow(dead_code)]
 mod common;

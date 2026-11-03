@@ -43,8 +43,8 @@ fn check_variant(v: Variant) {
         SeedsRefused::None,
     );
     assert!(naive_named, "C does not name n^2 for {}", v.naive());
-    // Refusing is allowed, but C names n log n for every good reference
-    // today; a refusal would be a change worth seeing. On a seed alone, C
+    // C names n log n on the medians for every good reference. On a seed
+    // alone, C
     // finds the good inversions reference too noisy on one seed (seed 3 in
     // November 2026, noise margin 0.035) and names n log n on the others.
     let good_refused = if v == Variant::Inversions {

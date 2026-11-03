@@ -3,7 +3,8 @@
 //! reference; the quadratic and good references pass the examples and the
 //! oracle on every generated input; estimator C names `n²` for the
 //! quadratic reference and `n` for the good one, on the medians and on each
-//! seed alone; and the naive (`2ⁿ`) reference times out under the plan at
+//! seed alone, except that it refuses the sign-changes quadratic reference
+//! (see [`check_variant`]); and the naive (`2ⁿ`) reference times out under the plan at
 //! 32 and 64.
 //!
 //! The naive reference cannot be fitted on the family's sweep, so it is

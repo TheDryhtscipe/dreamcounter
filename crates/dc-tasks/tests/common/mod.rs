@@ -129,9 +129,11 @@ pub fn named(fit: &ClassFit, expected: GrowthClass, what: &str) -> Result<bool, 
 pub enum SeedsRefused {
     /// C names the class on every seed.
     None,
-    /// C refuses at most this many seeds and names the class on the rest.
+    /// C finds at most this many seeds `TooNoisy` and names the class on
+    /// the rest. Any other refusal fails.
     AtMost(usize),
-    /// C may refuse every seed, as when it refuses the medians too.
+    /// C may refuse every seed, for any reason, as when it refuses the
+    /// medians too.
     Any,
 }
 
@@ -172,10 +174,12 @@ pub fn check_class<F: TaskFamily>(
         ..ClassSelect::default()
     };
     let mut refusals = Vec::new();
+    let mut too_noisy_only = true;
     for (seed, s) in per_seed(&sweep).iter().enumerate() {
         let f = one.fit(s).expect("C fits one seed");
         let what = format!("{entry} seed {seed}");
         if !named(&f, expected, &what).unwrap_or_else(|e| panic!("{e}")) {
+            too_noisy_only &= f.verdict == ClassVerdict::TooNoisy;
             refusals.push(format!(
                 "{seed}: {:?} noise_margin {:.4}",
                 f.verdict, f.noise_margin
@@ -184,12 +188,12 @@ pub fn check_class<F: TaskFamily>(
     }
     println!("SEEDS {entry}: C refuses {refusals:?}");
     let allowed = match refused {
-        SeedsRefused::None => 0,
-        SeedsRefused::AtMost(k) => k,
-        SeedsRefused::Any => usize::MAX,
+        SeedsRefused::None => refusals.is_empty(),
+        SeedsRefused::AtMost(k) => refusals.len() <= k && too_noisy_only,
+        SeedsRefused::Any => true,
     };
     assert!(
-        refusals.len() <= allowed,
+        allowed,
         "{entry}: C refuses {} seeds alone, {refused:?} allowed: {refusals:?}",
         refusals.len()
     );
