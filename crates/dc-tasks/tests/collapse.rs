@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{check_class, compile, list_len};
+use common::{check_class, compile, list_len, SeedsRefused};
 use dc_core::{Arena, TermId};
 use dc_eval::Value;
 use dc_tasks::families::collapse::{self, Collapse, Variant};
@@ -41,6 +41,7 @@ fn check_variant(v: Variant) {
         &plan,
         v.naive(),
         GrowthClass::Quadratic,
+        SeedsRefused::None,
     );
     assert!(naive_named, "C does not name n^2 for {}", v.naive());
     let good_named = check_class(
@@ -50,6 +51,7 @@ fn check_variant(v: Variant) {
         &plan,
         v.good(),
         GrowthClass::Linear,
+        SeedsRefused::None,
     );
     assert!(good_named, "C does not name n for {}", v.good());
 }

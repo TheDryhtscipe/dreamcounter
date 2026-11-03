@@ -2,7 +2,8 @@
 //! the ordinary way, with plain `if`s whose branches cost different amounts,
 //! unlike the references, which are written so that their steps depend on
 //! `n` alone. Estimator C must name their class on the medians, as for the
-//! references, and never name another class on a seed alone (see
+//! references, and on every seed alone, unless a test allows C to refuse
+//! some seeds as too noisy. C never names another class (see
 //! [`check_class`]).
 //!
 //! Two tests guard bead dreamcounter-0ea5b7, where C used to refuse these
@@ -14,15 +15,16 @@
 //! check that natural solutions across the families still get their class.
 //!
 //! Insertion sort and the plain quadratic close-steps solution are the
-//! exceptions (see their tests). Insertion sort is the one the growth module
-//! documents: its cost
-//! varies with each input's order by about `0.7 / √n`, so C may refuse it,
-//! but must not name a class other than `n²`.
+//! exceptions on the medians, and these two, pair sums and the quadratic
+//! zigzag solution on a seed alone (see their tests). Insertion sort is the
+//! one the growth module documents: its cost varies with each input's order
+//! by about `0.7 / √n`, so C may refuse it, but must not name a class other
+//! than `n²`.
 
 #[allow(dead_code)]
 mod common;
 
-use common::{check_class, compile, single_seed_noise};
+use common::{check_class, compile, single_seed_noise, SeedsRefused};
 use dc_core::Arena;
 use dc_tasks::families::collapse::{self, Collapse};
 use dc_tasks::families::sorted_order::{self, SortedOrder};
@@ -152,31 +154,46 @@ let cancel_natural xs =
 
 /// Whether C names `expected` on the medians of `entry`, measured under
 /// the plan made from `plan_entry`. Panics if C names another class on the
-/// medians or on a seed alone.
+/// medians or on a seed alone, or refuses more seeds alone than `refused`
+/// allows.
 fn named<F: TaskFamily>(
     family: &F,
     source: &str,
     plan_entry: &str,
     entry: &str,
     expected: GrowthClass,
+    refused: SeedsRefused,
 ) -> bool {
     let c = HarnessConfig::default();
     let mut arena = Arena::new();
     let reference = compile(&mut arena, source, plan_entry);
     let plan =
         FuelPlan::from_reference(family, &arena, reference, &c).expect("the reference is correct");
-    check_class(family, &mut arena, source, &plan, entry, expected)
+    check_class(family, &mut arena, source, &plan, entry, expected, refused)
 }
 
-fn sorted_order_named(v: sorted_order::Variant, entry: &str, expected: GrowthClass) -> bool {
+fn sorted_order_named(
+    v: sorted_order::Variant,
+    entry: &str,
+    expected: GrowthClass,
+    refused: SeedsRefused,
+) -> bool {
     let source = format!("{}\n{SORTED_ORDER}", sorted_order::SOURCE);
-    named(&SortedOrder(v), &source, v.naive(), entry, expected)
+    named(
+        &SortedOrder(v),
+        &source,
+        v.naive(),
+        entry,
+        expected,
+        refused,
+    )
 }
 
 fn subsequence_count_named(
     v: subsequence_count::Variant,
     entry: &str,
     expected: GrowthClass,
+    refused: SeedsRefused,
 ) -> bool {
     let source = format!("{}\n{SUBSEQUENCE_COUNT}", subsequence_count::SOURCE);
     named(
@@ -185,12 +202,18 @@ fn subsequence_count_named(
         v.quadratic(),
         entry,
         expected,
+        refused,
     )
 }
 
-fn collapse_named(v: collapse::Variant, entry: &str, expected: GrowthClass) -> bool {
+fn collapse_named(
+    v: collapse::Variant,
+    entry: &str,
+    expected: GrowthClass,
+    refused: SeedsRefused,
+) -> bool {
     let source = format!("{}\n{COLLAPSE}", collapse::SOURCE);
-    named(&Collapse(v), &source, v.naive(), entry, expected)
+    named(&Collapse(v), &source, v.naive(), entry, expected, refused)
 }
 
 #[test]
@@ -199,17 +222,21 @@ fn sorted_order_inversions() {
     assert!(sorted_order_named(
         Inversions,
         "inversions_natural",
-        GrowthClass::Quadratic
+        GrowthClass::Quadratic,
+        SeedsRefused::None,
     ));
 }
 
+/// On a seed alone, C finds two seeds too noisy (seeds 0 and 3 in November
+/// 2026, noise margin 0.055) and names `n²` on the other three.
 #[test]
 fn sorted_order_pair_sums() {
     use sorted_order::Variant::PairSums;
     assert!(sorted_order_named(
         PairSums,
         "pair_sums_natural",
-        GrowthClass::Quadratic
+        GrowthClass::Quadratic,
+        SeedsRefused::AtMost(2),
     ));
 }
 
@@ -219,7 +246,8 @@ fn sorted_order_distinct() {
     assert!(sorted_order_named(
         Distinct,
         "distinct_natural",
-        GrowthClass::NLogN
+        GrowthClass::NLogN,
+        SeedsRefused::None,
     ));
 }
 
@@ -229,11 +257,14 @@ fn sorted_order_min_gap() {
     assert!(sorted_order_named(
         MinGap,
         "min_gap_natural",
-        GrowthClass::NLogN
+        GrowthClass::NLogN,
+        SeedsRefused::None,
     ));
 }
 
-/// Refusing insertion sort is allowed; naming another class is not.
+/// Refusing insertion sort is allowed, on the medians and on every seed
+/// alone; naming another class is not. In November 2026 C refused every
+/// seed alone as too noisy (noise margin 0.31).
 #[test]
 fn sorted_order_lower_median_by_insertion_sort() {
     use sorted_order::Variant::LowerMedian;
@@ -241,6 +272,7 @@ fn sorted_order_lower_median_by_insertion_sort() {
         LowerMedian,
         "lower_median_insertion",
         GrowthClass::Quadratic,
+        SeedsRefused::Any,
     );
     println!("lower_median_insertion named n^2: {named}");
 }
@@ -249,7 +281,9 @@ fn sorted_order_lower_median_by_insertion_sort() {
 /// how many earlier values are within 2 of each, which varies most at the
 /// smallest size, 8: in November 2026 its `n²` misfit was 0.0112 with
 /// seed-centred medians (0.045 before), just above the tolerance, and drawing
-/// each seed's offset once rather than at each size left it at 0.0112.
+/// each seed's offset once rather than at each size left it at 0.0112. On a
+/// seed alone, C then found three seeds too noisy (seeds 2, 3 and 4, noise
+/// margin 0.059) and named `n²` on the other two.
 #[test]
 fn subsequence_count_close_steps_quadratic() {
     use subsequence_count::Variant::CloseSteps;
@@ -257,17 +291,21 @@ fn subsequence_count_close_steps_quadratic() {
         CloseSteps,
         "close_steps_quadratic_natural",
         GrowthClass::Quadratic,
+        SeedsRefused::AtMost(3),
     );
     println!("close_steps_quadratic_natural named n^2: {named}");
 }
 
+/// On a seed alone, C finds two seeds too noisy (seeds 1 and 2 in November
+/// 2026, noise margin 0.20) and names `n²` on the other three.
 #[test]
 fn subsequence_count_zigzag_quadratic() {
     use subsequence_count::Variant::Zigzag;
     assert!(subsequence_count_named(
         Zigzag,
         "zigzag_quadratic_natural",
-        GrowthClass::Quadratic
+        GrowthClass::Quadratic,
+        SeedsRefused::AtMost(2),
     ));
 }
 
@@ -277,14 +315,20 @@ fn subsequence_count_zigzag() {
     assert!(subsequence_count_named(
         Zigzag,
         "zigzag_natural",
-        GrowthClass::Linear
+        GrowthClass::Linear,
+        SeedsRefused::None,
     ));
 }
 
 #[test]
 fn collapse_merge() {
     use collapse::Variant::Merge;
-    assert!(collapse_named(Merge, "merge_natural", GrowthClass::Linear));
+    assert!(collapse_named(
+        Merge,
+        "merge_natural",
+        GrowthClass::Linear,
+        SeedsRefused::None,
+    ));
 }
 
 #[test]
@@ -293,7 +337,8 @@ fn collapse_cancel() {
     assert!(collapse_named(
         Cancel,
         "cancel_natural",
-        GrowthClass::Linear
+        GrowthClass::Linear,
+        SeedsRefused::None,
     ));
 }
 

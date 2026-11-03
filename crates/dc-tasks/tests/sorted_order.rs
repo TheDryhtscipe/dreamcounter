@@ -2,15 +2,17 @@
 //! variant is a valid family, its fuel plan is made from the naive
 //! reference, both references pass the examples and the oracle on every
 //! generated input, and estimator C puts the naive reference in `n²` and the
-//! good one in `n log n`, or refuses; it never names another class.
+//! good one in `n log n`; it never names another class.
 //!
 //! C is checked on the medians over seeds and on each seed alone, as in
 //! `reference_growth.rs`: a seed alone is fitted with the noise of one
-//! seed's `ln` step count, measured on the full sweep.
+//! seed's `ln` step count, measured on the full sweep. C names the class on
+//! every seed alone, except one seed of the good inversions reference (see
+//! [`check_variant`]).
 
 mod common;
 
-use common::{check_class, compile, list_len};
+use common::{check_class, compile, list_len, SeedsRefused};
 use dc_core::Arena;
 use dc_tasks::families::sorted_order::{self, SortedOrder, Variant};
 use dc_tasks::growth::GrowthClass;
@@ -38,10 +40,18 @@ fn check_variant(v: Variant) {
         &plan,
         v.naive(),
         GrowthClass::Quadratic,
+        SeedsRefused::None,
     );
     assert!(naive_named, "C does not name n^2 for {}", v.naive());
-    // Refusing is allowed, but C names n log n for every good reference
-    // today; a refusal would be a change worth seeing.
+    // C names n log n on the medians for every good reference. On a seed
+    // alone, C
+    // finds the good inversions reference too noisy on one seed (seed 3 in
+    // November 2026, noise margin 0.035) and names n log n on the others.
+    let good_refused = if v == Variant::Inversions {
+        SeedsRefused::AtMost(1)
+    } else {
+        SeedsRefused::None
+    };
     let good_named = check_class(
         &family,
         &mut arena,
@@ -49,6 +59,7 @@ fn check_variant(v: Variant) {
         &plan,
         v.good(),
         GrowthClass::NLogN,
+        good_refused,
     );
     assert!(good_named, "C does not name n log n for {}", v.good());
 }
