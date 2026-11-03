@@ -94,8 +94,12 @@
 //! fits the median of the centred `ln` steps `ln steps − b_j` at each size,
 //! by the same lower-median rule. The noise uses their sample variance at
 //! each size times `N / (N − 1)`. The factor makes up for estimating the
-//! levels from the same counts, so independent noise gives the same
-//! estimate on average as without centring. Seeds whose offsets change from
+//! levels from the same counts, so each size's variance is unbiased for
+//! independent noise. The noise C uses is the largest square root over the
+//! sizes, and centring makes the sizes' variances vary less, so with few
+//! seeds the centred noise runs a little below the per-size one: about 0.98
+//! of it at two seeds and 0.99 at five, over the seven default sizes, and
+//! close to 1 at forty. Seeds whose offsets change from
 //! size to size still spread after centring, and C still refuses them. C
 //! centres only if every size in the window has at least two seeds;
 //! [`ClassFit::seed_centred`] says whether it did. Step counts in any order
@@ -116,6 +120,11 @@
 //! says so with [`NoiseModel::Exact`]; one that knows the noise from
 //! elsewhere (for example, one seed of a sweep whose other seeds measured
 //! it) passes [`NoiseModel::Known`].
+//!
+//! Centring depends on the sweep, not on the noise model. A sweep in seed
+//! order with at least two seeds at every size in the window is fitted on
+//! its centred medians under [`NoiseModel::Exact`] and
+//! [`NoiseModel::Known`] too; the model sets only the noise margin.
 //!
 //! # What a verdict means
 //!
@@ -930,10 +939,14 @@ pub enum NoiseModel {
     /// comment).
     FromSeeds,
     /// The step counts are exact: noise 0. For deterministic programs on
-    /// fixed inputs, and for closed-form series.
+    /// fixed inputs, and for closed-form series. A sweep in seed order with
+    /// at least two seeds at every size in the window is still fitted on
+    /// its centred medians.
     Exact,
     /// The standard error of each median `ln` step count is at most this;
-    /// finite and `≥ 0`.
+    /// finite and `≥ 0`. As with [`NoiseModel::Exact`], a sweep in seed
+    /// order with at least two seeds at every size in the window is fitted
+    /// on its centred medians, and this is taken as their standard error.
     Known(f64),
 }
 

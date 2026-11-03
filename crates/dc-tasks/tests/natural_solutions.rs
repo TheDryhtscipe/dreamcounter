@@ -5,6 +5,14 @@
 //! references, and never name another class on a seed alone (see
 //! [`check_class`]).
 //!
+//! Two tests guard bead dreamcounter-0ea5b7, where C used to refuse these
+//! solutions: `sorted_order_pair_sums` and
+//! `subsequence_count_zigzag_quadratic`. The first fails without either half
+//! of that change: generators that keep a seed's kind and threshold at every
+//! size, and C taking out each seed's level. The second fails without the
+//! generators. The other tests were named before that change too; they
+//! check that natural solutions across the families still get their class.
+//!
 //! Insertion sort and the plain quadratic close-steps solution are the
 //! exceptions (see their tests). Insertion sort is the one the growth module
 //! documents: its cost
@@ -240,7 +248,8 @@ fn sorted_order_lower_median_by_insertion_sort() {
 /// Refusing is allowed; naming another class is not. Its cost depends on
 /// how many earlier values are within 2 of each, which varies most at the
 /// smallest size, 8: in November 2026 its `n²` misfit was 0.0112 with
-/// seed-centred medians (0.045 before), just above the tolerance.
+/// seed-centred medians (0.045 before), just above the tolerance, and drawing
+/// each seed's offset once rather than at each size left it at 0.0112.
 #[test]
 fn subsequence_count_close_steps_quadratic() {
     use subsequence_count::Variant::CloseSteps;

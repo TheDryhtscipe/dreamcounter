@@ -1846,3 +1846,57 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn c_centred_noise_is_slightly_low_at_five_seeds() {
+    // With few seeds the centred estimate runs 1-2 % below the per-size one,
+    // although each size's variance is unbiased: C takes the largest square
+    // root over the sizes, and centring makes the sizes' variances vary less,
+    // so their largest is smaller. At the default five seeds and seven sizes
+    // the ratio is about 0.99. Without the N / (N − 1) factor it would be
+    // about 0.92; without centring, exactly 1. 3000 sweeps with σ = 0.02,
+    // from a fixed seed, so the test is deterministic.
+    let mut normals = Normals(0x5EED);
+    let (mut centred, mut per_size) = (0.0, 0.0);
+    let seeds = 5;
+    for _ in 0..3000 {
+        let draws: Vec<f64> = (0..DEFAULT_SIZES.len() * seeds)
+            .map(|_| 0.02 * normals.next())
+            .collect();
+        let obs = seed_rows(|n| 1000.0 * n as f64, seeds, |i, j| draws[i * seeds + j]);
+        let raw = c_seeded(&any_order(obs.clone()));
+        let fit = c_seeded(&seed_order(obs));
+        assert!(fit.seed_centred && !raw.seed_centred);
+        centred += fit.noise.expect("seeds");
+        per_size += raw.noise.expect("seeds");
+    }
+    let ratio = centred / per_size;
+    assert!(
+        (0.98..0.998).contains(&ratio),
+        "centred / per-size noise {ratio}"
+    );
+}
+
+#[test]
+fn c_centres_a_sweep_in_seed_order_under_every_noise_model() {
+    // Centring depends on the sweep, not on the noise model: under Exact and
+    // Known a sweep in seed order is fitted on the same centred medians as
+    // under FromSeeds, and step counts in any order on the raw ones.
+    let mut normals = Normals(0xC3);
+    let seeds = 5;
+    let draws: Vec<f64> = (0..DEFAULT_SIZES.len() * seeds)
+        .map(|_| 0.05 * normals.next())
+        .collect();
+    let obs = seed_rows(|n| 1000.0 * n as f64, seeds, |i, j| draws[i * seeds + j]);
+    let misfits = |fit: &ClassFit| fit.candidates.map(|c| c.misfit);
+    let from_seeds = c_seeded(&seed_order(obs.clone()));
+    assert!(from_seeds.seed_centred, "{from_seeds:?}");
+    for model in [NoiseModel::Exact, NoiseModel::Known(0.003)] {
+        let c = c_with(model);
+        let centred = c.fit(&seed_order(obs.clone())).expect("C fits");
+        let raw = c.fit(&any_order(obs.clone())).expect("C fits");
+        assert!(centred.seed_centred && !raw.seed_centred, "{model:?}");
+        assert_eq!(misfits(&centred), misfits(&from_seeds), "{model:?}");
+        assert_ne!(misfits(&centred), misfits(&raw), "{model:?}");
+    }
+}

@@ -21,10 +21,11 @@
 //!
 //! The threshold of [`Variant::PairSums`] is chosen per seed in the same
 //! way, so that a natural solution's cost, which depends on the answer, does
-//! not jump between sizes. Seed `k` has an exact threshold if `(k / 3) mod 2`
-//! is 0 (seeds 0 to 2 of the default five), and a random one otherwise; and
-//! a quantile `q` in `[0, 1)`, drawn from [`TaskRng::seed_stream`]. Both are
-//! the same at every size.
+//! not jump between sizes. Seed `k` takes the plan `k mod 6` in
+//! `PAIR_SUMS_PLANS`: whether the threshold is exact or random, and where
+//! along the range it falls: at the bottom, at the top, or at a quantile `q`
+//! in `[0, 1)` drawn from [`TaskRng::seed_stream`]. The plan is the same at
+//! every size. Over seeds 0 to 5 every kind gets both modes.
 //!
 //! - An exact threshold is the sum of two elements, so some pair sums to
 //!   exactly `t`. In a tied input it is taken from the sums of two narrow
@@ -32,16 +33,23 @@
 //!   preferring those to which two equal elements sum (see
 //!   `tied_thresholds`). If there are none, and in the other kinds, it is
 //!   taken from the sorted sums of all pairs `i < j`. Either way it is the
-//!   sum at the fraction `q` of the way along the sorted list.
-//! - A random threshold is the value at the fraction `q` of the way along
-//!   `-2 top..=2 top`, where `top` is the largest magnitude of an element.
+//!   first, the last, or the sum at the fraction `q` of the way along the
+//!   sorted list. The last of all pair sums is the largest, so every pair
+//!   counts.
+//! - A random threshold is `-2 top`, `2 top`, or the value at the fraction
+//!   `q` of the way along `-2 top..=2 top`, where `top` is the largest
+//!   magnitude of an element. At `-2 top` in a wide input no pair counts, as
+//!   its elements are distinct.
 //!
 //! So seed 0, a tied input with an exact threshold, gives a threshold that
-//! several pairs sum to at every size where the input allows it.
+//! several pairs sum to at every size where the input allows it; seed 1, a
+//! spread input, the largest pair sum, so every pair counts; and seed 2, a
+//! wide input, `-2 top`, so none does.
 //!
 //! With the default five seeds, the sweep has least gaps of 0, small ones
-//! and large ones, and thresholds that at least one pair sums to and that
-//! several pairs sum to; a unit test checks this. So a solution that is wrong on
+//! and large ones; thresholds that at least one pair sums to and that
+//! several pairs sum to; and answers of 0 and of every pair. Unit tests
+//! check this. So a solution that is wrong on
 //! every input of one of those kinds fails the sweep, and so do two wrong
 //! pair-sums solutions that are right whenever at most one pair sums to `t`
 //! (`tests/sorted_order.rs`). The variants:
@@ -294,11 +302,70 @@ fn kind_of(seed: u64) -> u64 {
     seed % 3
 }
 
-/// Whether seed `seed`'s pair-sums threshold is a pair sum ("exact") at
-/// every size, rather than drawn from a range: seeds 0 to 2 yes, 3 to 5 no,
-/// and so on.
-fn exact_mode(seed: u64) -> bool {
-    (seed / 3) % 2 == 0
+/// Where along its range a pair-sums threshold falls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// The first value: the least pair sum, or `-2 top`.
+    Bottom,
+    /// The last value: the largest pair sum, or `2 top`.
+    Top,
+    /// The value at the seed's quantile, drawn from
+    /// [`TaskRng::seed_stream`].
+    Drawn,
+}
+
+/// A seed's pair-sums threshold: whether it is a pair sum ("exact") or
+/// drawn from `-2 top..=2 top`, and where along that range it falls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PairSumsPlan {
+    exact: bool,
+    place: Place,
+}
+
+/// The pair-sums plan of seed `k` is entry `k mod 6`. The mode does not
+/// follow the kind (`k mod 3`): over seeds 0 to 5 every kind gets both. The
+/// default five seeds have an exact threshold several pairs sum to (seed 0,
+/// tied), every pair counting (seed 1, spread, the largest pair sum), and no
+/// pair counting (seed 2, wide, `-2 top`).
+const PAIR_SUMS_PLANS: [PairSumsPlan; 6] = [
+    PairSumsPlan {
+        exact: true,
+        place: Place::Drawn,
+    },
+    PairSumsPlan {
+        exact: true,
+        place: Place::Top,
+    },
+    PairSumsPlan {
+        exact: false,
+        place: Place::Bottom,
+    },
+    PairSumsPlan {
+        exact: false,
+        place: Place::Drawn,
+    },
+    PairSumsPlan {
+        exact: false,
+        place: Place::Drawn,
+    },
+    PairSumsPlan {
+        exact: true,
+        place: Place::Drawn,
+    },
+];
+
+fn pair_sums_plan(seed: u64) -> PairSumsPlan {
+    PAIR_SUMS_PLANS[(seed % 6) as usize]
+}
+
+/// The index `place` picks in a list of `len > 0`: the first, the last, or
+/// the fraction `q / 2⁶⁴` of the way along.
+fn index_at(place: Place, q: u64, len: u64) -> u64 {
+    match place {
+        Place::Bottom => 0,
+        Place::Top => len - 1,
+        Place::Drawn => scale(q, len),
+    }
 }
 
 /// `floor(q / 2⁶⁴ · len)`: the index the fraction `q / 2⁶⁴` of the way
@@ -430,9 +497,10 @@ impl TaskFamily for SortedOrder {
         };
         let mut inputs = vec![list(&xs)];
         if self.0 == Variant::PairSums {
+            let plan = pair_sums_plan(rng.seed());
             // The seed's quantile: a fraction `q / 2⁶⁴` of the way along.
             let q = rng.seed_stream().next_u64();
-            let t = if xs.len() >= 2 && exact_mode(rng.seed()) {
+            let t = if xs.len() >= 2 && plan.exact {
                 let tied = if kind == 0 {
                     tied_thresholds(&xs, narrow)
                 } else {
@@ -445,13 +513,13 @@ impl TaskFamily for SortedOrder {
                             .flat_map(|(i, &a)| xs[i + 1..].iter().map(move |&b| a + b))
                             .collect(),
                     );
-                    sums[scale(q, sums.len() as u64) as usize]
+                    sums[index_at(plan.place, q, sums.len() as u64) as usize]
                 } else {
-                    tied[scale(q, tied.len() as u64) as usize]
+                    tied[index_at(plan.place, q, tied.len() as u64) as usize]
                 }
             } else {
                 let top = xs.iter().map(|x| x.abs()).max().unwrap_or(0).max(1);
-                -2 * top + scale(q, 4 * top as u64 + 1) as i64
+                -2 * top + index_at(plan.place, q, 4 * top as u64 + 1) as i64
             };
             inputs.push(Value::Int(t));
         }
@@ -584,6 +652,7 @@ mod tests {
         // size to the next (bead dreamcounter-0ea5b7).
         let f = SortedOrder(Variant::PairSums);
         let mut kinds_seen = Vec::new();
+        let mut modes_seen = Vec::new();
         for seed in 0..6 {
             let at = |n: u64| {
                 let i = f.generate(n, &mut TaskRng::new(n, seed));
@@ -599,7 +668,9 @@ mod tests {
                 "seed {seed}: kinds {kinds:?} over the sizes"
             );
             kinds_seen.push(kinds[0]);
-            if (seed / 3) % 2 == 0 {
+            let plan = pair_sums_plan(seed);
+            modes_seen.push((kinds[0], plan.exact));
+            if plan.exact {
                 // Exact: some pair sums to t at every size.
                 for n in f.sizes() {
                     let (xs, t) = at(n);
@@ -624,6 +695,41 @@ mod tests {
             }
         }
         assert_eq!(kinds_seen[..3], [0, 1, 2], "the first three seeds");
+        // The mode does not follow the kind: each kind gets both.
+        modes_seen.sort();
+        assert_eq!(
+            modes_seen,
+            [
+                (0, false),
+                (0, true),
+                (1, false),
+                (1, true),
+                (2, false),
+                (2, true)
+            ],
+            "(kind, exact) over seeds 0 to 5"
+        );
+    }
+
+    #[test]
+    fn default_seeds_give_pair_sums_answers_of_none_and_all() {
+        // A solution can be wrong only when no pair counts, or only when
+        // every pair does. Seed 2 (wide, -2 top) has answer 0 and seed 1
+        // (spread, the largest pair sum) every pair, at every size.
+        let f = SortedOrder(Variant::PairSums);
+        for n in f.sizes() {
+            let answer = |seed: u64| {
+                let i = f.generate(n, &mut TaskRng::new(n, seed));
+                pair_sums(&ints_of(&i[0]), int_of(&i[1]))
+            };
+            let all = (n * (n - 1) / 2) as i64;
+            assert_eq!(answer(2), 0, "n = {n}");
+            assert_eq!(answer(1), all, "n = {n}");
+            for seed in [0, 3, 4] {
+                let a = answer(seed);
+                assert!(0 < a && a < all, "seed {seed}, n = {n}: {a} of {all}");
+            }
+        }
     }
 
     proptest::proptest! {
