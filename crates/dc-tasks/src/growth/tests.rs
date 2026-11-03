@@ -1304,6 +1304,203 @@ fn c_noise_comes_only_from_sizes_in_the_window() {
     );
 }
 
+// ------------------------------------------------- C on sweeps in seed order
+
+/// Five seeds' `ln` offsets from the base: up to about 35 % either way, as
+/// far apart as the seeds of `seeded_sweep(_, 0.15)`.
+const SEED_LEVELS: [f64; 5] = [-0.3, -0.15, 0.0, 0.15, 0.3];
+
+/// Observations over the default sweep with `seeds` seeds per size: seed
+/// `j` at the `i`-th size has `ln` steps `ln base(n) + offset(i, j)`, and
+/// the counts are listed in seed order.
+fn seed_rows(
+    base: impl Fn(u64) -> f64,
+    seeds: usize,
+    offset: impl Fn(usize, usize) -> f64,
+) -> Vec<SizeObservation> {
+    DEFAULT_SIZES
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            let steps = (0..seeds)
+                .map(|j| (base(n).ln() + offset(i, j)).exp().round() as u64)
+                .collect();
+            SizeObservation::completed(n, steps)
+        })
+        .collect()
+}
+
+/// Each seed a constant `ln` offset from `base`, the same at every size.
+fn parallel_rows(base: impl Fn(u64) -> f64, scale: f64) -> Vec<SizeObservation> {
+    seed_rows(base, SEED_LEVELS.len(), |_, j| scale * SEED_LEVELS[j])
+}
+
+fn seed_order(obs: Vec<SizeObservation>) -> Sweep {
+    Sweep::in_seed_order(obs).expect("valid sweep in seed order")
+}
+
+fn any_order(obs: Vec<SizeObservation>) -> Sweep {
+    Sweep::new(obs).expect("valid sweep")
+}
+
+#[test]
+fn c_takes_out_each_seeds_level_in_seed_order() {
+    // Seeds 15 % or more apart, but each seed's offset is the same at every size:
+    // a difference in level, not in the shape of growth.
+    let linear = |n: u64| 1000.0 * n as f64;
+    let raw = c_seeded(&any_order(parallel_rows(linear, 1.0)));
+    assert!(!raw.seed_centred, "{raw:?}");
+    assert_eq!(raw.verdict, ClassVerdict::TooNoisy, "{raw:?}");
+
+    let fit = c_seeded(&seed_order(parallel_rows(linear, 1.0)));
+    assert!(fit.seed_centred, "{fit:?}");
+    // Only the rounding of the step counts to integers is left.
+    let noise = fit.noise.expect("five seeds");
+    assert!(noise < 1e-4, "{fit:?}");
+    assert!(
+        fit.candidates[GrowthClass::Linear as usize].misfit < 1e-4,
+        "{fit:?}"
+    );
+    assert_eq!(
+        fit.verdict,
+        ClassVerdict::Class(GrowthClass::Linear),
+        "{fit:?}"
+    );
+}
+
+#[test]
+fn c_centring_keeps_noise_in_the_shape() {
+    // Seed j is SEED_LEVELS[j] above the base at even sizes and as far below
+    // it at odd ones: the seeds disagree about the shape, not only the
+    // level. Taking out each seed's mean level leaves that spread, so C
+    // still refuses. Centring by rank at each size, rather than by seed,
+    // would line the seeds up and hide it.
+    let flip = |i: usize, j: usize| {
+        let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+        sign * SEED_LEVELS[j]
+    };
+    let obs = seed_rows(|n| 1000.0 * n as f64, SEED_LEVELS.len(), flip);
+    let raw = c_seeded(&any_order(obs.clone()));
+    let fit = c_seeded(&seed_order(obs));
+    assert!(fit.seed_centred, "{fit:?}");
+    assert_eq!(fit.verdict, ClassVerdict::TooNoisy, "{fit:?}");
+    // Each seed's level is a seventh of its offset, so the centred spread is
+    // 6/7 or 8/7 of the raw one, and the N / (N − 1) factor raises it.
+    let (centred, per_size) = (fit.noise.expect("seeds"), raw.noise.expect("seeds"));
+    assert!(centred >= per_size, "{centred} < {per_size}");
+}
+
+#[test]
+fn c_centred_seeds_do_not_name_growth_between_n_and_n_log_n() {
+    // As c_seed_noise_does_not_name_growth_between_n_and_n_log_n, with each
+    // seed a constant level apart. Centring takes the levels out and
+    // leaves the exact medians, which fit no class.
+    let cases: [fn(u64) -> f64; 2] = [
+        |n| 1000.0 * (n as f64).powf(1.1),
+        |n| 1000.0 * n as f64 * (n as f64).ln().ln(),
+    ];
+    for f in cases {
+        for scale in [0.1, 0.2, 0.3, 1.0] {
+            let fit = c_seeded(&seed_order(parallel_rows(f, scale)));
+            assert!(fit.seed_centred, "{fit:?}");
+            assert_eq!(fit.verdict, ClassVerdict::NoFit, "scale {scale}: {fit:?}");
+            assert!(fit.candidates[GrowthClass::NLogN as usize].misfit > fit.tolerance);
+        }
+    }
+}
+
+/// A deterministic standard normal sequence: SplitMix64 and Box–Muller.
+struct Normals(u64);
+
+impl Normals {
+    fn uniform(&mut self) -> f64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // In (0, 1]: 53 random bits, plus one.
+        ((z >> 11) + 1) as f64 / (1u64 << 53) as f64
+    }
+
+    fn next(&mut self) -> f64 {
+        let (u, v) = (self.uniform(), self.uniform());
+        (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+    }
+}
+
+#[test]
+fn c_centred_noise_matches_per_size_noise_for_independent_seeds() {
+    // Under independent noise the seeds have no level to take out. The
+    // centred estimate, with its N / (N − 1) factor, then measures the same
+    // noise as the per-size one; without the factor it would be about
+    // √(6/7) ≈ 0.926 of it on seven sizes. 300 sweeps of 40 seeds with
+    // σ = 0.02, from a fixed seed, so the test is deterministic.
+    let mut normals = Normals(0x5EED);
+    let (mut centred, mut per_size) = (0.0, 0.0);
+    let sweeps = 300;
+    for _ in 0..sweeps {
+        let draws: Vec<f64> = (0..DEFAULT_SIZES.len() * 40)
+            .map(|_| 0.02 * normals.next())
+            .collect();
+        let obs = seed_rows(|n| 1000.0 * n as f64, 40, |i, j| draws[i * 40 + j]);
+        let raw = c_seeded(&any_order(obs.clone()));
+        let fit = c_seeded(&seed_order(obs));
+        assert!(fit.seed_centred && !raw.seed_centred);
+        centred += fit.noise.expect("seeds");
+        per_size += raw.noise.expect("seeds");
+    }
+    let ratio = centred / per_size;
+    assert!(
+        (ratio - 1.0).abs() < 0.02,
+        "centred / per-size noise {ratio}"
+    );
+}
+
+#[test]
+fn sweep_in_seed_order_needs_equal_seed_counts() {
+    let obs = vec![
+        SizeObservation::completed(16, vec![1, 2, 3]),
+        SizeObservation::timed_out(32),
+        SizeObservation::completed(64, vec![1, 2]),
+    ];
+    let err = Sweep::in_seed_order(obs.clone()).expect_err("unequal counts");
+    assert_eq!(
+        err,
+        GrowthError::UnequalSeeds {
+            first_n: 16,
+            seeds: 3,
+            n: 64,
+            found: 2,
+        }
+    );
+    assert_eq!(
+        err.to_string(),
+        "sweep in seed order has 3 step count(s) at n = 16 but 2 at n = 64"
+    );
+    // In any order, the counts may differ.
+    assert!(!any_order(obs).is_in_seed_order());
+    // Timed-out and failed sizes have no counts to compare.
+    let sweep = seed_order(vec![
+        SizeObservation::completed(16, vec![1, 2]),
+        SizeObservation::errored(32),
+        SizeObservation::completed(64, vec![3, 4]),
+    ]);
+    assert!(sweep.is_in_seed_order());
+}
+
+#[test]
+fn c_on_one_seed_in_seed_order_falls_back_to_per_size_noise() {
+    let sweep = seed_order(seed_rows(|n| 1000.0 * n as f64, 1, |_, _| 0.0));
+    let fit = c_seeded(&sweep);
+    assert!(!fit.seed_centred, "{fit:?}");
+    assert_eq!(fit.noise, None, "{fit:?}");
+    assert_eq!(fit.verdict, ClassVerdict::NoiseUnknown, "{fit:?}");
+    let exact = c(&sweep);
+    assert!(!exact.seed_centred, "{exact:?}");
+    assert_eq!(exact.verdict, ClassVerdict::Class(GrowthClass::Linear));
+}
+
 #[test]
 fn c_rejects_parameters_out_of_range() {
     let sweep = default_sweep(|n| n);

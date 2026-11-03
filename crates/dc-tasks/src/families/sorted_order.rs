@@ -3,8 +3,11 @@
 //!
 //! The input is a list of `n` integers in `[-10⁶, 10⁶]`; [`Variant::PairSums`]
 //! also takes a threshold `t`. The size is `n`. Ties and gaps matter
-//! differently to each variant, so inputs come in three kinds, with equal
-//! odds:
+//! differently to each variant, so inputs come in three kinds. Seed `k` gets
+//! kind `k mod 3` at every size, in the order below, so the default five
+//! seeds have every kind. Each seed's step counts then follow one kind of
+//! input across the sweep, and estimator C can see a program's growth
+//! through them (bead dreamcounter-0ea5b7). The kinds:
 //!
 //! - tied: each element is drawn, with even odds, from the whole range or
 //!   from a narrow one of about `n / 2` values (see [`narrow_bound`]), so the
@@ -16,14 +19,25 @@
 //!   from the first half of its own slot, then the list is shuffled, so the
 //!   least gap is at least `10⁶ / n` (about 2 000 at 512).
 //!
-//! Half the time the threshold of [`Variant::PairSums`] is the sum of two
-//! elements, so some pair sums to exactly `t`; otherwise it is drawn from
-//! twice the largest magnitude of an element each side of 0. In a tied input
-//! the two elements are narrow ones (`|x| <= narrow_bound(n)`), chosen so
-//! that at least two pairs sum to `t` and, where the input allows it, two
-//! equal elements are one of those pairs; if no two narrow elements allow
-//! that, and in the other kinds, they are any two elements, and are usually
-//! the only pair that sums to `t`.
+//! The threshold of [`Variant::PairSums`] is chosen per seed in the same
+//! way, so that a natural solution's cost, which depends on the answer, does
+//! not jump between sizes. Seed `k` has an exact threshold if `(k / 3) mod 2`
+//! is 0 (seeds 0 to 2 of the default five), and a random one otherwise; and
+//! a quantile `q` in `[0, 1)`, drawn from [`TaskRng::seed_stream`]. Both are
+//! the same at every size.
+//!
+//! - An exact threshold is the sum of two elements, so some pair sums to
+//!   exactly `t`. In a tied input it is taken from the sums of two narrow
+//!   elements (`|x| <= narrow_bound(n)`) to which at least two pairs sum,
+//!   preferring those to which two equal elements sum (see
+//!   `tied_thresholds`). If there are none, and in the other kinds, it is
+//!   taken from the sorted sums of all pairs `i < j`. Either way it is the
+//!   sum at the fraction `q` of the way along the sorted list.
+//! - A random threshold is the value at the fraction `q` of the way along
+//!   `-2 top..=2 top`, where `top` is the largest magnitude of an element.
+//!
+//! So seed 0, a tied input with an exact threshold, gives a threshold that
+//! several pairs sum to at every size where the input allows it.
 //!
 //! With the default five seeds, the sweep has least gaps of 0, small ones
 //! and large ones, and thresholds that at least one pair sums to and that
@@ -274,6 +288,26 @@ fn list(xs: &[i64]) -> Value {
     Value::int_list(xs)
 }
 
+/// The kind of input seed `seed` gets at every size: 0 tied, 1 spread, 2
+/// wide.
+fn kind_of(seed: u64) -> u64 {
+    seed % 3
+}
+
+/// Whether seed `seed`'s pair-sums threshold is a pair sum ("exact") at
+/// every size, rather than drawn from a range: seeds 0 to 2 yes, 3 to 5 no,
+/// and so on.
+fn exact_mode(seed: u64) -> bool {
+    (seed / 3) % 2 == 0
+}
+
+/// `floor(q / 2⁶⁴ · len)`: the index the fraction `q / 2⁶⁴` of the way
+/// along a list of `len`, below `len` whenever `len > 0`. In integers, so it
+/// is the same on every platform.
+fn scale(q: u64, len: u64) -> u64 {
+    ((u128::from(q) * u128::from(len)) >> 64) as u64
+}
+
 impl TaskFamily for SortedOrder {
     fn name(&self) -> &str {
         match self.0 {
@@ -370,7 +404,7 @@ impl TaskFamily for SortedOrder {
     }
 
     fn generate(&self, n: u64, rng: &mut TaskRng) -> Inputs {
-        let kind = rng.below(3);
+        let kind = kind_of(rng.seed());
         let narrow = narrow_bound(n);
         let xs: Vec<i64> = match kind {
             0 => (0..n)
@@ -396,22 +430,28 @@ impl TaskFamily for SortedOrder {
         };
         let mut inputs = vec![list(&xs)];
         if self.0 == Variant::PairSums {
-            let t = if xs.len() >= 2 && rng.bool() {
+            // The seed's quantile: a fraction `q / 2⁶⁴` of the way along.
+            let q = rng.seed_stream().next_u64();
+            let t = if xs.len() >= 2 && exact_mode(rng.seed()) {
                 let tied = if kind == 0 {
                     tied_thresholds(&xs, narrow)
                 } else {
                     Vec::new()
                 };
                 if tied.is_empty() {
-                    let i = rng.below(xs.len() as u64) as usize;
-                    let j = (i + 1 + rng.below(xs.len() as u64 - 1) as usize) % xs.len();
-                    xs[i] + xs[j]
+                    let sums = sorted(
+                        xs.iter()
+                            .enumerate()
+                            .flat_map(|(i, &a)| xs[i + 1..].iter().map(move |&b| a + b))
+                            .collect(),
+                    );
+                    sums[scale(q, sums.len() as u64) as usize]
                 } else {
-                    tied[rng.below(tied.len() as u64) as usize]
+                    tied[scale(q, tied.len() as u64) as usize]
                 }
             } else {
                 let top = xs.iter().map(|x| x.abs()).max().unwrap_or(0).max(1);
-                rng.int_in(-2 * top, 2 * top)
+                -2 * top + scale(q, 4 * top as u64 + 1) as i64
             };
             inputs.push(Value::Int(t));
         }
@@ -517,6 +557,73 @@ mod tests {
             "exact pairs per threshold {exact:?}: {some} with one or more, {several} with \
              two or more, {twins} of those with two equal elements"
         );
+    }
+
+    /// The kind of input `xs` of size `n` is, worked out from the elements:
+    /// 2 if each element lies in the first half of its own slot once sorted,
+    /// 1 if every element is within the spread bound, and 0 otherwise.
+    fn observed_kind(n: u64, xs: &[i64]) -> u64 {
+        let step = (2 * VALUE_BOUND / n.max(1) as i64).max(1);
+        let in_slots = sorted(xs.to_vec()).iter().zip(0_i64..).all(|(&x, k)| {
+            let lo = -VALUE_BOUND + k * step;
+            lo <= x && x <= lo + step / 2
+        });
+        if in_slots {
+            2
+        } else if xs.iter().all(|x| x.abs() <= spread_bound(n)) {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn each_seed_gets_one_kind_and_threshold_mode_at_every_size() {
+        // Estimator C sees a program's growth through each seed's step
+        // counts, so a seed must not change kind, or threshold mode, from one
+        // size to the next (bead dreamcounter-0ea5b7).
+        let f = SortedOrder(Variant::PairSums);
+        let mut kinds_seen = Vec::new();
+        for seed in 0..6 {
+            let at = |n: u64| {
+                let i = f.generate(n, &mut TaskRng::new(n, seed));
+                (ints_of(&i[0]), int_of(&i[1]))
+            };
+            let kinds: Vec<u64> = f
+                .sizes()
+                .into_iter()
+                .map(|n| observed_kind(n, &at(n).0))
+                .collect();
+            assert!(
+                kinds.iter().all(|&k| k == seed % 3),
+                "seed {seed}: kinds {kinds:?} over the sizes"
+            );
+            kinds_seen.push(kinds[0]);
+            if (seed / 3) % 2 == 0 {
+                // Exact: some pair sums to t at every size.
+                for n in f.sizes() {
+                    let (xs, t) = at(n);
+                    assert!(exact_pairs(&xs, t) >= 1, "seed {seed}, n = {n}: t = {t}");
+                }
+            } else {
+                // Random: t is the same fraction of the way along
+                // `-2 top..=2 top` at every size.
+                let fractions: Vec<f64> = f
+                    .sizes()
+                    .into_iter()
+                    .map(|n| {
+                        let (xs, t) = at(n);
+                        let top = xs.iter().map(|x| x.abs()).max().unwrap_or(0).max(1);
+                        (t + 2 * top) as f64 / (4 * top + 1) as f64
+                    })
+                    .collect();
+                let (lo, hi) = fractions
+                    .iter()
+                    .fold((f64::MAX, f64::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+                assert!(hi - lo < 1e-3, "seed {seed}: fractions {fractions:?}");
+            }
+        }
+        assert_eq!(kinds_seen[..3], [0, 1, 2], "the first three seeds");
     }
 
     proptest::proptest! {

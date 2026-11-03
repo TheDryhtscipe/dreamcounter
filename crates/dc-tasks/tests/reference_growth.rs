@@ -34,8 +34,9 @@
 //! class (the acceptance criterion of bead dreamcounter-db440d). Where the
 //! step counts are exact or nearly so (`sum_ref`, `msort`, `zero_subsets`)
 //! it must name the class on the medians. Insertion sort's seeds vary by
-//! about 12 % in steps, so its medians are about 0.04 from `n²` in `ln`
-//! units, above C's tolerance of 0.01, and C refuses them as too noisy.
+//! about 12 % in steps, so its medians are about 0.05 from `n²` in `ln`
+//! units (0.04 without seed centring), above C's tolerance of 0.01, and C
+//! refuses them as too noisy.
 //! One seed per size says nothing about the noise, so each seed alone is
 //! fitted with [`NoiseModel::Known`]: the noise of one seed's `ln` step
 //! count, measured on the full sweep as the largest sample standard
@@ -794,7 +795,7 @@ fn merge_sort_is_n_log_n() {
 fn insertion_sort_is_quadratic() {
     // Measured under merge sort's fuel plan, as a candidate for the family
     // would be: ten times merge sort's steps is still enough up to 512. The
-    // seeds' spread (about 12 %) leaves the medians about 0.04 from n², above
+    // seeds' spread (about 12 %) leaves the medians about 0.05 from n², above
     // C's tolerance of 0.01 but within the noise margin, so C refuses them as
     // too noisy.
     check_polynomial(
