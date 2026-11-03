@@ -26,8 +26,9 @@
 //! every exponential candidate would run to the cap at every such size
 //! before timing out.
 //!
-//! The inputs come in kinds chosen per variant (see [`TaskFamily::generate`]
-//! on [`SubsequenceCount`]), so that the boundary of each rule is met often:
+//! The inputs come in kinds chosen per variant, one kind per seed at every
+//! size (see [`TaskFamily::generate`] on [`SubsequenceCount`]), so that the
+//! boundary of each rule is met often:
 //! differences of exactly 2 and 3 for close steps, long runs of one value
 //! for zigzag, zeros and runs of one sign for sign changes.
 //!
@@ -257,6 +258,15 @@ fn oracle_count(v: Variant, xs: &[i64], m: i64) -> i64 {
     }
 }
 
+/// The bound `m` of [`Variant::SignChanges`] for seed `seed`, the same at
+/// every size: `3 seed mod (MAX_M + 1)`. The kind is `seed mod 3`, so the
+/// bound does not follow it: over seeds 0 to 14 every kind gets every
+/// bound. The default five seeds give the uniform inputs bounds 0 and 4,
+/// the half-zero ones 3 and 2, and the runs of signs 1.
+fn bound_of(seed: u64) -> i64 {
+    ((3 * seed) % (MAX_M as u64 + 1)) as i64
+}
+
 impl TaskFamily for SubsequenceCount {
     fn name(&self) -> &str {
         match self.0 {
@@ -392,7 +402,11 @@ impl TaskFamily for SubsequenceCount {
     }
 
     /// An input of size `n`. Elements are drawn from
-    /// [`Variant::value_range`] in one of the kinds below, with equal odds.
+    /// [`Variant::value_range`] in one of the three kinds below. Seed `k` gets
+    /// the `k mod 3`th kind, counting from 0, at every size, so the default
+    /// five seeds have every kind. Each seed's step counts then follow one
+    /// kind of input across the sweep, and estimator C can see a program's
+    /// growth through them (bead dreamcounter-0ea5b7).
     ///
     /// - Sum mod 7 and no three in a row: uniform; or every element of one
     ///   sign (0 included), so sums run far from 0.
@@ -400,27 +414,36 @@ impl TaskFamily for SubsequenceCount {
     ///   `{a, a + 2, a + 3}`, so differences of exactly 2 and 3 are common.
     /// - Zigzag: uniform; or two neighbouring values, so ties are common.
     /// - Sign changes: uniform; half the elements 0; or signs in runs of 1
-    ///   to 8 elements. The bound `m` is uniform in `0..=MAX_M`.
+    ///   to 8 elements. The bound `m` is `3 k mod (MAX_M + 1)` for seed
+    ///   `k`, the same at every size, as a solution's cost can depend on it;
+    ///   the default five seeds have every bound from 0 to `MAX_M`.
+    ///
+    /// The choices that set an input's character are drawn once per seed,
+    /// from [`TaskRng::seed_stream`], so they are the same at every size:
+    /// the sign of a one-sign input, the offset `a` of close steps and
+    /// zigzag, and the first sign of the runs. The elements, which elements
+    /// are 0, and the lengths of the runs are drawn afresh at each size.
     fn generate(&self, n: u64, rng: &mut TaskRng) -> Inputs {
         let (lo, hi) = self.0.value_range();
-        let xs: Vec<i64> = match (self.0, rng.below(3)) {
+        let mut per_seed = rng.seed_stream();
+        let xs: Vec<i64> = match (self.0, rng.seed() % 3) {
             (_, 0) => (0..n).map(|_| rng.int_in(lo, hi)).collect(),
             (Variant::SumMod7 | Variant::NoThreeInARow, _) => {
-                let (a, b) = if rng.bool() { (0, 3) } else { (-3, 0) };
+                let (a, b) = if per_seed.bool() { (0, 3) } else { (-3, 0) };
                 (0..n).map(|_| rng.int_in(a, b)).collect()
             }
             (Variant::CloseSteps, 1) => {
-                let a = rng.int_in(0, 6);
+                let a = per_seed.int_in(0, 6);
                 (0..n).map(|_| rng.int_in(a, a + 3)).collect()
             }
             (Variant::CloseSteps, _) => {
-                let a = rng.int_in(0, 6);
+                let a = per_seed.int_in(0, 6);
                 (0..n)
                     .map(|_| a + [0, 2, 3][rng.below(3) as usize])
                     .collect()
             }
             (Variant::Zigzag, _) => {
-                let a = rng.int_in(0, 8);
+                let a = per_seed.int_in(0, 8);
                 (0..n).map(|_| a + rng.int_in(0, 1)).collect()
             }
             (Variant::SignChanges, 1) => (0..n)
@@ -428,7 +451,7 @@ impl TaskFamily for SubsequenceCount {
                 .collect(),
             (Variant::SignChanges, _) => {
                 let mut xs = Vec::with_capacity(n as usize);
-                let mut positive = rng.bool();
+                let mut positive = per_seed.bool();
                 while (xs.len() as u64) < n {
                     let run = rng.int_in(1, 8);
                     for _ in 0..run {
@@ -444,7 +467,7 @@ impl TaskFamily for SubsequenceCount {
         };
         let mut inputs = vec![list(&xs)];
         if self.0 == Variant::SignChanges {
-            inputs.push(Value::Int(rng.int_in(0, MAX_M)));
+            inputs.push(Value::Int(bound_of(rng.seed())));
         }
         inputs
     }
@@ -551,6 +574,117 @@ mod tests {
             let xs = vec![x; n];
             assert_eq!(oracle_count(v, &xs, 0) as u128, expected, "{v:?}");
         }
+    }
+
+    /// Whether `xs` looks uniform for `v`, not one of its narrower kinds:
+    /// both signs for sum mod 7 and no three in a row, more than two values
+    /// for zigzag, and a span over 3 for close steps. Sign changes has no
+    /// such test; its bound `m` is checked instead.
+    fn looks_uniform(v: Variant, xs: &[i64]) -> Option<bool> {
+        let span = xs.iter().max().unwrap_or(&0) - xs.iter().min().unwrap_or(&0);
+        match v {
+            Variant::SumMod7 | Variant::NoThreeInARow => {
+                Some(xs.iter().any(|&x| x > 0) && xs.iter().any(|&x| x < 0))
+            }
+            Variant::Zigzag => Some(span > 1),
+            Variant::CloseSteps => Some(span > 3),
+            Variant::SignChanges => None,
+        }
+    }
+
+    #[test]
+    fn each_seed_gets_one_kind_at_every_size() {
+        // Estimator C sees a program's growth through each seed's step
+        // counts, so a seed must not change kind, or bound, from one size to
+        // the next (bead dreamcounter-0ea5b7).
+        for v in Variant::ALL {
+            let f = SubsequenceCount(v);
+            for seed in 0..6 {
+                let inputs: Vec<Inputs> = f
+                    .sizes()
+                    .into_iter()
+                    .map(|n| f.generate(n, &mut TaskRng::new(n, seed)))
+                    .collect();
+                // At 8 elements a uniform input can have one sign by chance
+                // (seed 3 of sum mod 7 does), so the kind is read from 16 up.
+                let uniform: Vec<Option<bool>> = inputs
+                    .iter()
+                    .map(|i| ints_of(&i[0]))
+                    .filter(|xs| xs.len() >= 16)
+                    .map(|xs| looks_uniform(v, &xs))
+                    .collect();
+                if v != Variant::SignChanges {
+                    let expected = Some(seed % 3 == 0);
+                    assert!(
+                        uniform.iter().all(|&u| u == expected),
+                        "{v:?}, seed {seed}: uniform {uniform:?} over the sizes"
+                    );
+                } else {
+                    let bounds: Vec<i64> = inputs.iter().map(|i| int_of(&i[1])).collect();
+                    assert!(
+                        bounds.iter().all(|&m| m == bound_of(seed)),
+                        "seed {seed}: bounds {bounds:?} over the sizes"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What sets the character of a non-uniform input, read from it: the
+    /// sign of a one-sign input (sum mod 7, no three in a row), the least
+    /// value (close steps, zigzag: the offset `a` once `a` is drawn), or the
+    /// sign of the first non-zero element (the runs of sign changes).
+    fn character(v: Variant, xs: &[i64]) -> i64 {
+        match v {
+            Variant::SumMod7 | Variant::NoThreeInARow => xs.iter().sum::<i64>().signum(),
+            Variant::CloseSteps | Variant::Zigzag => *xs.iter().min().unwrap_or(&0),
+            Variant::SignChanges => xs.iter().find(|&&x| x != 0).map_or(0, |x| x.signum()),
+        }
+    }
+
+    #[test]
+    fn each_seed_keeps_its_sign_and_offset_at_every_size() {
+        // A natural solution's cost can depend on the sign of a one-sign
+        // input, the offset of close steps and zigzag, and where the runs of
+        // signs start, so each is drawn once per seed (bead
+        // dreamcounter-0ea5b7). Read from 32 up, where the least value is
+        // the offset in every such input of these seeds.
+        for v in Variant::ALL {
+            let f = SubsequenceCount(v);
+            let mut seen = Vec::new();
+            for seed in (0..12).filter(|s| s % 3 != 0) {
+                if v == Variant::SignChanges && seed % 3 != 2 {
+                    continue;
+                }
+                let chars: Vec<i64> = f
+                    .sizes()
+                    .into_iter()
+                    .filter(|&n| n >= 32)
+                    .map(|n| character(v, &ints_of(&f.generate(n, &mut TaskRng::new(n, seed))[0])))
+                    .collect();
+                assert!(
+                    chars.iter().all(|&c| c == chars[0]),
+                    "{v:?}, seed {seed}: {chars:?} over the sizes"
+                );
+                seen.push(chars[0]);
+            }
+            // And the seeds do not all agree, so the test sees a real draw.
+            assert!(
+                seen.iter().any(|&c| c != seen[0]),
+                "{v:?}: every seed gave {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_changes_bound_does_not_follow_the_kind() {
+        // Over seeds 0 to 14 every kind (seed mod 3) gets every bound; the
+        // default five have every bound, and the runs of seed 2 get 1.
+        let mut pairs: Vec<(u64, i64)> = (0..15).map(|s| (s % 3, bound_of(s))).collect();
+        pairs.sort();
+        pairs.dedup();
+        assert_eq!(pairs.len(), 15, "{pairs:?}");
+        assert_eq!((0..5).map(bound_of).collect::<Vec<i64>>(), [0, 3, 1, 4, 2]);
     }
 
     proptest::proptest! {

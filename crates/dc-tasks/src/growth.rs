@@ -65,7 +65,8 @@
 //! The *noise margin* `m` is [`ClassSelect::noise_z`] (default 3) times the
 //! seed noise: the largest standard error of a size's median `ln` step count,
 //! `√(π/2) · s / √k` for `k` seeds with sample standard deviation `s` of
-//! their `ln` steps (the large-sample standard error of a median). How the
+//! their `ln` steps (the large-sample standard error of a median). For a
+//! sweep in seed order, `s` is measured after centring (below). How the
 //! noise is found is set by [`ClassSelect::noise_model`]. C names a class if
 //! its misfit is at most `τ` and no other class's is at most `τ + m`. If
 //! some class's misfit is at most `τ + m` but that does not hold, the verdict
@@ -82,8 +83,31 @@
 //! 0.015, alternately up and down, and three seeds 0.01 apart in `ln` at each
 //! size (`m ≈ 0.022`) has misfit 0.015 against `n` and is `TooNoisy`.
 //!
+//! A sweep in seed order ([`Sweep::in_seed_order`], as the harness builds
+//! it) lists seed `k`'s step count `k`-th at every size. C then takes out
+//! each seed's level before it finds the medians and the noise. A seed whose
+//! inputs cost a fixed factor more than another's at every size moves all
+//! its `ln` steps by the same amount. That says nothing about the shape of
+//! growth: adding a constant to every median leaves every misfit unchanged.
+//! Over the `N` sizes of the window, seed `j`'s level `b_j` is the mean of
+//! its `ln` steps minus the mean over all seeds, so the levels sum to 0. C
+//! fits the median of the centred `ln` steps `ln steps − b_j` at each size,
+//! by the same lower-median rule. The noise uses their sample variance at
+//! each size times `N / (N − 1)`. The factor makes up for estimating the
+//! levels from the same counts, so each size's variance is unbiased for
+//! independent noise. The noise C uses is the largest square root over the
+//! sizes, and centring makes the sizes' variances vary less, so with few
+//! seeds the centred noise runs a little below the per-size one: about 0.98
+//! of it at two seeds and 0.99 at five, over the seven default sizes, and
+//! close to 1 at forty. Seeds whose offsets change from size to size still
+//! spread after centring, so that change stays in the noise C measures. C
+//! centres only if every size in the window has at least two seeds;
+//! [`ClassFit::seed_centred`] says whether it did. Step counts in any order
+//! ([`Sweep::new`]) are never centred: lining up counts from different seeds
+//! would hide noise.
+//!
 //! In practice this makes C refuse often under seed noise. With five seeds
-//! per size whose `ln` steps vary with standard deviation `σ` about exact
+//! per size whose `ln` steps vary independently with standard deviation `σ` about exact
 //! `n`, `n log n` or `n²`, C named the class in about 95 % of 3000 random
 //! sweeps at `σ = 0.01`, about 30 % at `σ = 0.02` and under 1 % at
 //! `σ = 0.05`, and refused the rest as `TooNoisy`.
@@ -97,23 +121,30 @@
 //! elsewhere (for example, one seed of a sweep whose other seeds measured
 //! it) passes [`NoiseModel::Known`].
 //!
+//! Centring depends on the sweep, not on the noise model. A sweep in seed
+//! order with at least two seeds at every size in the window is fitted on
+//! its centred medians under [`NoiseModel::Exact`] and
+//! [`NoiseModel::Known`] too; the model sets only the noise margin.
+//!
 //! # What a verdict means
 //!
 //! A named class says that over the window every median step count is
 //! within a factor `e^τ` of `c · (f(n) + r · g(n))`, with a lower-order term
-//! no larger than the main term. It is a statement about the window, not a
+//! no larger than the main term. On a sweep in seed order the medians are
+//! those of the centred counts. It is a statement about the window, not a
 //! proof of asymptotic growth. Over the default sweep `16..1024`, exact
 //! `n^a` is named `n` for `a` from 0.99 to 1.01, `n²` from 1.99 to 2.01 and
 //! `n³` from 2.99 to 3.01, and never `n log n`: the closest, `n^1.135`, has
 //! misfit 0.019 against it, about twice `τ`. Exact `n · (ln n)^b` is named
 //! `n log n` for `b` from 0.74 to 1.16. These bands are for exact series.
 //! Under seed noise a power near a class is occasionally named that class:
-//! with two to five seeds per size and `σ` from 0.01 to 0.02, `n^1.135` was
-//! named `n log n` in up to 12 of 3000 random sweeps.
+//! with two to five independent seeds per size and `σ` from 0.01 to 0.02,
+//! `n^1.135` was named `n log n` in up to 12 of 3000 random sweeps.
 //!
 //! The tolerance is below the noise of programs whose step counts vary much
 //! with their inputs. Insertion sort's seeds vary by about 12 % in steps,
-//! which leaves its medians about 0.04 from `n²`; C refuses them as
+//! which leaves its medians about 0.05 from `n²` (0.04 without centring);
+//! C refuses them as
 //! `TooNoisy` rather than name a class. The noise of a median falls as
 //! `1/√k` with the number of seeds `k`, so more seeds bring such medians
 //! closer to their class.
@@ -124,7 +155,9 @@
 //!   counts. For an even number of seeds the *lower* median is used (the
 //!   `(k/2)`-th smallest of `k` values, counting from 1), so the result is
 //!   always an exact step count that was actually observed. See
-//!   [`median_steps`].
+//!   [`median_steps`]. On a sweep in seed order, estimator C instead takes
+//!   the same order statistic of the centred `ln` step counts, which need
+//!   not be an observed count.
 //! * **Upper half.** For a sweep of `k` sizes sorted by `n`, the upper half is
 //!   the last `⌈k/2⌉` sizes, so for odd `k` the middle size is included. On
 //!   the default 7-size sweep A and B therefore fit over
@@ -154,7 +187,9 @@ pub const DEFAULT_SIZES: [u64; 7] = [16, 32, 64, 128, 256, 512, 1024];
 pub enum SizeOutcome {
     /// Every seeded input finished; one exact step count per seed.
     Completed {
-        /// Step counts, one per seed, in any order.
+        /// Step counts, one per seed. In any order, unless the sweep was
+        /// built with [`Sweep::in_seed_order`]: then the `k`-th count at
+        /// every completed size comes from seed `k`.
         steps: Vec<u64>,
     },
     /// The run exhausted its fuel at this size.
@@ -203,6 +238,9 @@ impl SizeObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sweep {
     observations: Vec<SizeObservation>,
+    /// Whether the `k`-th step count at every completed size comes from
+    /// seed `k` (see [`Sweep::in_seed_order`]).
+    seed_order: bool,
 }
 
 impl Sweep {
@@ -228,7 +266,45 @@ impl Sweep {
                 }
             }
         }
-        Ok(Self { observations })
+        Ok(Self {
+            observations,
+            seed_order: false,
+        })
+    }
+
+    /// Validates and sorts the observations as [`Sweep::new`] does, and
+    /// records that their step counts are in seed order: the `k`-th count at
+    /// every completed size comes from seed `k`, so every completed size has
+    /// the same number of seeds. Estimator C then takes out each seed's
+    /// level before it compares the sizes (see the module comment). Only a
+    /// producer that ran the same seeds at every size can say this; counts
+    /// in any other order would hide noise.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Sweep::new`], and [`GrowthError::UnequalSeeds`] if two
+    /// completed sizes have different numbers of step counts.
+    pub fn in_seed_order(observations: Vec<SizeObservation>) -> Result<Self, GrowthError> {
+        let mut sweep = Self::new(observations)?;
+        let mut first: Option<(u64, usize)> = None;
+        for o in &sweep.observations {
+            if let SizeOutcome::Completed { steps } = &o.outcome {
+                match first {
+                    None => first = Some((o.n, steps.len())),
+                    Some((first_n, seeds)) if steps.len() != seeds => {
+                        return Err(GrowthError::UnequalSeeds {
+                            first_n,
+                            seeds,
+                            n: o.n,
+                            found: steps.len(),
+                        });
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        sweep.seed_order = true;
+        Ok(sweep)
     }
 
     /// Builds a sweep with one seed per size from a step function, as used for
@@ -249,6 +325,12 @@ impl Sweep {
     /// The observations, sorted by strictly increasing `n`.
     pub fn observations(&self) -> &[SizeObservation] {
         &self.observations
+    }
+
+    /// Whether the sweep was built with [`Sweep::in_seed_order`]: the `k`-th
+    /// step count at every completed size comes from seed `k`.
+    pub fn is_in_seed_order(&self) -> bool {
+        self.seed_order
     }
 
     /// The median step count at each completed size, as `(n, median)`, in
@@ -312,6 +394,18 @@ pub enum GrowthError {
         /// The size concerned.
         n: u64,
     },
+    /// A sweep in seed order has two completed sizes with different numbers
+    /// of step counts.
+    UnequalSeeds {
+        /// The first completed size.
+        first_n: u64,
+        /// Its number of step counts.
+        seeds: usize,
+        /// A later completed size with another number.
+        n: u64,
+        /// Its number of step counts.
+        found: usize,
+    },
     /// The fit window has too few sizes for the estimator.
     TooFewPoints {
         /// The number of sizes in the window.
@@ -361,6 +455,16 @@ impl fmt::Display for GrowthError {
             GrowthError::ZeroSize => write!(f, "sweep contains size n = 0"),
             GrowthError::DuplicateSize { n } => write!(f, "sweep contains size n = {n} twice"),
             GrowthError::NoSeeds { n } => write!(f, "size n = {n} has no seed step counts"),
+            GrowthError::UnequalSeeds {
+                first_n,
+                seeds,
+                n,
+                found,
+            } => write!(
+                f,
+                "sweep in seed order has {seeds} step count(s) at n = {first_n} \
+                 but {found} at n = {n}"
+            ),
             GrowthError::TooFewPoints { points, needed } => {
                 write!(
                     f,
@@ -795,6 +899,11 @@ pub struct ClassFit {
     /// window, as the [`NoiseModel`] gives it. `None` if it is unknown
     /// (verdict [`ClassVerdict::NoiseUnknown`]).
     pub noise: Option<f64>,
+    /// Whether each seed's level was taken out before the medians and the
+    /// seed noise were found: the sweep is in seed order
+    /// ([`Sweep::is_in_seed_order`]) and every size in the window has at
+    /// least two seeds. See the module comment.
+    pub seed_centred: bool,
     /// The sizes fitted.
     pub window: FitWindow,
 }
@@ -825,13 +934,19 @@ impl ClassFit {
 pub enum NoiseModel {
     /// From the spread between seeds at the sizes in the window. If some
     /// size in the window has one seed, C refuses with
-    /// [`ClassVerdict::NoiseUnknown`].
+    /// [`ClassVerdict::NoiseUnknown`]. For a sweep in seed order, the spread
+    /// is measured after each seed's level is taken out (see the module
+    /// comment).
     FromSeeds,
     /// The step counts are exact: noise 0. For deterministic programs on
-    /// fixed inputs, and for closed-form series.
+    /// fixed inputs, and for closed-form series. A sweep in seed order with
+    /// at least two seeds at every size in the window is still fitted on
+    /// its centred medians.
     Exact,
     /// The standard error of each median `ln` step count is at most this;
-    /// finite and `≥ 0`.
+    /// finite and `≥ 0`. As with [`NoiseModel::Exact`], a sweep in seed
+    /// order with at least two seeds at every size in the window is fitted
+    /// on its centred medians, and this is taken as their standard error.
     Known(f64),
 }
 
@@ -912,7 +1027,21 @@ impl ClassSelect {
             }
         }
         let (points, window) = window_points(sweep, self.window, Self::MIN_POINTS, 2)?;
-        let ln_steps: Vec<f64> = points.iter().map(|&(_, s)| ln_u64(s)).collect();
+        // Checked whatever the model, so that a zero seed is always an error.
+        let from_seeds = seed_noise(sweep, window.n_min)?;
+        let centred = if sweep.is_in_seed_order() {
+            seed_centred(sweep, window.n_min)
+        } else {
+            None
+        };
+        let seed_centred = centred.is_some();
+        let (ln_steps, from_seeds) = match centred {
+            Some(c) => (c.ln_medians, Some(c.noise)),
+            None => (
+                points.iter().map(|&(_, s)| ln_u64(s)).collect::<Vec<f64>>(),
+                from_seeds,
+            ),
+        };
         let candidates = std::array::from_fn(|i| {
             let class = GrowthClass::ALL[i];
             // base_i = ln steps_i − ln f(n_i); h_i = g(n_i) / f(n_i).
@@ -937,8 +1066,6 @@ impl ClassSelect {
                 misfit,
             }
         });
-        // Checked whatever the model, so that a zero seed is always an error.
-        let from_seeds = seed_noise(sweep, window.n_min)?;
         let noise = match self.noise_model {
             NoiseModel::FromSeeds => from_seeds,
             NoiseModel::Exact => Some(0.0),
@@ -978,6 +1105,7 @@ impl ClassSelect {
             tolerance,
             noise_margin,
             noise,
+            seed_centred,
             window,
         })
     }
@@ -1108,6 +1236,68 @@ fn seed_noise(sweep: &Sweep, n_min: u64) -> Result<Option<f64>, GrowthError> {
         noise = Some(noise.map_or(se, |m| m.max(se)));
     }
     Ok(if single_seed { None } else { noise })
+}
+
+/// The seed-centred `ln` medians and seed noise of a sweep in seed order.
+struct SeedCentred {
+    /// The median centred `ln` step count at each size from `n_min` up.
+    ln_medians: Vec<f64>,
+    /// The largest standard error of those medians.
+    noise: f64,
+}
+
+/// Takes each seed's level out of the `ln` step counts at the completed
+/// sizes from `n_min` up, for a sweep in seed order, and returns the
+/// medians and noise of what is left. `None` if some such size has fewer
+/// than two seeds or there are fewer than two sizes; C then uses the raw
+/// medians and [`seed_noise`]. The caller has already checked that those
+/// sizes completed, with no zero step counts, and that the sweep is in seed
+/// order, so every size has the same number of seeds.
+///
+/// With `y_nj = ln steps` of seed `j` at size `n`, over `N` sizes and `k`
+/// seeds, seed `j`'s level is `b_j = mean_n y_nj − mean_n mean_j y_nj`, so
+/// `Σ b_j = 0`, and the centred count is `z_nj = y_nj − b_j`. Each size's
+/// median is the lower median of its `z_nj`. Its noise is
+/// `√(π/2 · v_n / k)` with `v_n` the sample variance of `z_n·` (divisor
+/// `k − 1`) times `N / (N − 1)`: estimating the `b_j` from the same counts
+/// takes `1 / N` of the variance of independent noise out of each size, and
+/// the factor puts it back.
+fn seed_centred(sweep: &Sweep, n_min: u64) -> Option<SeedCentred> {
+    let ys: Vec<Vec<f64>> = sweep
+        .observations()
+        .iter()
+        .filter(|o| o.n >= n_min)
+        .filter_map(|o| match &o.outcome {
+            SizeOutcome::Completed { steps } => Some(steps.iter().map(|&s| ln_u64(s)).collect()),
+            SizeOutcome::TimedOut | SizeOutcome::Errored => None,
+        })
+        .collect();
+    let k = ys.first()?.len();
+    if ys.len() < 2 || k < 2 || ys.iter().any(|row| row.len() != k) {
+        return None;
+    }
+    let sizes = ys.len() as f64;
+    let seeds = k as f64;
+    let row_means: Vec<f64> = ys
+        .iter()
+        .map(|row| row.iter().sum::<f64>() / seeds)
+        .collect();
+    let grand_mean = row_means.iter().sum::<f64>() / sizes;
+    let levels: Vec<f64> = (0..k)
+        .map(|j| ys.iter().map(|row| row[j]).sum::<f64>() / sizes - grand_mean)
+        .collect();
+    let mut ln_medians = Vec::with_capacity(ys.len());
+    let mut noise: f64 = 0.0;
+    for (row, mean) in ys.iter().zip(&row_means) {
+        let mut z: Vec<f64> = row.iter().zip(&levels).map(|(y, b)| y - b).collect();
+        // Σ b_j = 0, so the centred mean is the raw mean.
+        let var = z.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (seeds - 1.0) * sizes
+            / (sizes - 1.0);
+        noise = noise.max((std::f64::consts::FRAC_PI_2 * var / seeds).sqrt());
+        z.sort_by(f64::total_cmp);
+        ln_medians.push(z[(k - 1) / 2]);
+    }
+    Some(SeedCentred { ln_medians, noise })
 }
 
 /// The candidate with the smallest RSS; on a tie, the earliest (smallest `γ`,

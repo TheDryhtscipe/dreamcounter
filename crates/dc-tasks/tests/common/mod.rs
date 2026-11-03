@@ -35,21 +35,46 @@ pub fn list_len(inputs: &[Value]) -> u64 {
 }
 
 /// The noise of one seed's `ln` step count: the largest sample standard
-/// deviation of the seeds' `ln` steps at a size in `window`.
+/// deviation of the seeds' `ln` steps at a size in `window`. For a sweep in
+/// seed order it is measured as C measures it: after each seed's level over
+/// the window is taken out, with the variance times `N / (N − 1)` over `N`
+/// sizes, so that `√(π/2 · noise² / k)` is C's noise for `k` seeds. Seeds
+/// that differ only in level, as generators that keep one kind of input per
+/// seed make them, would otherwise make it larger, and so widen the noise
+/// margin of the check on each seed alone. 0 if no size is in the window.
 pub fn single_seed_noise(sweep: &Sweep, window: &FitWindow) -> f64 {
-    sweep
+    let ys: Vec<Vec<f64>> = sweep
         .observations()
         .iter()
         .filter(|o| o.n >= window.n_min)
         .map(|o| match &o.outcome {
             SizeOutcome::Completed { steps } if steps.len() >= 2 => {
-                let ys: Vec<f64> = steps.iter().map(|&s| (s as f64).ln()).collect();
-                let k = ys.len() as f64;
-                let mean = ys.iter().sum::<f64>() / k;
-                let var = ys.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / (k - 1.0);
-                var.sqrt()
+                steps.iter().map(|&s| (s as f64).ln()).collect()
             }
             other => panic!("n = {}: {other:?}", o.n),
+        })
+        .collect();
+    let Some(k) = ys.first().map(Vec::len) else {
+        return 0.0;
+    };
+    let sizes = ys.len() as f64;
+    let centre = sweep.is_in_seed_order() && ys.len() >= 2;
+    let levels: Vec<f64> = if centre {
+        let grand = ys.iter().flatten().sum::<f64>() / (sizes * k as f64);
+        (0..k)
+            .map(|j| ys.iter().map(|row| row[j]).sum::<f64>() / sizes - grand)
+            .collect()
+    } else {
+        vec![0.0; k]
+    };
+    let factor = if centre { sizes / (sizes - 1.0) } else { 1.0 };
+    ys.iter()
+        .map(|row| {
+            let z: Vec<f64> = row.iter().zip(&levels).map(|(y, b)| y - b).collect();
+            let n = z.len() as f64;
+            let mean = z.iter().sum::<f64>() / n;
+            let var = z.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / (n - 1.0);
+            (var * factor).sqrt()
         })
         .fold(0.0, f64::max)
 }

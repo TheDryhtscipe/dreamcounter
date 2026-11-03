@@ -605,6 +605,8 @@ fn sweep_runs_every_seed_and_fuel_covers_the_slowest_reference_run() {
     let plan = FuelPlan::from_reference(&ListNegSum, &arena, neg, &c).unwrap();
     let passed = check_examples(&ListNegSum, &arena, neg, &c).unwrap();
     let report = run_sweep(&ListNegSum, &arena, &passed, &plan, &c).unwrap();
+    // The steps below are compared seed by seed, so the sweep may say so.
+    assert!(report.sweep.is_in_seed_order());
     let mut medians = Vec::new();
     for ((r, o), s) in report
         .records

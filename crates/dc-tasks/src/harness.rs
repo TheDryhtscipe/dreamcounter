@@ -682,7 +682,9 @@ pub fn run_sweep<F: TaskFamily + ?Sized>(
     }
     Ok(SweepReport {
         records,
-        sweep: Sweep::new(observations)?,
+        // run_size runs seeds 0..seeds in order and completes only if every
+        // seed does, so each completed size's k-th count is seed k's.
+        sweep: Sweep::in_seed_order(observations)?,
     })
 }
 
