@@ -121,8 +121,24 @@ pub fn named(fit: &ClassFit, expected: GrowthClass, what: &str) -> Result<bool, 
     }
 }
 
+/// How many seeds C may refuse when it fits each seed alone. A refusal is
+/// `TooNoisy`, `NoiseUnknown` or `NoFit`; naming another class always fails.
+// Each test crate compiles this module and uses only some variants.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeedsRefused {
+    /// C names the class on every seed.
+    None,
+    /// C refuses at most this many seeds and names the class on the rest.
+    AtMost(usize),
+    /// C may refuse every seed, as when it refuses the medians too.
+    Any,
+}
+
 /// Measures `entry` under `plan` and checks C on the medians and on each
-/// seed alone. Returns whether C named the class on the medians.
+/// seed alone: on a seed alone C must name `expected`, or refuse no more
+/// seeds than `refused` allows. Returns whether C named the class on the
+/// medians.
 pub fn check_class<F: TaskFamily>(
     family: &F,
     arena: &mut Arena,
@@ -130,6 +146,7 @@ pub fn check_class<F: TaskFamily>(
     plan: &FuelPlan,
     entry: &str,
     expected: GrowthClass,
+    refused: SeedsRefused,
 ) -> bool {
     let c = HarnessConfig::default();
     let p = compile(arena, source, entry);
@@ -154,9 +171,27 @@ pub fn check_class<F: TaskFamily>(
         noise_model: noise,
         ..ClassSelect::default()
     };
+    let mut refusals = Vec::new();
     for (seed, s) in per_seed(&sweep).iter().enumerate() {
         let f = one.fit(s).expect("C fits one seed");
-        named(&f, expected, &format!("{entry} seed {seed}")).unwrap_or_else(|e| panic!("{e}"));
+        let what = format!("{entry} seed {seed}");
+        if !named(&f, expected, &what).unwrap_or_else(|e| panic!("{e}")) {
+            refusals.push(format!(
+                "{seed}: {:?} noise_margin {:.4}",
+                f.verdict, f.noise_margin
+            ));
+        }
     }
+    println!("SEEDS {entry}: C refuses {refusals:?}");
+    let allowed = match refused {
+        SeedsRefused::None => 0,
+        SeedsRefused::AtMost(k) => k,
+        SeedsRefused::Any => usize::MAX,
+    };
+    assert!(
+        refusals.len() <= allowed,
+        "{entry}: C refuses {} seeds alone, {refused:?} allowed: {refusals:?}",
+        refusals.len()
+    );
     on_medians
 }

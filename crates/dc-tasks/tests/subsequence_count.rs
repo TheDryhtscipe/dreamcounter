@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::{check_class, compile, list_len};
+use common::{check_class, compile, list_len, SeedsRefused};
 use dc_core::{Arena, Scheme};
 use dc_eval::Value;
 use dc_tasks::families::subsequence_count::{self, SubsequenceCount, Variant};
@@ -69,6 +69,16 @@ fn check_variant(v: Variant) {
         plan.sizes().iter().all(|s| s.reference_steps.is_some()),
         "the quadratic reference finishes under the cap at every size"
     );
+    // C refuses the sign-changes one (no class fits within tolerance): its
+    // n² term, about 54 n² steps, is only 4 to 16 times its linear term,
+    // about 900 n, over the fit window 64..256, so the local slope is still
+    // below 2 there. Refusing is allowed, on the medians and on every seed
+    // alone; naming another class is not.
+    let quadratic_refused = if v == Variant::SignChanges {
+        SeedsRefused::Any
+    } else {
+        SeedsRefused::None
+    };
     let quadratic = check_class(
         &family,
         &mut arena,
@@ -76,11 +86,8 @@ fn check_variant(v: Variant) {
         &plan,
         v.quadratic(),
         GrowthClass::Quadratic,
+        quadratic_refused,
     );
-    // C refuses the sign-changes one (no class fits within tolerance): its
-    // n² term, about 54 n² steps, is only 4 to 16 times its linear term,
-    // about 900 n, over the fit window 64..256, so the local slope is still
-    // below 2 there. Refusing is allowed; naming another class is not.
     assert!(
         quadratic || v == Variant::SignChanges,
         "C does not name n^2 for {}",
@@ -93,6 +100,7 @@ fn check_variant(v: Variant) {
         &plan,
         v.good(),
         GrowthClass::Linear,
+        SeedsRefused::None,
     );
     assert!(good, "C does not name n for {}", v.good());
 
@@ -140,6 +148,7 @@ fn check_variant(v: Variant) {
         &plan,
         v.naive(),
         GrowthClass::Exponential,
+        SeedsRefused::None,
     );
     assert!(naive_named, "C does not name 2^n for {}", v.naive());
 }
