@@ -5,6 +5,18 @@
 //! alone, so the same pair gives the same input on every run, platform and
 //! thread.
 //!
+//! # Choices that hold for a seed across the sweep
+//!
+//! A generator that draws a kind of input (many ties, say, or none) from the
+//! `(n, seed)` stream gives each seed a different kind at each size. A
+//! program whose cost depends on the kind then has step counts that jump
+//! between sizes, and estimator C cannot see its growth through them
+//! (bead dreamcounter-0ea5b7). Draw such choices from the seed instead:
+//! [`TaskRng::seed`] for a choice spread evenly over the seeds (the kind
+//! `seed % 3`, say), and [`TaskRng::seed_stream`] for a random one. Both are
+//! the same at every size, so each seed's step counts follow one kind of
+//! input across the sweep.
+//!
 //! # Why the stream is stable across versions
 //!
 //! The stream is ChaCha8 (`rand_chacha`, pinned to an exact version in the
@@ -22,10 +34,14 @@ use rand_chacha::ChaCha8Rng;
 /// generated input, so it carries a version.
 const DOMAIN: &[u8; 16] = b"dc-tasks/input/1";
 
+/// As [`DOMAIN`], for [`TaskRng::seed_stream`].
+const SEED_DOMAIN: &[u8; 16] = b"dc-tasks/seeds/1";
+
 /// A deterministic random source for one generated input.
 #[derive(Debug, Clone)]
 pub struct TaskRng {
     inner: ChaCha8Rng,
+    seed: u64,
 }
 
 impl TaskRng {
@@ -37,6 +53,27 @@ impl TaskRng {
         key[16..].copy_from_slice(DOMAIN);
         TaskRng {
             inner: ChaCha8Rng::from_seed(key),
+            seed,
+        }
+    }
+
+    /// The seed this stream was made for. The same at every size, so a
+    /// choice made from it holds for the seed across the sweep.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// A fresh stream derived from the seed alone: the same at every size,
+    /// and apart from every `(n, seed)` stream. For random choices that
+    /// should hold for the seed across the sweep. Each call starts the
+    /// stream again from its beginning.
+    pub fn seed_stream(&self) -> TaskRng {
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&self.seed.to_le_bytes());
+        key[16..].copy_from_slice(SEED_DOMAIN);
+        TaskRng {
+            inner: ChaCha8Rng::from_seed(key),
+            seed: self.seed,
         }
     }
 
@@ -124,6 +161,42 @@ mod tests {
             "int_in(-1000, 1000) for (n=1024, seed=4)"
         );
     }
+
+    #[test]
+    fn seed_stream_depends_on_the_seed_alone() {
+        let first = |n, seed| TaskRng::new(n, seed).seed_stream().next_u64();
+        assert_eq!(first(16, 3), first(1024, 3));
+        assert_ne!(first(16, 3), first(16, 4));
+        assert_eq!(TaskRng::new(16, 3).seed(), 3);
+        assert_eq!(TaskRng::new(16, 3).seed_stream().seed(), 3);
+        // Apart from the input streams, including (n = 0, seed).
+        for n in [0, 16, 1024] {
+            assert_ne!(first(n, 3), TaskRng::new(n, 3).next_u64());
+        }
+        // Drawing from the input stream does not move the seed stream.
+        let mut r = TaskRng::new(16, 3);
+        r.next_u64();
+        assert_eq!(r.seed_stream().next_u64(), first(16, 3));
+    }
+
+    /// Pins the seed stream, as [`golden_values`] pins the input streams.
+    /// Recorded from this implementation; the key layout is the input
+    /// stream's with the seed in the first eight bytes, zeros in the next
+    /// eight and [`SEED_DOMAIN`] after.
+    #[test]
+    fn seed_stream_golden_values() {
+        let raw: Vec<u64> = {
+            let mut r = TaskRng::new(512, 2).seed_stream();
+            (0..3).map(|_| r.next_u64()).collect()
+        };
+        assert_eq!(raw, GOLDEN_SEED_RAW, "seed stream for seed 2");
+    }
+
+    const GOLDEN_SEED_RAW: [u64; 3] = [
+        6030082216158595254,
+        2466040114500341188,
+        10803117707397758781,
+    ];
 
     const GOLDEN_RAW: [u64; 3] = [
         16912961933745333717,
