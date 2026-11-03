@@ -22,12 +22,12 @@
 #[allow(dead_code)]
 mod common;
 
-use common::{check_class, compile};
+use common::{check_class, compile, single_seed_noise};
 use dc_core::Arena;
 use dc_tasks::families::collapse::{self, Collapse};
 use dc_tasks::families::sorted_order::{self, SortedOrder};
 use dc_tasks::families::subsequence_count::{self, SubsequenceCount};
-use dc_tasks::growth::GrowthClass;
+use dc_tasks::growth::{ClassSelect, GrowthClass, SizeObservation, Sweep, DEFAULT_SIZES};
 use dc_tasks::harness::{FuelPlan, HarnessConfig};
 use dc_tasks::task::TaskFamily;
 
@@ -295,4 +295,37 @@ fn collapse_cancel() {
         "cancel_natural",
         GrowthClass::Linear
     ));
+}
+
+/// The noise of one seed that the check on each seed alone uses is C's own
+/// noise on a sweep in seed order: seeds four levels apart, with a small
+/// spread that changes from size to size on top. Without centring it would
+/// be about the spread of the levels.
+#[test]
+fn single_seed_noise_is_cs_centred_noise() {
+    let levels = [-0.3, -0.1, 0.1, 0.3];
+    let k = levels.len();
+    let obs: Vec<SizeObservation> = DEFAULT_SIZES
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            let steps = (0..k)
+                .map(|j| {
+                    let wobble = 0.01 * (((3 * i + 5 * j) % 7) as f64 - 3.0);
+                    (1e6 * n as f64 * (levels[j] + wobble).exp()).round() as u64
+                })
+                .collect();
+            SizeObservation::completed(n, steps)
+        })
+        .collect();
+    let in_order = Sweep::in_seed_order(obs.clone()).expect("a sweep in seed order");
+    let fit = ClassSelect::default().fit(&in_order).expect("C fits");
+    assert!(fit.seed_centred);
+    let one = single_seed_noise(&in_order, &fit.window);
+    let from_one = (std::f64::consts::FRAC_PI_2 * one * one / k as f64).sqrt();
+    let c = fit.noise.expect("seeds");
+    assert!((from_one - c).abs() < 1e-9, "{from_one} against C's {c}");
+    let any = Sweep::new(obs).expect("a sweep");
+    let raw = single_seed_noise(&any, &fit.window);
+    assert!(raw > 0.2 && one < 0.05, "raw {raw}, centred {one}");
 }

@@ -35,7 +35,9 @@
 //!   `tied_thresholds`). If there are none, and in the other kinds, it is
 //!   taken from the sorted sums of all pairs `i < j`. Either way it is the
 //!   first, the last, or the sum at the fraction `q` of the way along that
-//!   list. The last of all pair sums is the largest, so every pair counts.
+//!   list. When the list is all pair sums, its last is the largest, so every
+//!   pair counts; the first and last of a tied input's list are not the
+//!   least and largest pair sums.
 //! - A random threshold is `-2 top`, `2 top`, or the value at the fraction
 //!   `q` of the way along `-2 top..=2 top`, where `top` is the largest
 //!   magnitude of an element. At `2 top` every pair counts. At `-2 top` in
@@ -51,9 +53,9 @@
 //! | 3 | tied | random, at `q` |
 //! | 4 | spread | random, `2 top`: every pair counts |
 //!
-//! So the default sweep has no wide input with an exact threshold, and none
-//! with an answer strictly between 0 and every pair; seeds 5 and up have
-//! them.
+//! So the default sweep has no wide input with an exact threshold or with
+//! an answer strictly between 0 and every pair, and at seed 4, where every
+//! pair counts, no pair sums to `t` exactly. Seeds 5 and up have these.
 //!
 //! With the default five seeds, the sweep has least gaps of 0, small ones
 //! and large ones; thresholds that at least one pair sums to and that
@@ -314,9 +316,11 @@ fn kind_of(seed: u64) -> u64 {
 /// Where along its range a pair-sums threshold falls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Place {
-    /// The first value: the least pair sum, or `-2 top`.
+    /// The first value of the list: the least pair sum, the least of a
+    /// tied input's thresholds, or `-2 top`.
     Bottom,
-    /// The last value: the largest pair sum, or `2 top`.
+    /// The last value of the list: the largest pair sum, the largest of a
+    /// tied input's thresholds, or `2 top`.
     Top,
     /// The value at the seed's quantile, drawn from
     /// [`TaskRng::seed_stream`].
@@ -333,8 +337,9 @@ struct PairSumsPlan {
 
 /// The pair-sums plans, a row for each kind (tied, spread, wide), each row
 /// all six plans in some order. Seed `k` takes entry `(k / 3) mod 6` of row
-/// `k mod 3`, so the place does not follow the kind. The rows' first two
-/// entries are the default five seeds' plans (see the module comment).
+/// `k mod 3`, so the place does not follow the kind. The default five seeds
+/// take entries 0 and 1 of the tied and spread rows and entry 0 of the wide
+/// row (see the module comment).
 const PAIR_SUMS_PLANS: [[PairSumsPlan; 6]; 3] = {
     const fn p(exact: bool, place: Place) -> PairSumsPlan {
         PairSumsPlan { exact, place }

@@ -38,9 +38,10 @@ pub fn list_len(inputs: &[Value]) -> u64 {
 /// deviation of the seeds' `ln` steps at a size in `window`. For a sweep in
 /// seed order it is measured as C measures it: after each seed's level over
 /// the window is taken out, with the variance times `N / (N − 1)` over `N`
-/// sizes. Otherwise seeds that differ only in level, as generators that keep
-/// one kind of input per seed make them, would make it large and the check
-/// on each seed alone lenient.
+/// sizes, so that `√(π/2 · noise² / k)` is C's noise for `k` seeds. Seeds
+/// that differ only in level, as generators that keep one kind of input per
+/// seed make them, would otherwise make it larger, and so widen the noise
+/// margin of the check on each seed alone. 0 if no size is in the window.
 pub fn single_seed_noise(sweep: &Sweep, window: &FitWindow) -> f64 {
     let ys: Vec<Vec<f64>> = sweep
         .observations()
@@ -53,9 +54,11 @@ pub fn single_seed_noise(sweep: &Sweep, window: &FitWindow) -> f64 {
             other => panic!("n = {}: {other:?}", o.n),
         })
         .collect();
+    let Some(k) = ys.first().map(Vec::len) else {
+        return 0.0;
+    };
     let sizes = ys.len() as f64;
     let centre = sweep.is_in_seed_order() && ys.len() >= 2;
-    let k = ys[0].len();
     let levels: Vec<f64> = if centre {
         let grand = ys.iter().flatten().sum::<f64>() / (sizes * k as f64);
         (0..k)

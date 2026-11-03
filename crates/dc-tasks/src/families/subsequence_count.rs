@@ -684,10 +684,7 @@ mod tests {
         pairs.sort();
         pairs.dedup();
         assert_eq!(pairs.len(), 15, "{pairs:?}");
-        let mut first_five: Vec<i64> = (0..5).map(bound_of).collect();
         assert_eq!((0..5).map(bound_of).collect::<Vec<i64>>(), [0, 3, 1, 4, 2]);
-        first_five.sort();
-        assert_eq!(first_five, (0..=MAX_M).collect::<Vec<i64>>());
     }
 
     proptest::proptest! {
