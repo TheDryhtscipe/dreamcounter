@@ -259,12 +259,12 @@ fn oracle_count(v: Variant, xs: &[i64], m: i64) -> i64 {
 }
 
 /// The bound `m` of [`Variant::SignChanges`] for seed `seed`, the same at
-/// every size: `2 seed mod (MAX_M + 1)`. The kind is `seed mod 3`, so the
+/// every size: `3 seed mod (MAX_M + 1)`. The kind is `seed mod 3`, so the
 /// bound does not follow it: over seeds 0 to 14 every kind gets every
-/// bound, and the default five seeds give each kind different bounds (the
-/// runs of signs of seed 2 get `MAX_M`).
+/// bound. The default five seeds give the uniform inputs bounds 0 and 4,
+/// the half-zero ones 3 and 2, and the runs of signs 1.
 fn bound_of(seed: u64) -> i64 {
-    ((2 * seed) % (MAX_M as u64 + 1)) as i64
+    ((3 * seed) % (MAX_M as u64 + 1)) as i64
 }
 
 impl TaskFamily for SubsequenceCount {
@@ -414,7 +414,7 @@ impl TaskFamily for SubsequenceCount {
     ///   `{a, a + 2, a + 3}`, so differences of exactly 2 and 3 are common.
     /// - Zigzag: uniform; or two neighbouring values, so ties are common.
     /// - Sign changes: uniform; half the elements 0; or signs in runs of 1
-    ///   to 8 elements. The bound `m` is `2 k mod (MAX_M + 1)` for seed
+    ///   to 8 elements. The bound `m` is `3 k mod (MAX_M + 1)` for seed
     ///   `k`, the same at every size, as a solution's cost can depend on it;
     ///   the default five seeds have every bound from 0 to `MAX_M`.
     ///
@@ -679,13 +679,13 @@ mod tests {
     #[test]
     fn sign_changes_bound_does_not_follow_the_kind() {
         // Over seeds 0 to 14 every kind (seed mod 3) gets every bound; the
-        // default five have every bound, and the runs of seed 2 get MAX_M.
+        // default five have every bound, and the runs of seed 2 get 1.
         let mut pairs: Vec<(u64, i64)> = (0..15).map(|s| (s % 3, bound_of(s))).collect();
         pairs.sort();
         pairs.dedup();
         assert_eq!(pairs.len(), 15, "{pairs:?}");
         let mut first_five: Vec<i64> = (0..5).map(bound_of).collect();
-        assert_eq!(bound_of(2), MAX_M);
+        assert_eq!((0..5).map(bound_of).collect::<Vec<i64>>(), [0, 3, 1, 4, 2]);
         first_five.sort();
         assert_eq!(first_five, (0..=MAX_M).collect::<Vec<i64>>());
     }

@@ -1900,3 +1900,53 @@ fn c_centres_a_sweep_in_seed_order_under_every_noise_model() {
         assert_ne!(misfits(&centred), misfits(&raw), "{model:?}");
     }
 }
+
+#[test]
+fn c_fits_the_lower_median_of_the_centred_counts() {
+    // With an even number of seeds the lower and upper medians differ. C
+    // fits the lower median of the centred ln steps: the same misfits as an
+    // exact one-seed sweep through those medians.
+    let mut normals = Normals(0x10E);
+    let seeds = 4;
+    let draws: Vec<f64> = (0..DEFAULT_SIZES.len() * seeds)
+        .map(|_| 0.05 * normals.next())
+        .collect();
+    let base = |n: u64| 1e9 * n as f64;
+    let obs = seed_rows(base, seeds, |i, j| draws[i * seeds + j]);
+    // The centred counts, from the rounded step counts as C sees them.
+    let ys: Vec<Vec<f64>> = obs
+        .iter()
+        .map(|o| match &o.outcome {
+            SizeOutcome::Completed { steps } => steps.iter().map(|&s| (s as f64).ln()).collect(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    let sizes = ys.len() as f64;
+    let grand = ys.iter().flatten().sum::<f64>() / (sizes * seeds as f64);
+    let levels: Vec<f64> = (0..seeds)
+        .map(|j| ys.iter().map(|row| row[j]).sum::<f64>() / sizes - grand)
+        .collect();
+    let medians: Vec<SizeObservation> = ys
+        .iter()
+        .zip(DEFAULT_SIZES.iter())
+        .map(|(row, &n)| {
+            let mut z: Vec<f64> = row.iter().zip(&levels).map(|(y, b)| y - b).collect();
+            z.sort_by(f64::total_cmp);
+            SizeObservation::completed(n, vec![z[(seeds - 1) / 2].exp().round() as u64])
+        })
+        .collect();
+    let fit = c_seeded(&seed_order(obs));
+    let through = c_with(NoiseModel::Exact)
+        .fit(&any_order(medians))
+        .expect("C fits");
+    assert!(fit.seed_centred, "{fit:?}");
+    for (a, b) in fit.candidates.iter().zip(&through.candidates) {
+        assert!(
+            (a.misfit - b.misfit).abs() < 1e-6,
+            "{}: {} against {}",
+            a.class,
+            a.misfit,
+            b.misfit
+        );
+    }
+}

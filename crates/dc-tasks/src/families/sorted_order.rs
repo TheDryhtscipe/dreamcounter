@@ -21,11 +21,12 @@
 //!
 //! The threshold of [`Variant::PairSums`] is chosen per seed in the same
 //! way, so that a natural solution's cost, which depends on the answer, does
-//! not jump between sizes. Seed `k` takes the plan `k mod 6` in
-//! `PAIR_SUMS_PLANS`: whether the threshold is exact or random, and where
-//! along the range it falls: at the bottom, at the top, or at a quantile `q`
-//! in `[0, 1)` drawn from [`TaskRng::seed_stream`]. The plan is the same at
-//! every size. Over seeds 0 to 5 every kind gets both modes.
+//! not jump between sizes. A seed's plan says whether the threshold is exact
+//! or random, and where along its range it falls: at the bottom, at the top,
+//! or at a quantile `q` in `[0, 1)` drawn from [`TaskRng::seed_stream`]. The
+//! plan is the same at every size. Seed `k` of kind `k mod 3` takes the
+//! plan `(k / 3) mod 6` in its kind's row of `PAIR_SUMS_PLANS`; each row
+//! holds all six plans, so over seeds 0 to 17 every kind gets every plan.
 //!
 //! - An exact threshold is the sum of two elements, so some pair sums to
 //!   exactly `t`. In a tied input it is taken from the sums of two narrow
@@ -33,18 +34,26 @@
 //!   preferring those to which two equal elements sum (see
 //!   `tied_thresholds`). If there are none, and in the other kinds, it is
 //!   taken from the sorted sums of all pairs `i < j`. Either way it is the
-//!   first, the last, or the sum at the fraction `q` of the way along the
-//!   sorted list. The last of all pair sums is the largest, so every pair
-//!   counts.
+//!   first, the last, or the sum at the fraction `q` of the way along that
+//!   list. The last of all pair sums is the largest, so every pair counts.
 //! - A random threshold is `-2 top`, `2 top`, or the value at the fraction
 //!   `q` of the way along `-2 top..=2 top`, where `top` is the largest
-//!   magnitude of an element. At `-2 top` in a wide input no pair counts, as
-//!   its elements are distinct.
+//!   magnitude of an element. At `2 top` every pair counts. At `-2 top` in
+//!   a wide input none does, as its elements are distinct.
 //!
-//! So seed 0, a tied input with an exact threshold, gives a threshold that
-//! several pairs sum to at every size where the input allows it; seed 1, a
-//! spread input, the largest pair sum, so every pair counts; and seed 2, a
-//! wide input, `-2 top`, so none does.
+//! The default five seeds take these plans:
+//!
+//! | seed | kind | threshold |
+//! |---|---|---|
+//! | 0 | tied | exact, at `q`: several pairs sum to it wherever the input allows |
+//! | 1 | spread | exact, at `q` |
+//! | 2 | wide | random, `-2 top`: no pair counts |
+//! | 3 | tied | random, at `q` |
+//! | 4 | spread | random, `2 top`: every pair counts |
+//!
+//! So the default sweep has no wide input with an exact threshold, and none
+//! with an answer strictly between 0 and every pair; seeds 5 and up have
+//! them.
 //!
 //! With the default five seeds, the sweep has least gaps of 0, small ones
 //! and large ones; thresholds that at least one pair sums to and that
@@ -322,40 +331,45 @@ struct PairSumsPlan {
     place: Place,
 }
 
-/// The pair-sums plan of seed `k` is entry `k mod 6`. The mode does not
-/// follow the kind (`k mod 3`): over seeds 0 to 5 every kind gets both. The
-/// default five seeds have an exact threshold several pairs sum to (seed 0,
-/// tied), every pair counting (seed 1, spread, the largest pair sum), and no
-/// pair counting (seed 2, wide, `-2 top`).
-const PAIR_SUMS_PLANS: [PairSumsPlan; 6] = [
-    PairSumsPlan {
-        exact: true,
-        place: Place::Drawn,
-    },
-    PairSumsPlan {
-        exact: true,
-        place: Place::Top,
-    },
-    PairSumsPlan {
-        exact: false,
-        place: Place::Bottom,
-    },
-    PairSumsPlan {
-        exact: false,
-        place: Place::Drawn,
-    },
-    PairSumsPlan {
-        exact: false,
-        place: Place::Drawn,
-    },
-    PairSumsPlan {
-        exact: true,
-        place: Place::Drawn,
-    },
-];
+/// The pair-sums plans, a row for each kind (tied, spread, wide), each row
+/// all six plans in some order. Seed `k` takes entry `(k / 3) mod 6` of row
+/// `k mod 3`, so the place does not follow the kind. The rows' first two
+/// entries are the default five seeds' plans (see the module comment).
+const PAIR_SUMS_PLANS: [[PairSumsPlan; 6]; 3] = {
+    const fn p(exact: bool, place: Place) -> PairSumsPlan {
+        PairSumsPlan { exact, place }
+    }
+    use Place::{Bottom, Drawn, Top};
+    [
+        [
+            p(true, Drawn),
+            p(false, Drawn),
+            p(true, Top),
+            p(false, Bottom),
+            p(true, Bottom),
+            p(false, Top),
+        ],
+        [
+            p(true, Drawn),
+            p(false, Top),
+            p(false, Drawn),
+            p(true, Bottom),
+            p(true, Top),
+            p(false, Bottom),
+        ],
+        [
+            p(false, Bottom),
+            p(true, Drawn),
+            p(true, Top),
+            p(false, Drawn),
+            p(false, Top),
+            p(true, Bottom),
+        ],
+    ]
+};
 
 fn pair_sums_plan(seed: u64) -> PairSumsPlan {
-    PAIR_SUMS_PLANS[(seed % 6) as usize]
+    PAIR_SUMS_PLANS[kind_of(seed) as usize][((seed / 3) % 6) as usize]
 }
 
 /// The index `place` picks in a list of `len > 0`: the first, the last, or
@@ -712,22 +726,49 @@ mod tests {
     }
 
     #[test]
+    fn every_kind_gets_every_pair_sums_plan() {
+        // Over seeds 0 to 17 each kind takes all six plans: exact or
+        // random, at the bottom, the top or a drawn quantile.
+        for kind in 0..3 {
+            let mut plans: Vec<(bool, u8)> = (0..18)
+                .filter(|k| kind_of(*k) == kind)
+                .map(|k| {
+                    let p = pair_sums_plan(k);
+                    (p.exact, p.place as u8)
+                })
+                .collect();
+            plans.sort();
+            plans.dedup();
+            assert_eq!(plans.len(), 6, "kind {kind}: {plans:?}");
+        }
+    }
+
+    #[test]
     fn default_seeds_give_pair_sums_answers_of_none_and_all() {
         // A solution can be wrong only when no pair counts, or only when
-        // every pair does. Seed 2 (wide, -2 top) has answer 0 and seed 1
-        // (spread, the largest pair sum) every pair, at every size.
+        // every pair does. Seed 2 (wide, -2 top) has answer 0 and seed 4
+        // (spread, 2 top) every pair, at every size; seeds 0, 1 and 3 fall
+        // in between, and 0 and 1 are exact.
         let f = SortedOrder(Variant::PairSums);
         for n in f.sizes() {
-            let answer = |seed: u64| {
+            let at = |seed: u64| {
                 let i = f.generate(n, &mut TaskRng::new(n, seed));
-                pair_sums(&ints_of(&i[0]), int_of(&i[1]))
+                (ints_of(&i[0]), int_of(&i[1]))
+            };
+            let answer = |seed: u64| {
+                let (xs, t) = at(seed);
+                pair_sums(&xs, t)
             };
             let all = (n * (n - 1) / 2) as i64;
             assert_eq!(answer(2), 0, "n = {n}");
-            assert_eq!(answer(1), all, "n = {n}");
-            for seed in [0, 3, 4] {
+            assert_eq!(answer(4), all, "n = {n}");
+            for seed in [0, 1, 3] {
                 let a = answer(seed);
                 assert!(0 < a && a < all, "seed {seed}, n = {n}: {a} of {all}");
+            }
+            for seed in [0, 1] {
+                let (xs, t) = at(seed);
+                assert!(exact_pairs(&xs, t) >= 1, "seed {seed}, n = {n}: t = {t}");
             }
         }
     }

@@ -100,7 +100,8 @@
 //! seeds the centred noise runs a little below the per-size one: about 0.98
 //! of it at two seeds and 0.99 at five, over the seven default sizes, and
 //! close to 1 at forty. Seeds whose offsets change from
-//! size to size still spread after centring, and C still refuses them. C
+//! size to size still spread after centring, so that change stays in the
+//! noise C measures. C
 //! centres only if every size in the window has at least two seeds;
 //! [`ClassFit::seed_centred`] says whether it did. Step counts in any order
 //! ([`Sweep::new`]) are never centred: lining up counts from different seeds
