@@ -16,7 +16,12 @@ use std::rc::Rc;
 use dc_core::{Arena, LibId, Prim, Term, TermId};
 
 use crate::cost;
-use crate::value::{structural_eq, Env, EqResult, Fun, List, MemoKey, MemoTable, Tree, Value};
+use rustc_hash::FxHashMap;
+
+use crate::value::{
+    structural_eq, Env, EqResult, Fun, List, MemoKey, MemoTable, OverBudget, Part, Reach, TableId,
+    Tree, Value,
+};
 
 /// The result of one evaluation (spec §4). The `u64` is the number of steps taken.
 #[derive(Clone, Debug)]
@@ -248,18 +253,45 @@ struct Machine<'a> {
     stack: Vec<Frame>,
     steps: u64,
     fuel: u64,
-    /// Every memo table this evaluation created. The machine owns them until the
-    /// evaluation ends; a `memorec` `self` holds only a weak reference, so a `self`
-    /// stored in its own table cannot keep the table alive through a reference
-    /// cycle once the machine is dropped. See [`crate::cost`].
+    /// Every memo table this evaluation created and the program may still reach.
+    /// The machine owns them until the evaluation ends; a `memorec` `self` holds
+    /// only a weak reference, so a `self` stored in its own table cannot keep the
+    /// table alive through a reference cycle once the machine is dropped. See
+    /// [`crate::cost`].
     memo_tables: Vec<Rc<RefCell<MemoTable>>>,
     /// The number of tables at which [`Machine::adopt_table`] next releases the
     /// tables nothing can reach any more.
     memo_prune_at: usize,
+    pruning: Pruning,
+    /// The step count when the last reachability walk finished.
+    last_walk_at: u64,
+    /// The step count before which no reachability walk starts.
+    next_walk_at: u64,
+    /// The work of every reachability walk so far. Only tests read it.
+    walk_work: u64,
+}
+
+/// When [`Machine::adopt_table`] looks for memo tables the program cannot reach.
+#[derive(Clone, Copy, Debug)]
+struct Pruning {
+    /// The fewest tables at which it looks.
+    min_tables: usize,
+    /// Whether to look at every new table, with no bound on the reachability
+    /// walk. Only tests turn this on.
+    eager: bool,
 }
 
 /// The fewest tables at which [`Machine::adopt_table`] looks for unreachable ones.
 const MEMO_PRUNE_MIN: usize = 64;
+
+/// How an evaluation prunes memo tables.
+const PRUNING: Pruning = Pruning {
+    min_tables: MEMO_PRUNE_MIN,
+    eager: false,
+};
+
+/// The work a reachability walk may always do, whatever the steps since the last.
+const MEMO_WALK_MIN: u64 = 1024;
 
 impl<'a> Machine<'a> {
     fn new(arena: &'a Arena, fuel: u64) -> Machine<'a> {
@@ -270,6 +302,10 @@ impl<'a> Machine<'a> {
             fuel,
             memo_tables: Vec::new(),
             memo_prune_at: MEMO_PRUNE_MIN,
+            pruning: PRUNING,
+            last_walk_at: 0,
+            next_walk_at: 0,
+            walk_work: 0,
         }
     }
 
@@ -605,7 +641,7 @@ impl<'a> Machine<'a> {
                     entries: Default::default(),
                     misses_left: *n,
                 }));
-                self.adopt_table(table.clone());
+                self.adopt_table(table.clone(), args);
                 self.memo_call(&table, f, x.clone())
             }
             _ => Err(bad(p)),
@@ -741,22 +777,85 @@ impl<'a> Machine<'a> {
         call(f, this)
     }
 
-    /// Keeps `table` alive until the evaluation ends.
+    /// Keeps `table` alive until the evaluation ends, or until the program can
+    /// no longer reach it. `args` are the arguments of the `memorec` call that
+    /// created it: the only values the machine holds outside its stack.
     ///
-    /// A table that no `self` and no frame refers to can never be read again, so
-    /// releasing it changes nothing a program can observe. Such tables are
-    /// released whenever the count doubles, at amortised O(1) work per table. A
-    /// `self` stored in its own table's entries counts as a reference, so a loop
-    /// of curried `memorec` calls keeps every table until the evaluation ends.
-    fn adopt_table(&mut self, table: Rc<RefCell<MemoTable>>) {
-        if self.memo_tables.len() >= self.memo_prune_at {
+    /// A table that no `self` and no frame reaches can never be read again, so
+    /// releasing it changes nothing a program can observe. Whenever the count
+    /// doubles, at amortised O(1) work per table, the tables with no `self` and
+    /// no pending call are released. If tables are left that only their selves
+    /// refer to, a walk from the stack and `args` finds the tables still reachable,
+    /// and the rest are released too: tables whose entries hold their own `self`,
+    /// or the selves of each other.
+    ///
+    /// The walk visits the memory the stack can reach, which can be far more than
+    /// the tables. So it runs only once the steps since the last walk are at
+    /// least that walk's work, and it gives up after the steps since the last
+    /// completed walk (or [`MEMO_WALK_MIN`], if more); after giving up, it waits
+    /// twice that many steps. So its work is at most a constant times the steps.
+    fn adopt_table(&mut self, table: Rc<RefCell<MemoTable>>, args: &[Value]) {
+        if self.pruning.eager || self.memo_tables.len() >= self.memo_prune_at {
             // Strong references: this vector, plus any `MemoStore` frame. Weak
             // references: every `self` of this table that is still alive.
             self.memo_tables
                 .retain(|t| Rc::strong_count(t) > 1 || Rc::weak_count(t) > 0);
-            self.memo_prune_at = (2 * self.memo_tables.len()).max(MEMO_PRUNE_MIN);
+            if self.memo_tables.iter().any(|t| Rc::strong_count(t) == 1) {
+                self.release_unreachable_tables(args);
+            }
+            self.memo_prune_at = (2 * self.memo_tables.len()).max(self.pruning.min_tables);
         }
         self.memo_tables.push(table);
+    }
+
+    /// Releases the tables that a walk from the stack and `args` does not reach,
+    /// if the walk is due and finishes within its budget.
+    fn release_unreachable_tables(&mut self, args: &[Value]) {
+        let budget = if self.pruning.eager {
+            u64::MAX
+        } else if self.steps < self.next_walk_at {
+            return;
+        } else {
+            (self.steps - self.last_walk_at).max(MEMO_WALK_MIN)
+        };
+        let mut reach = Reach::new(budget);
+        let walked = self.reachable_tables(args, &mut reach);
+        self.walk_work = self.walk_work.saturating_add(reach.work());
+        match walked {
+            Ok(()) => {
+                self.memo_tables.retain(|t| reach.reached(Rc::as_ptr(t)));
+                self.last_walk_at = self.steps;
+                // Without this wait, a stack that a walk can just finish
+                // within the floor would be walked at every pruning.
+                self.next_walk_at = self.steps.saturating_add(reach.work());
+            }
+            Err(OverBudget) => {
+                self.next_walk_at = self.steps.saturating_add(budget.saturating_mul(2));
+            }
+        }
+    }
+
+    /// Walks the stack, `args` and the entries of every table they reach.
+    fn reachable_tables(&self, args: &[Value], reach: &mut Reach) -> Result<(), OverBudget> {
+        let mut parts: Vec<Part<'_>> = Vec::new();
+        gather(&mut parts, reach, args.iter().map(Part::Value))?;
+        for frame in &self.stack {
+            frame_parts(frame, &mut parts, reach)?;
+        }
+        reach.walk(parts)?;
+        let tables: FxHashMap<TableId, &Rc<RefCell<MemoTable>>> = self
+            .memo_tables
+            .iter()
+            .map(|t| (Rc::as_ptr(t), t))
+            .collect();
+        while let Some(id) = reach.next_table() {
+            // A `self` from an earlier evaluation has a table this machine
+            // never held.
+            if let Some(table) = tables.get(&id) {
+                reach.walk_values(table.borrow().entries.values())?;
+            }
+        }
+        Ok(())
     }
 
     /// One memo call on `x`: a hit returns the stored result, a miss evaluates
@@ -804,6 +903,78 @@ impl<'a> Machine<'a> {
             f: f.clone(),
         }));
         call(f, this)
+    }
+}
+
+/// Adds `items` to `parts`, counting them as work first.
+fn gather<'f>(
+    parts: &mut Vec<Part<'f>>,
+    reach: &mut Reach,
+    items: impl ExactSizeIterator<Item = Part<'f>>,
+) -> Result<(), OverBudget> {
+    reach.reserve(items.len())?;
+    parts.extend(items);
+    Ok(())
+}
+
+/// Adds the parts `frame` holds to `parts`, and the table of a `MemoStore` frame
+/// to `reach`. Every value a frame holds is a root. Some, such as the generator
+/// of `unfold`, may never be the only path to a table, but keeping them all
+/// needs no argument about which. Memo keys hold no functions, so they reach no
+/// table. A table that only its `MemoStore` frame reaches has no `self` left to
+/// read it, but it is kept like any table with a pending call.
+fn frame_parts<'f>(
+    frame: &'f Frame,
+    parts: &mut Vec<Part<'f>>,
+    reach: &mut Reach,
+) -> Result<(), OverBudget> {
+    use std::iter::once;
+    let value = |v: &'f Value| once(Part::Value(v));
+    match frame {
+        Frame::AppArg { env, .. }
+        | Frame::LetBody { env, .. }
+        | Frame::If { env, .. }
+        | Frame::And { env, .. }
+        | Frame::Or { env, .. } => gather(parts, reach, once(Part::Env(env))),
+        Frame::AppFun { f } | Frame::ApplyTo(f) | Frame::Loop { f, .. } => {
+            gather(parts, reach, value(f))
+        }
+        Frame::Foldl { f, rest } => {
+            gather(parts, reach, [Part::Value(f), Part::List(rest)].into_iter())
+        }
+        Frame::Foldr { f, elems } => {
+            gather(parts, reach, value(f))?;
+            gather(parts, reach, elems.iter().map(Part::Value))
+        }
+        Frame::Unfold { g, out } => {
+            gather(parts, reach, value(g))?;
+            gather(parts, reach, out.iter().map(Part::Value))
+        }
+        Frame::Tabulate { f, out, .. } => {
+            gather(parts, reach, value(f))?;
+            gather(parts, reach, out.iter().map(Part::Value))
+        }
+        Frame::TreeFold {
+            z,
+            f,
+            tasks,
+            results,
+        } => {
+            gather(parts, reach, [Part::Value(z), Part::Value(f)].into_iter())?;
+            gather(
+                parts,
+                reach,
+                tasks.iter().map(|task| match task {
+                    TreeTask::Visit(t) => Part::Tree(t),
+                    TreeTask::Combine(x) => Part::Value(x),
+                }),
+            )?;
+            gather(parts, reach, results.iter().map(Part::Value))
+        }
+        Frame::MemoStore { table, .. } => {
+            reach.mark_table(Rc::as_ptr(table));
+            Ok(())
+        }
     }
 }
 
@@ -925,5 +1096,306 @@ mod tests {
         let (o, kept) = run_machine(&mut arena, q, UNLIMITED);
         assert!(matches!(o, Outcome::Value(Value::Int(1), _)), "{o}");
         assert_eq!(kept, 200);
+    }
+
+    /// A curried functional: `self x` returns `λy. x + (self (x - 1)) (y - 1)`,
+    /// or `x` once `y` is 0. Each result holds `self` in its environment, and is
+    /// stored in the table of that `self`.
+    const CURRIED: &str =
+        "(lam (lam (lam (if (le $0 0) $1 (add $1 (($2 (sub $1 1)) (sub $0 1)))))))";
+
+    /// `memorec 5 CURRIED k`: a closure whose table holds itself.
+    fn curried(k: &str) -> String {
+        format!("(memorec 5 {CURRIED} {k})")
+    }
+
+    /// A walk at every `memorec` call, with no budget.
+    const ALWAYS: Pruning = Pruning {
+        min_tables: 0,
+        eager: true,
+    };
+
+    /// No pruning at all.
+    const NEVER: Pruning = Pruning {
+        min_tables: usize::MAX,
+        eager: false,
+    };
+
+    /// Runs `src` with `pruning`, as [`run_machine`] does.
+    fn run_pruned(src: &str, pruning: Pruning) -> (Outcome, usize) {
+        let mut arena = Arena::new();
+        let t = sexpr::parse(&mut arena, src).expect("parse");
+        let mut m = Machine::new(&arena, UNLIMITED);
+        m.pruning = pruning;
+        m.memo_prune_at = pruning.min_tables;
+        let o = m.run(Control::Eval(t, Env::empty()));
+        (o, m.memo_tables.len())
+    }
+
+    /// Asserts that `src` returns a value with no function in it, the same one
+    /// in the same steps whether or not tables are pruned, and, if `releases`,
+    /// that pruning released some.
+    #[track_caller]
+    fn assert_pruning_is_unobservable(src: &str, releases: bool) {
+        let (never, all) = run_pruned(src, NEVER);
+        let (always, kept) = run_pruned(src, ALWAYS);
+        let (default, _) = run_pruned(src, PRUNING);
+        let Outcome::Value(v, steps) = &never else {
+            panic!("{src}: {never}");
+        };
+        assert!(
+            matches!(v, Value::Int(_) | Value::Bool(_)),
+            "{src}: {never}"
+        );
+        for o in [always, default] {
+            assert!(
+                matches!(&o, Outcome::Value(w, s) if w == v && s == steps),
+                "{src}: {o}, not {never}"
+            );
+        }
+        assert!(
+            !releases || kept < all,
+            "{src}: {kept} of {all} tables kept"
+        );
+    }
+
+    /// Two `memorec` calls whose tables hold their own `self` and are
+    /// unreachable once they return; the second prunes while everything around
+    /// it is live. Returns 0. No closure is built, so the only frames that hold
+    /// the environment are those around it.
+    fn garbage() -> String {
+        let g = "(snd (memorec 1 pair 0))";
+        format!("(add {g} {g})")
+    }
+
+    #[test]
+    fn pruning_keeps_every_table_a_frame_or_a_value_still_reaches() {
+        let g = garbage();
+        let list = format!(
+            "(cons {} (cons {} (cons {} nil)))",
+            curried("1"),
+            curried("2"),
+            curried("3")
+        );
+        for src in [
+            // The elements still to fold: `foldr` and `foldl` frames.
+            format!("(foldr (lam (lam (add (add ($1 2) $0) {g}))) 0 {list})"),
+            format!("(foldl (lam (lam (add (add $1 ($0 2)) {g}))) 0 {list})"),
+            // The elements so far: `array_tabulate` and `unfold` frames.
+            format!(
+                "(let (array_tabulate 4 (lam (let {g} {}))) (add ((array_get $0 0) 2) ((array_get $0 3) 2)))",
+                curried("$1")
+            ),
+            format!(
+                "(foldl (lam (lam (add $1 ($0 2)))) 0 (unfold (lam (if (le $0 0) none (let {g} (some (pair {} (sub $1 1)))))) 3))",
+                curried("$1")
+            ),
+            // The left results while the right subtree folds: `tree_fold` frames.
+            format!(
+                "((tree_fold (lam $0) (lam (lam (lam (let {g} (let {} (lam (add (add ($5 $0) ($3 $0)) ($1 $0)))))))) (node (node leaf 1 leaf) 2 (node leaf 3 leaf))) 2)",
+                curried("$2")
+            ),
+            // The subtrees and values still to fold.
+            format!(
+                "(tree_fold 0 (lam (lam (lam (let {g} (add (add $3 $1) ($2 2)))))) (node (node leaf {} leaf) {} (node leaf {} leaf)))",
+                curried("1"),
+                curried("2"),
+                curried("3")
+            ),
+            // A table during its own misses, its `self` in the environment.
+            format!("((memorec 5 (lam (lam (let {g} (lam (if (le $0 0) $2 (add $2 (($3 (sub $2 1)) (sub $0 1)))))))) 3) 2)"),
+            // A closure held only by the functional of the `memorec` call.
+            format!("((lam (add {g} (memorec 1 (lam (lam (add ($2 2) {g}))) 0))) {})", curried("4")),
+            // Inside a pair, an option, a partial application, an array, a tree.
+            format!(
+                "(let (pair {} (some {})) (let {g} (add ((fst $1) 2) (option_case (snd $1) (lam 0) (lam ($0 2))))))",
+                curried("1"),
+                curried("2")
+            ),
+            format!("(let (pair {}) (let {g} ((fst ($1 0)) 2)))", curried("1")),
+            format!("(let (array_of_list (cons {} nil)) (let {g} ((array_get $1 0) 2)))", curried("1")),
+            format!(
+                "(let (node (node leaf {} leaf) 0 (node leaf {} leaf)) (let {g} (tree_case $1 (lam 0) (lam (lam (lam (add (tree_case $2 (lam 0) (lam (lam (lam ($1 2))))) (tree_case $0 (lam 0) (lam (lam (lam ($1 2))))))))))))",
+                curried("1"),
+                curried("2")
+            ),
+            // The environment, held only by a `let`, an argument still to
+            // evaluate, an `if`, an `and` or an `or`.
+            format!("(let {} (let {g} ($1 2)))", curried("1")),
+            format!("(let {} ((fst (pair (add 1) {g})) ($0 2)))", curried("1")),
+            format!("(let {} (if (le 0 {g}) ($0 2) 0))", curried("1")),
+            format!("(let {} (and (le 0 {g}) (le 0 ($0 2))))", curried("1")),
+            format!("(let {} (or (le 1 {g}) (le 0 ($0 2))))", curried("1")),
+            // A function value, held only by the frame that applies it: a
+            // partial `pair`, and a `tree_case` value still to pass.
+            format!("((fst ((pair {}) {g})) 2)", curried("1")),
+            format!(
+                "(tree_case (node leaf {} leaf) (lam 0) (lam (let {g} (lam (lam ($1 2))))))",
+                curried("1")
+            ),
+            // The functional of a `bfix` self, which holds the closure in its
+            // environment.
+            format!(
+                "(let ((lam (bfix 3 (lam (lam (if (int_eq $0 0) $1 ($2 2)))) 0)) {}) (let {g} ($1 1)))",
+                curried("1")
+            ),
+            // A table reached only through the entry of a table whose `self` is
+            // live: the self's table maps 1 to the pair of itself and a closure.
+            format!(
+                "(let (fst (memorec 5 (lam (lam (pair $1 {}))) 1)) (let {g} ((snd ($1 1)) 2)))",
+                curried("$0")
+            ),
+        ] {
+            assert_pruning_is_unobservable(&src, true);
+        }
+    }
+
+    #[test]
+    fn pruning_keeps_a_self_that_only_a_combinator_frame_holds() {
+        // `self` maps 99 to the pair of itself and 0, so its table holds it;
+        // other keys miss and return what F returns.
+        let memo_self = |f_result: &str| {
+            format!("(fst (memorec 5 (lam (lam (if (int_eq $0 99) (pair $1 0) {f_result}))) 99))")
+        };
+        // Closed functions, built before `self`, so their environments do not
+        // hold it, that make two garbage tables when called.
+        let g = "(snd (memorec 1 pair 0))";
+        let g1 = format!("(lam (add $0 (add {g} {g})))");
+        let g2 = format!("(lam (lam (add $0 (add {g} {g}))))");
+        let list = "(cons 1 (cons 2 (cons 3 nil)))";
+        for src in [
+            // `self` is the combinator's function, held only by its frame: each
+            // call misses and returns the garbage-making function, which the
+            // combinator then applies.
+            format!("(let {g1} (let {} (loop 3 0 $0)))", memo_self("$2")),
+            format!("(let {g1} (let {} (foldl $0 0 {list})))", memo_self("$2")),
+            format!("(let {g1} (let {} (foldr $0 0 {list})))", memo_self("$2")),
+            format!(
+                "(let {g2} (let {} (tree_fold 0 $0 (node (node leaf 1 leaf) 2 leaf))))",
+                memo_self("$2")
+            ),
+            // `self` inside `tree_fold`'s leaf value, held only by its frame
+            // while the inner subtree combines: no leaf is folded then, and the
+            // results do not hold it. The leaf at the root's right folds later
+            // and calls it. `self` returns its key.
+            format!(
+                "(let (lam (lam (lam (pair (add 0) (add (add (snd $2) $1) (add ((fst $0) 0) (add {g} {g}))))))) (let {} (snd (tree_fold (pair $0 0) $1 (node (node (node leaf 1 leaf) 2 (node leaf 1 leaf)) 3 leaf)))))",
+                memo_self("$0")
+            ),
+        ] {
+            assert_pruning_is_unobservable(&src, true);
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn pruning_is_unobservable_in_loops_that_keep_some_tables(
+            n in 1i64..80,
+            k in 1i64..6,
+            y in 0i64..4,
+        ) {
+            // Iteration i keeps its curried result when k divides i, else drops
+            // it; then every kept result is applied to y. The table of the last
+            // iteration is never pruned, so some table is released only if an
+            // earlier iteration drops its result.
+            let src = format!(
+                "(foldl (lam (lam (add $1 ($0 {y})))) 0 (loop {n} nil (lam (lam (if (int_eq (mod $1 {k}) 0) (cons {c} $0) (let {c} $1))))))",
+                c = curried("$1")
+            );
+            assert_pruning_is_unobservable(&src, k > 1 && n >= 3);
+        }
+    }
+
+    #[test]
+    fn reachability_walks_cost_at_most_a_constant_times_the_steps() {
+        // A live input of 100000 elements, about 200000 parts for every walk:
+        // more than the steps of the whole evaluation. One live curried result
+        // makes a walk worth trying, and 3000 memorec calls whose tables the
+        // cheap pass releases bring a try every 64 calls.
+        let mut arena = Arena::new();
+        let p = format!(
+            "(lam (let {} (loop 3000 0 (lam (lam (memorec 1 (lam (lam 0)) $1))))))",
+            curried("1")
+        );
+        let t = sexpr::parse(&mut arena, &p).expect("parse");
+        let xs: Vec<i64> = (0..100_000).collect();
+        let mut m = Machine::new(&arena, UNLIMITED);
+        m.stack.push(Frame::ApplyTo(Value::int_list(&xs)));
+        let o = m.run(Control::Eval(t, Env::empty()));
+        assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
+        let (steps, work) = (o.steps(), m.walk_work);
+        assert!(work > 0, "no walk started");
+        assert!(
+            work <= 3 * steps + 2 * MEMO_WALK_MIN,
+            "{work} for {steps} steps"
+        );
+    }
+
+    #[test]
+    fn a_walk_visits_each_element_of_shared_array_chunks_once() {
+        // 22 levels of arrays whose two elements are the level below: 2^22
+        // elements as a tree, 44 in memory. Few enough that visiting them all
+        // fails the test rather than hanging it. Then two garbage tables, the second
+        // walking the arrays, held by a `let` frame, with no budget.
+        let p = format!(
+            "(let (loop 22 0 (lam (lam (array_tabulate 2 (lam $1))))) (let {} (array_size $1)))",
+            garbage()
+        );
+        let mut arena = Arena::new();
+        let t = sexpr::parse(&mut arena, &p).expect("parse");
+        let mut m = Machine::new(&arena, UNLIMITED);
+        m.pruning = ALWAYS;
+        let o = m.run(Control::Eval(t, Env::empty()));
+        assert!(matches!(o, Outcome::Value(Value::Int(2), _)), "{o}");
+        assert!(m.walk_work > 44 && m.walk_work < 1000, "{}", m.walk_work);
+    }
+
+    #[test]
+    fn walks_finish_beside_an_array_that_many_values_hold() {
+        // One array of 8000 elements in each of 2000 list cells: about 10000
+        // parts of memory, but 16 million if every cell's array were visited in
+        // full, or 250000 if every cell's array cost its 125 chunks. Beside it,
+        // 20000 dropped curried results, about 140000 steps. Walks of about
+        // 20000 parts finish every few thousand iterations.
+        let mut arena = Arena::new();
+        let p = format!(
+            "(let (array_tabulate 8000 (lam 0)) (let (loop 2000 nil (lam (lam (cons $2 $0)))) (loop 20000 0 (lam (lam (let {} $1))))))",
+            curried("$1")
+        );
+        let (o, kept) = run_machine(&mut arena, &p, UNLIMITED);
+        assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
+        assert!(kept <= 5000, "{kept} tables kept");
+    }
+
+    #[test]
+    fn walks_finish_beside_arrays_that_share_chunks() {
+        // 200 versions of an array of 8000 elements, each with one element
+        // changed: about 200 × (125 chunks + 64 elements) parts if shared chunks
+        // are expanded once, 1.6 million if not. Beside them, 20000 dropped
+        // curried results, about 140000 steps.
+        let mut arena = Arena::new();
+        let p = format!(
+            "(let (array_tabulate 8000 (lam 0)) (let (loop 200 nil (lam (lam (cons (array_set $2 (mul $1 40) 1) $0)))) (loop 20000 0 (lam (lam (let {} $1))))))",
+            curried("$1")
+        );
+        let (o, kept) = run_machine(&mut arena, &p, UNLIMITED);
+        assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
+        assert!(kept <= 10000, "{kept} tables kept");
+    }
+
+    #[test]
+    fn memo_tables_that_only_their_own_entries_reach_are_released() {
+        let mut arena = Arena::new();
+        // 1000 curried memorec results, each dropped at once.
+        let p = format!("(loop 1000 0 (lam (lam (let {} $1))))", curried("$1"));
+        let (o, kept) = run_machine(&mut arena, &p, UNLIMITED);
+        assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
+        assert!(kept <= MEMO_PRUNE_MIN, "{kept} tables kept");
+        // 1000 pairs of tables that reach each other and nothing else: A's entry
+        // is B's self, and B's entry is the pair of both selves.
+        let q = "(loop 1000 0 (lam (lam (let (memorec 1 (lam (lam (snd (memorec 1 (lam (lam (pair $3 $1))) $0)))) $1) $1))))";
+        let (o, kept) = run_machine(&mut arena, q, UNLIMITED);
+        assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
+        assert!(kept <= MEMO_PRUNE_MIN, "{kept} tables kept");
     }
 }

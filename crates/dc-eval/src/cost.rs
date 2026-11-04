@@ -62,12 +62,19 @@
 //!   the evaluation ends, and an escaped `self` keeps working with its own table and
 //!   remaining misses. Tables are never shared between `memorec` calls or between
 //!   evaluations. Each `self` holds only a weak reference, so a `self` stored in its
-//!   own table cannot keep it alive after the evaluation. A table with no live
-//!   `self` and no pending call is released during the evaluation; that changes no
-//!   step count. A table whose own entries hold a `self` of it (a curried `memorec`
-//!   result, or `pair self ..`) counts as live and is kept until the evaluation
-//!   ends, even when the program can no longer reach it, so such tables cost memory
-//!   in proportion to steps (bead dreamcounter-fc8e0a). DECISION (coordinator, review of PR 7): this replaces the earlier
+//!   own table cannot keep it alive after the evaluation. The machine can release
+//!   a table that the program can no longer reach before the evaluation ends; that
+//!   changes no step count. Each time the number of tables doubles, it releases
+//!   the tables with no live `self` and no pending call. It finds the rest with a
+//!   walk from its stack: tables whose own entries hold their `self` (a curried
+//!   `memorec` result, or `pair self ..`), and tables whose entries hold each
+//!   other's selves. The walks cost at most a constant times the steps in work
+//!   (bead dreamcounter-3fd21a), so a walk gives up when it would visit more parts
+//!   than the steps since the last walk that finished, or a fixed minimum if that
+//!   is more. A walk visits each part of what the program can reach about once
+//!   (some arrays that share chunks cost one part per chunk each). While that is
+//!   more than the walk may visit, such tables stay until a later walk finishes or
+//!   the evaluation ends. DECISION (coordinator, review of PR 7): this replaces the earlier
 //!   reading, under which an escaped `self` raised `MemoSelfEscaped`.
 //! - **A `self` from an earlier evaluation.** A value returned by one evaluation
 //!   can hold a `memorec` `self` whose table was dropped when that evaluation

@@ -82,9 +82,10 @@ pub enum Fun {
     /// The recursive argument `self` passed by `memorec`.
     MemoSelf {
         /// The memo table shared by every call in one `memorec`. The machine owns
-        /// the table until the evaluation ends; `self` only refers to it, so a
-        /// `self` stored in the table cannot keep it alive through a cycle (table,
-        /// entry, `self`, table) after that. See [`crate::cost`].
+        /// the table until the evaluation ends, or until the program can no longer
+        /// reach it; `self` only refers to it, so a `self` stored in the table
+        /// cannot keep it alive through a cycle (table, entry, `self`, table) after
+        /// that. See [`crate::cost`].
         table: Weak<RefCell<MemoTable>>,
         /// The functional `F`.
         f: Value,
@@ -727,6 +728,212 @@ impl Value {
             Value::Int(n) => Some(*n),
             _ => None,
         }
+    }
+}
+
+/// The most arrays of one length and first chunk that [`Reach::walk`] compares
+/// a new array with.
+const ARRAYS_PER_KEY: usize = 8;
+
+/// The address of a memo table, as [`Reach`] records it.
+pub(crate) type TableId = *const RefCell<MemoTable>;
+
+/// A part of the machine state for [`Reach::walk`] to visit.
+#[derive(Clone, Copy)]
+pub(crate) enum Part<'v> {
+    Value(&'v Value),
+    Env(&'v Env),
+    List(&'v List),
+    Tree(&'v Tree),
+}
+
+/// [`Reach::walk`] used up its work budget.
+#[derive(Debug)]
+pub(crate) struct OverBudget;
+
+/// A walk over everything some values can reach, to find the memo tables a
+/// program can still call: the machine releases the others.
+///
+/// A table is reached through a `memorec` `self`, and its entries are reached in
+/// turn. The walk expands each shared part once. An array reached again through
+/// a clone costs one part, and arrays that share chunks of elements expand each
+/// shared chunk once. It stops once its work passes a budget.
+pub(crate) struct Reach {
+    /// The shared parts visited: a kind tag (parts of different kinds can share
+    /// an address) and the address.
+    seen: FxHashSet<(u8, *const ())>,
+    /// The array chunks visited: the address and length of the elements. Two
+    /// arrays can hold different parts of one chunk, so the address alone does
+    /// not name the elements.
+    chunks: FxHashSet<(*const Value, usize)>,
+    /// The tables reached.
+    tables: FxHashSet<TableId>,
+    /// The tables reached whose entries are not yet walked.
+    pending: Vec<TableId>,
+    /// The parts visited so far, each array element and chunk counted, and the
+    /// parts added with [`Reach::reserve`].
+    work: u64,
+    budget: u64,
+}
+
+impl Reach {
+    /// A walk that may visit up to `budget` parts in all.
+    pub(crate) fn new(budget: u64) -> Reach {
+        Reach {
+            seen: FxHashSet::default(),
+            chunks: FxHashSet::default(),
+            tables: FxHashSet::default(),
+            pending: Vec::new(),
+            work: 0,
+            budget,
+        }
+    }
+
+    /// Records the table at `table` as reached.
+    pub(crate) fn mark_table(&mut self, table: TableId) {
+        if self.tables.insert(table) {
+            self.pending.push(table);
+        }
+    }
+
+    /// A reached table whose entries are not yet walked.
+    pub(crate) fn next_table(&mut self) -> Option<TableId> {
+        self.pending.pop()
+    }
+
+    /// Whether the table at `table` was reached.
+    pub(crate) fn reached(&self, table: TableId) -> bool {
+        self.tables.contains(&table)
+    }
+
+    /// The work so far.
+    pub(crate) fn work(&self) -> u64 {
+        self.work
+    }
+
+    /// Counts `n` parts about to be gathered for a walk as work, so gathering
+    /// them stays within the budget too.
+    pub(crate) fn reserve(&mut self, n: usize) -> Result<(), OverBudget> {
+        self.work = self.work.saturating_add(n as u64);
+        if self.work > self.budget {
+            return Err(OverBudget);
+        }
+        Ok(())
+    }
+
+    /// Walks `values`, as [`Reach::walk`] does, after counting them with
+    /// [`Reach::reserve`].
+    pub(crate) fn walk_values<'v>(
+        &mut self,
+        values: impl ExactSizeIterator<Item = &'v Value>,
+    ) -> Result<(), OverBudget> {
+        self.reserve(values.len())?;
+        self.walk(values.map(Part::Value).collect())
+    }
+
+    /// Whether this is the first visit of the part of kind `kind` at `addr`.
+    fn first(&mut self, kind: u8, addr: *const ()) -> bool {
+        self.seen.insert((kind, addr))
+    }
+
+    /// Visits `parts` and everything they reach, except the entries of the
+    /// tables reached, which [`Reach::next_table`] hands back to walk next.
+    pub(crate) fn walk<'v>(&mut self, mut parts: Vec<Part<'v>>) -> Result<(), OverBudget> {
+        // The arrays this call has expanded, by length and the address of their
+        // first chunk, at most `ARRAYS_PER_KEY` for each.
+        let mut arrays: FxHashMap<(usize, *const Value), Vec<&'v imbl::Vector<Value>>> =
+            FxHashMap::default();
+        while let Some(part) = parts.pop() {
+            self.work += 1;
+            if self.work > self.budget {
+                return Err(OverBudget);
+            }
+            match part {
+                Part::Value(v) => match v {
+                    Value::Int(_) | Value::Bool(_) | Value::Unit | Value::Option(None) => {}
+                    Value::Pair(p) => {
+                        if self.first(0, Rc::as_ptr(p).cast()) {
+                            parts.push(Part::Value(&p.0));
+                            parts.push(Part::Value(&p.1));
+                        }
+                    }
+                    Value::Option(Some(x)) => {
+                        if self.first(1, Rc::as_ptr(x).cast()) {
+                            parts.push(Part::Value(x));
+                        }
+                    }
+                    Value::List(l) => parts.push(Part::List(l)),
+                    Value::Tree(t) => parts.push(Part::Tree(t)),
+                    // A vector has no address of its own to remember. A clone
+                    // of one already expanded is found with `ptr_eq`, which is
+                    // true only for vectors with the same chunks. Otherwise each
+                    // chunk costs one part, and its elements are added the
+                    // first time it is seen.
+                    Value::Array(a) => {
+                        let first = a.leaves().next().map_or(ptr::null(), <[Value]>::as_ptr);
+                        let same = arrays.entry((a.len(), first)).or_default();
+                        self.work += same.len() as u64;
+                        if self.work > self.budget {
+                            return Err(OverBudget);
+                        }
+                        if same.iter().any(|b| b.ptr_eq(a)) {
+                            continue;
+                        }
+                        if same.len() < ARRAYS_PER_KEY {
+                            same.push(a);
+                        }
+                        for chunk in a.leaves() {
+                            self.work += 1;
+                            if self.work > self.budget {
+                                return Err(OverBudget);
+                            }
+                            if self.chunks.insert((chunk.as_ptr(), chunk.len())) {
+                                if self.work.saturating_add(chunk.len() as u64) > self.budget {
+                                    return Err(OverBudget);
+                                }
+                                parts.extend(chunk.iter().map(Part::Value));
+                            }
+                        }
+                    }
+                    Value::Fun(f) => {
+                        if self.first(3, Rc::as_ptr(f).cast()) {
+                            match &**f {
+                                Fun::Closure { env, .. } => parts.push(Part::Env(env)),
+                                Fun::Partial { args, .. } => {
+                                    parts.extend(args.iter().map(Part::Value));
+                                }
+                                Fun::BfixSelf { f, .. } => parts.push(Part::Value(f)),
+                                Fun::MemoSelf { table, f } => {
+                                    self.mark_table(Weak::as_ptr(table));
+                                    parts.push(Part::Value(f));
+                                }
+                            }
+                        }
+                    }
+                },
+                Part::Env(Env(Some(node))) => {
+                    if self.first(4, Rc::as_ptr(node).cast()) {
+                        parts.push(Part::Value(&node.value));
+                        parts.push(Part::Env(&node.next));
+                    }
+                }
+                Part::List(List(Some(cell))) => {
+                    if self.first(5, Rc::as_ptr(cell).cast()) {
+                        parts.push(Part::Value(&cell.head));
+                        parts.push(Part::List(&cell.tail));
+                    }
+                }
+                Part::Tree(Tree(Some(node))) => {
+                    if self.first(6, Rc::as_ptr(node).cast()) {
+                        parts.push(Part::Tree(&node.left));
+                        parts.push(Part::Value(&node.value));
+                        parts.push(Part::Tree(&node.right));
+                    }
+                }
+                Part::Env(Env(None)) | Part::List(List(None)) | Part::Tree(Tree(None)) => {}
+            }
+        }
+        Ok(())
     }
 }
 
