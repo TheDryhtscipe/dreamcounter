@@ -65,15 +65,16 @@ pub enum Term {
 /// Builds the hasher of an [`Arena`]'s index from terms to ids.
 ///
 /// It is foldhash with its own seed for each new arena, not FxHash; a clone
-/// keeps its original's seed. A program's
-/// text chooses the integers, variable indices and library ids in its leaves,
-/// and the pairs of earlier nodes it combines. FxHash is unkeyed, so such a
-/// program could make many nodes share a bucket, and interning each would then
-/// be linear in their number. foldhash mixes a seed for each process, from
-/// addresses and the clock, with a seed for each arena, from an address and the
-/// previous arena's seed. Neither comes from the operating system's random
-/// source, but no fixed list of terms collides in every arena. It does not resist an attacker
-/// who can watch hash values or interning times and adapt to them.
+/// keeps its original's seed. A program's text chooses the integers, variable
+/// indices and library ids in its leaves, and the pairs of earlier nodes it
+/// combines. FxHash is unkeyed, so such a program could make many nodes share a
+/// bucket, and interning each would then be linear in their number.
+///
+/// foldhash mixes a seed for each process, from addresses and the clock, with a
+/// seed for each arena, from an address and the previous arena's seed. Neither
+/// comes from the operating system's random source, but no fixed list of terms
+/// collides in every arena. It does not resist an attacker who can watch hash
+/// values or interning times and adapt to them.
 ///
 /// Nothing iterates over the index, so the order of its entries, which differs
 /// between arenas, reaches no id or result. Only its [`Debug`] output shows it.
