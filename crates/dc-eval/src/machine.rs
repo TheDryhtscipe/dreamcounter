@@ -267,7 +267,7 @@ struct Machine<'a> {
     last_walk_at: u64,
     /// The step count before which no reachability walk starts.
     next_walk_at: u64,
-    /// The work of every reachability walk so far.
+    /// The work of every reachability walk so far. Only tests read it.
     walk_work: u64,
 }
 
@@ -284,6 +284,12 @@ struct Pruning {
 /// The fewest tables at which [`Machine::adopt_table`] looks for unreachable ones.
 const MEMO_PRUNE_MIN: usize = 64;
 
+/// How an evaluation prunes memo tables.
+const PRUNING: Pruning = Pruning {
+    min_tables: MEMO_PRUNE_MIN,
+    eager: false,
+};
+
 /// The work a reachability walk may always do, whatever the steps since the last.
 const MEMO_WALK_MIN: u64 = 1024;
 
@@ -296,10 +302,7 @@ impl<'a> Machine<'a> {
             fuel,
             memo_tables: Vec::new(),
             memo_prune_at: MEMO_PRUNE_MIN,
-            pruning: Pruning {
-                min_tables: MEMO_PRUNE_MIN,
-                eager: false,
-            },
+            pruning: PRUNING,
             last_walk_at: 0,
             next_walk_at: 0,
             walk_work: 0,
@@ -815,27 +818,29 @@ impl<'a> Machine<'a> {
         } else {
             (self.steps - self.last_walk_at).max(MEMO_WALK_MIN)
         };
-        match self.reachable_tables(args, budget) {
-            Ok(reach) => {
-                self.walk_work = self.walk_work.saturating_add(reach.work());
+        let mut reach = Reach::new(budget);
+        let walked = self.reachable_tables(args, &mut reach);
+        self.walk_work = self.walk_work.saturating_add(reach.work());
+        match walked {
+            Ok(()) => {
                 self.memo_tables.retain(|t| reach.reached(Rc::as_ptr(t)));
                 self.last_walk_at = self.steps;
+                // Without this wait, a stack that a walk can just finish
+                // within the floor would be walked at every pruning.
                 self.next_walk_at = self.steps.saturating_add(reach.work());
             }
             Err(OverBudget) => {
-                // The walk stopped at its first part over the budget.
-                self.walk_work = self.walk_work.saturating_add(budget.saturating_add(1));
                 self.next_walk_at = self.steps.saturating_add(budget.saturating_mul(2));
             }
         }
     }
 
     /// Walks the stack, `args` and the entries of every table they reach.
-    fn reachable_tables(&self, args: &[Value], budget: u64) -> Result<Reach, OverBudget> {
-        let mut reach = Reach::new(budget);
-        let mut parts: Vec<Part<'_>> = args.iter().map(Part::Value).collect();
+    fn reachable_tables(&self, args: &[Value], reach: &mut Reach) -> Result<(), OverBudget> {
+        let mut parts: Vec<Part<'_>> = Vec::new();
+        gather(&mut parts, reach, args.iter().map(Part::Value))?;
         for frame in &self.stack {
-            frame_parts(frame, &mut parts, &mut reach);
+            frame_parts(frame, &mut parts, reach)?;
         }
         reach.walk(parts)?;
         let tables: FxHashMap<TableId, &Rc<RefCell<MemoTable>>> = self
@@ -847,11 +852,10 @@ impl<'a> Machine<'a> {
             // A `self` from an earlier evaluation has a table this machine
             // never held.
             if let Some(table) = tables.get(&id) {
-                let table = table.borrow();
-                reach.walk(table.entries.values().map(Part::Value).collect())?;
+                reach.walk_values(table.borrow().entries.values())?;
             }
         }
-        Ok(reach)
+        Ok(())
     }
 
     /// One memo call on `x`: a hit returns the stored result, a miss evaluates
@@ -902,35 +906,53 @@ impl<'a> Machine<'a> {
     }
 }
 
+/// Adds `items` to `parts`, counting them as work first.
+fn gather<'f>(
+    parts: &mut Vec<Part<'f>>,
+    reach: &mut Reach,
+    items: impl ExactSizeIterator<Item = Part<'f>>,
+) -> Result<(), OverBudget> {
+    reach.reserve(items.len())?;
+    parts.extend(items);
+    Ok(())
+}
+
 /// Adds the parts `frame` holds to `parts`, and the table of a `MemoStore` frame
-/// to `reach`. Memo keys hold no functions, so they reach no table. A table
-/// that only its `MemoStore` frame reaches has no `self` left to read it, but it
-/// is kept like any table with a pending call.
-fn frame_parts<'f>(frame: &'f Frame, parts: &mut Vec<Part<'f>>, reach: &mut Reach) {
+/// to `reach`. Every value a frame holds is a root. Some, such as the generator
+/// of `unfold`, may never be the only path to a table, but keeping them all
+/// needs no argument about which. Memo keys hold no functions, so they reach no
+/// table. A table that only its `MemoStore` frame reaches has no `self` left to
+/// read it, but it is kept like any table with a pending call.
+fn frame_parts<'f>(
+    frame: &'f Frame,
+    parts: &mut Vec<Part<'f>>,
+    reach: &mut Reach,
+) -> Result<(), OverBudget> {
+    use std::iter::once;
+    let value = |v: &'f Value| once(Part::Value(v));
     match frame {
         Frame::AppArg { env, .. }
         | Frame::LetBody { env, .. }
         | Frame::If { env, .. }
         | Frame::And { env, .. }
-        | Frame::Or { env, .. } => parts.push(Part::Env(env)),
+        | Frame::Or { env, .. } => gather(parts, reach, once(Part::Env(env))),
         Frame::AppFun { f } | Frame::ApplyTo(f) | Frame::Loop { f, .. } => {
-            parts.push(Part::Value(f));
+            gather(parts, reach, value(f))
         }
         Frame::Foldl { f, rest } => {
-            parts.push(Part::Value(f));
-            parts.push(Part::List(rest));
+            gather(parts, reach, [Part::Value(f), Part::List(rest)].into_iter())
         }
         Frame::Foldr { f, elems } => {
-            parts.push(Part::Value(f));
-            parts.extend(elems.iter().map(Part::Value));
+            gather(parts, reach, value(f))?;
+            gather(parts, reach, elems.iter().map(Part::Value))
         }
         Frame::Unfold { g, out } => {
-            parts.push(Part::Value(g));
-            parts.extend(out.iter().map(Part::Value));
+            gather(parts, reach, value(g))?;
+            gather(parts, reach, out.iter().map(Part::Value))
         }
         Frame::Tabulate { f, out, .. } => {
-            parts.push(Part::Value(f));
-            parts.extend(out.iter().map(Part::Value));
+            gather(parts, reach, value(f))?;
+            gather(parts, reach, out.iter().map(Part::Value))
         }
         Frame::TreeFold {
             z,
@@ -938,15 +960,21 @@ fn frame_parts<'f>(frame: &'f Frame, parts: &mut Vec<Part<'f>>, reach: &mut Reac
             tasks,
             results,
         } => {
-            parts.push(Part::Value(z));
-            parts.push(Part::Value(f));
-            parts.extend(tasks.iter().map(|task| match task {
-                TreeTask::Visit(t) => Part::Tree(t),
-                TreeTask::Combine(x) => Part::Value(x),
-            }));
-            parts.extend(results.iter().map(Part::Value));
+            gather(parts, reach, [Part::Value(z), Part::Value(f)].into_iter())?;
+            gather(
+                parts,
+                reach,
+                tasks.iter().map(|task| match task {
+                    TreeTask::Visit(t) => Part::Tree(t),
+                    TreeTask::Combine(x) => Part::Value(x),
+                }),
+            )?;
+            gather(parts, reach, results.iter().map(Part::Value))
         }
-        Frame::MemoStore { table, .. } => reach.table(Rc::as_ptr(table)),
+        Frame::MemoStore { table, .. } => {
+            reach.mark_table(Rc::as_ptr(table));
+            Ok(())
+        }
     }
 }
 
@@ -1111,7 +1139,7 @@ mod tests {
     fn assert_pruning_is_unobservable(src: &str, releases: bool) {
         let (never, all) = run_pruned(src, NEVER);
         let (always, kept) = run_pruned(src, ALWAYS);
-        let (default, _) = run_pruned(src, Machine::new(&Arena::new(), 0).pruning);
+        let (default, _) = run_pruned(src, PRUNING);
         let Outcome::Value(v, steps) = &never else {
             panic!("{src}: {never}");
         };
@@ -1210,6 +1238,43 @@ mod tests {
             format!(
                 "(let (fst (memorec 5 (lam (lam (pair $1 {}))) 1)) (let {g} ((snd ($1 1)) 2)))",
                 curried("$0")
+            ),
+        ] {
+            assert_pruning_is_unobservable(&src, true);
+        }
+    }
+
+    #[test]
+    fn pruning_keeps_a_self_that_only_a_combinator_frame_holds() {
+        // `self` maps 99 to the pair of itself and 0, so its table holds it;
+        // other keys miss and return what F returns.
+        let memo_self = |f_result: &str| {
+            format!("(fst (memorec 5 (lam (lam (if (int_eq $0 99) (pair $1 0) {f_result}))) 99))")
+        };
+        // Closed functions, built before `self`, so their environments do not
+        // hold it, that make two garbage tables when called.
+        let g = "(snd (memorec 1 pair 0))";
+        let g1 = format!("(lam (add $0 (add {g} {g})))");
+        let g2 = format!("(lam (lam (add $0 (add {g} {g}))))");
+        let list = "(cons 1 (cons 2 (cons 3 nil)))";
+        for src in [
+            // `self` is the combinator's function, held only by its frame: each
+            // call misses and returns the garbage-making function, which the
+            // combinator then applies.
+            format!("(let {g1} (let {} (loop 3 0 $0)))", memo_self("$2")),
+            format!("(let {g1} (let {} (foldl $0 0 {list})))", memo_self("$2")),
+            format!("(let {g1} (let {} (foldr $0 0 {list})))", memo_self("$2")),
+            format!(
+                "(let {g2} (let {} (tree_fold 0 $0 (node (node leaf 1 leaf) 2 leaf))))",
+                memo_self("$2")
+            ),
+            // `self` inside `tree_fold`'s leaf value, held only by its frame
+            // while the inner subtree combines: no leaf is folded then, and the
+            // results do not hold it. The leaf at the root's right folds later
+            // and calls it. `self` returns its key.
+            format!(
+                "(let (lam (lam (lam (pair (add 0) (add (add (snd $2) $1) (add ((fst $0) 0) (add {g} {g}))))))) (let {} (snd (tree_fold (pair $0 0) $1 (node (node (node leaf 1 leaf) 2 (node leaf 1 leaf)) 3 leaf)))))",
+                memo_self("$0")
             ),
         ] {
             assert_pruning_is_unobservable(&src, true);

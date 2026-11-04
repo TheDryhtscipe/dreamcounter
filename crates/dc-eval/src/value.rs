@@ -751,8 +751,9 @@ pub(crate) struct OverBudget;
 /// program can still call: the machine releases the others.
 ///
 /// A table is reached through a `memorec` `self`, and its entries are reached in
-/// turn. The walk visits each shared part once, so its work is bounded by the
-/// memory the parts use, and it stops once that work passes a budget.
+/// turn. The walk expands each shared part once, except arrays: an array reached
+/// through k different places costs k times its length. It stops once its work
+/// passes a budget.
 pub(crate) struct Reach {
     /// The shared parts visited: a kind tag (parts of different kinds can share
     /// an address) and the address.
@@ -761,7 +762,8 @@ pub(crate) struct Reach {
     tables: FxHashSet<TableId>,
     /// The tables reached whose entries are not yet walked.
     pending: Vec<TableId>,
-    /// The parts visited so far, each array element counted.
+    /// The parts visited so far, each array element counted, and the parts
+    /// added with [`Reach::reserve`].
     work: u64,
     budget: u64,
 }
@@ -779,7 +781,7 @@ impl Reach {
     }
 
     /// Records the table at `table` as reached.
-    pub(crate) fn table(&mut self, table: TableId) {
+    pub(crate) fn mark_table(&mut self, table: TableId) {
         if self.tables.insert(table) {
             self.pending.push(table);
         }
@@ -795,9 +797,29 @@ impl Reach {
         self.tables.contains(&table)
     }
 
-    /// The parts visited so far.
+    /// The work so far.
     pub(crate) fn work(&self) -> u64 {
         self.work
+    }
+
+    /// Counts `n` parts about to be gathered for a walk as work, so gathering
+    /// them stays within the budget too.
+    pub(crate) fn reserve(&mut self, n: usize) -> Result<(), OverBudget> {
+        self.work = self.work.saturating_add(n as u64);
+        if self.work > self.budget {
+            return Err(OverBudget);
+        }
+        Ok(())
+    }
+
+    /// Walks `values`, as [`Reach::walk`] does, after counting them with
+    /// [`Reach::reserve`].
+    pub(crate) fn walk_values<'v>(
+        &mut self,
+        values: impl ExactSizeIterator<Item = &'v Value>,
+    ) -> Result<(), OverBudget> {
+        self.reserve(values.len())?;
+        self.walk(values.map(Part::Value).collect())
     }
 
     /// Whether this is the first visit of the part of kind `kind` at `addr`.
@@ -849,7 +871,7 @@ impl Reach {
                                 }
                                 Fun::BfixSelf { f, .. } => parts.push(Part::Value(f)),
                                 Fun::MemoSelf { table, f } => {
-                                    self.table(Weak::as_ptr(table));
+                                    self.mark_table(Weak::as_ptr(table));
                                     parts.push(Part::Value(f));
                                 }
                             }
