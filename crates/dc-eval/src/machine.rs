@@ -1161,6 +1161,13 @@ mod tests {
                 "((tree_fold (lam $0) (lam (lam (lam (let {g} (let {} (lam (add (add ($5 $0) ($3 $0)) ($1 $0)))))))) (node (node leaf 1 leaf) 2 (node leaf 3 leaf))) 2)",
                 curried("$2")
             ),
+            // The subtrees and values still to fold.
+            format!(
+                "(tree_fold 0 (lam (lam (lam (let {g} (add (add $3 $1) ($2 2)))))) (node (node leaf {} leaf) {} (node leaf {} leaf)))",
+                curried("1"),
+                curried("2"),
+                curried("3")
+            ),
             // A table during its own misses, its `self` in the environment.
             format!("((memorec 5 (lam (lam (let {g} (lam (if (le $0 0) $2 (add $2 (($3 (sub $2 1)) (sub $0 1)))))))) 3) 2)"),
             // A closure held only by the functional of the `memorec` call.
