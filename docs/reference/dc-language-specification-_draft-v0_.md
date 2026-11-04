@@ -4,7 +4,7 @@ title: dc language specification (draft v0)
 type: reference
 scope: internal
 created_at: '2026-10-27T17:11:12.135054Z'
-updated_at: '2026-10-27T22:24:39.932620Z'
+updated_at: '2026-10-29T18:00:08.842629Z'
 ---
 
 Status: phase 1 draft, 2026-10-27. Nothing here is implemented yet. Items marked
@@ -300,12 +300,13 @@ charges only through it.
   their own node.
 - **Timeout steps.** The machine stops with `Timeout(s)` at the first charge that
   takes the step count above the fuel. So `s > fuel`, and `s = fuel + 1` when that
-  charge is a single step.
+  charge is a single step. A count above the largest `u64` is reported as
+  `u64::MAX`, so at fuel `u64::MAX` a timeout reports `s = fuel`.
 - **`eq` near the fuel limit.** An `eq` that would compare more node pairs than the
   fuel left stops counting one pair above it, so it ends with
   `Timeout(fuel + 1)`. Sharing can make a value exponentially larger than the steps
   that built it, so the full count is not computed. A `memorec` key larger than the
-  fuel left is sized without being built, so its timeout count is exact.
+  fuel left is sized, and built only to look for a hit when no misses are left, so its timeout count is exact.
 - **Escaped memo selves.** A `memorec` `self` called after its `memorec` returned,
   within the same evaluation, costs what any `memorec` call costs (§6). A `self`
   called in a later evaluation raises `MemoSelfEscaped`, charged 0 steps.
@@ -412,7 +413,39 @@ Estimators, behind a `GrowthEstimator` trait so they can be swapped:
   `α̂` and R².
 - **B: c · n^α · (log n)^γ** with `γ ∈ {0, 1, 2}` on a grid and `α` continuous; pick
   the best by residual. The same form AlgoSkill uses.
-- **C (later): class selection** among {1, log n, n, n log n, n², n³, 2ⁿ} by best fit.
+- **C: class selection** among {1, log n, n, n log n, n², n³, 2ⁿ} (`ClassSelect`
+  in `crates/dc-tasks/src/growth.rs`). C fits over the whole sweep by default
+  (at least 4 sizes). Each class `f` has a lower-order term `g`: `1` for `log n`
+  and `n`; `n` for `n log n`, `n²` and `2ⁿ`; `n²` for `n³`; none for `1`. C
+  fits `c · (f(n) + r · g(n))`, choosing `c` and `r` to minimise the largest
+  `|ln steps − ln(c · (f(n) + r · g(n)))|` over the sweep; that largest value
+  is the class's *misfit*. The term is bounded at every size in the window:
+  `−½ f(n) ≤ r · g(n) ≤ ρ · f(n)`, with `ρ = 1` by default. The *tolerance* is
+  an absolute 0.01. The *noise margin* is 3 times the largest standard error
+  of a size's median `ln` step count, estimated from the seeds.
+  - C names `f` if `f`'s misfit is at most the tolerance and no other class's
+    misfit is at most the tolerance plus the noise margin.
+  - Otherwise the verdict is `TooNoisy` if some class's misfit is at most the
+    tolerance plus the noise margin, and `NoFit` if none is.
+  - If any size in the window has only one seed, the noise is unknown, and the
+    verdict is `NoiseUnknown` unless the caller declares the counts exact or gives
+    the noise. Sizes below the window do not affect the noise.
+
+  A named class is a statement about the sweep only. Over `16..1024`, exact
+  `n^a` is named `n` for `a` from 0.99 to 1.01, `n²` from 1.99 to 2.01 and
+  `n³` from 2.99 to 3.01, and never `n log n` (the closest, `n^1.135`, has
+  misfit 0.019). Exact `n · (ln n)^b` is named `n log n` for `b` from 0.74 to
+  1.16. These bands are for exact step counts. Under seed noise a
+  power near a class is occasionally named that class: `n^1.135` was named
+  `n log n` in up to 12 of 3000 random sweeps with two to five seeds and a
+  seed spread of 0.01 to 0.02 in `ln` steps. If each median is off by at most
+  the noise margin, C is sure to name a class only when the true misfit is at
+  most the tolerance minus the noise margin, so it refuses often under seed
+  noise: with five seeds and a spread of 0.01, 0.02
+  and 0.05, it named the class of exact `n`, `n log n` or `n²` in about 95 %,
+  30 % and under 1 % of sweeps. Programs whose step counts vary much between
+  seeds can be refused: insertion sort's medians are 0.039 from `n²`, so C returns
+  `TooNoisy`.
 
 Known weakness of A: over `n ∈ [128, 1024]`, `n log n` gives a local slope of
 roughly 1 + 1/ln n ≈ 1.17. That separates it from `n` (step counts are exact) but
