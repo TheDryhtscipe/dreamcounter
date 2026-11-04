@@ -82,9 +82,10 @@ pub enum Fun {
     /// The recursive argument `self` passed by `memorec`.
     MemoSelf {
         /// The memo table shared by every call in one `memorec`. The machine owns
-        /// the table until the evaluation ends; `self` only refers to it, so a
-        /// `self` stored in the table cannot keep it alive through a cycle (table,
-        /// entry, `self`, table) after that. See [`crate::cost`].
+        /// the table until the evaluation ends, or until the program can no longer
+        /// reach it; `self` only refers to it, so a `self` stored in the table
+        /// cannot keep it alive through a cycle (table, entry, `self`, table) after
+        /// that. See [`crate::cost`].
         table: Weak<RefCell<MemoTable>>,
         /// The functional `F`.
         f: Value,
