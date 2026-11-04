@@ -1262,11 +1262,12 @@ mod tests {
 
     #[test]
     fn a_walk_visits_each_element_of_shared_array_chunks_once() {
-        // 40 levels of arrays whose two elements are the level below: 2^40
-        // elements as a tree, 80 in memory. Then two garbage tables, the second
+        // 22 levels of arrays whose two elements are the level below: 2^22
+        // elements as a tree, 44 in memory. Few enough that visiting them all
+        // fails the test rather than hanging it. Then two garbage tables, the second
         // walking the arrays, held by a `let` frame, with no budget.
         let p = format!(
-            "(let (loop 40 0 (lam (lam (array_tabulate 2 (lam $1))))) (let {} (array_size $1)))",
+            "(let (loop 22 0 (lam (lam (array_tabulate 2 (lam $1))))) (let {} (array_size $1)))",
             garbage()
         );
         let mut arena = Arena::new();
@@ -1275,7 +1276,7 @@ mod tests {
         m.pruning = ALWAYS;
         let o = m.run(Control::Eval(t, Env::empty()));
         assert!(matches!(o, Outcome::Value(Value::Int(2), _)), "{o}");
-        assert!(m.walk_work > 80 && m.walk_work < 1000, "{}", m.walk_work);
+        assert!(m.walk_work > 44 && m.walk_work < 1000, "{}", m.walk_work);
     }
 
     #[test]
