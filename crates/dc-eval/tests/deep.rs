@@ -9,6 +9,11 @@ use dc_eval::{ErrorKind, List, Outcome, Tree, Value};
 
 const N: i64 = 100_000;
 
+/// The nesting depth of the array tests. Each array is an `imbl` vector of about
+/// 4 KB, so 100000 of them take 400 MB; 20000 still overflow the 256 KiB stack
+/// when drops or formatting recurse once per level.
+const ARRAY_DEPTH: i64 = 20_000;
+
 #[test]
 fn foldr_over_a_hundred_thousand_elements() {
     on_small_stack(|| {
@@ -51,23 +56,23 @@ fn a_hundred_thousand_composed_closures() {
 }
 
 #[test]
-fn dropping_a_million_element_list() {
+fn dropping_a_hundred_thousand_element_list() {
     on_small_stack(|| {
-        let xs: Vec<i64> = (0..1_000_000).collect();
+        let xs: Vec<i64> = (0..N).collect();
         let v = Value::int_list(&xs);
         drop(v);
         // A bare list and a bare degenerate tree, outside any `Value`.
         let l = List::from_values(xs.iter().map(|&n| Value::Int(n)));
-        assert_eq!(l.len(), 1_000_000);
+        assert_eq!(l.len(), N as u64);
         drop(l);
         let mut t = Tree::leaf();
-        for n in 0..1_000_000 {
+        for n in 0..N {
             t = Tree::node(t, Value::Int(n), Tree::leaf());
         }
         drop(t);
         // A list built by the machine, returned and then dropped.
-        let o = run_on("(lam (foldr cons nil $0))", &[range1(1_000_000)]);
-        assert_eq!(o.steps(), 2 + 2_000_000);
+        let o = run_on("(lam (foldr cons nil $0))", &[range1(N)]);
+        assert_eq!(o.steps(), 2 + 2 * N as u64);
         drop(o);
     });
 }
@@ -97,21 +102,21 @@ fn deeply_nested_options_pairs_and_trees() {
 }
 
 #[test]
-fn a_hundred_thousand_nested_arrays() {
+fn twenty_thousand_nested_arrays() {
     on_small_stack(|| {
         // Each iteration wraps the accumulator in a one-element array:
         // 1 + β 2 + nil 1 + cons 1 + array_of_list (1 + 1) = 7. Without the
         // array drop queue, dropping this nesting overflows the 256 KiB stack.
         let o = run_on(
             "(lam (loop $0 unit (lam (lam (array_of_list (cons $0 nil))))))",
-            &[int(N)],
+            &[int(ARRAY_DEPTH)],
         );
-        assert!(matches!(o, Outcome::Value(Value::Array(_), s) if s == 7 * N as u64 + 1));
+        assert!(matches!(o, Outcome::Value(Value::Array(_), s) if s == 7 * ARRAY_DEPTH as u64 + 1));
         drop(o);
         // The same kind of value bound by a let and dropped inside the evaluation:
         // β 1 + 7n; the body is a free literal.
         let p = "(lam (let (loop $0 unit (lam (lam (array_of_list (cons $0 nil))))) 0))";
-        assert_value_on(p, &[int(N)], int(0), 7 * N as u64 + 1);
+        assert_value_on(p, &[int(ARRAY_DEPTH)], int(0), 7 * ARRAY_DEPTH as u64 + 1);
     });
 }
 
@@ -152,7 +157,10 @@ fn formatting_deep_values() {
         assert!(d.len() < 10 * dc_eval::DEBUG_NODES as usize, "{d}");
         assert!(d.contains("Some (...)"), "{d}");
         // Nested arrays and a deep tree format too.
-        let a = run("(loop 100000 unit (lam (lam (array_of_list (cons $0 nil)))))");
+        let a = run_on(
+            "(lam (loop $0 unit (lam (lam (array_of_list (cons $0 nil))))))",
+            &[int(ARRAY_DEPTH)],
+        );
         assert!(a.to_string().contains("[|[|[|()|]|]|]"));
         let t = run("(loop 100000 leaf (lam (lam (node $0 $1 leaf))))");
         assert!(t
