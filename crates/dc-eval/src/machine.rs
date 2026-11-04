@@ -897,7 +897,9 @@ impl<'a> Machine<'a> {
 }
 
 /// Adds the parts `frame` holds to `parts`, and the table of a `MemoStore` frame
-/// to `reach`. Memo keys hold no functions, so they reach no table.
+/// to `reach`. Memo keys hold no functions, so they reach no table. A table
+/// that only its `MemoStore` frame reaches has no `self` left to read it, but it
+/// is kept like any table with a pending call.
 fn frame_parts<'f>(frame: &'f Frame, parts: &mut Vec<Part<'f>>, reach: &mut Reach) {
     match frame {
         Frame::AppArg { env, .. }
@@ -1096,21 +1098,25 @@ mod tests {
         (o, m.memo_tables.len())
     }
 
-    /// Asserts that `src` returns an integer, the same one in the same steps
-    /// whether or not tables are pruned, and, if `releases`, that pruning
-    /// released some.
+    /// Asserts that `src` returns a value with no function in it, the same one
+    /// in the same steps whether or not tables are pruned, and, if `releases`,
+    /// that pruning released some.
     #[track_caller]
     fn assert_pruning_is_unobservable(src: &str, releases: bool) {
         let (never, all) = run_pruned(src, NEVER);
         let (always, kept) = run_pruned(src, ALWAYS);
         let (default, _) = run_pruned(src, Machine::new(&Arena::new(), 0).pruning);
-        let Outcome::Value(Value::Int(n), steps) = never else {
+        let Outcome::Value(v, steps) = &never else {
             panic!("{src}: {never}");
         };
+        assert!(
+            matches!(v, Value::Int(_) | Value::Bool(_)),
+            "{src}: {never}"
+        );
         for o in [always, default] {
             assert!(
-                matches!(o, Outcome::Value(Value::Int(m), s) if m == n && s == steps),
-                "{src}: {o}, not Value({n}, {steps})"
+                matches!(&o, Outcome::Value(w, s) if w == v && s == steps),
+                "{src}: {o}, not {never}"
             );
         }
         assert!(
@@ -1119,10 +1125,12 @@ mod tests {
         );
     }
 
-    /// Two `memorec` calls whose tables are unreachable once they return; the
-    /// second prunes while everything around it is live. Returns 0.
+    /// Two `memorec` calls whose tables hold their own `self` and are
+    /// unreachable once they return; the second prunes while everything around
+    /// it is live. Returns 0. No closure is built, so the only frames that hold
+    /// the environment are those around it.
     fn garbage() -> String {
-        let g = format!("(let {} 0)", curried("0"));
+        let g = "(snd (memorec 1 pair 0))";
         format!("(add {g} {g})")
     }
 
@@ -1153,7 +1161,7 @@ mod tests {
                 "((tree_fold (lam $0) (lam (lam (lam (let {g} (let {} (lam (add (add ($5 $0) ($3 $0)) ($1 $0)))))))) (node (node leaf 1 leaf) 2 (node leaf 3 leaf))) 2)",
                 curried("$2")
             ),
-            // A table during its own miss: a `MemoStore` frame.
+            // A table during its own misses, its `self` in the environment.
             format!("((memorec 5 (lam (lam (let {g} (lam (if (le $0 0) $2 (add $2 (($3 (sub $2 1)) (sub $0 1)))))))) 3) 2)"),
             // A closure held only by the functional of the `memorec` call.
             format!("((lam (add {g} (memorec 1 (lam (lam (add ($2 2) {g}))) 0))) {})", curried("4")),
@@ -1167,6 +1175,20 @@ mod tests {
             format!("(let (array_of_list (cons {} nil)) (let {g} ((array_get $1 0) 2)))", curried("1")),
             format!(
                 "(let (node leaf {} leaf) (let {g} (tree_case $1 (lam 0) (lam (lam (lam ($1 2)))))))",
+                curried("1")
+            ),
+            // The environment, held only by a `let`, an argument still to
+            // evaluate, an `if`, an `and` or an `or`.
+            format!("(let {} (let {g} ($1 2)))", curried("1")),
+            format!("(let {} ((fst (pair (add 1) {g})) ($0 2)))", curried("1")),
+            format!("(let {} (if (le 0 {g}) ($0 2) 0))", curried("1")),
+            format!("(let {} (and (le 0 {g}) (le 0 ($0 2))))", curried("1")),
+            format!("(let {} (or (le 1 {g}) (le 0 ($0 2))))", curried("1")),
+            // A function value, held only by the frame that applies it: a
+            // partial `pair`, and a `tree_case` value still to pass.
+            format!("((fst ((pair {}) {g})) 2)", curried("1")),
+            format!(
+                "(tree_case (node leaf {} leaf) (lam 0) (lam (let {g} (lam (lam ($1 2))))))",
                 curried("1")
             ),
             // A table reached only through the entry of a table whose `self` is
