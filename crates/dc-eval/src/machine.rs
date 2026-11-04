@@ -267,6 +267,8 @@ struct Machine<'a> {
     last_walk_at: u64,
     /// The step count before which no reachability walk starts.
     next_walk_at: u64,
+    /// The work of every reachability walk so far.
+    walk_work: u64,
 }
 
 /// When [`Machine::adopt_table`] looks for memo tables the program cannot reach.
@@ -300,6 +302,7 @@ impl<'a> Machine<'a> {
             },
             last_walk_at: 0,
             next_walk_at: 0,
+            walk_work: 0,
         }
     }
 
@@ -814,11 +817,14 @@ impl<'a> Machine<'a> {
         };
         match self.reachable_tables(args, budget) {
             Ok(reach) => {
+                self.walk_work = self.walk_work.saturating_add(reach.work());
                 self.memo_tables.retain(|t| reach.reached(Rc::as_ptr(t)));
                 self.last_walk_at = self.steps;
                 self.next_walk_at = self.steps.saturating_add(reach.work());
             }
             Err(OverBudget) => {
+                // The walk stopped at its first part over the budget.
+                self.walk_work = self.walk_work.saturating_add(budget.saturating_add(1));
                 self.next_walk_at = self.steps.saturating_add(budget.saturating_mul(2));
             }
         }
@@ -1227,6 +1233,45 @@ mod tests {
             );
             assert_pruning_is_unobservable(&src, k > 1 && n >= 3);
         }
+    }
+
+    #[test]
+    fn reachability_walks_cost_at_most_a_constant_times_the_steps() {
+        // 3000 dropped curried results beside a live input of 100000 elements,
+        // about 200000 parts for every walk: more than the steps of the whole
+        // evaluation.
+        let mut arena = Arena::new();
+        let p = format!("(lam (loop 3000 0 (lam (lam (let {} $1)))))", curried("$1"));
+        let t = sexpr::parse(&mut arena, &p).expect("parse");
+        let xs: Vec<i64> = (0..100_000).collect();
+        let mut m = Machine::new(&arena, UNLIMITED);
+        m.stack.push(Frame::ApplyTo(Value::int_list(&xs)));
+        let o = m.run(Control::Eval(t, Env::empty()));
+        assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
+        let (steps, work) = (o.steps(), m.walk_work);
+        assert!(work > 0, "no walk started");
+        assert!(
+            work <= 3 * steps + 2 * MEMO_WALK_MIN,
+            "{work} for {steps} steps"
+        );
+    }
+
+    #[test]
+    fn a_walk_visits_each_element_of_shared_array_chunks_once() {
+        // 40 levels of arrays whose two elements are the level below: 2^40
+        // elements as a tree, 80 in memory. Then two garbage tables, the second
+        // walking the arrays with no budget.
+        let p = format!(
+            "(let (loop 40 0 (lam (lam (array_tabulate 2 (lam $1))))) {})",
+            garbage()
+        );
+        let mut arena = Arena::new();
+        let t = sexpr::parse(&mut arena, &p).expect("parse");
+        let mut m = Machine::new(&arena, UNLIMITED);
+        m.pruning = ALWAYS;
+        let o = m.run(Control::Eval(t, Env::empty()));
+        assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
+        assert!(m.walk_work > 0 && m.walk_work < 1000, "{}", m.walk_work);
     }
 
     #[test]
