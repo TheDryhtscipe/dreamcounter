@@ -5,6 +5,8 @@
 //! node is stored once, so two structurally equal terms built in the same arena get
 //! the same [`TermId`], and comparing terms is comparing ids.
 
+use std::collections::HashMap;
+
 use rustc_hash::FxHashMap;
 
 use crate::prim::Prim;
@@ -60,11 +62,26 @@ pub enum Term {
     Or(TermId, TermId),
 }
 
+/// Builds the hasher of an [`Arena`]'s index from terms to ids.
+///
+/// It is foldhash with its own seed for each arena, not FxHash. A program's
+/// text chooses the integers, variable indices and library ids in its leaves,
+/// and the pairs of earlier nodes it combines. FxHash is unkeyed, so such a
+/// program could make many nodes share a bucket, and interning each would then
+/// be linear in their number. foldhash derives each seed from addresses, the
+/// clock and the previous seed, not from the operating system's random source,
+/// so no fixed list of terms collides in every arena. It does not resist an attacker
+/// who can watch hash values or interning times and adapt to them.
+///
+/// Nothing iterates over the index, so the order of its entries, which differs
+/// between arenas, reaches no id or result. Only its [`Debug`] output shows it.
+type IndexHasher = foldhash::fast::RandomState;
+
 /// A hash-consing store of terms.
 #[derive(Debug, Default, Clone)]
 pub struct Arena {
     nodes: Vec<Term>,
-    index: FxHashMap<Term, TermId>,
+    index: HashMap<Term, TermId, IndexHasher>,
 }
 
 impl Arena {
@@ -392,6 +409,93 @@ mod tests {
 
     fn gets() -> u64 {
         GETS.with(std::cell::Cell::get)
+    }
+
+    use std::hash::BuildHasher;
+
+    /// The inverse of an odd `a` modulo 2^64 (Newton's iteration).
+    fn odd_inverse(a: u64) -> u64 {
+        let mut x = a;
+        for _ in 0..6 {
+            x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+        }
+        x
+    }
+
+    /// `n` ints whose `Term::Int` nodes have FxHash values `0, 1, ..., n-1` before
+    /// its final rotation, so they all share a bucket and a tag in any table
+    /// smaller than 2^26. FxHash maps its state by `h -> (h + w) * K` for each
+    /// word, so the hash before the rotation is `A * x + B` with `A` odd. It
+    /// assumes a 64-bit target, where rustc-hash 2.1 rotates by 26.
+    fn fx_colliding_ints(n: u64) -> Vec<i64> {
+        let fx = |x: i64| {
+            rustc_hash::FxBuildHasher
+                .hash_one(Term::Int(x))
+                .rotate_right(26)
+        };
+        let b = fx(0);
+        let a = fx(1).wrapping_sub(b);
+        assert_eq!(a % 2, 1, "the int is mixed by an odd multiplier");
+        let a_inv = odd_inverse(a);
+        let xs: Vec<i64> = (0..n)
+            .map(|i| i.wrapping_sub(b).wrapping_mul(a_inv) as i64)
+            .collect();
+        // The ints really do collide under FxHash, so the checks below test the
+        // index's hasher and not the inputs.
+        for (i, &x) in xs.iter().enumerate() {
+            assert_eq!(fx(x), i as u64);
+        }
+        xs
+    }
+
+    #[test]
+    fn the_index_spreads_ints_chosen_to_collide() {
+        let terms: Vec<Term> = fx_colliding_ints(4096).into_iter().map(Term::Int).collect();
+        let hasher = Arena::new().index.hasher().clone();
+        let hashes: Vec<u64> = terms.iter().map(|t| hasher.hash_one(t)).collect();
+        // A random hash puts 4096 terms in about 2589 of 4096 buckets, and in all
+        // 128 tags; FxHash puts these in one of each.
+        let buckets: FxHashMap<u64, ()> = hashes.iter().map(|h| (h & 0xFFF, ())).collect();
+        let tags: FxHashMap<u64, ()> = hashes.iter().map(|h| (h >> 57, ())).collect();
+        assert!(
+            buckets.len() > 2000 && tags.len() > 100,
+            "{} buckets, {} tags",
+            buckets.len(),
+            tags.len()
+        );
+    }
+
+    /// The fastest of three runs of `f`.
+    fn fastest(f: impl Fn()) -> std::time::Duration {
+        (0..3)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                f();
+                start.elapsed()
+            })
+            .min()
+            .expect("three runs")
+    }
+
+    #[test]
+    fn interning_ints_chosen_to_collide_takes_linear_time() {
+        let xs = fx_colliding_ints(16_000);
+        let intern_all = |xs: &[i64]| {
+            let mut a = Arena::new();
+            for &x in xs {
+                a.int(x);
+            }
+            assert_eq!(a.len(), xs.len());
+        };
+        let t_small = fastest(|| intern_all(&xs[..2_000]));
+        let t_large = fastest(|| intern_all(&xs));
+        // Eight times the ints: about 8 times the time if inserts are constant
+        // time, 64 times if each is linear.
+        let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
+        assert!(
+            ratio < 24.0,
+            "{t_small:?} for 2,000 ints, {t_large:?} for 16,000"
+        );
     }
 
     #[test]

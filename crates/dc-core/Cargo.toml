@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+foldhash.workspace = true
 rustc-hash.workspace = true
 
 [dev-dependencies]
