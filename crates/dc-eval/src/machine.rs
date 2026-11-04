@@ -1174,7 +1174,7 @@ mod tests {
             format!("(let (pair {}) (let {g} ((fst ($1 0)) 2)))", curried("1")),
             format!("(let (array_of_list (cons {} nil)) (let {g} ((array_get $1 0) 2)))", curried("1")),
             format!(
-                "(let (node (node leaf {} leaf) 0 (node leaf {} leaf)) (let {g} (tree_case $1 (lam 0) (lam (lam (lam (add (tree_case $2 (lam 0) (lam (lam (lam ($1 2))))) (tree_case $0 (lam 0) (lam (lam (lam ($1 2)))))))))))))",
+                "(let (node (node leaf {} leaf) 0 (node leaf {} leaf)) (let {g} (tree_case $1 (lam 0) (lam (lam (lam (add (tree_case $2 (lam 0) (lam (lam (lam ($1 2))))) (tree_case $0 (lam 0) (lam (lam (lam ($1 2))))))))))))",
                 curried("1"),
                 curried("2")
             ),
