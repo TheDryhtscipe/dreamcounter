@@ -730,6 +730,157 @@ impl Value {
     }
 }
 
+/// The address of a memo table, as [`Reach`] records it.
+pub(crate) type TableId = *const RefCell<MemoTable>;
+
+/// A part of the machine state for [`Reach::walk`] to visit.
+#[derive(Clone, Copy)]
+pub(crate) enum Part<'v> {
+    Value(&'v Value),
+    Env(&'v Env),
+    List(&'v List),
+    Tree(&'v Tree),
+}
+
+/// [`Reach::walk`] used up its work budget.
+#[derive(Debug)]
+pub(crate) struct OverBudget;
+
+/// A walk over everything some values can reach, to find the memo tables a
+/// program can still call: the machine releases the others.
+///
+/// A table is reached through a `memorec` `self`, and its entries are reached in
+/// turn. The walk visits each shared part once, so its work is bounded by the
+/// memory the parts use, and it stops once that work passes a budget.
+pub(crate) struct Reach {
+    /// The shared parts visited: a kind tag (parts of different kinds can share
+    /// an address) and the address.
+    seen: FxHashSet<(u8, *const ())>,
+    /// The tables reached.
+    tables: FxHashSet<TableId>,
+    /// The tables reached whose entries are not yet walked.
+    pending: Vec<TableId>,
+    /// The parts visited so far, each array element counted.
+    work: u64,
+    budget: u64,
+}
+
+impl Reach {
+    /// A walk that may visit up to `budget` parts in all.
+    pub(crate) fn new(budget: u64) -> Reach {
+        Reach {
+            seen: FxHashSet::default(),
+            tables: FxHashSet::default(),
+            pending: Vec::new(),
+            work: 0,
+            budget,
+        }
+    }
+
+    /// Records the table at `table` as reached.
+    pub(crate) fn table(&mut self, table: TableId) {
+        if self.tables.insert(table) {
+            self.pending.push(table);
+        }
+    }
+
+    /// A reached table whose entries are not yet walked.
+    pub(crate) fn next_table(&mut self) -> Option<TableId> {
+        self.pending.pop()
+    }
+
+    /// Whether the table at `table` was reached.
+    pub(crate) fn reached(&self, table: TableId) -> bool {
+        self.tables.contains(&table)
+    }
+
+    /// The parts visited so far.
+    pub(crate) fn work(&self) -> u64 {
+        self.work
+    }
+
+    /// Whether this is the first visit of the part of kind `kind` at `addr`.
+    fn first(&mut self, kind: u8, addr: *const ()) -> bool {
+        self.seen.insert((kind, addr))
+    }
+
+    /// Visits `parts` and everything they reach, except the entries of the
+    /// tables reached, which [`Reach::next_table`] hands back to walk next.
+    pub(crate) fn walk(&mut self, mut parts: Vec<Part<'_>>) -> Result<(), OverBudget> {
+        while let Some(part) = parts.pop() {
+            self.work += 1;
+            if self.work > self.budget {
+                return Err(OverBudget);
+            }
+            match part {
+                Part::Value(v) => match v {
+                    Value::Int(_) | Value::Bool(_) | Value::Unit | Value::Option(None) => {}
+                    Value::Pair(p) => {
+                        if self.first(0, Rc::as_ptr(p).cast()) {
+                            parts.push(Part::Value(&p.0));
+                            parts.push(Part::Value(&p.1));
+                        }
+                    }
+                    Value::Option(Some(x)) => {
+                        if self.first(1, Rc::as_ptr(x).cast()) {
+                            parts.push(Part::Value(x));
+                        }
+                    }
+                    Value::List(l) => parts.push(Part::List(l)),
+                    Value::Tree(t) => parts.push(Part::Tree(t)),
+                    // A vector has no address of its own to remember, but the
+                    // element values of shared chunks do. So an array reached
+                    // twice costs its length twice, and its elements' parts once.
+                    Value::Array(a) => {
+                        if self.first(2, ptr::from_ref(v).cast()) {
+                            if self.work.saturating_add(a.len() as u64) > self.budget {
+                                return Err(OverBudget);
+                            }
+                            parts.extend(a.iter().map(Part::Value));
+                        }
+                    }
+                    Value::Fun(f) => {
+                        if self.first(3, Rc::as_ptr(f).cast()) {
+                            match &**f {
+                                Fun::Closure { env, .. } => parts.push(Part::Env(env)),
+                                Fun::Partial { args, .. } => {
+                                    parts.extend(args.iter().map(Part::Value));
+                                }
+                                Fun::BfixSelf { f, .. } => parts.push(Part::Value(f)),
+                                Fun::MemoSelf { table, f } => {
+                                    self.table(Weak::as_ptr(table));
+                                    parts.push(Part::Value(f));
+                                }
+                            }
+                        }
+                    }
+                },
+                Part::Env(Env(Some(node))) => {
+                    if self.first(4, Rc::as_ptr(node).cast()) {
+                        parts.push(Part::Value(&node.value));
+                        parts.push(Part::Env(&node.next));
+                    }
+                }
+                Part::List(List(Some(cell))) => {
+                    if self.first(5, Rc::as_ptr(cell).cast()) {
+                        parts.push(Part::Value(&cell.head));
+                        parts.push(Part::List(&cell.tail));
+                    }
+                }
+                Part::Tree(Tree(Some(node))) => {
+                    if self.first(6, Rc::as_ptr(node).cast()) {
+                        parts.push(Part::Tree(&node.left));
+                        parts.push(Part::Value(&node.value));
+                        parts.push(Part::Tree(&node.right));
+                    }
+                }
+                Part::Env(Env(None)) | Part::List(List(None)) | Part::Tree(Tree(None)) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The result of comparing two values with `eq`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EqResult {
