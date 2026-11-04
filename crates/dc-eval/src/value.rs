@@ -731,6 +731,10 @@ impl Value {
     }
 }
 
+/// The most arrays of one length and first chunk that [`Reach::walk`] compares
+/// a new array with.
+const ARRAYS_PER_KEY: usize = 8;
+
 /// The address of a memo table, as [`Reach`] records it.
 pub(crate) type TableId = *const RefCell<MemoTable>;
 
@@ -751,19 +755,23 @@ pub(crate) struct OverBudget;
 /// program can still call: the machine releases the others.
 ///
 /// A table is reached through a `memorec` `self`, and its entries are reached in
-/// turn. The walk expands each shared part once, except arrays: an array reached
-/// through k different places costs k times its length. It stops once its work
-/// passes a budget.
+/// turn. The walk expands each shared part once. An array reached again through
+/// a clone costs one part, and arrays that share chunks of elements expand each
+/// shared chunk once. It stops once its work passes a budget.
 pub(crate) struct Reach {
     /// The shared parts visited: a kind tag (parts of different kinds can share
     /// an address) and the address.
     seen: FxHashSet<(u8, *const ())>,
+    /// The array chunks visited: the address and length of the elements. Two
+    /// arrays can hold different parts of one chunk, so the address alone does
+    /// not name the elements.
+    chunks: FxHashSet<(*const Value, usize)>,
     /// The tables reached.
     tables: FxHashSet<TableId>,
     /// The tables reached whose entries are not yet walked.
     pending: Vec<TableId>,
-    /// The parts visited so far, each array element counted, and the parts
-    /// added with [`Reach::reserve`].
+    /// The parts visited so far, each array element and chunk counted, and the
+    /// parts added with [`Reach::reserve`].
     work: u64,
     budget: u64,
 }
@@ -773,6 +781,7 @@ impl Reach {
     pub(crate) fn new(budget: u64) -> Reach {
         Reach {
             seen: FxHashSet::default(),
+            chunks: FxHashSet::default(),
             tables: FxHashSet::default(),
             pending: Vec::new(),
             work: 0,
@@ -829,7 +838,11 @@ impl Reach {
 
     /// Visits `parts` and everything they reach, except the entries of the
     /// tables reached, which [`Reach::next_table`] hands back to walk next.
-    pub(crate) fn walk(&mut self, mut parts: Vec<Part<'_>>) -> Result<(), OverBudget> {
+    pub(crate) fn walk<'v>(&mut self, mut parts: Vec<Part<'v>>) -> Result<(), OverBudget> {
+        // The arrays this call has expanded, by length and the address of their
+        // first chunk, at most `ARRAYS_PER_KEY` for each.
+        let mut arrays: FxHashMap<(usize, *const Value), Vec<&'v imbl::Vector<Value>>> =
+            FxHashMap::default();
         while let Some(part) = parts.pop() {
             self.work += 1;
             if self.work > self.budget {
@@ -851,15 +864,37 @@ impl Reach {
                     }
                     Value::List(l) => parts.push(Part::List(l)),
                     Value::Tree(t) => parts.push(Part::Tree(t)),
-                    // A vector has no address of its own to remember, but the
-                    // element values of shared chunks do. So an array reached
-                    // twice costs its length twice, and its elements' parts once.
+                    // A vector has no address of its own to remember. A clone
+                    // of one already expanded is found with `ptr_eq`, which is
+                    // true only for vectors with the same chunks. Otherwise each
+                    // chunk costs one part, and its elements are added the
+                    // first time it is seen.
                     Value::Array(a) => {
                         if self.first(2, ptr::from_ref(v).cast()) {
-                            if self.work.saturating_add(a.len() as u64) > self.budget {
+                            let first = a.leaves().next().map_or(ptr::null(), <[Value]>::as_ptr);
+                            let same = arrays.entry((a.len(), first)).or_default();
+                            self.work += same.len() as u64;
+                            if self.work > self.budget {
                                 return Err(OverBudget);
                             }
-                            parts.extend(a.iter().map(Part::Value));
+                            if same.iter().any(|b| b.ptr_eq(a)) {
+                                continue;
+                            }
+                            if same.len() < ARRAYS_PER_KEY {
+                                same.push(a);
+                            }
+                            for chunk in a.leaves() {
+                                self.work += 1;
+                                if self.work > self.budget {
+                                    return Err(OverBudget);
+                                }
+                                if self.chunks.insert((chunk.as_ptr(), chunk.len())) {
+                                    if self.work.saturating_add(chunk.len() as u64) > self.budget {
+                                        return Err(OverBudget);
+                                    }
+                                    parts.extend(chunk.iter().map(Part::Value));
+                                }
+                            }
                         }
                     }
                     Value::Fun(f) => {

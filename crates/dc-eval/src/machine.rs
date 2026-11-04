@@ -1233,6 +1233,12 @@ mod tests {
                 "(tree_case (node leaf {} leaf) (lam 0) (lam (let {g} (lam (lam ($1 2))))))",
                 curried("1")
             ),
+            // The functional of a `bfix` self, which holds the closure in its
+            // environment.
+            format!(
+                "(let ((lam (bfix 3 (lam (lam (if (int_eq $0 0) $1 ($2 2)))) 0)) {}) (let {g} ($1 1)))",
+                curried("1")
+            ),
             // A table reached only through the entry of a table whose `self` is
             // live: the self's table maps 1 to the pair of itself and a closure.
             format!(
@@ -1342,6 +1348,23 @@ mod tests {
         let o = m.run(Control::Eval(t, Env::empty()));
         assert!(matches!(o, Outcome::Value(Value::Int(2), _)), "{o}");
         assert!(m.walk_work > 44 && m.walk_work < 1000, "{}", m.walk_work);
+    }
+
+    #[test]
+    fn walks_finish_beside_an_array_that_many_values_hold() {
+        // One array of 8000 elements in each of 2000 list cells: about 10000
+        // parts of memory, but 16 million if every cell's array were visited in
+        // full, or 250000 if every cell's array cost its 125 chunks. Beside it,
+        // 20000 dropped curried results, about 140000 steps. Walks of about
+        // 20000 parts finish every few thousand iterations.
+        let mut arena = Arena::new();
+        let p = format!(
+            "(let (array_tabulate 8000 (lam 0)) (let (loop 2000 nil (lam (lam (cons $2 $0)))) (loop 20000 0 (lam (lam (let {} $1))))))",
+            curried("$1")
+        );
+        let (o, kept) = run_machine(&mut arena, &p, UNLIMITED);
+        assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
+        assert!(kept <= 5000, "{kept} tables kept");
     }
 
     #[test]
