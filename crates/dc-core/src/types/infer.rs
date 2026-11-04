@@ -449,6 +449,17 @@ enum Slot {
 /// A shared subterm and what its type depends on.
 type MemoKey = (TermId, Scope);
 
+/// A memo key added while uses are being tried.
+#[derive(Debug)]
+struct Logged {
+    key: MemoKey,
+    /// The nodes its kept type depends on, as the range of
+    /// `TypeChecker::memo_deps` that holds them, or `None` if going back to a
+    /// checkpoint always removes the key (see
+    /// [`TypeChecker::keep_past_checkpoints`]).
+    deps: Option<(usize, usize)>,
+}
+
 /// A shared subterm being inferred for the memo.
 #[derive(Debug)]
 struct Pending {
@@ -512,6 +523,8 @@ pub struct TypeChecker {
     canon: FxHashMap<Canon, u32>,
     /// For each [`Canon`] id, whether that type has no free variables.
     canon_closed: Vec<bool>,
+    /// The [`Canon`] of each id.
+    canon_of: Vec<Canon>,
     /// Walks every term as a tree, without reusing shared subterms: the
     /// reference the tests compare the memoised walk with.
     pub(super) tree_walk: bool,
@@ -524,10 +537,14 @@ pub struct TypeChecker {
     /// The old contents of the store nodes changed since the oldest checkpoint,
     /// in the order changed. Nodes made after the innermost checkpoint are left
     /// out: going back to any checkpoint leaves nothing that refers to them,
-    /// except kept types copied by [`TypeChecker::freeze`], which never change.
+    /// except kept types copied by [`TypeChecker::freeze`], which never change,
+    /// and kept types whose nodes [`TypeChecker::deps_hold`] finds unchanged.
     trail: Vec<(Ty, Node)>,
     /// The memo keys added since the oldest checkpoint, in the order added.
-    memo_log: Vec<MemoKey>,
+    memo_log: Vec<Logged>,
+    /// The nodes the kept types of the keys in `memo_log` depend on, with
+    /// their contents when each type was kept.
+    memo_deps: Vec<(Ty, Node)>,
     /// The ranges of nodes made by [`TypeChecker::freeze`], ascending: a node in
     /// one is a copy that never changes, so a later freeze shares it.
     frozen: Vec<(Ty, Ty)>,
@@ -893,9 +910,11 @@ impl TypeChecker {
         release_vec(&mut self.spine);
         release_vec(&mut self.pending);
         release_vec(&mut self.canon_closed);
+        release_vec(&mut self.canon_of);
         release_vec(&mut self.checkpoints);
         release_vec(&mut self.trail);
         release_vec(&mut self.memo_log);
+        release_vec(&mut self.memo_deps);
         release_vec(&mut self.frozen);
     }
 
@@ -907,9 +926,11 @@ impl TypeChecker {
                 + self.spine.capacity()
                 + self.pending.capacity()
                 + self.canon_closed.capacity()
+                + self.canon_of.capacity()
                 + self.checkpoints.capacity()
                 + self.trail.capacity()
-                + self.memo_log.capacity(),
+                + self.memo_log.capacity()
+                + self.memo_deps.capacity(),
         );
         self.nodes.clear();
         self.nodes.push(Node::Con(Head::Int, 0, 0));
@@ -925,10 +946,12 @@ impl TypeChecker {
         self.pending.clear();
         empty_map(&mut self.canon);
         self.canon_closed.clear();
+        self.canon_of.clear();
         self.steps = 0;
         self.checkpoints.clear();
         self.trail.clear();
         self.memo_log.clear();
+        self.memo_deps.clear();
         self.frozen.clear();
         empty_set(&mut self.failed);
     }
@@ -997,6 +1020,7 @@ impl TypeChecker {
                     }
                 };
                 self.canon_closed.push(closed);
+                self.canon_of.push(canon);
             }
             ids.insert(r, id);
         }
@@ -2021,6 +2045,7 @@ impl TypeChecker {
         if self.checkpoints.is_empty() {
             self.trail.clear();
             self.memo_log.clear();
+            self.memo_deps.clear();
         }
     }
 
@@ -2029,15 +2054,151 @@ impl TypeChecker {
     /// If the scope has no binding whose type has free variables, inferring the
     /// subterm used only nodes it made itself, so its kept type holds for that
     /// scope in any state of the store. Then it is copied out of reach of going
-    /// back to a checkpoint, and stays in the memo. Otherwise going back to a
-    /// checkpoint before it removes it.
+    /// back to a checkpoint, and stays in the memo.
+    ///
+    /// Otherwise the key is logged with the nodes the kept type depends on
+    /// (see [`TypeChecker::memo_deps`]), and going back to the oldest
+    /// checkpoint keeps it only if each of those nodes is then as it was here
+    /// (see [`TypeChecker::deps_hold`]). Inferring the subterm reads only the
+    /// types of the bindings in its scope, and changes only those and nodes it
+    /// makes. The shape of each polymorphic binding's type is fixed by its
+    /// [`Canon`] id, which is part of the key; the rest is what the store holds
+    /// at the free variables of that shape. If those nodes, and the nodes of
+    /// the kept type, read the same after going back, the inference changed
+    /// none of them, and inferring the subterm afresh there would give the
+    /// kept type again, up to renaming, and change nothing else.
     fn keep_past_checkpoints(&mut self, key: &MemoKey, kept: Ty) -> Ty {
         let closed = self.scope_closed(&key.1);
         if let Some(frozen) = closed.then(|| self.freeze(kept)).flatten() {
             return frozen;
         }
-        self.memo_log.push(key.clone());
+        let start = self.memo_deps.len();
+        let deps = if self.memo_deps(&key.1, kept) {
+            Some((start, self.memo_deps.len()))
+        } else {
+            self.memo_deps.truncate(start);
+            None
+        };
+        self.memo_log.push(Logged {
+            key: key.clone(),
+            deps,
+        });
         kept
+    }
+
+    /// Pushes onto `memo_deps` each node, other than a constructor, reached
+    /// from kept type `kept` or from the free variables of the [`Canon`] of a
+    /// polymorphic binding in `scope`, with its contents now. Links are
+    /// followed without being compressed, and a link is pushed with the node
+    /// at the end of its path. Constructor nodes never change, so they are
+    /// left out. Returns false, and the key cannot be kept past going back, if
+    /// a node made since the oldest checkpoint is a variable that is not
+    /// quantified, or a rigid one: then the type depends on a node that
+    /// nothing reachable after going back refers to.
+    ///
+    /// Each node, link followed and [`Canon`] visited costs a unit. The kept
+    /// type was built by the inference just done, which also read the scope's
+    /// types; this walk reads all of each of those types, where the
+    /// inference may have read only part.
+    fn memo_deps(&mut self, scope: &Scope, kept: Ty) -> bool {
+        let old = self.checkpoints.first().map_or(0, |cp| cp.nodes);
+        let mut work = std::mem::take(&mut self.work);
+        work.clear();
+        work.push(kept);
+        let mut canons: Vec<u32> = scope
+            .iter()
+            .filter_map(|slot| match *slot {
+                Slot::Mono => None,
+                Slot::Poly(c) => Some(c),
+            })
+            .collect();
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        while let Some(c) = canons.pop() {
+            self.spent += 1;
+            count_probes(1);
+            if !seen.insert(c) {
+                continue;
+            }
+            match self.canon_of[c as usize] {
+                Canon::Var { .. } => {}
+                Canon::Free(r) => work.push(r),
+                Canon::Con(h, a, b) => {
+                    if h.arity() >= 1 {
+                        canons.push(a);
+                    }
+                    if h.arity() >= 2 {
+                        canons.push(b);
+                    }
+                }
+            }
+        }
+        self.new_walk();
+        let mut ok = true;
+        while let Some(t) = work.pop() {
+            self.spent += 1;
+            if !self.first_visit(t) {
+                continue;
+            }
+            let n = self.node(t);
+            match n {
+                Node::Con(..) => Self::push_children(&mut work, n),
+                Node::Var { level, .. } if level != GENERIC && t as usize >= old => {
+                    ok = false;
+                    break;
+                }
+                Node::Var { .. } => self.memo_deps.push((t, n)),
+                Node::Rigid { .. } if t as usize >= old => {
+                    ok = false;
+                    break;
+                }
+                Node::Rigid { .. } => {}
+                Node::Link(_) => {
+                    let end = self.raw_end(t);
+                    self.memo_deps.push((t, Node::Link(end)));
+                    work.push(end);
+                }
+            }
+        }
+        self.work = work;
+        ok
+    }
+
+    /// The node at the end of the path of links from `t`, followed without
+    /// compressing it. A unit for each link.
+    fn raw_end(&mut self, t: Ty) -> Ty {
+        let mut end = t;
+        while let Node::Link(next) = self.node(end) {
+            self.spent += 1;
+            end = next;
+        }
+        end
+    }
+
+    /// Whether each node in `memo_deps[start..end]` reads as it did when it
+    /// was pushed: a variable has the same level and `Key` flag (its rank only
+    /// orders unions), and a link's path ends at the same node. A unit for each
+    /// node and link followed.
+    fn deps_hold(&mut self, start: usize, end: usize) -> bool {
+        for i in start..end {
+            self.spent += 1;
+            let (t, then) = self.memo_deps[i];
+            let holds = match (then, self.node(t)) {
+                (Node::Link(was), Node::Link(_)) => self.raw_end(t) == was,
+                (
+                    Node::Var {
+                        level: l0, key: k0, ..
+                    },
+                    Node::Var {
+                        level: l1, key: k1, ..
+                    },
+                ) => l0 == l1 && k0 == k1,
+                _ => false,
+            };
+            if !holds {
+                return false;
+            }
+        }
+        true
     }
 
     /// A copy of `t` in frozen nodes, with no links, or `None` if `t` has a
@@ -2166,7 +2327,10 @@ impl TypeChecker {
     /// subterm in place. Every node made before `cp` and changed since was
     /// saved on the trail, since every checkpoint after it was made later and
     /// so starts at a later node; nothing reachable after going back refers to
-    /// a node made since, except kept types copied by [`TypeChecker::freeze`].
+    /// a node made since, except kept types copied by [`TypeChecker::freeze`]
+    /// and the kept types of logged keys the memo keeps, whose nodes are
+    /// checked once the trail is undone (see
+    /// [`TypeChecker::keep_past_checkpoints`]).
     fn back_to(&mut self, cp: Checkpoint) -> Step {
         for (t, n) in self.trail.drain(cp.trail..).rev() {
             #[cfg(test)]
@@ -2183,10 +2347,20 @@ impl TypeChecker {
             }
         }
         self.env.truncate(cp.env);
-        for key in self.memo_log.drain(cp.memo_log..) {
+        // After the store is put back, so each key's nodes are read as they
+        // are at `cp`.
+        let mut logged = std::mem::take(&mut self.memo_log);
+        for entry in logged.drain(cp.memo_log..) {
             count_probes(1);
-            self.memo.remove(&key);
+            let holds = entry
+                .deps
+                .is_some_and(|(start, end)| self.deps_hold(start, end));
+            if !holds {
+                self.memo.remove(&entry.key);
+            }
         }
+        self.memo_log = logged;
+        self.memo_deps.clear();
         self.level = cp.level;
         debug_assert!(
             self.checkpoints.is_empty(),
@@ -2194,6 +2368,7 @@ impl TypeChecker {
         );
         self.trail.clear();
         self.memo_log.clear();
+        self.memo_deps.clear();
         Step::InPlace(cp.id, cp.want)
     }
 

@@ -1744,6 +1744,28 @@ fn going_back_keeps_memo_entries_it_does_not_change() {
     );
 }
 
+/// A memo entry is dropped when going back if the inference that made it
+/// bound a free variable of its scope since the checkpoint. Here `s =
+/// (add (fst (p 1)) 1)` makes `x` an `Int` while the outer use `t` is tried;
+/// `t` then fails at `not`, and going back makes `x` unbound again. Reusing
+/// the kept type of `s` would skip binding `x`, and the walk of `t` in place
+/// would accept `not x`.
+#[test]
+fn going_back_drops_memo_entries_whose_scope_it_changes() {
+    let s = "(add (fst ($0 1)) 1)";
+    let t = format!("(pair {s} (pair {s} (not (fst ($0 true)))))");
+    let src = format!("(lam (let (lam (pair $1 $0)) (pair {t} {t})))");
+    let mut a = Arena::new();
+    let term = parse_term(&mut a, &src);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, term, NO_LIBS);
+    assert!(want.is_err());
+    let mut tc = TypeChecker::new();
+    assert_eq!(tc.infer(&a, term, NO_LIBS), want);
+    assert_eq!(tc.rollbacks(), 1);
+}
+
 /// The type the chains with two parameters are checked against.
 fn of_two_parameters(_: usize) -> Scheme {
     sch("a -> b -> c")
