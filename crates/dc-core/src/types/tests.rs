@@ -1721,7 +1721,7 @@ fn partition_chain(a: &mut Arena, n: usize, fix_y: bool) -> TermId {
 /// subterms with an open scope whose kept types read the same after going
 /// back, so it does not infer them afresh again (dreamcounter-772e12). On
 /// partition at depth 80 it then infers a key afresh again only for the uses
-/// being tried when an error went back, one for each time but the last.
+/// being tried when an error went back, fewer times than it goes back.
 /// Dropping every such entry made it infer 3,474 keys afresh again.
 #[test]
 fn going_back_keeps_memo_entries_it_does_not_change() {
@@ -1764,6 +1764,90 @@ fn going_back_drops_memo_entries_whose_scope_it_changes() {
     let mut tc = TypeChecker::new();
     assert_eq!(tc.infer(&a, term, NO_LIBS), want);
     assert_eq!(tc.rollbacks(), 1);
+}
+
+/// A memo entry is dropped when going back if the inference that made it
+/// gave a free variable of its scope a `Key` constraint since the checkpoint.
+/// Here `s` uses `x` as a `memorec` key while `t` is tried; `t` then uses `x`
+/// as a function, which fails, and going back takes the constraint off `x`.
+/// Reusing the kept type of `s` would skip it, and the walk of `t` in place
+/// would accept `x` as a function.
+#[test]
+fn going_back_drops_memo_entries_whose_scope_lost_a_key_constraint() {
+    let s = "(memorec 1 (lam (lam $0)) (fst ($0 1)))";
+    let t = format!("(pair {s} (pair {s} (if true $1 (lam $0))))");
+    for src in [
+        format!("(lam (let (lam (pair $1 $0)) (if true {t} {t})))"),
+        format!("(lam (let (lam (pair $1 $0)) (pair (if true {t} {t}) (add true 1))))"),
+    ] {
+        let mut a = Arena::new();
+        let term = parse_term(&mut a, &src);
+        let mut tree = TypeChecker::new();
+        tree.tree_walk = true;
+        let want = tree.infer(&a, term, NO_LIBS);
+        assert!(want.is_err(), "{src}");
+        let mut tc = TypeChecker::new();
+        assert_eq!(tc.infer(&a, term, NO_LIBS), want, "{src}");
+    }
+}
+
+/// A balanced tree of pairs of `Int`, `depth` deep, as type text.
+fn pair_tree_text(depth: usize) -> String {
+    if depth == 0 {
+        "Int".to_string()
+    } else {
+        let s = pair_tree_text(depth - 1);
+        format!("({s}, {s})")
+    }
+}
+
+/// `lam x. let h = (lam (pair x $0)) in (pair (if true x lib_0) (pair (if
+/// true t t) tail))`, where `lib_0` has a large type, `t` is `m` levels of
+/// `(if true s_i (if true s_i t'))` with `s_i = (add i g)` and `g = (snd (h
+/// 1))`. Each `s_i` has `h` in its scope, but gets its type from the memo
+/// entry of `g`, without reading the type of `h`.
+fn subterms_over_a_large_helper(a: &mut Arena, m: usize, tail: &str) -> TermId {
+    let mut t = a.int(0);
+    for i in 0..m {
+        let s = parse_term(a, &format!("(add {} (snd ($0 1)))", i + 10));
+        let yes = a.bool(true);
+        let inner = a.if_(yes, s, t);
+        t = a.if_(yes, s, inner);
+    }
+    let (yes, pair) = (a.bool(true), a.prim(Prim::Pair));
+    let tt = a.if_(yes, t, t);
+    let tail = parse_term(a, tail);
+    let rest = a.apps(pair, &[tt, tail]);
+    let fix = parse_term(a, "(if true $1 lib_0)");
+    let body = a.apps(pair, &[fix, rest]);
+    let h = parse_term(a, "(lam (pair $1 $0))");
+    let body = a.let_(h, body);
+    a.lam(body)
+}
+
+/// Recording what a memo entry depends on costs at most a few times what
+/// inferring its subterm did. Recording all of `h`'s type for each `s_i`
+/// made the second walk cost over 13 times the first with no rollback at `m` =
+/// 100, and at `m` = 4,000 run out of budget, so the first walk's error was
+/// reported instead of the tree walk's.
+#[test]
+fn recording_memo_entries_costs_a_multiple_of_inferring_them() {
+    let libs = [sch(&pair_tree_text(11))];
+    let tails = [
+        (100, "(add true 1)"),
+        (4_000, "(lam (if $0 (add $0 1) (add $0 1)))"),
+    ];
+    for (m, tail) in tails {
+        let mut a = Arena::new();
+        let t = subterms_over_a_large_helper(&mut a, m, tail);
+        let mut tree = TypeChecker::with_work_budget(u64::MAX);
+        tree.tree_walk = true;
+        let want = tree.infer(&a, t, &libs[..]);
+        assert!(want.is_err(), "m = {m}");
+        let mut tc = TypeChecker::new();
+        assert_eq!(tc.infer(&a, t, &libs[..]), want, "m = {m}");
+        assert_eq!(locate_cost(&tc), Ok(()), "m = {m}");
+    }
 }
 
 /// The type the chains with two parameters are checked against.
