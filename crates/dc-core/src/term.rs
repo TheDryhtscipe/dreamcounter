@@ -64,13 +64,15 @@ pub enum Term {
 
 /// Builds the hasher of an [`Arena`]'s index from terms to ids.
 ///
-/// It is foldhash with its own seed for each arena, not FxHash. A program's
+/// It is foldhash with its own seed for each new arena, not FxHash; a clone
+/// keeps its original's seed. A program's
 /// text chooses the integers, variable indices and library ids in its leaves,
 /// and the pairs of earlier nodes it combines. FxHash is unkeyed, so such a
 /// program could make many nodes share a bucket, and interning each would then
-/// be linear in their number. foldhash derives each seed from addresses, the
-/// clock and the previous seed, not from the operating system's random source,
-/// so no fixed list of terms collides in every arena. It does not resist an attacker
+/// be linear in their number. foldhash mixes a seed for each process, from
+/// addresses and the clock, with a seed for each arena, from an address and the
+/// previous arena's seed. Neither comes from the operating system's random
+/// source, but no fixed list of terms collides in every arena. It does not resist an attacker
 /// who can watch hash values or interning times and adapt to them.
 ///
 /// Nothing iterates over the index, so the order of its entries, which differs
@@ -305,6 +307,7 @@ pub fn children(term: &Term) -> Vec<TermId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hash::BuildHasher;
 
     #[test]
     fn equal_structures_share_an_id() {
@@ -411,8 +414,6 @@ mod tests {
         GETS.with(std::cell::Cell::get)
     }
 
-    use std::hash::BuildHasher;
-
     /// The inverse of an odd `a` modulo 2^64 (Newton's iteration).
     fn odd_inverse(a: u64) -> u64 {
         let mut x = a;
@@ -465,16 +466,16 @@ mod tests {
         );
     }
 
-    /// The fastest of three runs of `f`.
+    /// The fastest of five runs of `f`.
     fn fastest(f: impl Fn()) -> std::time::Duration {
-        (0..3)
+        (0..5)
             .map(|_| {
                 let start = std::time::Instant::now();
                 f();
                 start.elapsed()
             })
             .min()
-            .expect("three runs")
+            .expect("five runs")
     }
 
     #[test]
