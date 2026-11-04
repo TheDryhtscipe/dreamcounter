@@ -870,30 +870,28 @@ impl Reach {
                     // chunk costs one part, and its elements are added the
                     // first time it is seen.
                     Value::Array(a) => {
-                        if self.first(2, ptr::from_ref(v).cast()) {
-                            let first = a.leaves().next().map_or(ptr::null(), <[Value]>::as_ptr);
-                            let same = arrays.entry((a.len(), first)).or_default();
-                            self.work += same.len() as u64;
+                        let first = a.leaves().next().map_or(ptr::null(), <[Value]>::as_ptr);
+                        let same = arrays.entry((a.len(), first)).or_default();
+                        self.work += same.len() as u64;
+                        if self.work > self.budget {
+                            return Err(OverBudget);
+                        }
+                        if same.iter().any(|b| b.ptr_eq(a)) {
+                            continue;
+                        }
+                        if same.len() < ARRAYS_PER_KEY {
+                            same.push(a);
+                        }
+                        for chunk in a.leaves() {
+                            self.work += 1;
                             if self.work > self.budget {
                                 return Err(OverBudget);
                             }
-                            if same.iter().any(|b| b.ptr_eq(a)) {
-                                continue;
-                            }
-                            if same.len() < ARRAYS_PER_KEY {
-                                same.push(a);
-                            }
-                            for chunk in a.leaves() {
-                                self.work += 1;
-                                if self.work > self.budget {
+                            if self.chunks.insert((chunk.as_ptr(), chunk.len())) {
+                                if self.work.saturating_add(chunk.len() as u64) > self.budget {
                                     return Err(OverBudget);
                                 }
-                                if self.chunks.insert((chunk.as_ptr(), chunk.len())) {
-                                    if self.work.saturating_add(chunk.len() as u64) > self.budget {
-                                        return Err(OverBudget);
-                                    }
-                                    parts.extend(chunk.iter().map(Part::Value));
-                                }
+                                parts.extend(chunk.iter().map(Part::Value));
                             }
                         }
                     }

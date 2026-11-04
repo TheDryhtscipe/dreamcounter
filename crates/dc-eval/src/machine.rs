@@ -1368,6 +1368,22 @@ mod tests {
     }
 
     #[test]
+    fn walks_finish_beside_arrays_that_share_chunks() {
+        // 200 versions of an array of 8000 elements, each with one element
+        // changed: about 200 × (125 chunks + 64 elements) parts if shared chunks
+        // are expanded once, 1.6 million if not. Beside them, 20000 dropped
+        // curried results, about 140000 steps.
+        let mut arena = Arena::new();
+        let p = format!(
+            "(let (array_tabulate 8000 (lam 0)) (let (loop 200 nil (lam (lam (cons (array_set $2 (mul $1 40) 1) $0)))) (loop 20000 0 (lam (lam (let {} $1))))))",
+            curried("$1")
+        );
+        let (o, kept) = run_machine(&mut arena, &p, UNLIMITED);
+        assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
+        assert!(kept <= 10000, "{kept} tables kept");
+    }
+
+    #[test]
     fn memo_tables_that_only_their_own_entries_reach_are_released() {
         let mut arena = Arena::new();
         // 1000 curried memorec results, each dropped at once.
