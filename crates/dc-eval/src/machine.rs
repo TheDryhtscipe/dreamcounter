@@ -1237,11 +1237,15 @@ mod tests {
 
     #[test]
     fn reachability_walks_cost_at_most_a_constant_times_the_steps() {
-        // 3000 dropped curried results beside a live input of 100000 elements,
-        // about 200000 parts for every walk: more than the steps of the whole
-        // evaluation.
+        // A live input of 100000 elements, about 200000 parts for every walk:
+        // more than the steps of the whole evaluation. One live curried result
+        // makes a walk worth trying, and 3000 memorec calls whose tables the
+        // cheap pass releases bring a try every 64 calls.
         let mut arena = Arena::new();
-        let p = format!("(lam (loop 3000 0 (lam (lam (let {} $1)))))", curried("$1"));
+        let p = format!(
+            "(lam (let {} (loop 3000 0 (lam (lam (memorec 1 (lam (lam 0)) $1))))))",
+            curried("1")
+        );
         let t = sexpr::parse(&mut arena, &p).expect("parse");
         let xs: Vec<i64> = (0..100_000).collect();
         let mut m = Machine::new(&arena, UNLIMITED);
@@ -1260,9 +1264,9 @@ mod tests {
     fn a_walk_visits_each_element_of_shared_array_chunks_once() {
         // 40 levels of arrays whose two elements are the level below: 2^40
         // elements as a tree, 80 in memory. Then two garbage tables, the second
-        // walking the arrays with no budget.
+        // walking the arrays, held by a `let` frame, with no budget.
         let p = format!(
-            "(let (loop 40 0 (lam (lam (array_tabulate 2 (lam $1))))) {})",
+            "(let (loop 40 0 (lam (lam (array_tabulate 2 (lam $1))))) (let {} (array_size $1)))",
             garbage()
         );
         let mut arena = Arena::new();
@@ -1270,8 +1274,8 @@ mod tests {
         let mut m = Machine::new(&arena, UNLIMITED);
         m.pruning = ALWAYS;
         let o = m.run(Control::Eval(t, Env::empty()));
-        assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
-        assert!(m.walk_work > 0 && m.walk_work < 1000, "{}", m.walk_work);
+        assert!(matches!(o, Outcome::Value(Value::Int(2), _)), "{o}");
+        assert!(m.walk_work > 80 && m.walk_work < 1000, "{}", m.walk_work);
     }
 
     #[test]
