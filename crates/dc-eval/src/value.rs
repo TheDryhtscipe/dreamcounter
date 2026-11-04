@@ -99,10 +99,13 @@ pub enum Fun {
 /// insert into such a map is then linear in its size, so building the map is
 /// quadratic. With random keys a program cannot know which integers collide.
 ///
-/// Random keys make the order of a map's entries differ between runs. Nothing
-/// iterates over these maps, so no result or step count depends on the order;
-/// keep it so. Only the [`Debug`] output of a [`MemoTable`] shows the order.
+/// Random keys make the order of a map's entries differ between runs. Only
+/// dropping a map and the [`Debug`] output of a [`MemoTable`] visit its entries
+/// in that order, so no result, error or step count depends on it; keep it so.
 pub(crate) type KeyHasher = std::collections::hash_map::RandomState;
+
+/// The map from each distinct subvalue of a large [`MemoKey`] to its position.
+type KeyNodeIds = HashMap<KeyNode, usize, KeyHasher>;
 
 /// The memo table of one `memorec` evaluation (spec §6).
 #[derive(Debug, Default)]
@@ -217,7 +220,7 @@ impl MemoKey {
     /// `None` for an invalid key. Each pair in memory is visited once.
     fn dag(v: &Value) -> Option<Vec<KeyNode>> {
         let mut nodes: Vec<KeyNode> = Vec::new();
-        let mut ids: HashMap<KeyNode, usize, KeyHasher> = HashMap::default();
+        let mut ids = KeyNodeIds::default();
         let mut by_ptr: FxHashMap<*const (Value, Value), usize> = FxHashMap::default();
         let mut intern = |node: KeyNode, nodes: &mut Vec<KeyNode>| -> usize {
             *ids.entry(node).or_insert_with(|| {
@@ -1117,7 +1120,8 @@ mod tests {
     /// before its final rotation, so they all share a bucket and a tag in any
     /// table smaller than 2^26. FxHash's state after the int is `(s + x) * K`, and
     /// every later word maps the state by `h -> (h + w) * K`, so the hash before
-    /// the rotation is `A * x + B` with `A` odd.
+    /// the rotation is `A * x + B` with `A` odd. It assumes a 64-bit target, where
+    /// rustc-hash 2.1 rotates by 26.
     fn fx_colliding_ints<T: std::hash::Hash>(n: u64, key: impl Fn(i64) -> T) -> Vec<i64> {
         let fx = |x: i64| rustc_hash::FxBuildHasher.hash_one(key(x)).rotate_right(26);
         let b = fx(0);
@@ -1167,7 +1171,7 @@ mod tests {
             .into_iter()
             .map(KeyNode::Int)
             .collect();
-        let (buckets, tags) = spread(&KeyHasher::default(), &nodes);
+        let (buckets, tags) = spread(KeyNodeIds::default().hasher(), &nodes);
         assert!(
             buckets > 2000 && tags > 100,
             "{buckets} buckets, {tags} tags"
@@ -1188,7 +1192,7 @@ mod tests {
 
     #[test]
     fn a_large_key_of_colliding_ints_builds_in_linear_time() {
-        // A right-nested chain of `n` ints is a key of 2n - 1 nodes, past the flat
+        // A right-nested chain of `n` ints is a key of 2n + 1 nodes, past the flat
         // form, so it is built through the `ids` map one int at a time.
         let chain = |xs: &[i64]| {
             xs.iter()
