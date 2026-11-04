@@ -11,6 +11,7 @@ repository = "https://github.com/TheDryhtscipe/dreamcounter"
 
 [workspace.dependencies]
 rustc-hash = "2.1"
+foldhash = "0.2"
 proptest = "1.12"
 imbl = "7.0"
 # Pinned exactly: task inputs must be the same on every platform and version.
