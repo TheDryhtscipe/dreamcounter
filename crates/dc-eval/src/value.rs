@@ -22,6 +22,7 @@
 //! `Display` writes the whole tree, so use it only on values known to be small.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt;
 use std::mem;
 use std::ptr;
@@ -90,11 +91,24 @@ pub enum Fun {
     },
 }
 
+/// Builds the hasher of the maps keyed by values a program chooses: the memo
+/// table's entries and the nodes of a large [`MemoKey`].
+///
+/// It is the standard library's SipHash with random keys, not FxHash. FxHash is
+/// unkeyed, so a program can choose integers whose hashes all collide, and each
+/// insert into such a map is then linear in its size, so building the map is
+/// quadratic. With random keys a program cannot know which integers collide.
+///
+/// Random keys make the order of a map's entries differ between runs. Nothing
+/// iterates over these maps, so no result or step count depends on the order;
+/// keep it so. Only the [`Debug`] output of a [`MemoTable`] shows the order.
+pub(crate) type KeyHasher = std::collections::hash_map::RandomState;
+
 /// The memo table of one `memorec` evaluation (spec §6).
 #[derive(Debug, Default)]
 pub struct MemoTable {
     /// Completed results.
-    pub entries: FxHashMap<MemoKey, Value>,
+    pub entries: HashMap<MemoKey, Value, KeyHasher>,
     /// How many more misses are allowed before `FuelExhausted`.
     pub misses_left: i64,
 }
@@ -203,7 +217,7 @@ impl MemoKey {
     /// `None` for an invalid key. Each pair in memory is visited once.
     fn dag(v: &Value) -> Option<Vec<KeyNode>> {
         let mut nodes: Vec<KeyNode> = Vec::new();
-        let mut ids: FxHashMap<KeyNode, usize> = FxHashMap::default();
+        let mut ids: HashMap<KeyNode, usize, KeyHasher> = HashMap::default();
         let mut by_ptr: FxHashMap<*const (Value, Value), usize> = FxHashMap::default();
         let mut intern = |node: KeyNode, nodes: &mut Vec<KeyNode>| -> usize {
             *ids.entry(node).or_insert_with(|| {
@@ -1086,6 +1100,113 @@ mod tests {
 
     fn queued() -> usize {
         ARRAY_DROPS.with(|q| q.borrow().len())
+    }
+
+    use std::hash::BuildHasher;
+
+    /// The inverse of an odd `a` modulo 2^64 (Newton's iteration).
+    fn odd_inverse(a: u64) -> u64 {
+        let mut x = a;
+        for _ in 0..6 {
+            x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+        }
+        x
+    }
+
+    /// `n` ints whose keys, built by `key`, have FxHash values `0, 1, ..., n-1`
+    /// before its final rotation, so they all share a bucket and a tag in any
+    /// table smaller than 2^26. FxHash's state after the int is `(s + x) * K`, and
+    /// every later word maps the state by `h -> (h + w) * K`, so the hash before
+    /// the rotation is `A * x + B` with `A` odd.
+    fn fx_colliding_ints<T: std::hash::Hash>(n: u64, key: impl Fn(i64) -> T) -> Vec<i64> {
+        let fx = |x: i64| rustc_hash::FxBuildHasher.hash_one(key(x)).rotate_right(26);
+        let b = fx(0);
+        let a = fx(1).wrapping_sub(b);
+        assert_eq!(a % 2, 1, "the int is mixed by an odd multiplier");
+        let a_inv = odd_inverse(a);
+        let xs: Vec<i64> = (0..n)
+            .map(|i| i.wrapping_sub(b).wrapping_mul(a_inv) as i64)
+            .collect();
+        // The ints really do collide under FxHash, so the spread check below
+        // tests the hasher and not the inputs.
+        for (i, &x) in xs.iter().enumerate() {
+            assert_eq!(fx(x), i as u64);
+        }
+        xs
+    }
+
+    /// How many distinct buckets of a 4096-bucket table, and distinct 7-bit
+    /// tags, the hashes of `keys` fall into under `hasher`.
+    fn spread<T: std::hash::Hash>(hasher: &impl BuildHasher, keys: &[T]) -> (usize, usize) {
+        let hashes: Vec<u64> = keys.iter().map(|k| hasher.hash_one(k)).collect();
+        let buckets: FxHashSet<u64> = hashes.iter().map(|h| h & 0xFFF).collect();
+        let tags: FxHashSet<u64> = hashes.iter().map(|h| h >> 57).collect();
+        (buckets.len(), tags.len())
+    }
+
+    #[test]
+    fn memo_table_entries_spread_ints_chosen_to_collide() {
+        let int_key = |x: i64| MemoKey::from_value(&Value::Int(x)).expect("an int is a key");
+        let keys: Vec<MemoKey> = fx_colliding_ints(4096, int_key)
+            .into_iter()
+            .map(int_key)
+            .collect();
+        let table = MemoTable::default();
+        // A random hash puts 4096 keys in about 2589 of 4096 buckets, and in all
+        // 128 tags; FxHash puts these in one of each.
+        let (buckets, tags) = spread(table.entries.hasher(), &keys);
+        assert!(
+            buckets > 2000 && tags > 100,
+            "{buckets} buckets, {tags} tags"
+        );
+    }
+
+    #[test]
+    fn large_key_nodes_spread_ints_chosen_to_collide() {
+        let nodes: Vec<KeyNode> = fx_colliding_ints(4096, KeyNode::Int)
+            .into_iter()
+            .map(KeyNode::Int)
+            .collect();
+        let (buckets, tags) = spread(&KeyHasher::default(), &nodes);
+        assert!(
+            buckets > 2000 && tags > 100,
+            "{buckets} buckets, {tags} tags"
+        );
+    }
+
+    /// The fastest of three runs of `f`.
+    fn fastest(f: impl Fn()) -> std::time::Duration {
+        (0..3)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                f();
+                start.elapsed()
+            })
+            .min()
+            .expect("three runs")
+    }
+
+    #[test]
+    fn a_large_key_of_colliding_ints_builds_in_linear_time() {
+        // A right-nested chain of `n` ints is a key of 2n - 1 nodes, past the flat
+        // form, so it is built through the `ids` map one int at a time.
+        let chain = |xs: &[i64]| {
+            xs.iter()
+                .rev()
+                .fold(Value::Unit, |rest, &x| Value::pair(Value::Int(x), rest))
+        };
+        let xs = fx_colliding_ints(16_000, KeyNode::Int);
+        let small = chain(&xs[..2_000]);
+        let large = chain(&xs);
+        let t_small = fastest(|| assert!(MemoKey::from_value(&small).is_some()));
+        let t_large = fastest(|| assert!(MemoKey::from_value(&large).is_some()));
+        // Eight times the ints: about 8 times the time if inserts are constant
+        // time, 64 times if each is linear.
+        let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
+        assert!(
+            ratio < 24.0,
+            "{t_small:?} for 2,000 ints, {t_large:?} for 16,000"
+        );
     }
 
     #[test]
