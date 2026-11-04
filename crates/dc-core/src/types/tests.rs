@@ -1717,6 +1717,33 @@ fn partition_chain(a: &mut Arena, n: usize, fix_y: bool) -> TermId {
     a.lam(body)
 }
 
+/// The second walk keeps, when it goes back, the memo entries of shared
+/// subterms with an open scope whose kept types read the same after going
+/// back, so it does not infer them afresh again (dreamcounter-772e12). On
+/// partition at depth 80 it then infers a key afresh again only for the uses
+/// being tried when an error went back, one for each time but the last.
+/// Dropping every such entry made it infer 3,474 keys afresh again.
+#[test]
+fn going_back_keeps_memo_entries_it_does_not_change() {
+    let mut a = Arena::new();
+    let t = partition_chain(&mut a, 80, true);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, t, NO_LIBS);
+    assert!(want.is_err());
+    let mut tc = TypeChecker::new();
+    assert_eq!(tc.infer(&a, t, NO_LIBS), want);
+    assert_eq!(locate_cost(&tc), Ok(()));
+    assert_eq!(tc.rollbacks(), 80);
+    assert!(
+        tc.repeat_tries() < tc.rollbacks(),
+        "{} keys inferred afresh again, with {} rollbacks and {} fresh tries",
+        tc.repeat_tries(),
+        tc.rollbacks(),
+        tc.locate_fresh_tries()
+    );
+}
+
 /// The type the chains with two parameters are checked against.
 fn of_two_parameters(_: usize) -> Scheme {
     sch("a -> b -> c")

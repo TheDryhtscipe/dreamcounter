@@ -560,6 +560,19 @@ pub struct TypeChecker {
     /// Keys the last call marked as failed.
     #[cfg(test)]
     failed_len: usize,
+    /// Shared subterms the last call inferred afresh, in either walk.
+    #[cfg(test)]
+    fresh_tries: u64,
+    /// Shared subterms the first walk of the last call inferred afresh.
+    #[cfg(test)]
+    first_fresh_tries: u64,
+    /// The keys the second walk of the last call inferred afresh.
+    #[cfg(test)]
+    tried_keys: FxHashSet<MemoKey>,
+    /// Times the second walk of the last call inferred afresh a key it had
+    /// inferred afresh before.
+    #[cfg(test)]
+    repeat_tries: u64,
 }
 
 /// The work budget of a [`TypeChecker`]; [`DEFAULT_WORK_BUDGET`] unless set.
@@ -799,11 +812,15 @@ impl TypeChecker {
         {
             self.walks = 0;
             self.rollbacks = 0;
+            self.fresh_tries = 0;
+            self.repeat_tries = 0;
+            self.tried_keys.clear();
         }
         let first = self.walk_from_scratch(arena, libs, term, expected);
         #[cfg(test)]
         {
             self.first_units = self.spent;
+            self.first_fresh_tries = self.fresh_tries;
         }
         let Err(e) = first else {
             return first;
@@ -1932,6 +1949,16 @@ impl TypeChecker {
         }
         self.pending.push(Pending { key, params, saved });
         self.frames.push(Frame::Memo);
+        #[cfg(test)]
+        {
+            self.fresh_tries += 1;
+            if self.locate {
+                let key = &self.pending.last().expect("just pushed").key;
+                if !self.tried_keys.insert(key.clone()) {
+                    self.repeat_tries += 1;
+                }
+            }
+        }
         Ok(Step::EvalShared(id))
     }
 
@@ -1957,6 +1984,19 @@ impl TypeChecker {
     #[cfg(test)]
     pub(super) fn shared_subterms(&self) -> usize {
         self.shared_len
+    }
+
+    /// The shared subterms the second walk of the last call inferred afresh.
+    #[cfg(test)]
+    pub(super) fn locate_fresh_tries(&self) -> u64 {
+        self.fresh_tries - self.first_fresh_tries
+    }
+
+    /// The times the second walk of the last call inferred afresh a key it
+    /// had already inferred afresh.
+    #[cfg(test)]
+    pub(super) fn repeat_tries(&self) -> u64 {
+        self.repeat_tries
     }
 
     /// The units of work the first walk of the last call did; the rest of
