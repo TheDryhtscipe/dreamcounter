@@ -26,7 +26,9 @@ pub const INT_PREFIX: &str = "int_";
 /// as a tree (see [`Arena::tree_size`]). In the text [`encode`] prints, each node
 /// adds at most 25 bytes (the most is `int_-9223372036854775808` and the space
 /// before it), or one byte more than its name for a library abstraction. So
-/// the text of a term within the limit is at most 25 MiB plus the names.
+/// the text of a term within the limit is at most 25 MiB, plus the length of
+/// each library name at each of its uses. [`LibNames`] does not limit the length
+/// of a name.
 pub const MAX_ENCODE_NODES: usize = 1 << 20;
 
 /// Why a core term could not be encoded.
@@ -131,7 +133,13 @@ impl From<ParseError> for DecodeError {
 /// each use, and the expression of a DAG can be exponentially larger than its
 /// number of distinct nodes. So it first measures `id` written out as a tree, at
 /// a cost linear in the number of distinct nodes, and refuses one with more
-/// than [`MAX_ENCODE_NODES`] nodes with [`EncodeError::TooLarge`].
+/// than [`MAX_ENCODE_NODES`] nodes with [`EncodeError::TooLarge`]. It checks the
+/// size before the library names, so a term that is too large and also uses an
+/// unnamed library gives [`EncodeError::TooLarge`].
+///
+/// The [`Expr`] it returns is a tree with a heap node for each node written out,
+/// so it takes several times the memory of its text: about 115 MB for the 20 MB
+/// of text of a term at the limit made of nested lets over `int_-9223372036854775808`.
 ///
 /// Works with an explicit stack, so the depth of `id` is limited only by memory.
 pub fn to_expr(arena: &Arena, id: TermId, names: &LibNames) -> Result<Expr, EncodeError> {
@@ -891,12 +899,13 @@ mod tests {
         let t = shared_ifs(&mut a, 19);
         assert_eq!(encode(&a, t, &n), Err(EncodeError::TooLarge));
         assert_eq!(to_expr(&a, t, &n), Err(EncodeError::TooLarge));
-        // `(and t t)` nested 19 deep over the longest integer token is 2^20 - 1
-        // nodes written out; one `lam` around it reaches the limit exactly, and a
-        // second goes over.
+        // `(let t t)` nested 19 deep over the longest integer token is 2^20 - 1
+        // nodes written out, about 20 bytes each, the most text per node of any
+        // term found; one `lam` around it reaches the limit exactly, and a second
+        // goes over.
         let mut t = a.int(i64::MIN);
         for _ in 0..19 {
-            t = a.and(t, t);
+            t = a.let_(t, t);
         }
         let at_limit = a.lam(t);
         assert_eq!(a.tree_size(at_limit, usize::MAX), Some(MAX_ENCODE_NODES));
