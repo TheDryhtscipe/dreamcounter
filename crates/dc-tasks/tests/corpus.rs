@@ -7,11 +7,12 @@
 //! its inputs have size `n`, and its inputs at the largest size differ for
 //! every seed. Every reference has the family's signature, passes its
 //! examples, and agrees with the oracle on every generated input it is run
-//! on, under the default fuel cap. By default the good reference runs at
-//! every size and the slower ones at the lower half of the sweep;
-//! `every_reference_at_every_size`, ignored by default, runs all of them at
-//! every size. An oracle that disagrees with the good reference on the last
-//! seed only fails the run (see
+//! on, under the default fuel cap. By default
+//! (`good_references_at_every_size_others_at_the_lower_half`) the good
+//! reference runs at every size and the slower ones at the lower half of
+//! the sweep only, so a naive reference wrong only in the upper half passes
+//! it; `every_reference_at_every_size`, ignored by default, runs all of
+//! them at every size. An oracle wrong on the last seed only fails the run (see
 //! [`a_wrong_answer_on_the_last_seed_fails_the_run`]).
 //!
 //! The family tests check the growth classes of the references; this run
@@ -29,7 +30,9 @@ use std::thread;
 use common::{compile, list_len};
 use dc_core::{Arena, Scheme};
 use dc_eval::Value;
-use dc_tasks::families::{self, CorpusVariant, Reference};
+use dc_tasks::families::{
+    self, collapse, sorted_order, subsequence_count, CorpusVariant, Reference,
+};
 use dc_tasks::growth::{ClassSelect, SizeObservation, Sweep};
 use dc_tasks::harness::{
     check_examples, check_generated, check_input_sizes, run_on, validate_family, HarnessConfig,
@@ -120,23 +123,42 @@ fn check_variant(
     Ok(())
 }
 
-/// Runs `check` on every variant of the corpus, one thread each (values are
-/// `!Send`, so each thread builds its own corpus), and fails with every
-/// variant's error.
-fn for_every_variant(check: impl Fn(&CorpusVariant) -> Result<(), String> + Sync) {
-    let count = families::development().len();
-    let errors: Vec<String> = thread::scope(|s| {
-        let handles: Vec<_> = (0..count)
+/// The errors of `check` on every variant of the corpus that `corpus`
+/// builds, one thread each (values are `!Send`, so each thread builds its
+/// own corpus), in corpus order. A check that panics gives an error naming
+/// its variant.
+fn errors_of(
+    corpus: impl Fn() -> Vec<CorpusVariant> + Sync,
+    check: impl Fn(&CorpusVariant) -> Result<(), String> + Sync,
+) -> Vec<String> {
+    let names: Vec<String> = corpus()
+        .iter()
+        .map(|v| v.family.name().to_owned())
+        .collect();
+    assert!(!names.is_empty(), "the corpus has variants");
+    thread::scope(|s| {
+        let handles: Vec<_> = (0..names.len())
             .map(|i| {
-                let check = &check;
-                s.spawn(move || check(&families::development()[i]))
+                let (corpus, check) = (&corpus, &check);
+                s.spawn(move || check(&corpus()[i]))
             })
             .collect();
         handles
             .into_iter()
-            .filter_map(|h| h.join().unwrap_or_else(|_| Err("panicked".into())).err())
+            .zip(&names)
+            .filter_map(|(h, name)| {
+                h.join()
+                    .unwrap_or_else(|_| Err(format!("{name}: the check panicked")))
+                    .err()
+            })
             .collect()
-    });
+    })
+}
+
+/// Fails with every variant's error if `check` fails on any variant of the
+/// development corpus.
+fn for_every_variant(check: impl Fn(&CorpusVariant) -> Result<(), String> + Sync) {
+    let errors = errors_of(families::development, check);
     assert!(errors.is_empty(), "{errors:#?}");
 }
 
@@ -145,23 +167,46 @@ fn the_corpus_holds_every_variant_once() {
     let corpus = families::development();
     let names: BTreeSet<&str> = corpus.iter().map(|v| v.family.name()).collect();
     assert_eq!(names.len(), corpus.len(), "variant names are unique");
-    let expected = families::collapse::all().len()
-        + families::sorted_order::all().len()
-        + families::subsequence_count::all().len();
-    assert_eq!(corpus.len(), expected);
+    let count = collapse::all().len() + sorted_order::all().len() + subsequence_count::all().len();
+    assert_eq!(corpus.len(), count);
     let families: BTreeSet<&str> = corpus.iter().map(|v| v.source).collect();
     assert_eq!(families.len(), FAMILIES);
+    // Every family's references, naive first and good last, as each
+    // family's own `Variant` names them.
+    let mut expected: Vec<(String, Vec<&str>)> = Vec::new();
+    for v in collapse::Variant::ALL {
+        expected.push((
+            collapse::Collapse(v).name().into(),
+            vec![v.naive(), v.good()],
+        ));
+    }
+    for v in sorted_order::Variant::ALL {
+        let name = sorted_order::SortedOrder(v).name().into();
+        expected.push((name, vec![v.naive(), v.good()]));
+    }
+    for v in subsequence_count::Variant::ALL {
+        let name = subsequence_count::SubsequenceCount(v).name().into();
+        expected.push((name, vec![v.naive(), v.quadratic(), v.good()]));
+    }
+    let actual: Vec<(String, Vec<&str>)> = corpus
+        .iter()
+        .map(|v| {
+            let entries = v.references.iter().map(|r| r.entry).collect();
+            (v.family.name().to_owned(), entries)
+        })
+        .collect();
+    assert_eq!(actual, expected);
+    // Only the 2ⁿ references stop short of the whole sweep.
     for v in &corpus {
-        assert!(
-            v.references.len() >= 2,
-            "{v:?}: a naive and a good reference"
-        );
-        let entries: BTreeSet<&str> = v.references.iter().map(|r| r.entry).collect();
-        assert_eq!(
-            entries.len(),
-            v.references.len(),
-            "{v:?}: distinct references"
-        );
+        for r in &v.references {
+            let exponential = v.source == subsequence_count::SOURCE && r.entry.ends_with("_naive");
+            let max_n = if exponential {
+                families::EXPONENTIAL_MAX_N
+            } else {
+                u64::MAX
+            };
+            assert_eq!(r.max_n, max_n, "{}", r.entry);
+        }
     }
 }
 
@@ -170,7 +215,7 @@ fn the_corpus_holds_every_variant_once() {
 /// of the whole run (about 14 CPU-minutes in release in November 2026), too
 /// long for every `cargo test`; [`every_reference_at_every_size`] runs them.
 #[test]
-fn every_reference_agrees_with_every_oracle_on_every_seed() {
+fn good_references_at_every_size_others_at_the_lower_half() {
     let config = corpus_config();
     for_every_variant(|v| check_variant(v, &config, Coverage::LowerHalf));
 }
@@ -184,17 +229,17 @@ fn every_reference_at_every_size() {
     for_every_variant(|v| check_variant(v, &config, Coverage::Whole));
 }
 
-/// A variant whose oracle is wrong on one input only: the input of the
-/// largest size and seed `seed`.
+/// A variant whose oracle is wrong on one input only: the input of size
+/// `n` and seed `seed`.
 struct WrongOn {
     inner: Box<dyn TaskFamily>,
+    n: u64,
     seed: u64,
 }
 
 impl WrongOn {
     fn input(&self) -> Inputs {
-        let largest = *self.inner.sizes().last().expect("a sweep has sizes");
-        generate_input(self.inner.as_ref(), largest, self.seed)
+        generate_input(self.inner.as_ref(), self.n, self.seed)
     }
 }
 
@@ -230,41 +275,62 @@ impl TaskFamily for WrongOn {
     }
 }
 
-/// The run is not vacuous: an oracle wrong only on the last corpus seed at
-/// the largest size fails it, while a check at the sweep's own seeds passes.
-#[test]
-fn a_wrong_answer_on_the_last_seed_fails_the_run() {
-    let seed = CORPUS_SEEDS - 1;
+/// The first sorted-order variant, with its oracle wrong on the input of
+/// size `n` (the largest if `None`) and the last corpus seed.
+fn tampered(n: Option<u64>) -> Vec<CorpusVariant> {
     let v = families::development()
         .into_iter()
         .find(|v| v.family.name().starts_with("sorted-order"))
         .expect("the corpus has a sorted-order variant");
     let largest = *v.family.sizes().last().expect("a sweep has sizes");
-    let tampered = CorpusVariant {
+    vec![CorpusVariant {
         family: Box::new(WrongOn {
             inner: v.family,
-            seed,
+            n: n.unwrap_or(largest),
+            seed: CORPUS_SEEDS - 1,
         }),
         source: v.source,
         references: v.references,
-    };
+    }]
+}
+
+/// The run is not vacuous: an oracle wrong only on the last corpus seed
+/// fails it, through the same runner, while a check at the sweep's own
+/// seeds passes. At the largest size only the good reference runs, so it is
+/// the one that fails; at a size in the lower half the naive one, which
+/// runs first, fails.
+#[test]
+fn a_wrong_answer_on_the_last_seed_fails_the_run() {
+    let seed = CORPUS_SEEDS - 1;
     let at_sweep_seeds = HarnessConfig {
         seeds: DEFAULT_SEEDS,
         ..HarnessConfig::default()
     };
-    assert_eq!(
-        check_variant(&tampered, &at_sweep_seeds, Coverage::LowerHalf),
-        Ok(())
-    );
-    let err = check_variant(&tampered, &corpus_config(), Coverage::LowerHalf)
-        .expect_err("the wrong seed is found");
-    let entry = tampered.references[tampered.references.len() - 1].entry;
-    assert!(
-        err.starts_with(entry)
-            && err.contains(&format!("n: {largest}, seed: {seed}"))
-            && err.contains("WrongOutput"),
-        "{err}"
-    );
+    let corpus = corpus_config();
+    let v = &tampered(None)[0];
+    let largest = *v.family.sizes().last().expect("a sweep has sizes");
+    let lower = v.family.sizes()[v.family.sizes().len() / 2 - 1];
+    let naive = v.references[0].entry;
+    let good = v.references[v.references.len() - 1].entry;
+    for (n, size, entry) in [(None, largest, good), (Some(lower), lower, naive)] {
+        let passes = errors_of(
+            || tampered(n),
+            |v| check_variant(v, &at_sweep_seeds, Coverage::LowerHalf),
+        );
+        assert_eq!(passes, Vec::<String>::new());
+        let errors = errors_of(
+            || tampered(n),
+            |v| check_variant(v, &corpus, Coverage::LowerHalf),
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let err = &errors[0];
+        assert!(
+            err.starts_with(entry)
+                && err.contains(&format!("n: {size}, seed: {seed}"))
+                && err.contains("WrongOutput"),
+            "{err}"
+        );
+    }
 }
 
 /// Prints each reference's median steps at each size it is run at over the
