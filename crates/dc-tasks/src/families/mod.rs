@@ -13,7 +13,8 @@
 //!   local rule.
 //!
 //! [`development`] lists every variant of these families with its reference
-//! solutions, so that a corpus-wide check cannot miss one.
+//! solutions in one place, for checks that run over the whole corpus. A new
+//! family or reference must be added to it by hand.
 
 pub mod collapse;
 pub mod sorted_order;
