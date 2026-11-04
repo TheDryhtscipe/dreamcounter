@@ -57,6 +57,11 @@
 //! recursion, so a deep term (for example a list literal of many thousands of
 //! elements, which nests one `cons` per element) is limited only by memory.
 //!
+//! Stitch reads programs as text, so a subterm shared in the arena is written out
+//! at each use, and the text of a DAG can be exponentially longer than its number
+//! of distinct nodes. [`encode`] and [`to_expr`] refuse a term with more than
+//! [`MAX_ENCODE_NODES`] nodes written out, with [`EncodeError::TooLarge`].
+//!
 //! # Stitch flags the encoding needs
 //!
 //! Stitch may cut an abstraction or a metavariable through a special form. Such
@@ -99,7 +104,7 @@ pub mod names;
 
 pub use codec::{
     decode, decode_abstraction, decode_open, encode, from_expr, to_expr, DecodeError, EncodeError,
-    AND, IF, INT_PREFIX, LET, LET_LAMBDA_TAG, OR,
+    AND, IF, INT_PREFIX, LET, LET_LAMBDA_TAG, MAX_ENCODE_NODES, OR,
 };
 pub use expr::{Expr, ParseError};
 pub use names::{LibNames, NameError};

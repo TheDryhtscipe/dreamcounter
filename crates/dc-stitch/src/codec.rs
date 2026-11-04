@@ -22,18 +22,32 @@ pub const OR: &str = "or_";
 pub const LET_LAMBDA_TAG: u32 = 0;
 /// Prefix of integer literal tokens: `int_3`, `int_-3`.
 pub const INT_PREFIX: &str = "int_";
+/// The most nodes a term [`to_expr`] and [`encode`] accept may have, written out
+/// as a tree (see [`Arena::tree_size`]). In the text [`encode`] prints, each node
+/// adds at most 25 bytes (the most is `int_-9223372036854775808` and the space
+/// before it), or one byte more than its name for a library abstraction. So
+/// the text of a term within the limit is at most 25 MiB, plus the length of
+/// each library name at each of its uses. [`LibNames`] does not limit the length
+/// of a name.
+pub const MAX_ENCODE_NODES: usize = 1 << 20;
 
 /// Why a core term could not be encoded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EncodeError {
     /// The term refers to a library abstraction the name table does not name.
     UnnamedLib(LibId),
+    /// The term has more than [`MAX_ENCODE_NODES`] nodes written out as a tree.
+    TooLarge,
 }
 
 impl fmt::Display for EncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EncodeError::UnnamedLib(l) => write!(f, "library {} has no Stitch name", l.0),
+            EncodeError::TooLarge => write!(
+                f,
+                "the term has more than {MAX_ENCODE_NODES} nodes written out, too many to encode"
+            ),
         }
     }
 }
@@ -115,8 +129,23 @@ impl From<ParseError> for DecodeError {
 
 /// Converts the core term `id` to a Stitch expression.
 ///
+/// Stitch expressions are trees, so a subterm shared in the arena is copied at
+/// each use, and the expression of a DAG can be exponentially larger than its
+/// number of distinct nodes. So it first measures `id` written out as a tree, at
+/// a cost linear in the number of distinct nodes, and refuses one with more
+/// than [`MAX_ENCODE_NODES`] nodes with [`EncodeError::TooLarge`]. It checks the
+/// size before the library names, so a term that is too large and also uses an
+/// unnamed library gives [`EncodeError::TooLarge`].
+///
+/// The [`Expr`] it returns is a tree with a heap node for each node written out,
+/// so it takes several times the memory of its text: about 115 MB for the 20 MB
+/// of text of a term at the limit made of nested lets over `int_-9223372036854775808`.
+///
 /// Works with an explicit stack, so the depth of `id` is limited only by memory.
 pub fn to_expr(arena: &Arena, id: TermId, names: &LibNames) -> Result<Expr, EncodeError> {
+    arena
+        .tree_size(id, MAX_ENCODE_NODES)
+        .ok_or(EncodeError::TooLarge)?;
     /// `Visit` a term, or `Build` a node from the expressions its children left.
     enum Job {
         Visit(TermId),
@@ -189,6 +218,9 @@ fn pop<T>(built: &mut Vec<T>) -> T {
 }
 
 /// Prints the core term `id` in Stitch's input format.
+///
+/// It refuses the terms [`to_expr`] refuses, so the text is bounded as
+/// [`MAX_ENCODE_NODES`] describes.
 pub fn encode(arena: &Arena, id: TermId, names: &LibNames) -> Result<String, EncodeError> {
     to_expr(arena, id, names).map(|e| expr::print(&e))
 }
@@ -846,6 +878,51 @@ mod tests {
             decode_abstraction(&mut a, "(lam (lam #0))", u32::MAX, &n),
             Err(DecodeError::TooDeep)
         );
+    }
+
+    /// `(if true t t)` nested `n` deep around `$0`: `n + 2` distinct nodes,
+    /// `3 * 2^n - 2` written out as a tree.
+    fn shared_ifs(a: &mut Arena, n: usize) -> TermId {
+        let c = a.bool(true);
+        let mut t = a.var(0);
+        for _ in 0..n {
+            t = a.if_(c, t, t);
+        }
+        t
+    }
+
+    #[test]
+    fn encoding_refuses_terms_over_the_node_limit() {
+        let n = names();
+        let mut a = Arena::new();
+        // 3 * 2^19 - 2 = 1_572_862 nodes written out, from 21 distinct ones.
+        let t = shared_ifs(&mut a, 19);
+        assert_eq!(encode(&a, t, &n), Err(EncodeError::TooLarge));
+        assert_eq!(to_expr(&a, t, &n), Err(EncodeError::TooLarge));
+        // `(let t t)` nested 19 deep over the longest integer token is 2^20 - 1
+        // nodes written out, about 20 bytes each, the most text per node of any
+        // term found; one `lam` around it reaches the limit exactly, and a second
+        // goes over.
+        let mut t = a.int(i64::MIN);
+        for _ in 0..19 {
+            t = a.let_(t, t);
+        }
+        let at_limit = a.lam(t);
+        assert_eq!(a.tree_size(at_limit, usize::MAX), Some(MAX_ENCODE_NODES));
+        let text = encode(&a, at_limit, &n).expect("a term at the limit encodes");
+        assert!(text.len() <= 25 * MAX_ENCODE_NODES, "{} bytes", text.len());
+        assert_eq!(decode(&mut a, &text, &n), Ok(at_limit));
+        let over = a.lam(at_limit);
+        assert_eq!(encode(&a, over, &n), Err(EncodeError::TooLarge));
+    }
+
+    #[test]
+    fn encoding_refuses_a_huge_dag_without_writing_it_out() {
+        // 102 distinct nodes, 3 * 2^100 - 2 written out: building the tree would
+        // never finish.
+        let mut a = Arena::new();
+        let t = shared_ifs(&mut a, 100);
+        assert_eq!(encode(&a, t, &names()), Err(EncodeError::TooLarge));
     }
 
     /// Nesting this deep overflows a test thread's stack if encoding or decoding
