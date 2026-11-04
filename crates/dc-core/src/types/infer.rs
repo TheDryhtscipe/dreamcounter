@@ -449,6 +449,17 @@ enum Slot {
 /// A shared subterm and what its type depends on.
 type MemoKey = (TermId, Scope);
 
+/// The units [`TypeChecker::memo_deps`] may spend on a key for each unit of
+/// its subterm's own inference, past [`DEPS_SLACK`]. A key whose nodes cost
+/// more to record is removed when the walk goes back, as one whose nodes
+/// changed is; so the recording costs at most this many times the work of
+/// inferring afresh, at every depth of nesting.
+const DEPS_PER_UNIT: u64 = 4;
+
+/// The units [`TypeChecker::memo_deps`] may spend on any key, for a subterm
+/// whose own inference is small.
+const DEPS_SLACK: u64 = 64;
+
 /// A memo key added while uses are being tried.
 #[derive(Debug)]
 struct Logged {
@@ -469,6 +480,11 @@ struct Pending {
     /// The bindings replaced by those variables, by position in `env`, to put
     /// back afterwards.
     saved: Vec<(usize, Binding)>,
+    /// Units of work spent when it was started.
+    start: u64,
+    /// Units of work spent since then on shared subterms inferred afresh
+    /// inside it; the rest is its own work.
+    inner: u64,
 }
 
 /// An application `app` = `head a1 ... an`, with the arguments at
@@ -1971,7 +1987,13 @@ impl TypeChecker {
                 self.env[pos] = Binding { ty: p, class: None };
             }
         }
-        self.pending.push(Pending { key, params, saved });
+        self.pending.push(Pending {
+            key,
+            params,
+            saved,
+            start: self.spent,
+            inner: 0,
+        });
         self.frames.push(Frame::Memo);
         #[cfg(test)]
         {
@@ -2067,13 +2089,19 @@ impl TypeChecker {
     /// the kept type, read the same after going back, the inference changed
     /// none of them, and inferring the subterm afresh there would give the
     /// kept type again, up to renaming, and change nothing else.
-    fn keep_past_checkpoints(&mut self, key: &MemoKey, kept: Ty) -> Ty {
+    ///
+    /// `own` is the work of the subterm's inference, without that of the
+    /// shared subterms it inferred afresh inside it. Recording the nodes may
+    /// cost at most [`DEPS_PER_UNIT`] times that, plus [`DEPS_SLACK`];
+    /// past that the key is logged with no nodes, and going back removes it.
+    fn keep_past_checkpoints(&mut self, key: &MemoKey, kept: Ty, own: u64) -> Ty {
         let closed = self.scope_closed(&key.1);
         if let Some(frozen) = closed.then(|| self.freeze(kept)).flatten() {
             return frozen;
         }
         let start = self.memo_deps.len();
-        let deps = if self.memo_deps(&key.1, kept) {
+        let cap = DEPS_PER_UNIT * own + DEPS_SLACK;
+        let deps = if self.memo_deps(&key.1, kept, cap) {
             Some((start, self.memo_deps.len()))
         } else {
             self.memo_deps.truncate(start);
@@ -2096,12 +2124,14 @@ impl TypeChecker {
     /// quantified, or a rigid one: then the type depends on a node that
     /// nothing reachable after going back refers to.
     ///
-    /// Each node, link followed and [`Canon`] visited costs a unit. The kept
-    /// type was built by the inference just done, which also read the scope's
-    /// types; this walk reads all of each of those types, where the
-    /// inference may have read only part.
-    fn memo_deps(&mut self, scope: &Scope, kept: Ty) -> bool {
+    /// Each node, link followed and [`Canon`] visited costs a unit. The walk
+    /// reads all of each polymorphic binding's type, which the inference may
+    /// not have read at all: it may have taken the type of a use from the
+    /// memo. So the walk stops, and returns false, once it has spent `cap`
+    /// units.
+    fn memo_deps(&mut self, scope: &Scope, kept: Ty, cap: u64) -> bool {
         let old = self.checkpoints.first().map_or(0, |cp| cp.nodes);
+        let limit = self.spent.saturating_add(cap);
         let mut work = std::mem::take(&mut self.work);
         work.clear();
         work.push(kept);
@@ -2116,6 +2146,10 @@ impl TypeChecker {
         while let Some(c) = canons.pop() {
             self.spent += 1;
             count_probes(1);
+            if self.spent > limit {
+                self.work = work;
+                return false;
+            }
             if !seen.insert(c) {
                 continue;
             }
@@ -2136,6 +2170,10 @@ impl TypeChecker {
         let mut ok = true;
         while let Some(t) = work.pop() {
             self.spent += 1;
+            if self.spent > limit {
+                ok = false;
+                break;
+            }
             if !self.first_visit(t) {
                 continue;
             }
@@ -2594,10 +2632,17 @@ impl TypeChecker {
                 Step::Return(t)
             }
             Frame::Memo => {
-                let Pending { key, params, saved } = self
+                let Pending {
+                    key,
+                    params,
+                    saved,
+                    start,
+                    inner,
+                } = self
                     .pending
                     .pop()
                     .expect("a pending shared subterm per memo frame");
+                let own = (self.spent - start).saturating_sub(inner);
                 for (pos, b) in saved {
                     self.env[pos] = b;
                 }
@@ -2608,8 +2653,12 @@ impl TypeChecker {
                 let kept = if self.checkpoints.is_empty() {
                     kept
                 } else {
-                    self.keep_past_checkpoints(&key, kept)
+                    self.keep_past_checkpoints(&key, kept, own)
                 };
+                let used = self.spent - start;
+                if let Some(outer) = self.pending.last_mut() {
+                    outer.inner += used;
+                }
                 // Instantiated from the kept type as it goes into the memo, so
                 // this use and later reuses get the same closed nodes. If this
                 // use got the type before it was copied by `freeze`, a term
