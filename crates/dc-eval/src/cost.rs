@@ -71,8 +71,10 @@
 //!   other's selves. The walks cost at most a constant times the steps in work
 //!   (bead dreamcounter-3fd21a), so a walk gives up when it would visit more parts
 //!   than the steps since the last walk that finished, or a fixed minimum if that
-//!   is more. While a program keeps more memory reachable than that, such tables
-//!   stay until a later walk finishes or the evaluation ends. DECISION (coordinator, review of PR 7): this replaces the earlier
+//!   is more. A walk visits each part of what the program can reach about once
+//!   (some arrays that share chunks cost one part per chunk each). While that is
+//!   more than the walk may visit, such tables stay until a later walk finishes or
+//!   the evaluation ends. DECISION (coordinator, review of PR 7): this replaces the earlier
 //!   reading, under which an escaped `self` raised `MemoSelfEscaped`.
 //! - **A `self` from an earlier evaluation.** A value returned by one evaluation
 //!   can hold a `memorec` `self` whose table was dropped when that evaluation
