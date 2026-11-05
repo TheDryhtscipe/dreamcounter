@@ -455,8 +455,8 @@ struct Logged {
     key: MemoKey,
     /// Its kept type.
     kept: Ty,
-    /// The length of the trail when it was kept: the changes made to the
-    /// store since the oldest checkpoint and before then are `trail[..len]`.
+    /// The length of the trail when it was kept: `trail[..len]` holds the
+    /// changes made since the oldest checkpoint and before the key was kept.
     trail_len: usize,
 }
 
@@ -2054,13 +2054,17 @@ impl TypeChecker {
     /// back to the oldest checkpoint keeps it only if no node its kept type
     /// depends on was changed before that point of the trail (see
     /// [`TypeChecker::keep_logged`]). Inferring the subterm reads only the
-    /// types of the bindings in its scope, and changes only those and nodes it
-    /// makes. The shape of each polymorphic binding's type is fixed by its
-    /// [`Canon`] id, which is part of the key; the rest is what the store holds
-    /// at the free variables of that shape. If those nodes, and the nodes of
-    /// the kept type, read after going back as they did here, the inference
-    /// changed none of them, and inferring the subterm afresh there would give
-    /// the kept type again, up to renaming, and change nothing else.
+    /// types of the bindings in its scope, and the kept types of shared
+    /// subterms inside it, which reach no further; it changes only those
+    /// types and nodes it makes. The shape of each polymorphic binding's type
+    /// is fixed by its [`Canon`] id, which is part of the key; the rest is
+    /// what the store holds at the free variables of that shape. If those
+    /// nodes, and the nodes of the kept type, were not changed between the
+    /// checkpoint and here, they read after going back as they did here: the
+    /// inference changed none of them, and inferring the subterm afresh there
+    /// would give the kept type again, up to renaming, and change nothing
+    /// else. The check is stricter than it need be: a change before the key
+    /// was kept removes it whichever use made the change.
     fn keep_past_checkpoints(&mut self, key: &MemoKey, kept: Ty) -> Ty {
         let closed = self.scope_closed(&key.1);
         if let Some(frozen) = closed.then(|| self.freeze(kept)).flatten() {
@@ -2076,7 +2080,8 @@ impl TypeChecker {
 
     /// Whether a type that holds a node reads it differently now that it is
     /// `now` rather than `then`. A variable's rank only orders unions, and a
-    /// link whose path was compressed still ends at the same node.
+    /// link whose path was compressed still ends at the same node. Comparing
+    /// the level is a safety rule: no judge needs it.
     fn differs(then: Node, now: Node) -> bool {
         match (then, now) {
             (
@@ -2130,11 +2135,17 @@ impl TypeChecker {
 
     /// The first change since the oldest checkpoint to a node reached from
     /// `t`, as its index on the trail plus one, from `changed`; `u64::MAX` if
-    /// none was changed. It is 0 if one is a variable that is not quantified,
-    /// or a rigid one, made since that checkpoint (whose first node is `old`):
-    /// nothing reachable after going back refers to such a node, so no key
-    /// depending on it is kept. Links are followed without being compressed.
-    /// `nodes` memoises the answer for each node, so one walk serves every key.
+    /// none was changed. Links are followed without being compressed. `nodes`
+    /// memoises the answer for each node, so one walk serves every key.
+    ///
+    /// It is 0 if one is a variable that is not quantified, or a rigid one,
+    /// made since that checkpoint (whose first node is `old`), so that no key
+    /// depending on such a node is kept. This is a safety rule: no judge needs
+    /// it, and rigid nodes are all made before the first checkpoint. Such a
+    /// variable that a kept type made stayed unquantified only through a
+    /// variable at a lower level, which a change on the trail or a free
+    /// variable of the scope accounts for; one that was a free variable of
+    /// the scope and is now bound can never be in a key again.
     fn first_change(
         &mut self,
         t: Ty,
