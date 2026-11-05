@@ -449,6 +449,17 @@ enum Slot {
 /// A shared subterm and what its type depends on.
 type MemoKey = (TermId, Scope);
 
+/// A memo key added while uses are being tried.
+#[derive(Debug)]
+struct Logged {
+    key: MemoKey,
+    /// Its kept type.
+    kept: Ty,
+    /// The length of the trail when it was kept: `trail[..len]` holds the
+    /// changes made since the oldest checkpoint and before the key was kept.
+    trail_len: usize,
+}
+
 /// A shared subterm being inferred for the memo.
 #[derive(Debug)]
 struct Pending {
@@ -512,6 +523,8 @@ pub struct TypeChecker {
     canon: FxHashMap<Canon, u32>,
     /// For each [`Canon`] id, whether that type has no free variables.
     canon_closed: Vec<bool>,
+    /// The [`Canon`] of each id.
+    canon_of: Vec<Canon>,
     /// Walks every term as a tree, without reusing shared subterms: the
     /// reference the tests compare the memoised walk with.
     pub(super) tree_walk: bool,
@@ -524,10 +537,12 @@ pub struct TypeChecker {
     /// The old contents of the store nodes changed since the oldest checkpoint,
     /// in the order changed. Nodes made after the innermost checkpoint are left
     /// out: going back to any checkpoint leaves nothing that refers to them,
-    /// except kept types copied by [`TypeChecker::freeze`], which never change.
+    /// except kept types copied by [`TypeChecker::freeze`], which never change,
+    /// and the kept types of logged keys that [`TypeChecker::keep_logged`]
+    /// keeps.
     trail: Vec<(Ty, Node)>,
     /// The memo keys added since the oldest checkpoint, in the order added.
-    memo_log: Vec<MemoKey>,
+    memo_log: Vec<Logged>,
     /// The ranges of nodes made by [`TypeChecker::freeze`], ascending: a node in
     /// one is a copy that never changes, so a later freeze shares it.
     frozen: Vec<(Ty, Ty)>,
@@ -560,6 +575,19 @@ pub struct TypeChecker {
     /// Keys the last call marked as failed.
     #[cfg(test)]
     failed_len: usize,
+    /// Shared subterms the last call inferred afresh, in either walk.
+    #[cfg(test)]
+    fresh_tries: u64,
+    /// Shared subterms the first walk of the last call inferred afresh.
+    #[cfg(test)]
+    first_fresh_tries: u64,
+    /// The keys the second walk of the last call inferred afresh.
+    #[cfg(test)]
+    tried_keys: FxHashSet<MemoKey>,
+    /// Times the second walk of the last call inferred afresh a key it had
+    /// inferred afresh before.
+    #[cfg(test)]
+    repeat_tries: u64,
 }
 
 /// The work budget of a [`TypeChecker`]; [`DEFAULT_WORK_BUDGET`] unless set.
@@ -799,11 +827,15 @@ impl TypeChecker {
         {
             self.walks = 0;
             self.rollbacks = 0;
+            self.fresh_tries = 0;
+            self.repeat_tries = 0;
+            self.tried_keys.clear();
         }
         let first = self.walk_from_scratch(arena, libs, term, expected);
         #[cfg(test)]
         {
             self.first_units = self.spent;
+            self.first_fresh_tries = self.fresh_tries;
         }
         let Err(e) = first else {
             return first;
@@ -876,6 +908,7 @@ impl TypeChecker {
         release_vec(&mut self.spine);
         release_vec(&mut self.pending);
         release_vec(&mut self.canon_closed);
+        release_vec(&mut self.canon_of);
         release_vec(&mut self.checkpoints);
         release_vec(&mut self.trail);
         release_vec(&mut self.memo_log);
@@ -890,6 +923,7 @@ impl TypeChecker {
                 + self.spine.capacity()
                 + self.pending.capacity()
                 + self.canon_closed.capacity()
+                + self.canon_of.capacity()
                 + self.checkpoints.capacity()
                 + self.trail.capacity()
                 + self.memo_log.capacity(),
@@ -908,6 +942,7 @@ impl TypeChecker {
         self.pending.clear();
         empty_map(&mut self.canon);
         self.canon_closed.clear();
+        self.canon_of.clear();
         self.steps = 0;
         self.checkpoints.clear();
         self.trail.clear();
@@ -980,6 +1015,7 @@ impl TypeChecker {
                     }
                 };
                 self.canon_closed.push(closed);
+                self.canon_of.push(canon);
             }
             ids.insert(r, id);
         }
@@ -1932,6 +1968,16 @@ impl TypeChecker {
         }
         self.pending.push(Pending { key, params, saved });
         self.frames.push(Frame::Memo);
+        #[cfg(test)]
+        {
+            self.fresh_tries += 1;
+            if self.locate {
+                let key = &self.pending.last().expect("just pushed").key;
+                if !self.tried_keys.insert(key.clone()) {
+                    self.repeat_tries += 1;
+                }
+            }
+        }
         Ok(Step::EvalShared(id))
     }
 
@@ -1957,6 +2003,19 @@ impl TypeChecker {
     #[cfg(test)]
     pub(super) fn shared_subterms(&self) -> usize {
         self.shared_len
+    }
+
+    /// The shared subterms the second walk of the last call inferred afresh.
+    #[cfg(test)]
+    pub(super) fn locate_fresh_tries(&self) -> u64 {
+        self.fresh_tries - self.first_fresh_tries
+    }
+
+    /// The times the second walk of the last call inferred afresh a key it
+    /// had already inferred afresh.
+    #[cfg(test)]
+    pub(super) fn repeat_tries(&self) -> u64 {
+        self.repeat_tries
     }
 
     /// The units of work the first walk of the last call did; the rest of
@@ -1989,15 +2048,207 @@ impl TypeChecker {
     /// If the scope has no binding whose type has free variables, inferring the
     /// subterm used only nodes it made itself, so its kept type holds for that
     /// scope in any state of the store. Then it is copied out of reach of going
-    /// back to a checkpoint, and stays in the memo. Otherwise going back to a
-    /// checkpoint before it removes it.
+    /// back to a checkpoint, and stays in the memo.
+    ///
+    /// Otherwise the key is logged with the length of the trail now, and going
+    /// back to the oldest checkpoint keeps it only if no node its kept type
+    /// depends on was changed before that point of the trail (see
+    /// [`TypeChecker::keep_logged`]). Inferring the subterm reads only the
+    /// types of the bindings in its scope, and the kept types of shared
+    /// subterms inside it, which reach no further; it changes only those
+    /// types and nodes it makes. The shape of each polymorphic binding's type
+    /// is fixed by its [`Canon`] id, which is part of the key; the rest is
+    /// what the store holds at the free variables of that shape. If those
+    /// nodes, and the nodes of the kept type, were not changed between the
+    /// checkpoint and here, they read after going back as they did here: the
+    /// inference changed none of them, and inferring the subterm afresh there
+    /// would give the kept type again, up to renaming, and change nothing
+    /// else. The check is stricter than it need be: a change before the key
+    /// was kept removes it whichever use made the change.
     fn keep_past_checkpoints(&mut self, key: &MemoKey, kept: Ty) -> Ty {
         let closed = self.scope_closed(&key.1);
         if let Some(frozen) = closed.then(|| self.freeze(kept)).flatten() {
             return frozen;
         }
-        self.memo_log.push(key.clone());
+        self.memo_log.push(Logged {
+            key: key.clone(),
+            kept,
+            trail_len: self.trail.len(),
+        });
         kept
+    }
+
+    /// Whether a type that holds a node reads it differently now that it is
+    /// `now` rather than `then`. A variable's rank only orders unions, and a
+    /// link whose path was compressed still ends at the same node. Comparing
+    /// the level is a safety rule: no judge needs it.
+    fn differs(then: Node, now: Node) -> bool {
+        match (then, now) {
+            (
+                Node::Var {
+                    level: l0, key: k0, ..
+                },
+                Node::Var {
+                    level: l1, key: k1, ..
+                },
+            ) => l0 != l1 || k0 != k1,
+            (Node::Link(_), Node::Link(_)) => false,
+            _ => true,
+        }
+    }
+
+    /// Removes from the memo each key in `log` whose kept type depends on a
+    /// node changed before the key was kept. The trail has been undone to the
+    /// oldest checkpoint, whose first node is `old`; `changed` gives each node
+    /// changed since it the index of its first change on the trail, plus one.
+    ///
+    /// The kept type depends on the nodes reached from it and from the free
+    /// variables of the [`Canon`] of each polymorphic binding in the key's
+    /// scope (see [`TypeChecker::keep_past_checkpoints`]). Such a node now
+    /// reads as it did when the key was kept if its first change is at or past
+    /// the length of the trail then: the changes after were undone, and there
+    /// were none before. If a change came before, the kept type depends on it,
+    /// and undoing it may leave inferring the subterm afresh to change the
+    /// node again, as the judges for this in the tests show.
+    ///
+    /// The walks are shared by every key, through `first_change`, so going
+    /// back costs at most the size of the store the keys reach, and nothing
+    /// at all if no use fails. A unit for each node and `Canon` popped.
+    fn keep_logged(&mut self, log: &[Logged], old: usize, changed: &FxHashMap<Ty, u64>) {
+        let mut nodes: FxHashMap<Ty, u64> = FxHashMap::default();
+        let mut canons: FxHashMap<u32, u64> = FxHashMap::default();
+        for entry in log {
+            count_probes(1);
+            let mut first = self.first_change(entry.kept, old, changed, &mut nodes);
+            for slot in &entry.key.1 {
+                if let Slot::Poly(c) = *slot {
+                    let in_canon =
+                        self.first_change_in_canon(c, old, changed, &mut nodes, &mut canons);
+                    first = first.min(in_canon);
+                }
+            }
+            if first <= entry.trail_len as u64 {
+                self.memo.remove(&entry.key);
+            }
+        }
+    }
+
+    /// The first change since the oldest checkpoint to a node reached from
+    /// `t`, as its index on the trail plus one, from `changed`; `u64::MAX` if
+    /// none was changed. Links are followed without being compressed. `nodes`
+    /// memoises the answer for each node, so one walk serves every key.
+    ///
+    /// It is 0 if one is a variable that is not quantified, or a rigid one,
+    /// made since that checkpoint (whose first node is `old`), so that no key
+    /// depending on such a node is kept. This is a safety rule: no judge needs
+    /// it, and rigid nodes are all made before the first checkpoint. Such a
+    /// variable that a kept type made stayed unquantified only through a
+    /// variable at a lower level, which a change on the trail or a free
+    /// variable of the scope accounts for; one that was a free variable of
+    /// the scope and is now bound can never be in a key again.
+    fn first_change(
+        &mut self,
+        t: Ty,
+        old: usize,
+        changed: &FxHashMap<Ty, u64>,
+        nodes: &mut FxHashMap<Ty, u64>,
+    ) -> u64 {
+        // A node is pushed with `false` to be expanded, and again with `true`
+        // once its children are done, as in `canonical`.
+        let mut stack: Vec<(Ty, bool)> = vec![(t, false)];
+        while let Some((r, children_done)) = stack.pop() {
+            self.spent += 1;
+            if children_done {
+                let first = match self.node(r) {
+                    Node::Con(h, a, b) => {
+                        let child = |c: Ty, used: bool| if used { nodes[&c] } else { u64::MAX };
+                        child(a, h.arity() >= 1).min(child(b, h.arity() >= 2))
+                    }
+                    Node::Link(next) => nodes[&next],
+                    Node::Var { .. } | Node::Rigid { .. } => {
+                        unreachable!("a leaf is answered when it is popped")
+                    }
+                };
+                nodes.insert(r, first);
+                continue;
+            }
+            if nodes.contains_key(&r) {
+                continue;
+            }
+            let n = self.node(r);
+            let first = match n {
+                Node::Con(h, a, b) => {
+                    stack.push((r, true));
+                    if h.arity() >= 1 {
+                        stack.push((a, false));
+                    }
+                    if h.arity() >= 2 {
+                        stack.push((b, false));
+                    }
+                    continue;
+                }
+                Node::Link(next) => {
+                    stack.push((r, true));
+                    stack.push((next, false));
+                    continue;
+                }
+                Node::Var { level, .. } if level != GENERIC && r as usize >= old => 0,
+                Node::Rigid { .. } if r as usize >= old => 0,
+                Node::Var { .. } | Node::Rigid { .. } => {
+                    changed.get(&r).copied().unwrap_or(u64::MAX)
+                }
+            };
+            nodes.insert(r, first);
+        }
+        nodes[&t]
+    }
+
+    /// [`TypeChecker::first_change`] over the free variables of [`Canon`] `c`,
+    /// memoised for each `Canon` id in `canons`.
+    fn first_change_in_canon(
+        &mut self,
+        c: u32,
+        old: usize,
+        changed: &FxHashMap<Ty, u64>,
+        nodes: &mut FxHashMap<Ty, u64>,
+        canons: &mut FxHashMap<u32, u64>,
+    ) -> u64 {
+        let mut stack: Vec<(u32, bool)> = vec![(c, false)];
+        while let Some((x, children_done)) = stack.pop() {
+            self.spent += 1;
+            if children_done {
+                let first = match self.canon_of[x as usize] {
+                    Canon::Con(h, a, b) => {
+                        let child = |y: u32, used: bool| if used { canons[&y] } else { u64::MAX };
+                        child(a, h.arity() >= 1).min(child(b, h.arity() >= 2))
+                    }
+                    Canon::Var { .. } | Canon::Free(_) => {
+                        unreachable!("a leaf is answered when it is popped")
+                    }
+                };
+                canons.insert(x, first);
+                continue;
+            }
+            if canons.contains_key(&x) {
+                continue;
+            }
+            let first = match self.canon_of[x as usize] {
+                Canon::Var { .. } => u64::MAX,
+                Canon::Free(r) => self.first_change(r, old, changed, nodes),
+                Canon::Con(h, a, b) => {
+                    stack.push((x, true));
+                    if h.arity() >= 1 {
+                        stack.push((a, false));
+                    }
+                    if h.arity() >= 2 {
+                        stack.push((b, false));
+                    }
+                    continue;
+                }
+            };
+            canons.insert(x, first);
+        }
+        canons[&c]
     }
 
     /// A copy of `t` in frozen nodes, with no links, or `None` if `t` has a
@@ -2126,11 +2377,23 @@ impl TypeChecker {
     /// subterm in place. Every node made before `cp` and changed since was
     /// saved on the trail, since every checkpoint after it was made later and
     /// so starts at a later node; nothing reachable after going back refers to
-    /// a node made since, except kept types copied by [`TypeChecker::freeze`].
+    /// a node made since, except kept types copied by [`TypeChecker::freeze`]
+    /// and the kept types of logged keys the memo keeps, whose nodes are
+    /// checked once the trail is undone (see [`TypeChecker::keep_logged`]).
     fn back_to(&mut self, cp: Checkpoint) -> Step {
-        for (t, n) in self.trail.drain(cp.trail..).rev() {
+        // Only needed if a key was logged since `cp`. Undone last to first, so
+        // the entry left for a node is its first change, and `now` is what the
+        // change made of it. A unit for each change noted.
+        let logged = self.memo_log.len() > cp.memo_log;
+        let mut changed: FxHashMap<Ty, u64> = FxHashMap::default();
+        for (i, (t, n)) in self.trail.drain(cp.trail..).enumerate().rev() {
             #[cfg(test)]
             STORE_READS.with(|r| r.set(r.get() + 1));
+            let now = self.nodes[t as usize];
+            if logged && Self::differs(n, now) {
+                self.spent += 1;
+                changed.insert(t, (cp.trail + i) as u64 + 1);
+            }
             self.nodes[t as usize] = n;
         }
         self.frames.truncate(cp.frames);
@@ -2143,10 +2406,14 @@ impl TypeChecker {
             }
         }
         self.env.truncate(cp.env);
-        for key in self.memo_log.drain(cp.memo_log..) {
-            count_probes(1);
-            self.memo.remove(&key);
+        // After the store is put back, so each key's nodes are read as they
+        // are at `cp`.
+        let mut log = std::mem::take(&mut self.memo_log);
+        if logged {
+            self.keep_logged(&log[cp.memo_log..], cp.nodes, &changed);
         }
+        log.clear();
+        self.memo_log = log;
         self.level = cp.level;
         debug_assert!(
             self.checkpoints.is_empty(),
