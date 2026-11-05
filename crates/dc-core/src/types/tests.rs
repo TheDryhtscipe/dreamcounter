@@ -1825,13 +1825,17 @@ fn subterms_over_a_large_helper(a: &mut Arena, m: usize, tail: &str) -> TermId {
     a.lam(body)
 }
 
-/// Recording what a memo entry depends on costs at most a few times what
-/// inferring its subterm did. Recording all of `h`'s type for each `s_i`
-/// made the second walk cost over 13 times the first with no rollback at `m` =
-/// 100, and at `m` = 4,000 run out of budget, so the first walk's error was
-/// reported instead of the tree walk's.
+/// Keeping memo entries past going back costs the second walk nothing until
+/// a use fails: what an entry depends on is checked when the walk goes back,
+/// not recorded when the entry is kept. Here many shared subterms `s_i` have
+/// a helper over a large type in scope, and no use fails before the error at
+/// the tail, so the second walk costs about what the first did. Recording the
+/// helper's type for each `s_i` as it was kept cost the second walk 1.8 times
+/// the first at `m` = 100 and 2.6 times at `m` = 4,000, with the recording
+/// capped; uncapped, 13 times, and at `m` = 4,000 the budget ran out, so the
+/// first walk's error was reported instead of the tree walk's.
 #[test]
-fn recording_memo_entries_costs_a_multiple_of_inferring_them() {
+fn keeping_memo_entries_costs_nothing_until_a_use_fails() {
     let libs = [sch(&pair_tree_text(11))];
     let tails = [
         (100, "(add true 1)"),
@@ -1847,6 +1851,13 @@ fn recording_memo_entries_costs_a_multiple_of_inferring_them() {
         let mut tc = TypeChecker::new();
         assert_eq!(tc.infer(&a, t, &libs[..]), want, "m = {m}");
         assert_eq!(locate_cost(&tc), Ok(()), "m = {m}");
+        let first = tc.first_units();
+        let second = tc.spent() - first;
+        assert!(
+            second <= first + first / 10,
+            "m = {m}: the second walk took {second} units, the first {first}, with {} rollbacks",
+            tc.rollbacks()
+        );
     }
 }
 
