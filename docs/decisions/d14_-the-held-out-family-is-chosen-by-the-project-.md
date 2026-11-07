@@ -5,7 +5,7 @@ title: 'D14: The held-out family is chosen by the project lead from four candida
 type: decision
 scope: internal
 created_at: '2026-10-29T18:39:53.431269Z'
-updated_at: '2026-10-29T23:27:51.062296Z'
+updated_at: '2026-11-04T10:39:21.739228Z'
 ---
 
 Status: accepted 2026-10-29 (answers Q7, dreamcounter-ee11eb). Work: P3.9 (dreamcounter-4eda41).
@@ -84,15 +84,16 @@ Naive: `2ⁿ` (enumerate every `x`), so it declares a small sweep for the naive 
 
 ## As built
 
-The four candidates were built on 2026-10-29 (beads dreamcounter-4c48e2, ca97cb, fb8728, b3a3c8). All four pass the step 2 validation. H3 was rebuilt with untimed checks (below) after a review found that a wrong program could pass its generated inputs. The project lead picks after H3's bead, dreamcounter-fb8728, is closed. The candidates differ from the descriptions above in these ways:
+The four candidates were built on 2026-10-29 (beads dreamcounter-4c48e2, ca97cb, fb8728, b3a3c8). All four pass the step 2 validation. H3 was rebuilt with untimed checks (below) after a review found that a wrong program could pass its generated inputs. H3 is ready: its bead, dreamcounter-fb8728, closed on 2026-11-04 after a fifth independent review found no blocker. All four candidates are ready, and the project lead can pick. The candidates differ from the descriptions above in these ways:
 
 - **Sweeps.** H1 uses the default sweep `16..1024`. H2, H3 and H4 stop at 512, because their naive or plan references need more than the default fuel cap of 50 million steps at 1024 under a plan of ten times the reference's steps.
 - **H2 intervals.** An interval `(s, l)` covers the integer points `s..=s+l-1`, a half-open interval `[s, s+l)`. Naive fewest stabs is `n²` (`n` rounds of a greedy over the unsorted list), not `n³` by trial, which would not finish at 512.
 - **H3 full palette** takes no bound `k`. Its signature is `List Int -> Int`, and an empty list gives 0.
 - **H4 references.** Each variant has three references: the naive `2ⁿ` reference, checked on its own short sweep `6..16`; an `n²` reference, which makes the fuel plan; and the good `n` reference.
 - **Inputs built for natural solutions.** In each candidate, every input mixes all of its kinds, so a natural correct solution costs about the same on every seed of a size and estimator C can name its class. Each candidate's module documentation lists what its sweep holds.
-- **Untimed checks.** A variant can also have checks (`HeldoutVariant::checks`). A check is an input that a program must answer as the oracle does, within the default fuel cap, but that is not timed. The evaluation counts a variant solved only if the program passes its checks as well as the sweep. It treats a variant whose good reference fails a check as broken. Only H3 has checks. They hold the regimes that make natural solutions too noisy for C when the sweep holds them: bounds of 0, bounds that few or most elements exceed, long answer windows, and full palette windows away from the end of the list. Each H3 variant has 204 checks, of sizes up to 512, the sweep's largest. A larger check could time out, under the default fuel cap, a correct program that the sweep's fuel plan allows.
-- **Natural solutions and C.** C names `n` for most natural linear solutions written in the tests, but not all of them (for example, two natural few-kinds solutions in H3). Estimator C refusing natural correct solutions is a project-wide issue, dreamcounter-0ea5b7. It affects the evaluation's `good_class` count for every candidate.
+- **Untimed checks.** A variant can also have checks (`HeldoutVariant::checks`). A check is an input that a program must answer as the oracle does, within the default fuel cap, but that is not timed. The evaluation counts a variant solved only if the program passes its checks as well as the sweep. It treats a variant whose good reference fails a check as broken. Only H3 has checks. They hold the regimes that make natural solutions too noisy for C when the sweep holds them: bounds of 0, bounds that few or most elements exceed, long answer windows, and full palette windows away from the end of the list. Each H3 variant has 204 checks, of sizes up to 512, the sweep's largest. A larger check could time out, under the default fuel cap, a correct program that the sweep's fuel plan allows. Stopping at 512 makes such a timeout unlikely but does not rule it out, because a check's cost depends on its input. For example, an `n²` program that stops early costs about 8 times as much on a check as on the sweep.
+- **H3 few kinds' bound.** The sweep's bound `k` is always 2, so a natural solution's cost per element is the same on every seed. The checks use bounds from 0 to 10.
+- **Natural solutions and C.** C names `n` for most natural linear solutions written in the tests, but not all of them. In H3, the tests require 13 natural solutions to be named `n`. One more natural few-kinds solution, which rescans the last positions each time the window breaks the bound, is measured but refused as too noisy, because its cost depends on the size of the list's alphabet. Estimator C refusing natural correct solutions is a project-wide issue, dreamcounter-0ea5b7. It affects the evaluation's `good_class` count for every candidate.
 
 ## Limits
 

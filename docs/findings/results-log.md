@@ -4,7 +4,7 @@ title: Results log
 type: reference
 scope: internal
 created_at: '2026-10-27T17:11:14.071510Z'
-updated_at: '2026-11-04T00:22:28.628933Z'
+updated_at: '2026-11-04T22:31:28.049800Z'
 ---
 
 Dated entries for every experiment run, including failed and null results. Each
@@ -249,3 +249,72 @@ The next-closest class to each median series: msort `n` (0.112 on 16..512, 0.151
 
 - **Result:** C names the expected class for every reference fitted on the whole sweep, except `sign_changes_quadratic`. C refuses that one with NoFit. This refusal is known: see the entry of 2026-11-03, and `tests/subsequence_count.rs`, which allows it. The `2ⁿ` references are not fitted, because two sizes are too few for a fit. From n = 8 to 16 their steps grow by a factor of 253 to 257, close to `2⁸` = 256. Absorb and absorb-count have the same step counts at every size.
 - **What CI runs:** `cargo test` runs the good references at every size and the other references at the lower half of each sweep, at the same 32 seeds. That took about 4.8 CPU-minutes at the test profile (opt-level 1). The whole run is an ignored test.
+
+
+
+---
+
+## 2026-11-04: Evaluator throughput with a randomly keyed hasher for memo maps
+
+- **Question:** how much single-thread throughput does the evaluator lose when two memo maps use the standard library's SipHash with random keys instead of FxHash? The maps are the memo table's entries and the node map of a large memo key. Bead dreamcounter-36be80 made this change, so that a program cannot choose integers whose hashes all collide.
+- **Builds:** base `b7f73a5` (main). New `1a138fa` on branch `fix-36be80-hash-flooding`. Both `release` with default `RUSTFLAGS`. The later commits on the branch change only tests and comments.
+- **Probe:** a scratch example program in `dc-bench`, not committed. It compiles each benchmark program and runs it at its full `n` on one thread: a tenth of the count as warm-up, then a fixed count (`sum` 300, `fib_memo` 30,000). It reports steps per second of the thread's CPU time, read from `/proc/thread-self/schedstat`. `sum` does not use `memorec`, so it is the control.
+- **Method:** 8 rounds, each running the base build and then the new one. The table gives the median of the 8 runs.
+- **Machine:** AMD Ryzen 7 2700, 16 threads. Load average 3.72 at the start and 3.49 at the end, from desktop and agent processes. `perf` was not available (`perf_event_paranoid`).
+
+| program | base Msteps/CPU-s | new Msteps/CPU-s | change |
+|---|---|---|---|
+| sum | 5.355 | 5.382 | +0.5 % |
+| fib_memo | 3.448 | 3.364 | −2.4 % |
+
+- **Raw `fib_memo` runs, base:** 3.503, 3.396, 3.391, 3.454, 3.441, 3.285, 3.485, 3.479. **New:** 3.417, 3.167, 3.385, 3.360, 3.367, 3.388, 3.293, 3.354. The new build was slower in 7 of the 8 rounds.
+- **Result:** the memo-heavy benchmark program loses about 2.4 % single-thread throughput, and the control does not change.
+- **Discarded run:** a first attempt with `dc-bench` itself ran under a load average of 17 to 38. It showed differences of up to 29 % on `sum`, which the change does not touch, so its numbers are not used.
+- **Collision check:** in a debug test build with FxHash, a memo key of 16,000 integers chosen to collide took 416 ms, against 6.7 ms for 2,000. That is 62 times the time for 8 times the integers. With the new hasher, the test `a_large_key_of_colliding_ints_builds_in_linear_time` gave ratios of 3.3 to 9.5 under load.
+
+
+
+---
+
+## 2026-11-04: Interning throughput with foldhash for the arena index
+
+- **Question:** how much slower is interning when `Arena`'s index from terms to ids uses foldhash with a seed for each arena instead of FxHash? Bead dreamcounter-e3548c made this change, so that a program's literals, variable indices and choice of child pairs cannot make interning quadratic. No enumerator exists yet, so interning stands in for enumeration throughput.
+- **Builds:** base `f0c5f02` (main) with the index hasher named but still FxHash. New `93c5365` on branch `fix-e3548c-arena-int-hash`, with `foldhash::fast::RandomState` (foldhash 0.2.0). Both `release` with default `RUSTFLAGS`. The later commits on the branch change only tests and comments.
+- **Probe:** a scratch example program in `dc-core`, not committed. It interns 2,000,000 terms on one thread, chosen by an xorshift generator from a fixed seed. Half are applications and the rest are lambdas, small integers, `if`s and `let`s over earlier ids. Some terms are new and some repeat. It reports CPU nanoseconds per `intern` call, read from `/proc/thread-self/schedstat`, as the best of 5 runs.
+  - **Large arena:** new ids join the pool of children until it holds 300,000. The arena ends with 1,667,451 nodes.
+  - **Small arena:** the pool stops at 2,000 ids, and the second child comes from the first 64. The arena ends with 349,891 nodes, so the hash function's own cost weighs more.
+- **Method:** 8 rounds, each running the base build and then the new one. Rounds 1 to 6 ran at a load average of about 3.6. During rounds 7 and 8 the load rose and both builds slowed by about 60 %, so the table uses rounds 1 to 6.
+- **Machine:** AMD Ryzen 7 2700, 16 threads.
+
+| arena | base ns/intern | new ns/intern | change |
+|---|---|---|---|
+| large | 159.8 | 170.5 | +6.7 % |
+| small | 63.5 | 80.3 | +26 % |
+
+- **Raw runs, rounds 1 to 8, ns/intern.** Large base: 161.0, 159.0, 160.5, 186.5, 159.0, 151.1, 256.1, 263.5. Large new: 170.9, 170.0, 172.0, 165.0, 165.0, 175.5, 259.9, 252.0. Small base: 63.5, 63.5, 61.5, 82.5, 61.0, 67.5, 118.3, 110.5. Small new: 82.5, 78.0, 118.0, 75.0, 75.5, 104.0, 119.6, 124.5.
+- **Result:** interning costs about 7 % more on a large arena and about 23 to 26 % more on a small one. The fastest small-arena runs are 61.0 ns and 75.0 ns.
+- **Rejected alternative:** FxHash over the term followed by one seeded foldhash step on its 64-bit result. On integers crafted to collide under FxHash, it put 4,096 terms in 689 of 4,096 buckets, against about 2,589 expected for a random hash. The crafted FxHash values differ in about 12 bits, and the single foldhash step does not spread them. The test `the_index_spreads_ints_chosen_to_collide` fails on it. Its speed was not measured.
+- **Collision check:** in a debug test build with FxHash, interning 16,000 integers chosen to collide took 1.15 s, against 16.5 ms for 2,000: 70 times the time for 8 times the integers. With foldhash, the test `interning_ints_chosen_to_collide_takes_linear_time` gave ratios of 2.5 to 8.9 over 30 runs.
+
+
+
+
+---
+
+## 2026-11-04: Memory of memo tables that only their own entries reach
+
+- **Question:** how much memory does a long evaluation keep when each iteration makes a memo table whose entries hold the table's own `self`? Before bead dreamcounter-3fd21a, such a table stayed alive until the evaluation ended. The bead adds a reachability walk that releases tables the program can no longer reach. Does the walk change step counts or time?
+- **Builds:** base `origin/main` at the time of the run. New: branch `fix/dreamcounter-3fd21a-memo-reachability` (PR 47, head `ad20d66`). The RSS runs were at earlier commits on the branch with the same release logic. Both builds are `release` with default `RUSTFLAGS`, each in its own target directory.
+- **Probe:** a scratch example program `memo_rss` in `dc-eval`, not committed. It runs a loop of 300,000 iterations. Each iteration calls `memorec` with a curried function, so the table's entries hold its own `self`. A control runs the same loop with a plain `memorec` whose entries do not hold `self`. Peak RSS is from `/usr/bin/time -f '%M'`.
+- **Machine:** AMD Ryzen 7 2700, 16 threads. The load average was 14 to 19 during the timing runs, so the times are rough.
+
+| case | base peak RSS | new peak RSS | base time | new time | steps |
+|---|---|---|---|---|---|
+| table reached only by its own entries, 300,000 iterations | 417 MB | 2.2 MB | 1.417 s (median) | 0.68 to 0.73 s | 2,100,000 on both |
+| control: plain `memorec` | not measured | not measured | 0.692 s | 0.668 s | equal on both |
+| review case: tables beside an array that many values share, 3000 × 3000 | 418 MB | 5.9 MB | not measured | not measured | not measured |
+
+- **deep.rs test binary:** peak RSS with the tests run in parallel fell from 1.19 GB to 422 MB. An independent re-run gave 464 MB. The largest single test now peaks at 123 MB. The array test nests 20,000 levels, and the list test drops a list of 100,000 elements. Each still overflows a small stack when the drop of arrays, lists or trees is made recursive.
+- **Result:** tables that only their own entries reach are released, and peak memory no longer grows with the iteration count. Step counts do not change. The new build was faster on the bead case. Under this load, that difference does not measure the walk's own cost.
+- **Cost bound:** the test `reachability_walks_cost_at_most_a_constant_times_the_steps` checks that walk work stays within a constant times the steps taken. A walk that would visit more parts than the steps since the last finished walk gives up. The next walk then waits twice as long.
+- **Limits:** while the reachable memory is larger than the steps since the last finished walk, walks give up. Unreachable tables then stay until a walk finishes. Some frames count as roots even where they may not be the only path to a table: `unfold`'s `g`, `tabulate`'s `f`, and memo stores. This can keep a table longer; it never releases a reachable one.

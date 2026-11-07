@@ -4,7 +4,7 @@ title: 'D13: Locate-walk errors go back to the outermost use being tried'
 type: decision
 scope: internal
 created_at: '2026-10-28T22:53:39.678329Z'
-updated_at: '2026-10-29T00:25:12.430254Z'
+updated_at: '2026-11-05T00:42:03.408771Z'
 relates_to:
 - doc-ue2
 ---
@@ -54,7 +54,7 @@ On the repo's proptest generators the worst cost ratio, locate units over `(roll
 
 - Partition-like chains cost about `n` times the first walk. They reach the default budget near depth 90, and past that they report the first walk's error.
 - A correct type-level failure cache on top of this rule could win back up to a factor of the nesting depth. The worst measured loss against PR 28 is 1.6× (mono-ill-outer). Leaving the cache out is a choice about cost, not a theorem. Under this rule a cache that misses costs one more try and never doubles.
-- Open-scope memo entries are dropped when the walk goes back, so successful subterms are inferred again. This is a separate follow-up.
+- Open-scope memo entries are dropped when the walk goes back, so successful subterms are inferred again. This is a separate follow-up. D16 (doc-s4m, 2026-11-04) keeps those whose nodes were not changed before the entry was kept, checked against the trail when the walk goes back.
 - Freeze-doubling on closed DAGs was a pre-existing exponential (`dreamcounter-715365`). This decision did not change it. It was fixed in PR 30, merged on 2026-10-29. A second change in the same PR makes `freeze` share nodes an earlier freeze made, since a kept type over two closed shared subterms holds two distinct frozen copies, and copying both doubled the store on interleaved families. In `Frame::Memo`, the first use of a closed shared subterm got an instance of the kept type before `freeze` copied it, and later uses got instances of the copy. A level over two uses then held two distinct copies, and freezing it doubled the store. The instance is now taken from the type as it goes into the memo. On `(pair P_n (add true 1))` at n=16 the locate walk fell from 1,378,309 units to 3,310, against 4,270 for the first walk.
 
 ## Options considered
