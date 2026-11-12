@@ -40,7 +40,9 @@
 //! One seed per size says nothing about the noise, so each seed alone is
 //! fitted with [`NoiseModel::Known`]: the noise of one seed's `ln` step
 //! count, measured on the full sweep as the largest sample standard
-//! deviation over the seeds at a size in the window. The exact series of
+//! deviation over the seeds at a size in the window, after each seed's
+//! level is taken out as C takes it out (the shared helper
+//! `common::single_seed_noise`). The exact series of
 //! the meta-test are fitted with [`NoiseModel::Exact`].
 //!
 //! Estimators A and B fit the medians over seeds, as the pipeline does. B's
@@ -66,6 +68,11 @@ use dc_tasks::harness::{
 };
 use dc_tasks::rng::TaskRng;
 use dc_tasks::task::{Example, Inputs, TaskFamily};
+
+#[allow(dead_code)]
+mod common;
+
+use common::{per_seed, single_seed_noise};
 
 // ---------------------------------------------------------------------------
 // Programs
@@ -493,33 +500,11 @@ fn check_c(fit: &ClassFit, expected: Class) -> Result<(), String> {
     }
 }
 
-/// The noise of a single seed's `ln` step count, measured on the full sweep:
-/// the largest sample standard deviation of the seeds' `ln` steps at a size
-/// in `window`. This is the spread of one measurement, not the standard
-/// error of a median. `None` if no size in the window has two seeds.
-fn single_seed_noise(sweep: &Sweep, window: &FitWindow) -> Option<f64> {
-    sweep
-        .observations()
-        .iter()
-        .filter(|o| o.n >= window.n_min)
-        .filter_map(|o| match &o.outcome {
-            SizeOutcome::Completed { steps } if steps.len() >= 2 => {
-                let ys: Vec<f64> = steps.iter().map(|&s| (s as f64).ln()).collect();
-                let k = ys.len() as f64;
-                let mean = ys.iter().sum::<f64>() / k;
-                let var = ys.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / (k - 1.0);
-                Some(var.sqrt())
-            }
-            SizeOutcome::Completed { .. } => None,
-            other => panic!("n = {}: {other:?}", o.n),
-        })
-        .reduce(f64::max)
-}
-
 /// The noise model for fitting each seed of `sweep` alone: the single-seed
-/// noise measured on the full sweep (see [`single_seed_noise`]).
+/// noise measured on the full sweep (see [`single_seed_noise`]), with each
+/// seed's level taken out when the sweep is in seed order.
 fn per_seed_noise(sweep: &Sweep, window: &FitWindow) -> NoiseModel {
-    NoiseModel::Known(single_seed_noise(sweep, window).expect("a size in the window has seeds"))
+    NoiseModel::Known(single_seed_noise(sweep, window))
 }
 
 /// Estimator C for one seed alone, with the given noise model.
@@ -557,32 +542,6 @@ fn check_c_per_seed(
         }
     }
     Ok(refused)
-}
-
-/// One sweep per seed, each holding only that seed's step count at every
-/// size.
-fn per_seed(sweep: &Sweep) -> Vec<Sweep> {
-    let seeds = match &sweep.observations()[0].outcome {
-        SizeOutcome::Completed { steps } => steps.len(),
-        other => panic!("{other:?}"),
-    };
-    (0..seeds)
-        .map(|k| {
-            Sweep::new(
-                sweep
-                    .observations()
-                    .iter()
-                    .map(|o| match &o.outcome {
-                        SizeOutcome::Completed { steps } => {
-                            SizeObservation::completed(o.n, vec![steps[k]])
-                        }
-                        other => panic!("n = {}: {other:?}", o.n),
-                    })
-                    .collect(),
-            )
-            .expect("a valid sweep")
-        })
-        .collect()
 }
 
 /// Estimator A over the first and over the last three sizes of the sweep. A
@@ -871,6 +830,43 @@ fn subset_enumeration_is_exponential() {
         drift > 0.5 * ln2 * 6.0,
         "drift {drift}: no sign of super-polynomial growth"
     );
+}
+
+/// The noise model for each seed alone is C's own noise on a sweep in seed
+/// order, as `measure` makes them: seeds four levels apart, with a small
+/// spread that changes from size to size on top. Without centring it would
+/// be about the spread of the levels, and would widen the noise margin.
+#[test]
+fn per_seed_noise_is_centred_on_a_sweep_in_seed_order() {
+    let levels = [-0.3, -0.1, 0.1, 0.3];
+    let k = levels.len();
+    let obs: Vec<SizeObservation> = DEFAULT_SIZES
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            let steps = (0..k)
+                .map(|j| {
+                    let wobble = 0.01 * (((3 * i + 5 * j) % 7) as f64 - 3.0);
+                    (1e6 * n as f64 * (levels[j] + wobble).exp()).round() as u64
+                })
+                .collect();
+            SizeObservation::completed(n, steps)
+        })
+        .collect();
+    let in_order = Sweep::in_seed_order(obs.clone()).expect("a sweep in seed order");
+    let fit = ClassSelect::default().fit(&in_order).expect("C fits");
+    assert!(fit.seed_centred);
+    let NoiseModel::Known(one) = per_seed_noise(&in_order, &fit.window) else {
+        panic!("a known noise model");
+    };
+    let from_one = (std::f64::consts::FRAC_PI_2 * one * one / k as f64).sqrt();
+    let c = fit.noise.expect("seeds");
+    assert!((from_one - c).abs() < 1e-9, "{from_one} against C's {c}");
+    let NoiseModel::Known(raw) = per_seed_noise(&Sweep::new(obs).expect("a sweep"), &fit.window)
+    else {
+        panic!("a known noise model");
+    };
+    assert!(raw > 0.2 && one < 0.05, "raw {raw}, centred {one}");
 }
 
 /// A stand-in estimator that reports slope 1 for every sweep.
