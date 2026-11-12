@@ -40,9 +40,10 @@
 //! One seed per size says nothing about the noise, so each seed alone is
 //! fitted with [`NoiseModel::Known`]: the noise of one seed's `ln` step
 //! count, measured on the full sweep as the largest sample standard
-//! deviation over the seeds at a size in the window, after each seed's
-//! level is taken out as C takes it out (the shared helper
-//! `common::single_seed_noise`). The exact series of
+//! deviation over the seeds at a size in the window. On a sweep in seed
+//! order, as `measure` makes them, each seed's level is first taken out as
+//! C takes it out (the shared helper `common::single_seed_noise`). The
+//! exact series of
 //! the meta-test are fitted with [`NoiseModel::Exact`].
 //!
 //! Estimators A and B fit the medians over seeds, as the pipeline does. B's
@@ -833,7 +834,7 @@ fn subset_enumeration_is_exponential() {
 }
 
 /// The noise model for each seed alone is C's own noise on a sweep in seed
-/// order, as `measure` makes them: seeds four levels apart, with a small
+/// order, as `measure` makes them: four seeds at levels 0.2 apart, with a small
 /// spread that changes from size to size on top. Without centring it would
 /// be about the spread of the levels, and would widen the noise margin.
 #[test]
