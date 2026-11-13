@@ -1793,11 +1793,10 @@ fn going_back_drops_memo_entries_whose_scope_lost_a_key_constraint() {
 
 /// Checks `src` against the tree walk: both must reject it with the same
 /// error, and the second walk must go back exactly once.
-/// The walk of the shared subterm in place may accept a term the first walk
-/// rejected; the `debug_assert` in `TypeChecker::run` is what then fails, so
-/// these checks mean nothing without debug assertions.
+/// If the walk of the shared subterm in place accepts a term the first walk
+/// rejected, the `debug_assert` in `TypeChecker::run` is what fails, so the
+/// tests that use this are ignored without debug assertions.
 fn agrees_with_the_tree_walk_after_one_rollback(src: &str) {
-    assert!(cfg!(debug_assertions), "the judge is a debug_assert in run");
     let mut a = Arena::new();
     let term = parse_term(&mut a, src);
     let mut tree = TypeChecker::new();
@@ -1821,6 +1820,7 @@ fn agrees_with_the_tree_walk_after_one_rollback(src: &str) {
 /// from `x` to `y`, the key of `s` would be kept, and the walk of `t` in
 /// place would accept `add`.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "the judge is a debug_assert in run")]
 fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_through_a_link() {
     let s = "(if (fst ($0 1)) true true)";
     let t = format!("(pair {s} (pair {s} (add (fst ($0 1)) 1)))");
@@ -1837,6 +1837,7 @@ fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_through_a_li
 /// constructor. If `first_change` read only a constructor's first child, the
 /// key of `s` would be kept.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "the judge is a debug_assert in run")]
 fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_second_child() {
     let s = "(if (snd (fst ($0 1))) true true)";
     let t = format!("(pair {s} (pair {s} (add (snd (fst ($0 1))) 1)))");
@@ -1848,6 +1849,7 @@ fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_second_
 /// As the test above, with `x` bound to `(y, Int)`, so that `y` is reached
 /// only through the first child of a constructor.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "the judge is a debug_assert in run")]
 fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_first_child() {
     let s = "(if (fst (fst ($0 1))) true true)";
     let t = format!("(pair {s} (pair {s} (add (fst (fst ($0 1))) 1)))");
@@ -1875,6 +1877,7 @@ fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_first_c
 /// would be kept, and the walk of `t` in place would accept `z` as a
 /// function.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "the judge is a debug_assert in run")]
 fn going_back_drops_memo_entries_whose_node_changed_before_and_after_they_were_kept() {
     // Under `let h`: $1 is y, $2 x, $3 z, $4 q2, $5 q1, $6 to $12 are p7 to p1.
     let ranks = [
