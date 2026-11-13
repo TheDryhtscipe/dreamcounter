@@ -1792,10 +1792,10 @@ fn going_back_drops_memo_entries_whose_scope_lost_a_key_constraint() {
 }
 
 /// Checks `src` against the tree walk: both must reject it with the same
-/// error, and the second walk must go back exactly once.
-/// If the walk of the shared subterm in place accepts a term the first walk
-/// rejected, the `debug_assert` in `TypeChecker::run` is what fails, so the
-/// tests that use this are ignored without debug assertions.
+/// error, and the second walk must go back exactly once. If the walk of the
+/// shared subterm in place accepts a term the first walk rejected, the
+/// `debug_assert` in `TypeChecker::run` is what fails, so the tests that use
+/// this are ignored without debug assertions.
 fn agrees_with_the_tree_walk_after_one_rollback(src: &str) {
     let mut a = Arena::new();
     let term = parse_term(&mut a, src);
@@ -1812,13 +1812,14 @@ fn agrees_with_the_tree_walk_after_one_rollback(src: &str) {
 /// already a link at the checkpoint, and the inference that made the entry
 /// bound the node at the end of that link (dreamcounter-7b9905). Under `lam
 /// a. lam b. lam c. lam y. lam x`, the helper `h = (lam (pair x $0))` takes
-/// its `Canon` with `x` unbound, and inferring `h` gives `x` rank 1. The
-/// unifications before the body give `y` rank 2, so `(if true x y)` links
-/// `x` to `y` whichever side union by rank favours on a tie. The `Canon` of
-/// `h` still names the node of `x`. Then `s = (if (fst (h 1)) true true)`
-/// makes `y` a `Bool` while `t` is tried, and `t` fails at `add`. If `first_change` did not follow the link
-/// from `x` to `y`, the key of `s` would be kept, and the walk of `t` in
-/// place would accept `add`.
+/// its `Canon` when the class of `x` has rank 1, and the `Canon` names that
+/// class's root. Before `t`, the body joins `a`, `b`, `c`, and `y` into a
+/// class of rank 2, so `(if true x y)` links the root of the class of `x`
+/// into it, whichever side union by rank favours on a tie. Then `s = (if
+/// (fst (h 1)) true true)` makes that class a `Bool` while `t` is tried, and
+/// `t` fails at `add`. If `first_change` did not follow the link from the
+/// node the `Canon` names, the key of `s` would be kept, and the walk of `t`
+/// in place would accept `add`.
 #[test]
 #[cfg_attr(not(debug_assertions), ignore = "the judge is a debug_assert in run")]
 fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_through_a_link() {
@@ -1833,9 +1834,10 @@ fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_through_a_li
 }
 
 /// As the test above, but under `lam y. lam x`, `x` is bound to `(Int, y)`,
-/// so the changed node `y` is reached only through the second child of a
-/// constructor. If `first_change` read only a constructor's first child, the
-/// key of `s` would be kept.
+/// so the changed node `y` is reached only through the link from `x` and
+/// then the second child of a constructor. If `first_change` read only a
+/// constructor's first child, the key of `s` would be kept. Not following
+/// links also fails this test.
 #[test]
 #[cfg_attr(not(debug_assertions), ignore = "the judge is a debug_assert in run")]
 fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_second_child() {
@@ -1847,7 +1849,7 @@ fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_second_
 }
 
 /// As the test above, with `x` bound to `(y, Int)`, so that `y` is reached
-/// only through the first child of a constructor.
+/// only through the link from `x` and then the first child of a constructor.
 #[test]
 #[cfg_attr(not(debug_assertions), ignore = "the judge is a debug_assert in run")]
 fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_first_child() {
@@ -1862,19 +1864,21 @@ fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_first_c
 /// before it was kept, even if the node changed again after. `back_to` must
 /// map each node to its first change on the trail, not its last.
 ///
-/// Lambda variables `p1` to `p7`, `q1`, `q2`, `z`, `x`, and `y` (innermost)
-/// are unified first so that `x` has rank 2 with `z` linked to it, and `y`
-/// has rank 3. While `t` is tried, `s` unifies `x` with the type of its
-/// `memorec` key, a class of rank 1 with the `Key` constraint; `x` stays the
-/// root and takes the constraint, and the key of `s` is kept. The ranks
-/// differ at every union this relies on, so the shape does not depend on
-/// which side union by rank favours on a tie. Inside `t`, the lambda variables are fresh
-/// parameters: `(if true x y)` unifies the parameters of `x` and `y`, and
-/// `(if true z (lam $0))` makes the parameter of `z` a function. Then
-/// `apply_scope` unifies `y`, then `x`, which links `x` to `y` (a second
-/// change to `x`, after `s` was kept), then `z`, which reaches `y` with the
-/// `Key` constraint and fails. If `changed` held the link, the key of `s`
-/// would be kept, and the walk of `t` in place would accept `z` as a
+/// Lambda variables `p1` to `p7`, `q1`, `q2`, `z`, `x`, and `y` (innermost) are
+/// unified first, so that `z`, `q1`, `q2`, `x`, and the variable of `h` form a
+/// class of rank 2, and `y` and `p1` to `p7` a class of rank 3. While `t` is
+/// tried, `s` joins the class of `x` with the type of its `memorec` key, a
+/// class of rank 1 with the `Key` constraint. The root of the class of `x`
+/// stays the root and takes the constraint, and the key of `s` is kept. Inside
+/// `t`, the lambda variables are fresh parameters: `(if true x y)` unifies the
+/// parameters of `x` and `y`, and `(if true z (lam $0))` makes the parameter of
+/// `z` a function. Then `apply_scope` unifies `y`, then `x`, which links the
+/// root of the class of `x` into the class of `y` (its second change, after `s`
+/// was kept), then `z`, which reaches that class with the `Key` constraint and
+/// fails. The two unions that decide this join classes of different rank, so
+/// the shape does not depend on which side union by rank favours on a tie. If
+/// `changed` held that root's last change (the link) rather than its first, the
+/// key of `s` would be kept, and the walk of `t` in place would accept `z` as a
 /// function.
 #[test]
 #[cfg_attr(not(debug_assertions), ignore = "the judge is a debug_assert in run")]
