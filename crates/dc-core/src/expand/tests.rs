@@ -1092,3 +1092,138 @@ proptest! {
         prop_assert_eq!(rs.after_shift(r, by), interned(&mut rs, &shifted));
     }
 }
+
+/// The inverse of an odd `a` modulo 2^64 (Newton's iteration).
+fn odd_inverse(a: u64) -> u64 {
+    let mut x = a;
+    for _ in 0..6 {
+        x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+    }
+    x
+}
+
+/// `n` pairs `(x, y)` whose keys `key(x, y)` have FxHash values that agree in
+/// their low 50 bits before FxHash's final rotation, so they share a bucket and
+/// a tag in any table with at most 2^12 buckets.
+///
+/// FxHash maps its state by `h -> (h + w) * K` for each word, so the hash before
+/// the rotation is `a1 * x + a2 * y + b`. The pairs are points of the lattice of
+/// `(x, y)` with `a1 * x + a2 * y = 0` modulo 2^50, shifted to the middle of the
+/// `u32` square. The square holds about 2^14 of them. Assumes a 64-bit target,
+/// where rustc-hash 2.1 rotates by 26.
+fn fx_colliding_pairs<K: std::hash::Hash>(
+    n: usize,
+    key: impl Fn(u32, u32) -> K,
+) -> Vec<(u32, u32)> {
+    use std::hash::BuildHasher;
+    const BITS: u32 = 50;
+    let fx = |x: u32, y: u32| {
+        rustc_hash::FxBuildHasher
+            .hash_one(key(x, y))
+            .rotate_right(26)
+    };
+    let b = fx(0, 0);
+    let a1 = fx(1, 0).wrapping_sub(b);
+    let a2 = fx(0, 1).wrapping_sub(b);
+    assert_eq!(a1 % 2, 1, "the first word is mixed by an odd multiplier");
+    let m = 1i128 << BITS;
+    // x = c * y modulo 2^50 on the lattice.
+    let c = i128::from(a2.wrapping_neg().wrapping_mul(odd_inverse(a1))) % m;
+    // Gauss reduction of the basis (2^50, 0), (c, 1).
+    let norm = |v: (i128, i128)| v.0 * v.0 + v.1 * v.1;
+    let (mut u, mut v) = ((m, 0i128), (c, 1i128));
+    loop {
+        if norm(u) < norm(v) {
+            std::mem::swap(&mut u, &mut v);
+        }
+        // Now |v| <= |u|; subtract the nearest multiple of v from u.
+        let k = (u.0 * v.0 + u.1 * v.1) as f64 / norm(v) as f64;
+        let k = k.round() as i128;
+        if k == 0 {
+            break;
+        }
+        u = (u.0 - k * v.0, u.1 - k * v.1);
+        if norm(u) >= norm(v) {
+            break;
+        }
+    }
+    let side = 1i128 << 32;
+    let reach = |w: (i128, i128)| 2 * side / w.0.abs().max(w.1.abs()).max(1) + 2;
+    let (ri, rj) = (reach(u), reach(v));
+    assert!(ri * rj < 50_000_000, "a skewed basis: {u:?}, {v:?}");
+    let mid = 1i128 << 31;
+    let mut pairs = vec![];
+    'search: for i in -ri..=ri {
+        for j in -rj..=rj {
+            let (x, y) = (mid + i * u.0 + j * v.0, mid + i * u.1 + j * v.1);
+            if (0..side).contains(&x) && (0..side).contains(&y) {
+                pairs.push((x as u32, y as u32));
+                if pairs.len() == n {
+                    break 'search;
+                }
+            }
+        }
+    }
+    assert_eq!(pairs.len(), n, "too few lattice points in the square");
+    // The keys really do collide under FxHash, so the checks below test the
+    // maps' hasher and not the inputs.
+    let low = |h: u64| h & ((1 << BITS) - 1);
+    let first = low(fx(pairs[0].0, pairs[0].1));
+    for &(x, y) in &pairs {
+        assert_eq!(low(fx(x, y)), first);
+    }
+    pairs
+}
+
+/// Checks that `hash` puts the keys in about as many buckets and tags as a random
+/// hash would. A random hash puts 4096 keys in about 2589 of 4096 buckets, and in
+/// all 128 tags; FxHash puts the crafted keys in one of each.
+#[track_caller]
+fn assert_spread(hashes: &[u64]) {
+    let buckets: std::collections::HashSet<u64> = hashes.iter().map(|h| h & 0xFFF).collect();
+    let tags: std::collections::HashSet<u64> = hashes.iter().map(|h| h >> 57).collect();
+    assert!(
+        buckets.len() > 2000 && tags.len() > 100,
+        "{} buckets, {} tags",
+        buckets.len(),
+        tags.len()
+    );
+}
+
+#[test]
+fn the_renaming_index_spreads_keys_chosen_to_collide() {
+    use std::hash::BuildHasher;
+    let key = |gap: u32, rest: u32| (gap, 1u32, RenId(rest));
+    let hasher = Renamings::new().index.hasher().clone();
+    let hashes: Vec<u64> = fx_colliding_pairs(4096, key)
+        .into_iter()
+        .map(|(x, y)| hasher.hash_one(key(x, y)))
+        .collect();
+    assert_spread(&hashes);
+}
+
+#[test]
+fn the_restrict_memo_spreads_keys_chosen_to_collide() {
+    use std::hash::BuildHasher;
+    let key = |r: u32, depth: u32| (RenId(r), depth);
+    let hasher = Renamings::new().restricted.hasher().clone();
+    let hashes: Vec<u64> = fx_colliding_pairs(4096, key)
+        .into_iter()
+        .map(|(x, y)| hasher.hash_one(key(x, y)))
+        .collect();
+    assert_spread(&hashes);
+}
+
+#[test]
+fn the_task_memo_spreads_keys_chosen_to_collide() {
+    use std::hash::BuildHasher;
+    let key = |t: u32, r: u32| Task::Expand(TermId::from_raw(t), RenId(r));
+    let mut arena = Arena::new();
+    let ex = Expander::new(&mut arena, &[]).unwrap();
+    let hasher = ex.memo.hasher().clone();
+    let hashes: Vec<u64> = fx_colliding_pairs(4096, key)
+        .into_iter()
+        .map(|(x, y)| hasher.hash_one(key(x, y)))
+        .collect();
+    assert_spread(&hashes);
+}
