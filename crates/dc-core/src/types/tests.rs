@@ -1793,7 +1793,11 @@ fn going_back_drops_memo_entries_whose_scope_lost_a_key_constraint() {
 
 /// Checks `src` against the tree walk: both must reject it with the same
 /// error, and the second walk must go back exactly once.
+/// The walk of the shared subterm in place may accept a term the first walk
+/// rejected; the `debug_assert` in `TypeChecker::run` is what then fails, so
+/// these checks mean nothing without debug assertions.
 fn agrees_with_the_tree_walk_after_one_rollback(src: &str) {
+    assert!(cfg!(debug_assertions), "the judge is a debug_assert in run");
     let mut a = Arena::new();
     let term = parse_term(&mut a, src);
     let mut tree = TypeChecker::new();
@@ -1808,20 +1812,23 @@ fn agrees_with_the_tree_walk_after_one_rollback(src: &str) {
 /// A memo entry is dropped when going back if its scope's free variable was
 /// already a link at the checkpoint, and the inference that made the entry
 /// bound the node at the end of that link (dreamcounter-7b9905). Under `lam
-/// w. lam y. lam x`, the helper `h = (lam (pair x $0))` takes its `Canon`
-/// with `x` unbound; `(if true w y)` raises the rank of `y`, so `(if true x
-/// y)` links `x` to `y`. The `Canon` of `h` still names the node of `x`.
-/// Then `s = (if (fst (h 1)) true true)` makes `y` a `Bool` while `t` is
-/// tried, and `t` fails at `add`. If `first_change` did not follow the link
+/// a. lam b. lam c. lam y. lam x`, the helper `h = (lam (pair x $0))` takes
+/// its `Canon` with `x` unbound, and inferring `h` gives `x` rank 1. The
+/// unifications before the body give `y` rank 2, so `(if true x y)` links
+/// `x` to `y` whichever side union by rank favours on a tie. The `Canon` of
+/// `h` still names the node of `x`. Then `s = (if (fst (h 1)) true true)`
+/// makes `y` a `Bool` while `t` is tried, and `t` fails at `add`. If `first_change` did not follow the link
 /// from `x` to `y`, the key of `s` would be kept, and the walk of `t` in
 /// place would accept `add`.
 #[test]
 fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_through_a_link() {
     let s = "(if (fst ($0 1)) true true)";
     let t = format!("(pair {s} (pair {s} (add (fst ($0 1)) 1)))");
-    let links = "(pair (if true $3 $2) (if true $1 $2))";
+    // Under `let h`: $1 is x, $2 y, $3 c, $4 b, $5 a.
+    let links =
+        "(pair (if true $5 $2) (pair (if true $4 $3) (pair (if true $5 $4) (if true $1 $2))))";
     agrees_with_the_tree_walk_after_one_rollback(&format!(
-        "(lam (lam (lam (let (lam (pair $1 $0)) (pair {links} (pair {t} {t}))))))"
+        "(lam (lam (lam (lam (lam (let (lam (pair $1 $0)) (pair {links} (pair {t} {t}))))))))"
     ));
 }
 
@@ -1838,14 +1845,28 @@ fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_second_
     ));
 }
 
+/// As the test above, with `x` bound to `(y, Int)`, so that `y` is reached
+/// only through the first child of a constructor.
+#[test]
+fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_first_child() {
+    let s = "(if (fst (fst ($0 1))) true true)";
+    let t = format!("(pair {s} (pair {s} (add (fst (fst ($0 1))) 1)))");
+    agrees_with_the_tree_walk_after_one_rollback(&format!(
+        "(lam (lam (let (lam (pair $1 $0)) (pair (if true $1 (pair $2 1)) (pair {t} {t})))))"
+    ));
+}
+
 /// A memo entry is dropped when going back if a node it depends on changed
 /// before it was kept, even if the node changed again after. `back_to` must
 /// map each node to its first change on the trail, not its last.
 ///
-/// Lambda variables `p1` to `p7`, `z`, `x`, and `y` (innermost) are unified
-/// first so that `x` has rank 1 with `z` linked to it, and `y` has rank 3.
-/// While `t` is tried, `s` gives `x` a `Key` constraint, which raises its
-/// rank to 2, and is kept. Inside `t`, the lambda variables are fresh
+/// Lambda variables `p1` to `p7`, `q1`, `q2`, `z`, `x`, and `y` (innermost)
+/// are unified first so that `x` has rank 2 with `z` linked to it, and `y`
+/// has rank 3. While `t` is tried, `s` unifies `x` with the type of its
+/// `memorec` key, a class of rank 1 with the `Key` constraint; `x` stays the
+/// root and takes the constraint, and the key of `s` is kept. The ranks
+/// differ at every union this relies on, so the shape does not depend on
+/// which side union by rank favours on a tie. Inside `t`, the lambda variables are fresh
 /// parameters: `(if true x y)` unifies the parameters of `x` and `y`, and
 /// `(if true z (lam $0))` makes the parameter of `z` a function. Then
 /// `apply_scope` unifies `y`, then `x`, which links `x` to `y` (a second
@@ -1855,16 +1876,18 @@ fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_second_
 /// function.
 #[test]
 fn going_back_drops_memo_entries_whose_node_changed_before_and_after_they_were_kept() {
-    // Under `let h`: $1 is y, $2 x, $3 z, $4 to $10 are p7 to p1.
+    // Under `let h`: $1 is y, $2 x, $3 z, $4 q2, $5 q1, $6 to $12 are p7 to p1.
     let ranks = [
         "(if true $3 $2)",
-        "(if true $10 $1)",
+        "(if true $5 $4)",
+        "(if true $4 $2)",
+        "(if true $12 $1)",
+        "(if true $10 $11)",
+        "(if true $11 $1)",
         "(if true $8 $9)",
-        "(if true $9 $1)",
         "(if true $6 $7)",
-        "(if true $4 $5)",
-        "(if true $5 $7)",
-        "(if true $7 $1)",
+        "(if true $7 $9)",
+        "(if true $9 $1)",
     ];
     let ranks = ranks.iter().rev().fold(String::new(), |acc, u| {
         if acc.is_empty() {
@@ -1876,7 +1899,7 @@ fn going_back_drops_memo_entries_whose_node_changed_before_and_after_they_were_k
     let s = "(memorec 1 (lam (lam $0)) (fst ($0 1)))";
     let t = format!("(pair {s} (pair {s} (pair (if true $2 $1) (if true $3 (lam $0)))))");
     let body = format!("(let (lam (pair $2 $0)) (pair {ranks} (if true {t} {t})))");
-    let src = (0..10).fold(body, |b, _| format!("(lam {b})"));
+    let src = (0..12).fold(body, |b, _| format!("(lam {b})"));
     agrees_with_the_tree_walk_after_one_rollback(&src);
 }
 
