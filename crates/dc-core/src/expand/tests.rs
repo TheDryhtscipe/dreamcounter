@@ -1104,7 +1104,7 @@ fn odd_inverse(a: u64) -> u64 {
 
 /// `n` pairs `(x, y)` whose keys `key(x, y)` have FxHash values that agree in
 /// their low 50 bits before FxHash's final rotation, so they share a bucket and
-/// a tag in any table smaller than 2^12 buckets.
+/// a tag in any table with at most 2^12 buckets.
 ///
 /// FxHash maps its state by `h -> (h + w) * K` for each word, so the hash before
 /// the rotation is `a1 * x + a2 * y + b`. The pairs are points of the lattice of

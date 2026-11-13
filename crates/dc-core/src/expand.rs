@@ -52,14 +52,14 @@ use crate::term::{children, Arena, LibId, Term, TermId};
 /// Builds the hasher of the [`Expander`]'s memo and of the [`Renamings`] tables.
 ///
 /// It is foldhash with its own seed for each new map, not FxHash, as for the
-/// [`Arena`] index. The keys are arena ids, renaming ids and binder depths. A
-/// program's shape chooses which combinations of them occur, and FxHash is affine
-/// in each field, so some sets of keys share one bucket and one tag under FxHash.
-/// Whether a program can produce such a set has not been shown; this hasher
-/// removes the question.
+/// [`Arena`] index; its seeds, and the attacks it does not resist, are as described
+/// there. The keys are arena ids, renaming ids and binder depths. A program's
+/// shape chooses which combinations of them occur, and FxHash is affine in each
+/// field, so some sets of keys share one bucket and one tag under FxHash. Whether
+/// a program can produce such a set has not been shown.
 ///
-/// Nothing iterates over these maps, so the order of their entries, which differs
-/// between maps, reaches no id or result.
+/// Nothing but the [`Debug`] output iterates over these maps, so the order of
+/// their entries, which differs between maps, reaches no id or result.
 type KeyHasher = foldhash::fast::RandomState;
 
 /// A library abstraction: `term` is the closed term `λ^arity. body`, in which the
