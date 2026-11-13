@@ -27,6 +27,12 @@ impl TermId {
     pub fn index(self) -> usize {
         self.0 as usize
     }
+
+    /// The id with raw index `i`, which need not be in any arena.
+    #[cfg(test)]
+    pub(crate) fn from_raw(i: u32) -> TermId {
+        TermId(i)
+    }
 }
 
 /// Index of a library abstraction (spec §8).
