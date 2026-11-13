@@ -44,11 +44,23 @@
 //! application spine are shared. Every traversal uses an explicit stack, so the
 //! depth of a term is limited only by memory.
 
+use std::collections::HashMap;
 use std::fmt;
 
-use rustc_hash::FxHashMap;
-
 use crate::term::{children, Arena, LibId, Term, TermId};
+
+/// Builds the hasher of the [`Expander`]'s memo and of the [`Renamings`] tables.
+///
+/// It is foldhash with its own seed for each new map, not FxHash, as for the
+/// [`Arena`] index. The keys are arena ids, renaming ids and binder depths. A
+/// program's shape chooses which combinations of them occur, and FxHash is affine
+/// in each field, so some sets of keys share one bucket and one tag under FxHash.
+/// Whether a program can produce such a set has not been shown; this hasher
+/// removes the question.
+///
+/// Nothing iterates over these maps, so the order of their entries, which differs
+/// between maps, reaches no id or result.
+type KeyHasher = foldhash::fast::RandomState;
 
 /// A library abstraction: `term` is the closed term `λ^arity. body`, in which the
 /// parameter `#i` under `d` binders of `body` is `$(d + arity - 1 - i)`.
@@ -148,7 +160,7 @@ pub struct Expander {
     bodies: Vec<(u32, TermId)>,
     /// The number of libraries, including those still being prepared.
     total: usize,
-    memo: FxHashMap<Task, TermId>,
+    memo: HashMap<Task, TermId, KeyHasher>,
     sites: Vec<Site>,
     renamings: Renamings,
     free: FreeDepth,
@@ -165,7 +177,7 @@ impl Expander {
         let mut ex = Expander {
             bodies: Vec::with_capacity(libs.len()),
             total: libs.len(),
-            memo: FxHashMap::default(),
+            memo: HashMap::default(),
             sites: Vec::new(),
             renamings: Renamings::new(),
             free: FreeDepth::default(),
@@ -562,9 +574,9 @@ struct Point {
 struct Renamings {
     /// The cells; entry 0 stands for the identity and is never read.
     points: Vec<Point>,
-    index: FxHashMap<(u32, u32, RenId), RenId>,
+    index: HashMap<(u32, u32, RenId), RenId, KeyHasher>,
     /// Memo of [`Renamings::restrict`] for renamings it had to cut.
-    restricted: FxHashMap<(RenId, u32), RenId>,
+    restricted: HashMap<(RenId, u32), RenId, KeyHasher>,
 }
 
 impl Renamings {
@@ -577,8 +589,8 @@ impl Renamings {
         };
         Renamings {
             points: vec![unused],
-            index: FxHashMap::default(),
-            restricted: FxHashMap::default(),
+            index: HashMap::default(),
+            restricted: HashMap::default(),
         }
     }
 

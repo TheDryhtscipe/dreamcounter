@@ -1111,10 +1111,17 @@ fn odd_inverse(a: u64) -> u64 {
 /// `(x, y)` with `a1 * x + a2 * y = 0` modulo 2^50, shifted to the middle of the
 /// `u32` square. The square holds about 2^14 of them. Assumes a 64-bit target,
 /// where rustc-hash 2.1 rotates by 26.
-fn fx_colliding_pairs<K: std::hash::Hash>(n: usize, key: impl Fn(u32, u32) -> K) -> Vec<(u32, u32)> {
+fn fx_colliding_pairs<K: std::hash::Hash>(
+    n: usize,
+    key: impl Fn(u32, u32) -> K,
+) -> Vec<(u32, u32)> {
     use std::hash::BuildHasher;
     const BITS: u32 = 50;
-    let fx = |x: u32, y: u32| rustc_hash::FxBuildHasher.hash_one(key(x, y)).rotate_right(26);
+    let fx = |x: u32, y: u32| {
+        rustc_hash::FxBuildHasher
+            .hash_one(key(x, y))
+            .rotate_right(26)
+    };
     let b = fx(0, 0);
     let a1 = fx(1, 0).wrapping_sub(b);
     let a2 = fx(0, 1).wrapping_sub(b);
