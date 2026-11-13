@@ -1791,6 +1791,95 @@ fn going_back_drops_memo_entries_whose_scope_lost_a_key_constraint() {
     }
 }
 
+/// Checks `src` against the tree walk: both must reject it with the same
+/// error, and the second walk must go back exactly once.
+fn agrees_with_the_tree_walk_after_one_rollback(src: &str) {
+    let mut a = Arena::new();
+    let term = parse_term(&mut a, src);
+    let mut tree = TypeChecker::new();
+    tree.tree_walk = true;
+    let want = tree.infer(&a, term, NO_LIBS);
+    assert!(want.is_err(), "{src}");
+    let mut tc = TypeChecker::new();
+    assert_eq!(tc.infer(&a, term, NO_LIBS), want, "{src}");
+    assert_eq!(tc.rollbacks(), 1, "{src}");
+}
+
+/// A memo entry is dropped when going back if its scope's free variable was
+/// already a link at the checkpoint, and the inference that made the entry
+/// bound the node at the end of that link (dreamcounter-7b9905). Under `lam
+/// w. lam y. lam x`, the helper `h = (lam (pair x $0))` takes its `Canon`
+/// with `x` unbound; `(if true w y)` raises the rank of `y`, so `(if true x
+/// y)` links `x` to `y`. The `Canon` of `h` still names the node of `x`.
+/// Then `s = (if (fst (h 1)) true true)` makes `y` a `Bool` while `t` is
+/// tried, and `t` fails at `add`. If `first_change` did not follow the link
+/// from `x` to `y`, the key of `s` would be kept, and the walk of `t` in
+/// place would accept `add`.
+#[test]
+fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_through_a_link() {
+    let s = "(if (fst ($0 1)) true true)";
+    let t = format!("(pair {s} (pair {s} (add (fst ($0 1)) 1)))");
+    let links = "(pair (if true $3 $2) (if true $1 $2))";
+    agrees_with_the_tree_walk_after_one_rollback(&format!(
+        "(lam (lam (lam (let (lam (pair $1 $0)) (pair {links} (pair {t} {t}))))))"
+    ));
+}
+
+/// As the test above, but under `lam y. lam x`, `x` is bound to `(Int, y)`,
+/// so the changed node `y` is reached only through the second child of a
+/// constructor. If `first_change` read only a constructor's first child, the
+/// key of `s` would be kept.
+#[test]
+fn going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_second_child() {
+    let s = "(if (snd (fst ($0 1))) true true)";
+    let t = format!("(pair {s} (pair {s} (add (snd (fst ($0 1))) 1)))");
+    agrees_with_the_tree_walk_after_one_rollback(&format!(
+        "(lam (lam (let (lam (pair $1 $0)) (pair (if true $1 (pair 1 $2)) (pair {t} {t})))))"
+    ));
+}
+
+/// A memo entry is dropped when going back if a node it depends on changed
+/// before it was kept, even if the node changed again after. `back_to` must
+/// map each node to its first change on the trail, not its last.
+///
+/// Lambda variables `p1` to `p7`, `z`, `x`, and `y` (innermost) are unified
+/// first so that `x` has rank 1 with `z` linked to it, and `y` has rank 3.
+/// While `t` is tried, `s` gives `x` a `Key` constraint, which raises its
+/// rank to 2, and is kept. Inside `t`, the lambda variables are fresh
+/// parameters: `(if true x y)` unifies the parameters of `x` and `y`, and
+/// `(if true z (lam $0))` makes the parameter of `z` a function. Then
+/// `apply_scope` unifies `y`, then `x`, which links `x` to `y` (a second
+/// change to `x`, after `s` was kept), then `z`, which reaches `y` with the
+/// `Key` constraint and fails. If `changed` held the link, the key of `s`
+/// would be kept, and the walk of `t` in place would accept `z` as a
+/// function.
+#[test]
+fn going_back_drops_memo_entries_whose_node_changed_before_and_after_they_were_kept() {
+    // Under `let h`: $1 is y, $2 x, $3 z, $4 to $10 are p7 to p1.
+    let ranks = [
+        "(if true $3 $2)",
+        "(if true $10 $1)",
+        "(if true $8 $9)",
+        "(if true $9 $1)",
+        "(if true $6 $7)",
+        "(if true $4 $5)",
+        "(if true $5 $7)",
+        "(if true $7 $1)",
+    ];
+    let ranks = ranks.iter().rev().fold(String::new(), |acc, u| {
+        if acc.is_empty() {
+            (*u).to_string()
+        } else {
+            format!("(pair {u} {acc})")
+        }
+    });
+    let s = "(memorec 1 (lam (lam $0)) (fst ($0 1)))";
+    let t = format!("(pair {s} (pair {s} (pair (if true $2 $1) (if true $3 (lam $0)))))");
+    let body = format!("(let (lam (pair $2 $0)) (pair {ranks} (if true {t} {t})))");
+    let src = (0..10).fold(body, |b, _| format!("(lam {b})"));
+    agrees_with_the_tree_walk_after_one_rollback(&src);
+}
+
 /// A balanced tree of pairs of `Int`, `depth` deep, as type text.
 fn pair_tree_text(depth: usize) -> String {
     if depth == 0 {
