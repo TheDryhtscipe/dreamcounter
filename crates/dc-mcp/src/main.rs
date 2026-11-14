@@ -80,6 +80,8 @@ fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn st
             }
             Some(run) => {
                 let server = ProposerServer::new(store, run, Arc::new(SystemClock));
+                // Check what a server that stopped left unchecked.
+                server.check_in_background();
                 let service = server.serve(rmcp::transport::stdio()).await?;
                 service.waiting().await?;
             }

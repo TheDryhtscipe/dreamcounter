@@ -13,13 +13,15 @@
 //! A tool call runs on a thread of its own, so a call that waits for a run's
 //! lock does not hold up other calls or the protocol.
 
-use std::sync::Arc;
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
 
-use crate::proposer::{next_batch, submit, Clock, NextBatch, Receipt, Refused};
+use crate::proposer::{check_pending, next_batch, submit, Clock, NextBatch, Receipt, Refused};
 use crate::state::{Arm, Event, LogKind, LogRecord, RunConfig, RunId, RunState};
 use crate::store::{Store, StoreError};
 
@@ -159,6 +161,9 @@ pub struct TaskStats {
     pub name: String,
     /// Batches issued for it.
     pub batches: u64,
+    /// Programs received that its batches asked for, checked or not, from
+    /// submissions that came in during the batch's iteration.
+    pub received: u64,
     /// Programs checked: those its batches asked for, from submissions that
     /// came in during the batch's iteration.
     pub programs: u64,
@@ -177,9 +182,12 @@ pub struct TaskStats {
 pub struct IterationStats {
     /// The iteration.
     pub iteration: u64,
-    /// Whether every task has its programs. Only meaningful for the current
-    /// iteration, where it says the iteration can be finished.
+    /// Whether every task has its programs, all checked. For the current
+    /// iteration it says the iteration can be finished.
     pub quota_in: bool,
+    /// Submissions that wait to be checked. Only the current iteration has
+    /// any: an iteration cannot finish while checks are pending.
+    pub pending_checks: usize,
     /// How many tasks have a program that passed.
     pub tasks_solved: usize,
     /// Submissions received, of any standing.
@@ -188,6 +196,9 @@ pub struct IterationStats {
     pub late: u64,
     /// Submissions for a batch that already had one: kept, not checked.
     pub repeats: u64,
+    /// Submissions from a worker that does not hold the batch: kept, not
+    /// checked.
+    pub foreign: u64,
     /// Bytes of payload handed out. About four bytes make a token.
     pub payload_bytes: u64,
     /// Bytes of program text received.
@@ -206,6 +217,7 @@ impl IterationStats {
                 TaskStats {
                     name: name.clone(),
                     batches: c.batches,
+                    received: c.received,
                     programs: c.programs,
                     compiled: c.compiled,
                     typed: c.typed,
@@ -216,13 +228,24 @@ impl IterationStats {
             .collect();
         let counts = state.iteration_counts(iteration);
         let quota = u64::from(state.config().proposals_per_task);
+        let current = iteration == state.iteration();
         IterationStats {
             iteration,
-            quota_in: tasks.iter().all(|t| t.programs >= quota),
+            quota_in: if current {
+                state.quota_in()
+            } else {
+                tasks.iter().all(|t| t.programs >= quota)
+            },
+            pending_checks: if current {
+                state.pending_checks().len()
+            } else {
+                0
+            },
             tasks_solved: tasks.iter().filter(|t| t.solved).count(),
             submissions: counts.submissions,
             late: counts.late,
             repeats: counts.repeats,
+            foreign: counts.foreign,
             payload_bytes: counts.payload_bytes,
             submission_bytes: counts.submission_bytes,
             tasks,
@@ -450,6 +473,8 @@ pub struct NextBatchArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitArgs {
+    /// Your id: the one you gave `dc_next_batch` for this batch.
+    pub worker: String,
     /// The batch's number, from `dc_next_batch`.
     pub batch: u64,
     /// The programs, one string for each: the full text of a dc program that
@@ -467,6 +492,16 @@ pub struct ProposerServer {
     store: Arc<Store>,
     run: RunId,
     clock: Arc<dyn Clock>,
+    checker: Arc<Checker>,
+}
+
+/// Runs the checks of pending submissions, one at a time in each process.
+#[derive(Debug, Default)]
+struct Checker {
+    /// Held while checks run.
+    running: Mutex<()>,
+    /// Set when there may be new work.
+    dirty: AtomicBool,
 }
 
 impl ProposerServer {
@@ -477,7 +512,35 @@ impl ProposerServer {
             store: Arc::new(store),
             run,
             clock,
+            checker: Arc::default(),
         }
+    }
+
+    /// Checks the run's pending submissions on a thread of its own. Call it
+    /// after a submission, and once when the server starts, so a submission
+    /// left unchecked by a server that stopped is checked. Must be called
+    /// within a Tokio runtime.
+    pub fn check_in_background(&self) {
+        self.checker.dirty.store(true, Ordering::SeqCst);
+        let store = Arc::clone(&self.store);
+        let run = self.run.clone();
+        let checker = Arc::clone(&self.checker);
+        tokio::task::spawn_blocking(move || loop {
+            // If another thread is checking, it sees `dirty` before it stops.
+            let Ok(_running) = checker.running.try_lock() else {
+                return;
+            };
+            if !checker.dirty.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            if let Err(e) = check_pending(&store, &run) {
+                // Standard error may be closed.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "dc-mcp: the submissions of run {run} could not be checked: {e}"
+                );
+            }
+        });
     }
 
     /// Runs `work` on a thread that may block, and waits for it.
@@ -489,11 +552,22 @@ impl ProposerServer {
         let store = Arc::clone(&self.store);
         let run = self.run.clone();
         let clock = Arc::clone(&self.clock);
-        tokio::task::spawn_blocking(move || work(&store, &run, clock.now_ms()))
+        let done = tokio::task::spawn_blocking(move || work(&store, &run, clock.now_ms()))
             .await
-            .map_err(|e| format!("the tool call did not finish: {e}"))?
-            .map(Json)
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("the tool call did not finish: {e}"))?;
+        match done {
+            Ok(value) => Ok(Json(value)),
+            // The details are for the operator, not the proposer.
+            Err(Refused::State(why)) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "dc-mcp: run {} cannot take work: {why}",
+                    self.run
+                );
+                Err("the run cannot take work now; tell the operator".to_owned())
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 
@@ -524,9 +598,20 @@ impl ProposerServer {
         &self,
         Parameters(arg): Parameters<SubmitArgs>,
     ) -> Result<Json<Receipt>, String> {
-        self.blocking(move |store, run, now| {
-            submit(store, run, arg.batch, arg.programs, arg.model, now)
-        })
-        .await
+        let receipt = self
+            .blocking(move |store, run, now| {
+                submit(
+                    store,
+                    run,
+                    arg.batch,
+                    &arg.worker,
+                    arg.programs,
+                    arg.model,
+                    now,
+                )
+            })
+            .await?;
+        self.check_in_background();
+        Ok(receipt)
     }
 }

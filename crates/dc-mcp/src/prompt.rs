@@ -7,8 +7,10 @@
 //! of the run. The types are taken from the code, not written by hand, so
 //! they cannot drift from what the type checker accepts.
 //!
-//! The payload does not show the task's name, any cost, any frontier size, or
-//! anything about earlier submissions.
+//! The payload does not show the task's name, any cost, or any frontier
+//! size, and it says nothing about the proposer's own submissions. The
+//! programs that solve other tasks are frontier members, so they come from
+//! earlier submissions that passed: that is how LILO shows solved tasks.
 
 use dc_core::{prim::Prim, sexpr, types::prim_scheme, Arena, LibId};
 use dc_surface::pretty;
@@ -151,7 +153,7 @@ fn library(state: &RunState, verifier: &Verifier) -> String {
         out.push_str(&format!("{name} : {scheme}\n"));
         match surface(verifier, &entry.term) {
             Some(body) => out.push_str(&format!("let {name} = {body}\n\n")),
-            None => out.push('\n'),
+            None => out.push_str("(its definition is too large to show)\n\n"),
         }
     }
     out

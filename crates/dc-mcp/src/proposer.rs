@@ -3,21 +3,24 @@
 //!
 //! [`next_batch`] picks the task with the most open slots (see
 //! [`RunState::next_task`]), builds its payload, and commits a
-//! [`BatchIssued`] event that holds the payload as it is sent. [`submit`]
-//! keeps every submission for a batch the run has issued, as a [`Submitted`]
-//! event with the programs as they were sent. It checks the programs (see
-//! [`crate::verify`]) only when the submission is the batch's first and its
-//! iteration is still the current one.
+//! [`BatchIssued`] event that holds the payload as it is sent.
 //!
-//! Checking runs the programs, which can take seconds, so it runs without the
-//! run's lock, on a copy of the state. The commit then works the standing out
-//! again. If another server ended the iteration or took in a submission for
-//! the batch in the meantime, the submission is kept as late or as a repeat,
-//! with no checks. If the library changed, the programs are checked again.
+//! [`submit`] commits every submission for a batch the run has issued, as a
+//! [`Submitted`] event with the programs as they were sent, as soon as it
+//! arrives. So the first submission for a batch is the first to arrive. The
+//! submission's programs count towards the quota at once.
 //!
-//! **The blind arm.** The reply to a submission is the same for every
-//! submission, whatever its programs did: the batch and how many programs came
-//! in.
+//! [`check_pending`] then checks the programs of each submission that is
+//! the first for its batch from the batch's worker and in the batch's
+//! iteration (see [`crate::verify`]), and commits a [`Checked`] event with the
+//! results. An iteration cannot end while a check is pending.
+//!
+//! **The blind arm.** The reply to a submission is the batch and how many
+//! programs came in, whatever the programs are. It comes before the programs
+//! are checked, so its timing does not depend on them. Checks run in the
+//! background on the same machine, so a long check can slow the replies to
+//! later calls; that is the one path from what programs do to how fast a
+//! reply comes.
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,7 +29,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 use crate::prompt::{payload, Payload};
-use crate::state::{BatchIssued, Check, Event, RunId, RunState, Standing, Submitted};
+use crate::state::{BatchIssued, Check, Checked, Event, LibraryEntry, RunId, RunState, Submitted};
 use crate::store::{Store, StoreError};
 use crate::verify::{task, Verifier};
 
@@ -36,9 +39,6 @@ pub const MAX_NAME_LEN: usize = 200;
 pub const MAX_PROGRAM_LEN: usize = 64 * 1024;
 /// The most programs one submission may hold.
 pub const MAX_PROGRAMS: usize = 32;
-/// How many times a submission is checked again when the library changes
-/// while it is being checked.
-const MAX_TRIES: usize = 3;
 
 /// The time, for leases.
 pub trait Clock: Send + Sync + fmt::Debug {
@@ -191,31 +191,79 @@ pub struct Receipt {
     pub received: usize,
 }
 
-/// What a submission's checks were made under.
-#[derive(Clone, Debug)]
-struct Snapshot {
-    standing: Standing,
-    task: String,
-    wanted: usize,
-    library_len: usize,
+/// Takes in `programs` for `batch` of `run` from `worker`, received at
+/// `now_ms`, with the model the proposer named, if any. The submission is
+/// committed as it arrives; its programs are checked later, by
+/// [`check_pending`]. So the reply does not wait for the checks, and does not
+/// take longer for one program than for another.
+pub fn submit(
+    store: &Store,
+    run: &RunId,
+    batch: u64,
+    worker: &str,
+    programs: Vec<String>,
+    model: Option<String>,
+    now_ms: u64,
+) -> Result<Receipt, Refused> {
+    check_name("worker id", worker)?;
+    if let Some(model) = &model {
+        check_name("model name", model)?;
+    }
+    if programs.len() > MAX_PROGRAMS {
+        return Err(Refused::Request(format!(
+            "a submission holds at most {MAX_PROGRAMS} programs"
+        )));
+    }
+    if programs.iter().any(|p| p.len() > MAX_PROGRAM_LEN) {
+        return Err(Refused::Request(format!(
+            "a program has at most {MAX_PROGRAM_LEN} bytes"
+        )));
+    }
+    let receipt = Receipt {
+        batch,
+        received: programs.len(),
+    };
+    store.commit(run, |state| {
+        let standing = state
+            .standing(batch, worker, now_ms)
+            .ok_or_else(|| Refused::Request(format!("batch {batch} was not issued in this run")))?;
+        let event = Event::Submitted(Submitted {
+            batch,
+            worker: worker.to_owned(),
+            iteration: state.iteration(),
+            received_ms: now_ms,
+            model,
+            programs,
+            standing,
+        });
+        Ok((receipt, vec![event]))
+    })
 }
 
-fn snapshot(state: &RunState, batch: u64, now_ms: u64) -> Result<Snapshot, Refused> {
-    let standing = state
-        .standing(batch, now_ms)
-        .ok_or_else(|| Refused::Request(format!("the run has issued no batch {batch}")))?;
+/// A submission that waits to be checked, and the library to check it with.
+struct Pending {
+    batch: u64,
+    task: String,
+    wanted: usize,
+    programs: Vec<String>,
+    library: Vec<LibraryEntry>,
+}
+
+fn first_pending(state: &RunState) -> Option<Pending> {
+    let batch = *state.pending_checks().first()?;
     let b = &state.batches()[batch as usize];
-    Ok(Snapshot {
-        standing,
+    Some(Pending {
+        batch,
         task: b.task.clone(),
         wanted: b.wanted as usize,
-        library_len: state.library().len(),
+        programs: b.awaiting_check.clone().unwrap_or_default(),
+        library: state.library().to_vec(),
     })
 }
 
 /// Checks `programs` for a batch of `task` that asked for `wanted`.
 fn checks(
-    library: &[crate::state::LibraryEntry],
+    library: &[LibraryEntry],
     task_name: &str,
     wanted: usize,
     programs: &[String],
@@ -236,70 +284,35 @@ fn checks(
         .collect())
 }
 
-/// Takes in `programs` for `batch` of `run`, received at `now_ms`, with the
-/// model the proposer named, if any.
-pub fn submit(
-    store: &Store,
-    run: &RunId,
-    batch: u64,
-    programs: Vec<String>,
-    model: Option<String>,
-    now_ms: u64,
-) -> Result<Receipt, Refused> {
-    if let Some(model) = &model {
-        check_name("model name", model)?;
-    }
-    if programs.len() > MAX_PROGRAMS {
-        return Err(Refused::Request(format!(
-            "a submission holds at most {MAX_PROGRAMS} programs"
-        )));
-    }
-    if programs.iter().any(|p| p.len() > MAX_PROGRAM_LEN) {
-        return Err(Refused::Request(format!(
-            "a program has at most {MAX_PROGRAM_LEN} bytes"
-        )));
-    }
-    let receipt = Receipt {
-        batch,
-        received: programs.len(),
-    };
-    for _ in 0..MAX_TRIES {
-        let (before, library) = store.read(run, |state| {
-            snapshot(state, batch, now_ms).map(|s| (s, state.library().to_vec()))
-        })??;
-        let checked = if before.standing.evaluated() {
-            Some(checks(&library, &before.task, before.wanted, &programs)?)
-        } else {
-            None
-        };
-        let committed: bool = store.commit(run, |state| -> Result<_, Refused> {
-            let now = snapshot(state, batch, now_ms)?;
-            let checks = if !now.standing.evaluated() {
-                Vec::new()
-            } else if now.standing == before.standing && now.library_len == before.library_len {
-                checked.clone().unwrap_or_default()
+/// Checks every submission of `run` that waits to be checked, oldest first,
+/// and commits a [`Checked`] event for each. Returns how many it checked.
+///
+/// Checking runs the programs, so it runs without the run's lock, on a copy.
+/// If the library changed in the meantime, the commit is refused and the
+/// submission is checked again. If another server checked it first, nothing
+/// is written. An error leaves the rest waiting: a library that does not load
+/// stops every check until it is put right.
+pub fn check_pending(store: &Store, run: &RunId) -> Result<usize, Refused> {
+    let mut done = 0;
+    while let Some(p) = store.read(run, first_pending)? {
+        let checks = checks(&p.library, &p.task, p.wanted, &p.programs)?;
+        let event = Event::Checked(Checked {
+            batch: p.batch,
+            library_len: p.library.len() as u64,
+            checks,
+        });
+        let wrote: bool = store.commit(run, |state| -> Result<_, Refused> {
+            let still = state.pending_checks().contains(&p.batch)
+                && state.library().len() == p.library.len();
+            Ok(if still {
+                (true, vec![event])
             } else {
-                // Checked under another library or standing: try again.
-                return Ok((false, Vec::new()));
-            };
-            let event = Event::Submitted(Submitted {
-                batch,
-                iteration: state.iteration(),
-                received_ms: now_ms,
-                model: model.clone(),
-                programs: programs.clone(),
-                standing: now.standing,
-                checks,
-            });
-            Ok((true, vec![event]))
+                (false, Vec::new())
+            })
         })?;
-        if committed {
-            return Ok(receipt);
-        }
+        done += usize::from(wrote);
     }
-    Err(Refused::Request(
-        "the run's library kept changing while the programs were checked; submit again".to_owned(),
-    ))
+    Ok(done)
 }
 
 #[cfg(test)]
@@ -307,7 +320,7 @@ mod tests {
     use std::ops::ControlFlow;
 
     use super::*;
-    use crate::state::{Arm, RunConfig};
+    use crate::state::{Arm, RunConfig, Standing};
     use tempfile::TempDir;
 
     const MERGE: &str = "collapse/merge";
@@ -377,6 +390,16 @@ mod tests {
             .collect()
     }
 
+    fn checked(store: &Store, run: &RunId) -> Vec<Checked> {
+        events(store, run)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Checked(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn a_batch_is_kept_with_its_payload_as_sent() {
         let (_dir, store, run) = setup(1, 1);
@@ -411,12 +434,12 @@ mod tests {
     }
 
     #[test]
-    fn the_reply_to_a_submission_says_nothing_about_its_programs() {
+    fn a_submission_is_kept_on_arrival_and_checked_afterwards() {
         let (_dir, store, run) = setup(1, 1);
         next_batch(&store, &run, "a", 0).unwrap();
         next_batch(&store, &run, "b", 0).unwrap();
-        let good = submit(&store, &run, 0, vec![solves_merge()], None, 10).unwrap();
-        let bad = submit(&store, &run, 1, vec!["let solve = (".into()], None, 10).unwrap();
+        let good = submit(&store, &run, 0, "a", vec![solves_merge()], None, 10).unwrap();
+        let bad = submit(&store, &run, 1, "b", vec!["let solve = (".into()], None, 10).unwrap();
         assert_eq!(
             good,
             Receipt {
@@ -431,8 +454,20 @@ mod tests {
                 received: 1
             }
         );
-        // The server knows: the good program is verified, the bad one is not.
+        // Nothing is checked yet, and the iteration is not done.
         let state = store.state(&run).unwrap();
+        assert_eq!(state.pending_checks(), [0, 1]);
+        assert_eq!(state.task_counts(0, MERGE).received, 1);
+        assert_eq!(state.task_counts(0, MERGE).programs, 0);
+        assert!(!state.quota_in());
+        assert!(checked(&store, &run).is_empty());
+        let w = next_batch(&store, &run, "c", 20).unwrap().wait.unwrap();
+        assert!(w.reason.contains("held"), "{}", w.reason);
+
+        assert_eq!(check_pending(&store, &run).unwrap(), 2);
+        assert_eq!(check_pending(&store, &run).unwrap(), 0);
+        let state = store.state(&run).unwrap();
+        assert!(state.pending_checks().is_empty());
         assert_eq!(state.task_counts(0, MERGE).passed, 1);
         assert_eq!(state.task_counts(0, CANCEL).compiled, 0);
         assert_eq!(state.verified().len(), 1);
@@ -452,42 +487,54 @@ mod tests {
             solves_merge(),
             "-- an extra one\nlet solve xs = []".to_owned(),
         ];
+        // Another worker's submission for batch 0 is kept but does not take
+        // the batch.
+        submit(&store, &run, 0, "b", vec!["not mine".into()], None, 9).unwrap();
         submit(
             &store,
             &run,
             0,
+            "a",
             programs.clone(),
             Some("model-x".into()),
             10,
         )
         .unwrap();
-        // A second submission for the batch is a repeat.
-        submit(&store, &run, 0, vec!["again".into()], None, 11).unwrap();
+        // The first submission to arrive takes the batch; a second is a
+        // repeat, whether or not the first has been checked.
+        submit(&store, &run, 0, "a", vec!["again".into()], None, 11).unwrap();
+        check_pending(&store, &run).unwrap();
         // After the iteration ends, batch 1's submission is late.
         store
             .append(&run, vec![Event::IterationFinished { iteration: 0 }])
             .unwrap();
-        submit(&store, &run, 1, vec!["late".into()], None, 12).unwrap();
+        submit(&store, &run, 1, "b", vec!["late".into()], None, 12).unwrap();
 
         let subs = submissions(&store, &run);
-        assert_eq!(subs.len(), 3);
-        assert_eq!(subs[0].programs, programs);
-        assert_eq!(subs[0].model.as_deref(), Some("model-x"));
-        assert_eq!(subs[0].standing, Standing::OnTime);
-        assert!(matches!(subs[0].checks[0], Check::Run { .. }));
-        assert!(matches!(subs[0].checks[1], Check::Passed { .. }));
-        assert_eq!(subs[0].checks[2], Check::Extra);
+        assert_eq!(subs.len(), 4);
         assert_eq!(
-            (subs[1].standing, subs[1].checks.len()),
-            (Standing::Repeat, 0)
+            (subs[0].standing, subs[0].worker.as_str()),
+            (Standing::Foreign, "b")
         );
-        assert_eq!(subs[1].programs, ["again"]);
-        assert_eq!((subs[2].standing, subs[2].iteration), (Standing::Late, 1));
-        assert!(subs[2].checks.is_empty());
+        assert_eq!(subs[1].programs, programs);
+        assert_eq!(subs[1].model.as_deref(), Some("model-x"));
+        assert_eq!(subs[1].standing, Standing::OnTime);
+        assert_eq!(subs[2].standing, Standing::Repeat);
+        assert_eq!(subs[2].programs, ["again"]);
+        assert_eq!((subs[3].standing, subs[3].iteration), (Standing::Late, 1));
+
+        let checks = checked(&store, &run);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].batch, 0);
+        assert!(matches!(checks[0].checks[0], Check::Run { .. }));
+        assert!(matches!(checks[0].checks[1], Check::Passed { .. }));
+        assert_eq!(checks[0].checks[2], Check::Extra);
 
         let state = store.state(&run).unwrap();
         let merge = state.task_counts(0, MERGE);
         assert_eq!((merge.programs, merge.passed), (2, 1));
+        let ic = state.iteration_counts(0);
+        assert_eq!((ic.submissions, ic.repeats, ic.foreign), (3, 1, 1));
         assert_eq!(state.iteration_counts(1).late, 1);
         assert_eq!(state.task_counts(1, CANCEL).programs, 0);
     }
@@ -496,9 +543,69 @@ mod tests {
     fn a_submission_after_its_lease_is_still_checked_and_counted() {
         let (_dir, store, run) = setup(1, 1);
         next_batch(&store, &run, "a", 0).unwrap();
-        submit(&store, &run, 0, vec![solves_merge()], None, 5000).unwrap();
+        submit(&store, &run, 0, "a", vec![solves_merge()], None, 5000).unwrap();
+        check_pending(&store, &run).unwrap();
         assert_eq!(submissions(&store, &run)[0].standing, Standing::Expired);
         assert_eq!(store.state(&run).unwrap().task_counts(0, MERGE).passed, 1);
+    }
+
+    #[test]
+    fn checks_use_the_library_as_it_is_when_they_run() {
+        let (_dir, store, run) = setup(1, 1);
+        next_batch(&store, &run, "a", 0).unwrap();
+        submit(
+            &store,
+            &run,
+            0,
+            "a",
+            vec!["let solve xs = fn_0 xs".into()],
+            None,
+            1,
+        )
+        .unwrap();
+        store
+            .append(
+                &run,
+                vec![Event::LibraryExtended {
+                    entries: vec![LibraryEntry {
+                        arity: 1,
+                        term: "(lam $0)".into(),
+                    }],
+                }],
+            )
+            .unwrap();
+        check_pending(&store, &run).unwrap();
+        let c = &checked(&store, &run)[0];
+        assert_eq!(c.library_len, 1);
+        assert!(
+            !matches!(c.checks[0], Check::Compile { .. }),
+            "{:?}",
+            c.checks
+        );
+    }
+
+    #[test]
+    fn a_library_that_does_not_load_leaves_the_submissions_kept_and_waiting() {
+        let (_dir, store, run) = setup(1, 1);
+        next_batch(&store, &run, "a", 0).unwrap();
+        store
+            .append(
+                &run,
+                vec![Event::LibraryExtended {
+                    entries: vec![LibraryEntry {
+                        arity: 1,
+                        term: "(lam (add $0 true))".into(),
+                    }],
+                }],
+            )
+            .unwrap();
+        submit(&store, &run, 0, "a", vec![solves_merge()], None, 1).unwrap();
+        assert!(matches!(
+            check_pending(&store, &run),
+            Err(Refused::State(_))
+        ));
+        assert_eq!(submissions(&store, &run).len(), 1);
+        assert_eq!(store.state(&run).unwrap().pending_checks(), [0]);
     }
 
     #[test]
@@ -508,25 +615,28 @@ mod tests {
         let before = events(&store, &run);
         let long = "x".repeat(MAX_PROGRAM_LEN + 1);
         let cases: Vec<Result<Receipt, Refused>> = vec![
-            submit(&store, &run, 9, vec![], None, 1),
-            submit(&store, &run, 0, vec![long], None, 1),
+            submit(&store, &run, 9, "a", vec![], None, 1),
+            submit(&store, &run, 0, "a", vec![long], None, 1),
             submit(
                 &store,
                 &run,
                 0,
+                "a",
                 vec![String::new(); MAX_PROGRAMS + 1],
                 None,
                 1,
             ),
-            submit(&store, &run, 0, vec![], Some(String::new()), 1),
+            submit(&store, &run, 0, "a", vec![], Some(String::new()), 1),
             submit(
                 &store,
                 &run,
                 0,
+                "a",
                 vec![],
                 Some("m".repeat(MAX_NAME_LEN + 1)),
                 1,
             ),
+            submit(&store, &run, 0, "", vec![], None, 1),
         ];
         for case in cases {
             assert!(matches!(case, Err(Refused::Request(_))), "{case:?}");

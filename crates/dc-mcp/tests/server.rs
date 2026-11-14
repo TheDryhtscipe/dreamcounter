@@ -648,25 +648,40 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
     let good = proposer
         .call(
             "dc_submit",
-            json!({ "batch": 0, "programs": [solves_merge()], "model": "test-model" }),
+            json!({
+                "worker": "agent-1", "batch": 0,
+                "programs": [solves_merge()], "model": "test-model"
+            }),
         )
         .unwrap();
     let bad = proposer
         .call(
             "dc_submit",
-            json!({ "batch": 1, "programs": ["let solve = ("] }),
+            json!({ "worker": "agent-2", "batch": 1, "programs": ["let solve = ("] }),
         )
         .unwrap();
     assert_eq!(good, json!({ "batch": 0, "received": 1 }));
     assert_eq!(bad, json!({ "batch": 1, "received": 1 }));
-    let unknown = proposer.call("dc_submit", json!({ "batch": 9, "programs": [] }));
-    assert!(unknown.unwrap_err().contains("no batch 9"));
+    let unknown = proposer.call(
+        "dc_submit",
+        json!({ "worker": "agent-1", "batch": 9, "programs": [] }),
+    );
+    assert!(unknown.unwrap_err().contains("batch 9 was not issued"));
 
-    // The operator sees what came in.
-    let stats = operator
-        .call("dc_proposal_stats", json!({ "run": "r1" }))
-        .unwrap();
+    // The operator sees what came in, once the server has checked it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let stats = loop {
+        let stats = operator
+            .call("dc_proposal_stats", json!({ "run": "r1" }))
+            .unwrap();
+        if stats["iterations"][0]["pending_checks"] == 0 {
+            break stats;
+        }
+        assert!(std::time::Instant::now() < deadline, "{stats}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
     let it = &stats["iterations"][0];
+    assert_eq!(it["tasks"][0]["received"], 1);
     assert_eq!(it["quota_in"], true);
     assert_eq!(it["tasks_solved"], 1);
     assert_eq!(it["submissions"], 2);

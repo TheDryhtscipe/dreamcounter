@@ -67,6 +67,11 @@ pub struct Verifier {
     expander: Expander,
     schemes: Vec<Scheme>,
     harness: HarnessConfig,
+    /// The library, to build the verifier again after a panic.
+    library: Vec<LibraryEntry>,
+    /// A check panicked. The expander's tables may be half changed, so the
+    /// next check builds the verifier again first.
+    poisoned: bool,
 }
 
 impl Verifier {
@@ -117,6 +122,8 @@ impl Verifier {
             expander,
             schemes,
             harness: HarnessConfig::default(),
+            library: library.to_vec(),
+            poisoned: false,
         })
     }
 
@@ -133,19 +140,29 @@ impl Verifier {
     /// Checks `text` against `family`. A panic in the checks is reported as a
     /// failure of the run stage, so the submission is still kept.
     pub fn check(&mut self, family: &dyn TaskFamily, text: &str) -> Check {
+        if self.poisoned {
+            match Verifier::new(&self.library) {
+                Ok(fresh) => *self = fresh,
+                Err(e) => {
+                    return Check::Run {
+                        error: format!("the server could not check the program: {e}"),
+                    }
+                }
+            }
+        }
         let checked = panic::catch_unwind(AssertUnwindSafe(|| self.check_stages(family, text)));
+        let poisoned = checked.is_err();
         let check = checked.unwrap_or_else(|payload| {
             let why = payload
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_owned())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_default();
-            // The arena may hold half-built terms; it is only ever added to,
-            // so the terms of other programs are not affected.
             Check::Run {
                 error: format!("the server failed while checking the program: {why}"),
             }
         });
+        self.poisoned = poisoned;
         cut(check)
     }
 
@@ -160,10 +177,12 @@ impl Verifier {
                 error: e.to_string(),
             };
         }
+        // The program compiled and typed, so a failure from here on is a
+        // failure of the run stage.
         let stored = match sexpr::print(&self.arena, program) {
             Ok(stored) => stored,
             Err(e) => {
-                return Check::Compile {
+                return Check::Run {
                     error: format!("the program is too large to keep: {e}"),
                 }
             }
@@ -172,8 +191,8 @@ impl Verifier {
         let expanded = match self.expander.expand(&mut self.arena, expanded) {
             Ok(expanded) => expanded,
             Err(e) => {
-                return Check::Compile {
-                    error: e.to_string(),
+                return Check::Run {
+                    error: format!("the program does not expand: {e}"),
                 }
             }
         };

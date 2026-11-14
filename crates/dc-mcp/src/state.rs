@@ -165,22 +165,28 @@ pub struct BatchIssued {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Standing {
-    /// The first submission for the batch, in its iteration, before its lease
-    /// ended. Its programs are evaluated and counted.
+    /// The first submission for the batch to arrive from its worker, in its
+    /// iteration, before its lease ended. Its programs are checked, by a
+    /// [`Checked`] event, and counted.
     OnTime,
-    /// As `OnTime`, after the lease ended. Its programs are evaluated and
+    /// As `OnTime`, after the lease ended. Its programs are checked and
     /// counted too: they are real samples, even if the batch's slots were
     /// handed out again.
     Expired,
-    /// The first submission for the batch, after the batch's iteration ended.
-    /// It is kept but not evaluated: it was written for another library.
+    /// The first submission for the batch to arrive from its worker, after
+    /// the batch's iteration ended. It is kept but not checked: it was written
+    /// for another library.
     Late,
-    /// Not the first submission for the batch. It is kept but not evaluated.
+    /// A later submission for the batch from its worker. It is kept but not
+    /// checked.
     Repeat,
+    /// A submission from a worker the batch was not issued to. It is kept but
+    /// not checked, and the batch stays open for its own worker.
+    Foreign,
 }
 
 impl Standing {
-    /// Whether the submission's programs are evaluated and counted.
+    /// Whether the submission's programs are checked and counted.
     pub fn evaluated(self) -> bool {
         matches!(self, Standing::OnTime | Standing::Expired)
     }
@@ -217,12 +223,16 @@ pub enum Check {
     Extra,
 }
 
-/// What a proposer submitted for a batch, and what the server found.
+/// What a proposer submitted for a batch, as it was sent. It is committed
+/// when it arrives, before its programs are checked, so the order of
+/// submissions in the journal is the order they arrived in.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Submitted {
     /// The batch.
     pub batch: u64,
+    /// The id the submitting proposer gave for itself.
+    pub worker: String,
     /// The run's iteration when the submission came in.
     pub iteration: u64,
     /// When it came in, in milliseconds since the Unix epoch.
@@ -233,8 +243,19 @@ pub struct Submitted {
     pub programs: Vec<String>,
     /// How the submission stands to its batch.
     pub standing: Standing,
-    /// One check for each program when the standing is evaluated, and none
-    /// otherwise.
+}
+
+/// What the server found when it checked the programs of a batch's
+/// submission (one whose standing is [`Standing::evaluated`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Checked {
+    /// The batch.
+    pub batch: u64,
+    /// How many library entries the programs were checked with. It must be
+    /// the library's size when the event is applied.
+    pub library_len: u64,
+    /// One check for each program of the submission.
     pub checks: Vec<Check>,
 }
 
@@ -255,6 +276,8 @@ pub enum Event {
     BatchIssued(BatchIssued),
     /// A proposer submits programs for a batch.
     Submitted(Submitted),
+    /// The server has checked a submission's programs.
+    Checked(Checked),
     /// A task gets a new frontier, which replaces the one it had.
     FrontierSet {
         /// The task.
@@ -312,8 +335,23 @@ pub enum Rejected {
     BadBatch,
     /// The run has issued no batch of this number.
     UnknownBatch(u64),
-    /// A `Submitted` event's standing or checks do not fit its batch.
+    /// A `Submitted` event's standing, or a `Checked` event's checks, do not
+    /// fit the batch.
     BadSubmission(u64),
+    /// A `Checked` event names a batch with no submission waiting to be
+    /// checked.
+    NotAwaitingCheck(u64),
+    /// A `Checked` event was made with a library of another size.
+    StaleLibrary {
+        /// The batch.
+        batch: u64,
+        /// The library's size.
+        library: u64,
+        /// The size the checks were made with.
+        checked_with: u64,
+    },
+    /// The iteration cannot end while a submission of it waits to be checked.
+    ChecksPending(u64),
 }
 
 impl fmt::Display for Rejected {
@@ -344,6 +382,22 @@ impl fmt::Display for Rejected {
                 f,
                 "the submission's standing or checks do not fit batch {b}"
             ),
+            Rejected::NotAwaitingCheck(b) => {
+                write!(f, "batch {b} has no submission waiting to be checked")
+            }
+            Rejected::StaleLibrary {
+                batch,
+                library,
+                checked_with,
+            } => write!(
+                f,
+                "batch {batch} was checked with {checked_with} library entries, \
+                 but the library has {library}"
+            ),
+            Rejected::ChecksPending(b) => write!(
+                f,
+                "the iteration cannot end: batch {b}'s submission waits to be checked"
+            ),
         }
     }
 }
@@ -363,8 +417,10 @@ pub struct Batch {
     pub worker: String,
     /// When its lease ends, in milliseconds since the Unix epoch.
     pub deadline_ms: u64,
-    /// Whether a submission for it has come in.
+    /// Whether a submission for it has come in from its worker.
     pub submitted: bool,
+    /// The programs of its submission, while they wait to be checked.
+    pub awaiting_check: Option<Vec<String>>,
 }
 
 /// What came in for one task in one iteration. Only evaluated submissions
@@ -373,7 +429,10 @@ pub struct Batch {
 pub struct TaskCounts {
     /// Batches issued for the task.
     pub batches: u64,
-    /// Programs evaluated: those a batch asked for, not the extra ones.
+    /// Programs received in submissions that are checked, up to the number
+    /// each batch asked for. They count towards the quota when they arrive.
+    pub received: u64,
+    /// Programs checked: those a batch asked for, not the extra ones.
     pub programs: u64,
     /// Programs that compiled.
     pub compiled: u64,
@@ -396,6 +455,8 @@ pub struct IterationCounts {
     pub late: u64,
     /// Submissions for a batch that already had one.
     pub repeats: u64,
+    /// Submissions from a worker the batch was not issued to.
+    pub foreign: u64,
 }
 
 /// A program of the current iteration that passed its task's examples.
@@ -487,6 +548,7 @@ impl RunState {
             }
             Event::BatchIssued(issued) => self.issue(issued)?,
             Event::Submitted(submitted) => self.submit(submitted)?,
+            Event::Checked(checked) => self.check(checked)?,
             Event::FrontierSet { task, members } => {
                 self.check_task(task)?;
                 self.frontiers.insert(task.clone(), members.clone());
@@ -499,6 +561,9 @@ impl RunState {
             }
             Event::IterationFinished { iteration } => {
                 self.check_iteration(*iteration)?;
+                if let Some(b) = self.pending_checks().first() {
+                    return Err(Rejected::ChecksPending(*b));
+                }
                 self.iteration = self
                     .iteration
                     .checked_add(1)
@@ -529,6 +594,7 @@ impl RunState {
             worker: issued.worker.clone(),
             deadline_ms: issued.deadline_ms,
             submitted: false,
+            awaiting_check: None,
         });
         self.task_counts
             .entry((issued.iteration, issued.task.clone()))
@@ -541,11 +607,13 @@ impl RunState {
         Ok(())
     }
 
-    /// The standing a submission for `batch` has if it comes in at
-    /// `received_ms`, or `None` if the run has no such batch.
-    pub fn standing(&self, batch: u64, received_ms: u64) -> Option<Standing> {
+    /// The standing a submission for `batch` from `worker` has if it comes in
+    /// at `received_ms`, or `None` if the run has no such batch.
+    pub fn standing(&self, batch: u64, worker: &str, received_ms: u64) -> Option<Standing> {
         let b = self.batches.get(usize::try_from(batch).ok()?)?;
-        Some(if b.submitted {
+        Some(if b.worker != worker {
+            Standing::Foreign
+        } else if b.submitted {
             Standing::Repeat
         } else if b.iteration != self.iteration {
             Standing::Late
@@ -559,33 +627,24 @@ impl RunState {
     fn submit(&mut self, s: &Submitted) -> Result<(), Rejected> {
         self.check_iteration(s.iteration)?;
         let standing = self
-            .standing(s.batch, s.received_ms)
+            .standing(s.batch, &s.worker, s.received_ms)
             .ok_or(Rejected::UnknownBatch(s.batch))?;
-        let bad = Rejected::BadSubmission(s.batch);
         if standing != s.standing {
-            return Err(bad);
+            return Err(Rejected::BadSubmission(s.batch));
         }
-        let index = s.batch as usize;
-        let wanted = self.batches[index].wanted as usize;
+        let batch = &mut self.batches[s.batch as usize];
+        if standing != Standing::Foreign {
+            batch.submitted = true;
+        }
+        let (iteration, task, wanted) = (batch.iteration, batch.task.clone(), batch.wanted);
         if standing.evaluated() {
-            if s.checks.len() != s.programs.len() {
-                return Err(bad);
-            }
-            let extra_fits = s
-                .checks
-                .iter()
-                .enumerate()
-                .all(|(i, c)| matches!(c, Check::Extra) == (i >= wanted));
-            if !extra_fits {
-                return Err(bad);
-            }
-        } else if !s.checks.is_empty() {
-            return Err(bad);
+            batch.awaiting_check = Some(s.programs.clone());
+            let received = (s.programs.len() as u64).min(u64::from(wanted));
+            self.task_counts
+                .entry((iteration, task))
+                .or_default()
+                .received += received;
         }
-
-        let batch = &mut self.batches[index];
-        batch.submitted = true;
-        let task = batch.task.clone();
         let counts = self.iteration_counts.entry(s.iteration).or_default();
         counts.submissions += 1;
         let bytes: u64 = s.programs.iter().map(|p| p.len() as u64).sum();
@@ -593,16 +652,45 @@ impl RunState {
         match standing {
             Standing::Late => counts.late += 1,
             Standing::Repeat => counts.repeats += 1,
+            Standing::Foreign => counts.foreign += 1,
             Standing::OnTime | Standing::Expired => {}
         }
-        if !standing.evaluated() {
-            return Ok(());
+        Ok(())
+    }
+
+    fn check(&mut self, c: &Checked) -> Result<(), Rejected> {
+        let index = usize::try_from(c.batch)
+            .ok()
+            .filter(|&i| i < self.batches.len())
+            .ok_or(Rejected::UnknownBatch(c.batch))?;
+        let library = self.library.len() as u64;
+        let batch = &self.batches[index];
+        let Some(programs) = &batch.awaiting_check else {
+            return Err(Rejected::NotAwaitingCheck(c.batch));
+        };
+        if c.library_len != library {
+            return Err(Rejected::StaleLibrary {
+                batch: c.batch,
+                library,
+                checked_with: c.library_len,
+            });
         }
+        let wanted = batch.wanted as usize;
+        let fits = c.checks.len() == programs.len()
+            && c.checks
+                .iter()
+                .enumerate()
+                .all(|(i, check)| matches!(check, Check::Extra) == (i >= wanted));
+        if !fits {
+            return Err(Rejected::BadSubmission(c.batch));
+        }
+        let (iteration, task) = (batch.iteration, batch.task.clone());
+        self.batches[index].awaiting_check = None;
         let tc = self
             .task_counts
-            .entry((s.iteration, task.clone()))
+            .entry((iteration, task.clone()))
             .or_default();
-        for check in &s.checks {
+        for check in &c.checks {
             let (compiled, typed, passed) = match check {
                 Check::Extra => continue,
                 Check::Compile { .. } => (false, false, false),
@@ -615,7 +703,9 @@ impl RunState {
             tc.typed += u64::from(typed);
             tc.passed += u64::from(passed);
         }
-        for check in &s.checks {
+        // An iteration cannot end with a check pending, so the batch is of
+        // the current iteration.
+        for check in &c.checks {
             if let Check::Passed { program } = check {
                 self.verified.push(Verified {
                     task: task.clone(),
@@ -624,6 +714,16 @@ impl RunState {
             }
         }
         Ok(())
+    }
+
+    /// The batches whose submission waits to be checked, in order.
+    pub fn pending_checks(&self) -> Vec<u64> {
+        self.batches
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.awaiting_check.is_some())
+            .map(|(i, _)| i as u64)
+            .collect()
     }
 
     fn check_iteration(&self, given: u64) -> Result<(), Rejected> {
@@ -706,7 +806,7 @@ impl RunState {
     /// programs received and the live leases at `now_ms`. A lease is live until
     /// its batch is submitted or its deadline has passed.
     pub fn open_slots(&self, task: &str, now_ms: u64) -> u64 {
-        let received = self.task_counts(self.iteration, task).programs;
+        let received = self.task_counts(self.iteration, task).received;
         let leased: u64 = self
             .batches
             .iter()
@@ -722,12 +822,14 @@ impl RunState {
     }
 
     /// Whether every task has received its programs for the current
-    /// iteration.
+    /// iteration and every one of them has been checked.
     pub fn quota_in(&self) -> bool {
         let quota = u64::from(self.config.proposals_per_task);
-        self.tasks
-            .iter()
-            .all(|t| self.task_counts(self.iteration, t).programs >= quota)
+        self.pending_checks().is_empty()
+            && self
+                .tasks
+                .iter()
+                .all(|t| self.task_counts(self.iteration, t).received >= quota)
     }
 
     /// The task the next batch should be for at `now_ms`, and how many
@@ -944,28 +1046,33 @@ mod tests {
         })
     }
 
-    fn submitted(
+    fn sub(
         batch: u64,
+        worker: &str,
         iteration: u64,
         received_ms: u64,
         standing: Standing,
-        checks: Vec<Check>,
+        programs: usize,
     ) -> Event {
-        let programs = if standing.evaluated() {
-            checks
-                .iter()
-                .map(|_| "let solve x = x".to_owned())
-                .collect()
-        } else {
-            vec!["let solve x = x".to_owned()]
-        };
         Event::Submitted(Submitted {
             batch,
+            worker: worker.into(),
             iteration,
             received_ms,
             model: None,
-            programs,
+            programs: vec!["let solve x = x".to_owned(); programs],
             standing,
+        })
+    }
+
+    fn submitted(batch: u64, received_ms: u64, standing: Standing, programs: usize) -> Event {
+        sub(batch, "w", 0, received_ms, standing, programs)
+    }
+
+    fn checked(batch: u64, checks: Vec<Check>) -> Event {
+        Event::Checked(Checked {
+            batch,
+            library_len: 0,
             checks,
         })
     }
@@ -994,26 +1101,20 @@ mod tests {
         assert_eq!(s.open_slots("a", 1001), 4);
         assert_eq!(s.next_task(1001), Some(("a", 2)));
 
-        // A submission with one program of two counts one.
-        s.apply(&submitted(0, 0, 10, Standing::OnTime, vec![passed("p")]))
-            .unwrap();
+        // A submission with one program of two counts one when it arrives,
+        // before it is checked.
+        s.apply(&submitted(0, 10, Standing::OnTime, 1)).unwrap();
         assert_eq!(s.open_slots("a", 1001), 3);
         assert_eq!(s.task_counts(0, "a").batches, 2);
-        assert_eq!(s.task_counts(0, "a").programs, 1);
+        assert_eq!(s.task_counts(0, "a").received, 1);
+        assert_eq!(s.task_counts(0, "a").programs, 0);
     }
 
     #[test]
     fn the_last_batch_of_a_task_asks_only_for_what_is_left() {
         let mut s = new_state();
         s.apply(&issued(0, "a", 2, 0)).unwrap();
-        s.apply(&submitted(
-            0,
-            0,
-            5,
-            Standing::OnTime,
-            vec![passed("p"), Check::Run { error: "e".into() }],
-        ))
-        .unwrap();
+        s.apply(&submitted(0, 5, Standing::OnTime, 2)).unwrap();
         s.apply(&issued(1, "a", 1, 0)).unwrap();
         // a has 4 - 2 received - 1 leased = 1 open slot; b has 4.
         assert_eq!(s.open_slots("a", 0), 1);
@@ -1023,44 +1124,80 @@ mod tests {
     }
 
     #[test]
-    fn submissions_are_counted_by_stage_and_standing() {
+    fn checks_are_counted_by_stage_and_submissions_by_standing() {
         let mut s = new_state();
         for b in 0..4 {
             s.apply(&issued(b, "a", 2, 0)).unwrap();
         }
-        // `Extra` is only right after the programs the batch asked for.
-        let misplaced = vec![
-            Check::Compile { error: "c".into() },
-            Check::Extra,
-            Check::Type { error: "t".into() },
-        ];
-        assert_eq!(
-            s.clone()
-                .apply(&submitted(0, 0, 10, Standing::OnTime, misplaced)),
-            Err(Rejected::BadSubmission(0))
-        );
-        let fits = vec![
-            Check::Compile { error: "c".into() },
-            Check::Type { error: "t".into() },
-            Check::Extra,
-        ];
-        s.apply(&submitted(0, 0, 10, Standing::OnTime, fits))
+        s.apply(&submitted(0, 10, Standing::OnTime, 3)).unwrap();
+        s.apply(&submitted(1, 2000, Standing::Expired, 2)).unwrap();
+        // A later submission from the batch's worker is a repeat; one from
+        // another worker is foreign and leaves the batch open.
+        s.apply(&submitted(0, 20, Standing::Repeat, 1)).unwrap();
+        s.apply(&sub(2, "intruder", 0, 20, Standing::Foreign, 1))
             .unwrap();
-        s.apply(&submitted(
-            1,
+        assert_eq!(s.standing(2, "w", 30), Some(Standing::OnTime));
+        assert_eq!(s.pending_checks(), [0, 1]);
+        assert!(!s.quota_in());
+
+        // `Extra` is only right after the programs the batch asked for, and
+        // there is one check for each program.
+        for bad in [
+            vec![
+                Check::Compile { error: "c".into() },
+                Check::Extra,
+                Check::Type { error: "t".into() },
+            ],
+            vec![Check::Compile { error: "c".into() }],
+        ] {
+            assert_eq!(
+                s.clone().apply(&checked(0, bad)),
+                Err(Rejected::BadSubmission(0))
+            );
+        }
+        let stale = Event::Checked(Checked {
+            batch: 0,
+            library_len: 1,
+            checks: vec![],
+        });
+        assert!(matches!(
+            s.clone().apply(&stale),
+            Err(Rejected::StaleLibrary { batch: 0, .. })
+        ));
+        assert_eq!(
+            s.clone().apply(&checked(2, vec![])),
+            Err(Rejected::NotAwaitingCheck(2))
+        );
+
+        // The iteration cannot end while checks are pending.
+        assert_eq!(
+            s.clone().apply(&Event::IterationFinished { iteration: 0 }),
+            Err(Rejected::ChecksPending(0))
+        );
+
+        s.apply(&checked(
             0,
-            2000,
-            Standing::Expired,
+            vec![
+                Check::Compile { error: "c".into() },
+                Check::Type { error: "t".into() },
+                Check::Extra,
+            ],
+        ))
+        .unwrap();
+        s.apply(&checked(
+            1,
             vec![Check::Run { error: "r".into() }, passed("p1")],
         ))
         .unwrap();
-        s.apply(&submitted(0, 0, 20, Standing::Repeat, vec![]))
-            .unwrap();
-        let counts = s.task_counts(0, "a");
         assert_eq!(
-            counts,
+            s.clone().apply(&checked(1, vec![passed("x"), passed("y")])),
+            Err(Rejected::NotAwaitingCheck(1))
+        );
+        assert_eq!(
+            s.task_counts(0, "a"),
             TaskCounts {
                 batches: 4,
+                received: 4,
                 programs: 4,
                 compiled: 3,
                 typed: 2,
@@ -1068,7 +1205,10 @@ mod tests {
             }
         );
         let ic = s.iteration_counts(0);
-        assert_eq!((ic.submissions, ic.late, ic.repeats), (3, 0, 1));
+        assert_eq!(
+            (ic.submissions, ic.late, ic.repeats, ic.foreign),
+            (4, 0, 1, 1)
+        );
         assert_eq!(ic.payload_bytes, 4 * 3);
         assert_eq!(
             s.verified(),
@@ -1078,40 +1218,29 @@ mod tests {
             }]
         );
 
-        // A batch's iteration ends: a submission for it is late, kept, not
+        // The iteration ends: a submission for its batch 2 is late, kept, not
         // counted, and the verified programs start again.
         s.apply(&Event::IterationFinished { iteration: 0 }).unwrap();
         assert!(s.verified().is_empty());
-        assert_eq!(s.standing(2, 10), Some(Standing::Late));
-        s.apply(&submitted(2, 1, 10, Standing::Late, vec![]))
-            .unwrap();
+        assert_eq!(s.standing(2, "w", 10), Some(Standing::Late));
+        s.apply(&sub(2, "w", 1, 10, Standing::Late, 1)).unwrap();
+        assert!(s.pending_checks().is_empty());
         assert_eq!(s.task_counts(1, "a"), TaskCounts::default());
-        assert_eq!(s.task_counts(0, "a").programs, 4);
         assert_eq!(s.iteration_counts(1).late, 1);
-        assert_eq!(s.standing(2, 10), Some(Standing::Repeat));
+        assert_eq!(s.standing(2, "w", 10), Some(Standing::Repeat));
     }
 
     #[test]
-    fn a_submission_must_fit_its_batch() {
+    fn a_submission_must_have_the_standing_the_state_gives() {
         let mut s = new_state();
         s.apply(&issued(0, "a", 1, 0)).unwrap();
-        let cases = [
-            // The standing is not the one the state gives.
-            submitted(0, 0, 10, Standing::Expired, vec![passed("p")]),
-            submitted(0, 0, 5000, Standing::OnTime, vec![passed("p")]),
-            submitted(0, 0, 10, Standing::Late, vec![]),
-            // Too few checks, and checks where none are allowed.
-            Event::Submitted(Submitted {
-                batch: 0,
-                iteration: 0,
-                received_ms: 10,
-                model: None,
-                programs: vec!["x".into(), "y".into()],
-                standing: Standing::OnTime,
-                checks: vec![passed("p")],
-            }),
-        ];
-        for event in cases {
+        for event in [
+            submitted(0, 10, Standing::Expired, 1),
+            submitted(0, 5000, Standing::OnTime, 1),
+            submitted(0, 10, Standing::Late, 1),
+            submitted(0, 10, Standing::Foreign, 1),
+            sub(0, "other", 0, 10, Standing::OnTime, 1),
+        ] {
             let mut t = s.clone();
             assert_eq!(
                 t.apply(&event),
@@ -1122,11 +1251,11 @@ mod tests {
         }
         let mut t = s.clone();
         assert_eq!(
-            t.apply(&submitted(7, 0, 10, Standing::OnTime, vec![])),
+            t.apply(&submitted(7, 10, Standing::OnTime, 1)),
             Err(Rejected::UnknownBatch(7))
         );
         assert_eq!(
-            t.apply(&submitted(0, 1, 10, Standing::OnTime, vec![passed("p")])),
+            t.apply(&sub(0, "w", 1, 10, Standing::OnTime, 1)),
             Err(Rejected::WrongIteration {
                 current: 0,
                 given: 1
@@ -1156,7 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn the_quota_is_in_when_every_task_has_its_programs() {
+    fn the_quota_is_in_when_every_task_has_its_programs_checked() {
         let mut s = RunState::create(
             RunConfig {
                 proposals_per_task: 1,
@@ -1167,18 +1296,14 @@ mod tests {
         .unwrap();
         s.apply(&issued(0, "a", 1, 0)).unwrap();
         s.apply(&issued(1, "b", 1, 0)).unwrap();
-        s.apply(&submitted(
-            0,
-            0,
-            1,
-            Standing::OnTime,
-            vec![Check::Compile { error: "x".into() }],
-        ))
-        .unwrap();
-        assert!(!s.quota_in());
-        s.apply(&submitted(1, 0, 1, Standing::OnTime, vec![passed("p")]))
-            .unwrap();
-        assert!(s.quota_in());
+        s.apply(&submitted(0, 1, Standing::OnTime, 1)).unwrap();
+        s.apply(&submitted(1, 1, Standing::OnTime, 1)).unwrap();
+        assert!(!s.quota_in(), "checks are pending");
         assert_eq!(s.next_task(0), None);
+        s.apply(&checked(0, vec![Check::Compile { error: "x".into() }]))
+            .unwrap();
+        assert!(!s.quota_in());
+        s.apply(&checked(1, vec![passed("p")])).unwrap();
+        assert!(s.quota_in());
     }
 }
