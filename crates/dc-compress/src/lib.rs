@@ -21,8 +21,8 @@
 //!
 //! Stitch can cut an abstraction or a parameter through a special form or the
 //! binder of a let, which leaves a body or a rewritten program with no core term
-//! (see the `dc-stitch` crate docs). [`stitch_config`] sets the three flags that
-//! rule this out: `--fused-lambda-tags 0`, `--no-curried-bodies` and
+//! (see the `dc-stitch` crate docs). [`stitch_config`] sets the three flags meant
+//! to rule this out: `--fused-lambda-tags 0`, `--no-curried-bodies` and
 //! `--no-curried-metavars`. It runs Stitch on one thread, without shuffling, so
 //! that the same programs give the same result.
 //!
@@ -179,6 +179,11 @@ pub enum CompressError {
     LibraryTooLarge,
     /// The library names could not be built.
     Names(NameError),
+    /// A program has free variables.
+    OpenProgram {
+        /// The program's index in the input.
+        index: usize,
+    },
     /// A program could not be encoded.
     Encode {
         /// The program's index in the input.
@@ -193,6 +198,7 @@ impl fmt::Display for CompressError {
         match self {
             CompressError::LibraryTooLarge => f.write_str("the library has too many entries"),
             CompressError::Names(e) => write!(f, "library names: {e}"),
+            CompressError::OpenProgram { index } => write!(f, "program {index} is not closed"),
             CompressError::Encode { index, error } => {
                 write!(f, "program {index} cannot be encoded: {error}")
             }
@@ -201,6 +207,8 @@ impl fmt::Display for CompressError {
 }
 
 impl std::error::Error for CompressError {}
+
+impl std::error::Error for RejectReason {}
 
 /// The Stitch configuration for `cfg`, given a library of `library_len` entries.
 pub fn stitch_config(cfg: &CompressConfig, library_len: usize) -> MultistepCompressionConfig {
@@ -231,7 +239,11 @@ fn library_names(len: u32) -> Result<LibNames, CompressError> {
 /// Runs Stitch on `programs`, which may refer to `libs`, and decodes the result.
 ///
 /// The new abstractions extend `libs`; see [`Compression`]. Stitch is given no
-/// weights.
+/// weights. A program with free variables gives [`CompressError::OpenProgram`].
+///
+/// Stitch's time and memory are not bounded, and grow quickly with the length
+/// of a long list literal. Stitch panics on input it cannot
+/// handle, and this function does not catch the panic.
 pub fn compress(
     arena: &mut Arena,
     libs: &[LibDef],
@@ -242,6 +254,9 @@ pub fn compress(
     let names = library_names(len)?;
     let mut text = Vec::with_capacity(programs.len());
     for (index, p) in programs.iter().enumerate() {
+        if !arena.is_closed(p.program) {
+            return Err(CompressError::OpenProgram { index });
+        }
         let encoded = encode(arena, p.program, &names)
             .map_err(|error| CompressError::Encode { index, error })?;
         text.push(encoded);
@@ -274,6 +289,9 @@ pub fn compress(
 /// Decodes Stitch's `steps` for `programs` over a library of `library_len`
 /// entries. Keeps the steps before the first that does not decode, and drops
 /// that step and the rest.
+///
+/// [`compress`] calls this on Stitch's output. It is public so that recorded
+/// Stitch output can be decoded again.
 pub fn accept_steps(
     arena: &mut Arena,
     library_len: u32,
@@ -475,7 +493,7 @@ mod tests {
 
     #[test]
     fn a_rewritten_program_cut_through_an_if_is_dropped() {
-        // A curried argument `(if_ int_1)` has no core term.
+        // A curried argument `(if_ true)` has no core term.
         let bad = step(
             "fn_2",
             1,
@@ -528,7 +546,8 @@ mod tests {
     #[test]
     fn a_step_whose_id_would_overflow_is_refused() {
         // `accept_steps` passes `None` when the library length plus the step
-        // index does not fit in a `u32`.
+        // index does not fit in a `u32`. That path is defensive: it needs a name
+        // table of about 2^32 entries, so this test calls `accept_step` directly.
         let mut a = Arena::new();
         let s = step("fn_0", 0, "int_1", &[]);
         assert_eq!(

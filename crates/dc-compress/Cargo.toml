@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 dc-core.workspace = true
 dc-stitch.workspace = true
-stitch_core = { git = "https://github.com/mlb2251/stitch", rev = "350804b7b35807c78bd21c313785ae5152ae2985" }
+stitch_core.workspace = true
 
 [dev-dependencies]
 dc-surface.workspace = true

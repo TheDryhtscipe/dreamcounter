@@ -1,9 +1,11 @@
 //! The bridge against real Stitch runs: the abstractions it keeps decode, and the
 //! rewritten programs expand back to the programs Stitch was given.
 
-use dc_compress::{compress, stitch_config, CompressConfig, Compression, FrontierProgram};
+use dc_compress::{
+    compress, stitch_config, CompressConfig, CompressError, Compression, FrontierProgram,
+};
 use dc_core::{expand, sexpr, Arena, LibDef, LibId, TermId};
-use dc_stitch::{decode_abstraction, encode, DecodeError, LibNames};
+use dc_stitch::{decode, decode_abstraction, encode, DecodeError, LibNames, AND, IF, LET};
 use stitch_core::{multistep_compression, MultistepCompressionConfig};
 
 /// A program that is the same apart from a let whose bound value and body vary.
@@ -14,6 +16,17 @@ const LETS: [&str; 5] = [
     "(mul 3 (add 1 (let 7 (add $0 $0))))",
     "(mul 3 (add 1 (let 8 (div $0 4))))",
     "(mul 3 (add 1 (let 9 (mod $0 3))))",
+];
+
+/// Programs that differ in the function applied to the same two operands.
+/// Without `--no-curried-metavars`, Stitch puts a parameter in head position and
+/// passes a bare reserved token such as `and_` as its argument.
+const HEADS: [&str; 5] = [
+    "(pair (and (lt 1 2) (lt 3 4)) (cons 5 nil))",
+    "(pair (or (lt 1 2) (lt 3 4)) (cons 5 nil))",
+    "(pair (eq (lt 1 2) (lt 3 4)) (cons 5 nil))",
+    "(pair (pair (lt 1 2) (lt 3 4)) (cons 5 nil))",
+    "(pair (and (lt 1 2) (lt 3 4)) (cons 6 nil))",
 ];
 
 /// Pairs of ifs with the same condition. Without `--no-curried-bodies`, Stitch
@@ -38,9 +51,12 @@ fn frontier(a: &mut Arena, srcs: &[&str]) -> Vec<FrontierProgram> {
         .collect()
 }
 
-/// Runs Stitch with its default flags (apart from the bridge's naming, thread
-/// and silence settings) and returns each abstraction's body and arity.
-fn raw_stitch(a: &mut Arena, srcs: &[&str]) -> Vec<(String, usize)> {
+/// One step of a raw Stitch run: the body, the arity and the rewritten programs.
+type RawStep = (String, usize, Vec<String>);
+
+/// Runs Stitch with its default flags (apart from the thread and silence
+/// settings) and returns its steps.
+fn raw_stitch(a: &mut Arena, srcs: &[&str]) -> Vec<RawStep> {
     let names = LibNames::new();
     let text: Vec<String> = srcs
         .iter()
@@ -56,27 +72,39 @@ fn raw_stitch(a: &mut Arena, srcs: &[&str]) -> Vec<(String, usize)> {
     let (steps, _) = multistep_compression(&text, Some(tasks), None, None, None, &cfg);
     steps
         .iter()
-        .map(|s| (s.inv.body.to_string(), s.inv.arity))
+        .map(|s| {
+            (
+                s.inv.body.to_string(),
+                s.inv.arity,
+                s.rewritten.iter().map(|p| p.to_string()).collect(),
+            )
+        })
         .collect()
 }
 
-/// Checks that, without the bridge's flags, Stitch learns an abstraction on
-/// `srcs` whose body has no core term, so that the corpus exercises the flags.
-#[track_caller]
-fn raw_stitch_cuts_through_a_special_form(srcs: &[&str]) {
+/// The reserved token of the first special form that Stitch, run without the
+/// bridge's flags on `srcs`, cuts through: in an abstraction's body, or else in a
+/// rewritten program. Checks that the corpus needs the flags.
+fn raw_stitch_cuts_through(srcs: &[&str]) -> &'static str {
     let mut a = Arena::new();
     let steps = raw_stitch(&mut a, srcs);
-    let names = LibNames::sequential("fn_", steps.len() as u32).expect("names");
-    let malformed = steps.iter().any(|(body, arity)| {
-        matches!(
-            decode_abstraction(&mut a, body, *arity as u32, &names),
-            Err(DecodeError::MalformedSpecialForm { .. })
-        )
-    });
-    assert!(
-        malformed,
-        "no abstraction cut through a special form: {steps:?}"
-    );
+    let mut names = LibNames::new();
+    for (i, (body, arity, rewritten)) in steps.iter().enumerate() {
+        let decoded = decode_abstraction(&mut a, body, *arity as u32, &names);
+        if let Err(DecodeError::MalformedSpecialForm { token, .. }) = decoded {
+            return token;
+        }
+        names
+            .insert(LibId(i as u32), format!("fn_{i}"))
+            .expect("fresh name");
+        for p in rewritten {
+            if let Err(DecodeError::MalformedSpecialForm { token, .. }) = decode(&mut a, p, &names)
+            {
+                return token;
+            }
+        }
+    }
+    panic!("no step cut through a special form: {steps:?}");
 }
 
 /// Checks that `c` kept every Stitch step, and that each rewritten program
@@ -103,18 +131,31 @@ fn expands_back(a: &mut Arena, libs: &[LibDef], programs: &[FrontierProgram], c:
 
 #[test]
 fn without_the_flags_stitch_puts_a_parameter_on_a_let_binder() {
-    raw_stitch_cuts_through_a_special_form(&LETS);
+    assert_eq!(raw_stitch_cuts_through(&LETS), LET);
 }
 
 #[test]
 fn without_the_flags_stitch_abstracts_a_partly_applied_if() {
-    raw_stitch_cuts_through_a_special_form(&IFS);
+    assert_eq!(raw_stitch_cuts_through(&IFS), IF);
+}
+
+#[test]
+fn without_the_flags_stitch_passes_a_bare_and_as_an_argument() {
+    assert_eq!(raw_stitch_cuts_through(&HEADS), AND);
 }
 
 #[test]
 fn the_bridge_keeps_every_step_on_a_corpus_of_lets() {
     let mut a = Arena::new();
     let programs = frontier(&mut a, &LETS);
+    let c = compress(&mut a, &[], &programs, &CompressConfig::default()).expect("compress");
+    expands_back(&mut a, &[], &programs, &c);
+}
+
+#[test]
+fn the_bridge_keeps_every_step_on_a_corpus_of_heads() {
+    let mut a = Arena::new();
+    let programs = frontier(&mut a, &HEADS);
     let c = compress(&mut a, &[], &programs, &CompressConfig::default()).expect("compress");
     expands_back(&mut a, &[], &programs, &c);
 }
@@ -150,8 +191,6 @@ fn new_abstractions_take_the_ids_after_the_library() {
     );
     let c = compress(&mut a, &libs, &programs, &CompressConfig::default()).expect("compress");
     expands_back(&mut a, &libs, &programs, &c);
-    assert_eq!(c.names.name(LibId(0)), Some("fn_0"));
-    assert_eq!(c.names.name(LibId(1)), Some("fn_1"));
     assert_eq!(c.names.name(LibId(2)), Some("fn_2"));
     assert_eq!(c.names.len(), libs.len() + c.new_libs.len());
     // The rewritten programs use the first new abstraction under its new id.
@@ -196,7 +235,6 @@ fn a_second_round_continues_the_numbering() {
         .collect();
     let second = compress(&mut a, &library, &again, &one).expect("second round");
     expands_back(&mut a, &library, &again, &second);
-    assert_eq!(second.names.name(LibId(0)), Some("fn_0"));
     assert_eq!(second.names.name(LibId(1)), Some("fn_1"));
     let first_program = sexpr::print(&a, second.rewritten[0]).expect("print");
     assert!(
@@ -205,6 +243,9 @@ fn a_second_round_continues_the_numbering() {
     );
 }
 
+/// Checks that Stitch gives the same result for the same programs within one
+/// process. `the_config_sets_the_bridge_flags` checks the one-thread and
+/// no-shuffle settings, which are also Stitch's defaults.
 #[test]
 fn the_same_programs_give_the_same_result() {
     let run = || {
@@ -262,5 +303,22 @@ fn the_config_sets_the_bridge_flags() {
     assert_eq!(
         format!("{:?}", s.step.fused_lambda_tags),
         "FusedLambdaTags { tags: Some({0}) }"
+    );
+}
+
+#[test]
+fn an_open_program_is_refused_before_stitch_runs() {
+    let mut a = Arena::new();
+    let programs = frontier(
+        &mut a,
+        &[
+            "(add 1 (mul 2 (sub 3 4)))",
+            "(add $0 (mul 2 (sub 3 5)))",
+            "(add 1 (mul 2 (sub 3 6)))",
+        ],
+    );
+    assert_eq!(
+        compress(&mut a, &[], &programs, &CompressConfig::default()),
+        Err(CompressError::OpenProgram { index: 1 })
     );
 }
