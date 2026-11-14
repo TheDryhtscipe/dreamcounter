@@ -1,0 +1,21 @@
+[package]
+name = "dc-driver"
+description = "One iteration of the DreamCounter loop: frontier update, Stitch compression, and library update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+dc-core.workspace = true
+dc-stitch.workspace = true
+dc-compress.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

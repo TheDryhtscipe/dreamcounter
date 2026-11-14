@@ -310,6 +310,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-driver"
+version = "0.1.0"
+dependencies = [
+ "dc-compress",
+ "dc-core",
+ "dc-stitch",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dc-eval"
 version = "0.1.0"
 dependencies = [
