@@ -13,6 +13,7 @@ use dc_driver::{
     InProcess, IterationInput, IterationOutcome, LibraryEntry, Source, Stitch, TaskSpec,
 };
 use dc_stitch::LibNames;
+use dc_surface::prelude::Prelude;
 
 fn scheme(text: &str) -> Scheme {
     text.parse().unwrap_or_else(|e| panic!("{text}: {e:?}"))
@@ -65,6 +66,7 @@ impl Stitch for Nothing {
     fn run(
         &mut self,
         _arena: &mut Arena,
+        _prelude: Option<&Prelude>,
         _libs: &[LibDef],
         programs: &[FrontierProgram],
         _cfg: &CompressConfig,
@@ -93,6 +95,7 @@ impl Stitch for Fixed {
     fn run(
         &mut self,
         arena: &mut Arena,
+        _prelude: Option<&Prelude>,
         _libs: &[LibDef],
         programs: &[FrontierProgram],
         _cfg: &CompressConfig,
@@ -130,12 +133,13 @@ impl Stitch for Failing {
     fn run(
         &mut self,
         arena: &mut Arena,
+        prelude: Option<&Prelude>,
         libs: &[LibDef],
         programs: &[FrontierProgram],
         cfg: &CompressConfig,
     ) -> Result<Compression, CompressError> {
         if self.errors.is_empty() {
-            return self.inner.run(arena, libs, programs, cfg);
+            return self.inner.run(arena, prelude, libs, programs, cfg);
         }
         self.inner
             .calls
@@ -158,6 +162,7 @@ fn run(
             library,
             frontiers,
             candidates,
+            prelude: None,
         },
         cfg,
         stitch,
@@ -1066,6 +1071,7 @@ fn a_runner_that_returns_the_wrong_number_of_programs_fails_the_run() {
         fn run(
             &mut self,
             _arena: &mut Arena,
+            _prelude: Option<&Prelude>,
             _libs: &[LibDef],
             programs: &[FrontierProgram],
             _cfg: &CompressConfig,
