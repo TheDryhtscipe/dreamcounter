@@ -941,27 +941,38 @@ fn a_lock_on_a_removed_directory_does_not_license_a_write_to_its_successor() {
 
 #[test]
 fn create_does_not_write_to_the_successor_of_a_removed_directory() {
-    let dir = TempDir::new().unwrap();
-    let run = id("r1");
-    let store = Store::open_with_lock_wait(dir.path(), std::time::Duration::from_secs(2)).unwrap();
-    fs::create_dir(dir.path().join("r1")).unwrap();
-    let old_lock = fs::File::open(dir.path().join("r1")).unwrap();
-    old_lock.lock().unwrap();
-
-    std::thread::scope(|scope| {
-        // This waits for the lock on the directory that is about to go.
-        let waiting = scope.spawn(|| store.create_run(&run, config(), tasks()));
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        fs::remove_dir(dir.path().join("r1")).unwrap();
+    // The call must be waiting for the lock when the directory goes. If the
+    // machine is busy it may not be there yet. It then finds the new
+    // directory locked, which shows nothing, so the test waits longer and
+    // tries again.
+    for pause in [200, 800, 3200] {
+        let dir = TempDir::new().unwrap();
+        let run = id("r1");
+        let store =
+            Store::open_with_lock_wait(dir.path(), std::time::Duration::from_secs(2)).unwrap();
         fs::create_dir(dir.path().join("r1")).unwrap();
-        // Another server holds the new directory. The old lock is released.
-        let new_lock = fs::File::open(dir.path().join("r1")).unwrap();
-        new_lock.lock().unwrap();
-        drop(old_lock);
-        let result = waiting.join().unwrap();
-        assert!(matches!(result, Err(StoreError::Replaced(_))), "{result:?}");
+        let old_lock = fs::File::open(dir.path().join("r1")).unwrap();
+        old_lock.lock().unwrap();
+
+        let result = std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| store.create_run(&run, config(), tasks()));
+            std::thread::sleep(std::time::Duration::from_millis(pause));
+            fs::remove_dir(dir.path().join("r1")).unwrap();
+            fs::create_dir(dir.path().join("r1")).unwrap();
+            // Another server holds the new directory. The old lock is released.
+            let new_lock = fs::File::open(dir.path().join("r1")).unwrap();
+            new_lock.lock().unwrap();
+            drop(old_lock);
+            waiting.join().unwrap()
+        });
         assert_eq!(fs::read_dir(dir.path().join("r1")).unwrap().count(), 0);
-    });
+        if matches!(result, Err(StoreError::Busy(_))) {
+            continue;
+        }
+        assert!(matches!(result, Err(StoreError::Replaced(_))), "{result:?}");
+        return;
+    }
+    panic!("the call never waited on the directory that was removed");
 }
 
 /// The names and contents of the files set aside in a run's directory.
