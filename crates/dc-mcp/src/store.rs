@@ -26,7 +26,8 @@
 //!
 //! An operation waits for the lock for a limited time, [`DEFAULT_LOCK_WAIT`]
 //! unless the store was opened with another, and then fails with
-//! [`StoreError::Busy`].
+//! [`StoreError::Busy`]. If the run's directory was removed while it waited,
+//! it fails with [`StoreError::Replaced`] or [`StoreError::NoSuchRun`].
 //!
 //! # Torn tails
 //!
@@ -35,9 +36,17 @@
 //! file `torn-<offset>-<n>` beside the journal and writes its record in the
 //! tail's place. It says so in a log record of kind
 //! [`LogKind::Recovery`], which it puts first
-//! in that commit, and on standard error. The store deletes nothing. Damage to
-//! the end of a journal looks the same, so an operator who sees such a record
-//! after a clean stop should treat it as lost commits.
+//! in that commit, and on standard error. Damage to the end of a journal looks
+//! the same, so an operator who sees such a record after a clean stop should
+//! treat it as lost commits.
+//!
+//! If that commit fails, the store puts the tail back, and the next commit
+//! starts again. It uses the file it already made, so commits that fail do not
+//! add files. The store deletes one thing only: a `torn-*` file that it could
+//! not finish writing.
+//!
+//! One case leaves a `torn-*` file with no log record: the commit fails, and
+//! then the store cannot put the tail back either.
 //!
 //! # A journal that is replaced
 //!
@@ -80,6 +89,9 @@ pub enum StoreError {
     /// Another store held the run's lock for the whole wait. Nothing was
     /// written.
     Busy(RunId),
+    /// The run's directory was removed, or removed and made again, while the
+    /// operation waited for its lock. Nothing was changed.
+    Replaced(RunId),
     /// The run's journal does not read back. The store does not change it.
     Corrupt {
         /// The run.
@@ -125,6 +137,12 @@ impl fmt::Display for StoreError {
                 "run {:?} is locked by another server or call. Nothing was changed",
                 run.as_str()
             ),
+            StoreError::Replaced(run) => write!(
+                f,
+                "the directory of run {:?} was replaced while the call waited for it. Nothing \
+                 was changed. Try again",
+                run.as_str()
+            ),
             StoreError::Corrupt { run, error } => {
                 write!(
                     f,
@@ -157,6 +175,7 @@ impl std::error::Error for StoreError {
             StoreError::NoSuchRun(_)
             | StoreError::RunExists(_)
             | StoreError::Busy(_)
+            | StoreError::Replaced(_)
             | StoreError::UnsupportedFormat { .. } => None,
         }
     }
@@ -304,6 +323,9 @@ impl Store {
         sync_dir(&self.root)?;
         let dir = File::open(&dir_path).map_err(io_at(&dir_path))?;
         self.wait_for_lock(run, &dir, &dir_path)?;
+        if still_at(&dir, &dir_path).map_err(io_at(&dir_path))? != Some(true) {
+            return Err(StoreError::Replaced(run.clone()));
+        }
 
         let path = dir_path.join(JOURNAL);
         if path.try_exists().map_err(io_at(&path))? {
@@ -441,6 +463,14 @@ impl Store {
         match self.append_record(&mut locked.journal, cached.len, record.as_bytes()) {
             Ok(()) => {}
             Err(AppendError::NotWritten(error)) => {
+                // The append cut the tail off. It goes back, so that the
+                // commit that does replace it reports it. If this fails, the
+                // file set aside is the only sign of the tail.
+                if !torn.is_empty() {
+                    let journal = &mut locked.journal;
+                    let _ = Durable::write_at(journal, cached.len, &torn)
+                        .and_then(|()| Durable::sync(journal));
+                }
                 self.put(run, cached);
                 return Err(io_at(&locked.path)(error).into());
             }
@@ -539,14 +569,10 @@ impl Store {
             Err(e) => return Err(io_at(&dir_path)(e)),
         };
         self.wait_for_lock(run, &dir, &dir_path)?;
-        // The directory may have been removed, or removed and made again,
-        // since it was opened. Then the lock is on a directory that is gone.
-        let same = |a: &fs::Metadata, b: &fs::Metadata| (a.dev(), a.ino()) == (b.dev(), b.ino());
-        match (dir.metadata(), fs::metadata(&dir_path)) {
-            (Ok(held), Ok(named)) if same(&held, &named) => {}
-            (Ok(_), Ok(_)) => return Err(StoreError::Busy(run.clone())),
-            (_, Err(e)) if missing(&e) => return Err(StoreError::NoSuchRun(run.clone())),
-            (Err(e), _) | (_, Err(e)) => return Err(io_at(&dir_path)(e)),
+        match still_at(&dir, &dir_path).map_err(io_at(&dir_path))? {
+            Some(true) => {}
+            Some(false) => return Err(StoreError::Replaced(run.clone())),
+            None => return Err(StoreError::NoSuchRun(run.clone())),
         }
         let path = dir_path.join(JOURNAL);
         match OpenOptions::new().read(true).write(true).open(&path) {
@@ -720,21 +746,59 @@ fn read_from(
     })
 }
 
-/// Copies the journal's torn tail, which starts at byte `at`, to a new file
-/// beside the journal, and says so on standard error. Returns the log record
+/// Whether `dir`, an open directory, is still the one at `path`. `None` when
+/// nothing is at `path`.
+///
+/// A directory can be removed, or removed and made again, while an operation
+/// waits for its lock. Then the lock is on a directory that is gone.
+fn still_at(dir: &File, path: &Path) -> io::Result<Option<bool>> {
+    let held = dir.metadata()?;
+    match fs::metadata(path) {
+        Ok(named) => Ok(Some((held.dev(), held.ino()) == (named.dev(), named.ino()))),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Makes a new file at `path` and has `fill` write it. Fails if a file is
+/// there. If `fill` fails, the new file is removed.
+fn write_new(path: &Path, fill: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    // This call made the file, so it is this call's to take away.
+    fill(&mut file).inspect_err(|_| {
+        let _ = fs::remove_file(path);
+    })
+}
+
+/// Copies the journal's torn tail, which starts at byte `at`, to a file
+/// beside the journal, unless a file `torn-<at>-<n>` already holds the same
+/// bytes, and says so on standard error. Returns the log record
 /// that reports it, for `iteration`.
 fn set_aside(locked: &Locked, at: u64, torn: &[u8], iteration: u64) -> Result<Event, StoreError> {
     for n in 0_u32.. {
         let name = format!("torn-{at}-{n}");
         let path = locked.dir_path.join(&name);
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+        match fs::read(&path) {
+            // A commit that then failed set these bytes aside before.
+            Ok(old) if old == torn => File::open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(io_at(&path))?,
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                write_new(&path, |file| {
+                    file.write_all(torn).and_then(|()| file.sync_all())
+                })
+                .map_err(io_at(&path))?;
+            }
             Err(e) => return Err(io_at(&path)(e)),
-        };
-        file.write_all(torn)
-            .and_then(|()| file.sync_all())
-            .map_err(io_at(&path))?;
+        }
         locked.dir.sync_all().map_err(io_at(&locked.dir_path))?;
         let text = format!(
             "{} bytes after the last good record, at byte {at} of the journal, were not a \

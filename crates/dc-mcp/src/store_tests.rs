@@ -934,7 +934,100 @@ fn a_lock_on_a_removed_directory_does_not_license_a_write_to_its_successor() {
         new_lock.lock().unwrap();
         drop(old_lock);
         let result = waiting.join().unwrap();
-        assert!(matches!(result, Err(StoreError::Busy(_))), "{result:?}");
+        assert!(matches!(result, Err(StoreError::Replaced(_))), "{result:?}");
         assert_eq!(fs::read(journal(dir.path(), "r1")).unwrap(), bytes);
     });
+}
+
+#[test]
+fn create_does_not_write_to_the_successor_of_a_removed_directory() {
+    let dir = TempDir::new().unwrap();
+    let run = id("r1");
+    let store = Store::open_with_lock_wait(dir.path(), std::time::Duration::from_secs(2)).unwrap();
+    fs::create_dir(dir.path().join("r1")).unwrap();
+    let old_lock = fs::File::open(dir.path().join("r1")).unwrap();
+    old_lock.lock().unwrap();
+
+    std::thread::scope(|scope| {
+        // This waits for the lock on the directory that is about to go.
+        let waiting = scope.spawn(|| store.create_run(&run, config(), tasks()));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        fs::remove_dir(dir.path().join("r1")).unwrap();
+        fs::create_dir(dir.path().join("r1")).unwrap();
+        // Another server holds the new directory. The old lock is released.
+        let new_lock = fs::File::open(dir.path().join("r1")).unwrap();
+        new_lock.lock().unwrap();
+        drop(old_lock);
+        let result = waiting.join().unwrap();
+        assert!(matches!(result, Err(StoreError::Replaced(_))), "{result:?}");
+        assert_eq!(fs::read_dir(dir.path().join("r1")).unwrap().count(), 0);
+    });
+}
+
+/// The names and contents of the files set aside in a run's directory.
+fn set_aside_files(root: &Path, run: &str) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(root.join(run))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("torn-"))
+        .map(|entry| {
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn a_failed_commit_over_a_torn_tail_puts_the_tail_back_and_a_later_one_reports_it() {
+    let dir = TempDir::new().unwrap();
+    let run = id("r1");
+    mid_iteration(&Store::open(dir.path()).unwrap(), &run);
+    let path = journal(dir.path(), "r1");
+    let mut bytes = fs::read(&path).unwrap();
+    let at = bytes.len();
+    bytes.extend_from_slice(b"7 half a rec");
+    fs::write(&path, &bytes).unwrap();
+
+    let store = Store::open(dir.path()).unwrap();
+    // The steps of an append are truncate, write, sync. Each fails in turn.
+    for step in 0..3 {
+        *store.faults.lock().unwrap() = vec![step];
+        let failed = store.append(&run, vec![note(1, "lost")]);
+        assert!(
+            matches!(failed, Err(StoreError::Io { .. })),
+            "step {step}: {failed:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes, "step {step}");
+    }
+    // Three failed commits set the same bytes aside once.
+    let aside = vec![(format!("torn-{at}-0"), b"7 half a rec".to_vec())];
+    assert_eq!(set_aside_files(dir.path(), "r1"), aside);
+
+    store.append(&run, vec![note(1, "kept")]).unwrap();
+    assert_eq!(store.state(&run).unwrap().log_count(LogKind::Recovery), 1);
+    assert_eq!(set_aside_files(dir.path(), "r1"), aside);
+    let fresh = Store::open(dir.path()).unwrap().state(&run).unwrap();
+    assert_eq!(fresh.log_count(LogKind::Recovery), 1);
+}
+
+#[test]
+fn a_file_that_could_not_be_filled_is_not_left_behind() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("torn-1-0");
+    let failed = write_new(&path, |file| {
+        file.write_all(b"part")?;
+        Err(std::io::Error::other("injected"))
+    });
+    assert!(failed.is_err());
+    assert!(!path.exists());
+
+    write_new(&path, |file| file.write_all(b"whole")).unwrap();
+    // A file that is there is not written over, and not removed.
+    let again = write_new(&path, |file| file.write_all(b"other"));
+    assert_eq!(again.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read(&path).unwrap(), b"whole");
 }

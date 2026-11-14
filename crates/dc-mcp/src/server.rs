@@ -2,8 +2,8 @@
 //!
 //! Every tool reads or writes through the [`Store`], which brings its copy of
 //! the run up to the journal on disk first. A request the server cannot carry
-//! out is a tool error with a message. It changes nothing, unless the message
-//! says the outcome is not known.
+//! out is a tool error with a message. It changes nothing in a run's state,
+//! unless the message says the outcome is not known.
 //!
 //! A tool call runs on a thread of its own, so a call that waits for a run's
 //! lock does not hold up other calls or the protocol.
@@ -79,7 +79,8 @@ pub struct LogCounts {
     /// Remarks.
     pub note: u64,
     /// Reports that the store set aside bytes of the journal that were not a
-    /// record. More than 0 can mean lost changes: read the records.
+    /// record. More than 0 can mean lost changes: look at the `torn-*` files
+    /// in the run's directory.
     pub recovery: u64,
 }
 

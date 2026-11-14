@@ -26,12 +26,14 @@
 //! Everything else that does not read back is corruption, and [`scan`] returns
 //! an error:
 //!
-//! * a line that fails its checksum, or part of a line, with a good record
-//!   after it;
+//! * a line that fails its checksum with a good record on a later line;
 //! * a line with a right checksum whose number is out of order or whose events
 //!   do not parse.
 //!
 //! # What the format cannot detect
+//!
+//! [`scan`] reads line by line. If the line break before the last record is
+//! lost, that record is part of a bad last line, and so part of a torn tail.
 //!
 //! Damage to the end of a journal looks like a torn tail. If the last records
 //! are cut off or damaged after they were acknowledged, [`scan`] reads a
