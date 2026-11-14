@@ -19,11 +19,11 @@
 //!
 //! A write that the server or the machine did not finish can leave anything
 //! after the last complete record: part of a line, or a whole line with wrong
-//! bytes. [`scan`] calls that a torn tail when no record with a right
+//! bytes. [`scan_records`] calls that a torn tail when no record with a right
 //! checksum follows it. The commit was never acknowledged, so the store sets
 //! the tail aside and goes on (see [`crate::store`]).
 //!
-//! Everything else that does not read back is corruption, and [`scan`] returns
+//! Everything else that does not read back is corruption, and [`scan_records`] returns
 //! an error:
 //!
 //! * a line that fails its checksum with a good record on a later line;
@@ -32,15 +32,17 @@
 //!
 //! # What the format cannot detect
 //!
-//! [`scan`] reads line by line. If the line break before the last record is
+//! [`scan_records`] reads line by line. If the line break before the last record is
 //! lost, that record is part of a bad last line, and so part of a torn tail.
 //!
 //! Damage to the end of a journal looks like a torn tail. If the last records
-//! are cut off or damaged after they were acknowledged, [`scan`] reads a
+//! are cut off or damaged after they were acknowledged, [`scan_records`] reads a
 //! shorter run and reports no error. Nothing in the file says how long it
 //! should be.
 
+use std::convert::Infallible;
 use std::fmt;
+use std::io::{self, BufRead};
 
 use crate::state::Event;
 
@@ -108,19 +110,6 @@ impl fmt::Display for Corrupt {
 
 impl std::error::Error for Corrupt {}
 
-/// What [`scan`] read.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Scan {
-    /// The events of each good record, in order.
-    pub records: Vec<Vec<Event>>,
-    /// Where each good record starts, in bytes from the start of the file.
-    pub offsets: Vec<u64>,
-    /// The length of the good records, in bytes.
-    pub valid_len: usize,
-    /// Whether a torn tail follows the good records.
-    pub torn: bool,
-}
-
 /// The CRC-32 table for the IEEE polynomial, one entry for each byte value.
 const CRC_TABLE: [u32; 256] = {
     let mut table = [0; 256];
@@ -144,11 +133,16 @@ const CRC_TABLE: [u32; 256] = {
 
 /// The CRC-32 of `bytes` (the IEEE polynomial, as in zlib and PNG).
 pub fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
+    !crc32_update(u32::MAX, bytes)
+}
+
+/// Runs the CRC-32 register `crc`, not yet inverted, over `bytes`. So the
+/// CRC-32 of `a` then `b` is `!crc32_update(crc32_update(u32::MAX, a), b)`.
+fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
     for byte in bytes {
         crc = CRC_TABLE[usize::from((crc as u8) ^ *byte)] ^ (crc >> 8);
     }
-    !crc
+    crc
 }
 
 /// The line for record `seq`, with its line break.
@@ -160,49 +154,164 @@ pub fn encode(seq: u64, events: &[Event]) -> String {
     format!("{seq} {:08x} {json}\n", crc32(body.as_bytes()))
 }
 
-/// Reads the records in `bytes`, which start at a record boundary.
+/// One good record, as [`scan_records`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Record {
+    /// Where the record starts, in bytes from the start of the file.
+    pub offset: u64,
+    /// The record's events, at least one.
+    pub events: Vec<Event>,
+}
+
+/// What [`scan_records`] read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct End {
+    /// How many good records there are.
+    pub records: u64,
+    /// The length of the good records, in bytes.
+    pub valid_len: u64,
+    /// The length of the torn tail after the good records, in bytes. It is 0
+    /// when there is no torn tail.
+    pub torn_len: u64,
+    /// Where the last good record starts, in bytes from the start of the
+    /// file, and the length of its line with the line break.
+    pub last: Option<(u64, u64)>,
+}
+
+/// Why [`scan_records`] stopped before the end.
+#[derive(Debug)]
+pub enum ScanError<E> {
+    /// The records do not read back. See the module docs.
+    Corrupt(Corrupt),
+    /// Reading failed.
+    Read(io::Error),
+    /// The caller's function returned this error.
+    Stopped(E),
+}
+
+/// Reads the records from `reader`, which starts at a record boundary, and
+/// hands each good record to `each` as soon as it is read, before the next
+/// one is read.
 ///
-/// `base` is the offset of `bytes` in the file, for error messages, and
-/// `first_seq` is the number the first record must have.
-pub fn scan(bytes: &[u8], base: u64, first_seq: u64) -> Result<Scan, Corrupt> {
-    let mut records = Vec::new();
-    let mut offsets = Vec::new();
-    let mut start = 0;
+/// So the scan holds one line in memory at a time, and the caller decides
+/// what to keep. If `each` returns an error, the scan stops and returns it.
+/// A corrupt line after records that `each` was given still makes the scan an
+/// error: the caller must not act on those records until the scan returns
+/// `Ok`.
+///
+/// `base` is the offset of `reader` in the file, for offsets and error
+/// messages, and `first_seq` is the number the first record must have.
+pub fn scan_records<R, E, F>(
+    mut reader: R,
+    base: u64,
+    first_seq: u64,
+    mut each: F,
+) -> Result<End, ScanError<E>>
+where
+    R: BufRead,
+    F: FnMut(Record) -> Result<(), E>,
+{
+    let mut line = Vec::new();
+    let mut start = 0_u64;
     let mut seq = first_seq;
-    while let Some(len) = bytes[start..].iter().position(|b| *b == b'\n') {
-        let corrupt = |reason| Corrupt {
-            offset: base + start as u64,
-            reason,
+    let mut last = None;
+    // The length of the first line that is not a good record, if there is one.
+    let first_bad = loop {
+        line.clear();
+        let len = reader
+            .read_until(b'\n', &mut line)
+            .map_err(ScanError::Read)?;
+        if len == 0 {
+            break None;
+        }
+        let Some(body) = line.strip_suffix(b"\n") else {
+            break Some(len as u64);
         };
-        let Some(json) = verified(&bytes[start..start + len], seq).map_err(corrupt)? else {
-            break;
+        let offset = base + start;
+        let corrupt = |reason| ScanError::Corrupt(Corrupt { offset, reason });
+        let Some(json) = verified(body, seq).map_err(corrupt)? else {
+            break Some(len as u64);
         };
         let events: Vec<Event> = serde_json::from_str(json)
             .map_err(|_| corrupt("a record whose events do not parse"))?;
         if events.is_empty() {
             return Err(corrupt("a record with no events"));
         }
-        records.push(events);
-        offsets.push(base + start as u64);
-        start += len + 1;
+        each(Record { offset, events }).map_err(ScanError::Stopped)?;
+        last = Some((offset, len as u64));
+        start += len as u64;
         seq += 1;
-    }
-    // What is left is a torn tail, unless a good record follows it.
-    let mut rest = &bytes[start..];
-    while let Some(len) = rest.iter().position(|b| *b == b'\n') {
-        if checksum_holds(&rest[..len]) {
-            return Err(Corrupt {
-                offset: base + start as u64,
-                reason: "a damaged record with a good record after it",
-            });
+    };
+    let Some(mut torn_len) = first_bad else {
+        return Ok(End {
+            records: seq - first_seq,
+            valid_len: start,
+            torn_len: 0,
+            last,
+        });
+    };
+    // What is left is a torn tail, unless a good record follows it. The
+    // first bad line has no right checksum, so only the lines after it are
+    // checked.
+    loop {
+        line.clear();
+        let len = reader
+            .read_until(b'\n', &mut line)
+            .map_err(ScanError::Read)?;
+        if len == 0 {
+            break;
         }
-        rest = &rest[len + 1..];
+        if line.strip_suffix(b"\n").is_some_and(checksum_holds) {
+            return Err(ScanError::Corrupt(Corrupt {
+                offset: base + start,
+                reason: "a damaged record with a good record after it",
+            }));
+        }
+        torn_len += len as u64;
     }
+    Ok(End {
+        records: seq - first_seq,
+        valid_len: start,
+        torn_len,
+        last,
+    })
+}
+
+/// What [`scan`] read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scan {
+    /// The events of each good record, in order.
+    pub records: Vec<Vec<Event>>,
+    /// Where each good record starts, in bytes from the start of the file.
+    pub offsets: Vec<u64>,
+    /// The length of the good records, in bytes.
+    pub valid_len: usize,
+    /// Whether a torn tail follows the good records.
+    pub torn: bool,
+}
+
+/// Reads all the records in `bytes`, which start at a record boundary, as
+/// [`scan_records`] does, and collects them. For a journal on disk use
+/// [`scan_records`], which does not hold every record at once.
+pub fn scan(bytes: &[u8], base: u64, first_seq: u64) -> Result<Scan, Corrupt> {
+    let mut records = Vec::new();
+    let mut offsets = Vec::new();
+    let collect = |record: Record| {
+        offsets.push(record.offset);
+        records.push(record.events);
+        Ok::<(), Infallible>(())
+    };
+    let end = match scan_records(bytes, base, first_seq, collect) {
+        Ok(end) => end,
+        Err(ScanError::Corrupt(corrupt)) => return Err(corrupt),
+        Err(ScanError::Read(error)) => unreachable!("reading a slice does not fail: {error}"),
+        Err(ScanError::Stopped(never)) => match never {},
+    };
     Ok(Scan {
         records,
         offsets,
-        valid_len: start,
-        torn: start < bytes.len(),
+        valid_len: end.valid_len as usize,
+        torn: end.torn_len > 0,
     })
 }
 
@@ -216,7 +325,11 @@ fn fields(line: &[u8]) -> Option<(&str, &str)> {
         return None;
     }
     let checksum = u32::from_str_radix(checksum, 16).ok()?;
-    (crc32(format!("{number} {json}").as_bytes()) == checksum).then_some((number, json))
+    // The checksum covers `<number> <events>`: the line without its checksum.
+    let crc = [number.as_bytes(), b" ", json.as_bytes()]
+        .into_iter()
+        .fold(u32::MAX, crc32_update);
+    (!crc == checksum).then_some((number, json))
 }
 
 /// Whether `line`, without its line break, has a right checksum.

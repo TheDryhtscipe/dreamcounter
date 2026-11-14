@@ -182,6 +182,124 @@ fn offsets_in_errors_include_the_base() {
     assert_eq!(scan(&bad, 1000, 1).unwrap_err().offset, 1000);
 }
 
+/// Every record `scan_records` hands over, read through a buffer of
+/// `capacity` bytes, and what it returns.
+fn scan_chunked(
+    bytes: &[u8],
+    capacity: usize,
+) -> Result<(Vec<Record>, End), ScanError<Infallible>> {
+    let mut seen = Vec::new();
+    let reader = std::io::BufReader::with_capacity(capacity, bytes);
+    let end = scan_records(reader, 0, 0, |record| {
+        seen.push(record);
+        Ok::<(), Infallible>(())
+    })?;
+    Ok((seen, end))
+}
+
+#[test]
+fn small_reads_give_the_same_scan_as_one_read() {
+    let (bytes, ends) = three();
+    let mut cases = vec![bytes.clone()];
+    for cut in 0..bytes.len() {
+        cases.push(bytes[..cut].to_vec());
+    }
+    for i in 0..bytes.len() {
+        let mut bad = bytes.clone();
+        bad[i] ^= 0x01;
+        cases.push(bad);
+    }
+    let mut junk = bytes[..ends[1]].to_vec();
+    junk.extend_from_slice(b"junk\n");
+    junk.extend_from_slice(&bytes[ends[1]..]);
+    cases.push(junk);
+    for case in cases {
+        let whole = scan(&case, 0, 0);
+        for capacity in [1, 2, 7, 64] {
+            match (&whole, scan_chunked(&case, capacity)) {
+                (Ok(whole), Ok((seen, end))) => {
+                    let records: Vec<Vec<Event>> = seen.iter().map(|r| r.events.clone()).collect();
+                    let offsets: Vec<u64> = seen.iter().map(|r| r.offset).collect();
+                    assert_eq!(records, whole.records, "{case:?} {capacity}");
+                    assert_eq!(offsets, whole.offsets, "{case:?} {capacity}");
+                    assert_eq!(end.valid_len as usize, whole.valid_len);
+                    assert_eq!(end.torn_len > 0, whole.torn);
+                }
+                (Err(whole), Err(ScanError::Corrupt(chunked))) => {
+                    assert_eq!(&chunked, whole, "{case:?} {capacity}")
+                }
+                (whole, chunked) => {
+                    panic!("{case:?} {capacity}: {whole:?} against {chunked:?}")
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_end_gives_the_last_record_and_the_tail() {
+    let (bytes, ends) = three();
+    let (_, end) = scan_chunked(&bytes, 64).unwrap();
+    let last_len = (ends[2] - ends[1]) as u64;
+    assert_eq!(
+        end,
+        End {
+            records: 3,
+            valid_len: bytes.len() as u64,
+            torn_len: 0,
+            last: Some((ends[1] as u64, last_len)),
+        }
+    );
+
+    let mut torn = bytes.clone();
+    torn.extend_from_slice(b"junk\n\n9 zz");
+    let (_, end) = scan_chunked(&torn, 3).unwrap();
+    assert_eq!(end.torn_len, b"junk\n\n9 zz".len() as u64);
+    assert_eq!(end.valid_len, bytes.len() as u64);
+    assert_eq!(end.last, Some((ends[1] as u64, last_len)));
+
+    // A torn tail in place of the first record leaves no last record.
+    let (seen, end) = scan_chunked(&bytes[..ends[0] - 1], 3).unwrap();
+    assert!(seen.is_empty());
+    assert_eq!(end.records, 0);
+    assert_eq!(end.last, None);
+    assert_eq!(end.torn_len, (ends[0] - 1) as u64);
+}
+
+#[test]
+fn an_error_from_the_caller_stops_the_scan() {
+    let (bytes, ends) = three();
+    let mut seen = Vec::new();
+    let result = scan_records(&bytes[..], 0, 0, |record| {
+        seen.push(record.offset);
+        if seen.len() == 2 {
+            Err("enough")
+        } else {
+            Ok(())
+        }
+    });
+    assert!(matches!(result, Err(ScanError::Stopped("enough"))));
+    assert_eq!(seen, [0, ends[0] as u64]);
+}
+
+#[test]
+fn records_before_a_corrupt_line_are_handed_over_and_the_scan_fails() {
+    let (bytes, ends) = three();
+    let mut bad = bytes.clone();
+    bad[ends[1] + 2] ^= 0x01;
+    bad.extend_from_slice(encode(3, &[note("after")]).as_bytes());
+    let mut seen = Vec::new();
+    let result = scan_records(&bad[..], 0, 0, |record| {
+        seen.push(record.offset);
+        Ok::<(), Infallible>(())
+    });
+    match result {
+        Err(ScanError::Corrupt(corrupt)) => assert_eq!(corrupt.offset, ends[1] as u64),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(seen, [0, ends[0] as u64]);
+}
+
 #[test]
 fn a_header_reads_back_and_other_starts_are_told_apart() {
     for id in [0, 1, 0xdead_beef, u64::MAX] {
