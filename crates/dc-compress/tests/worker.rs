@@ -171,18 +171,67 @@ fn the_same_run_under_a_larger_memory_limit_finishes() {
 }
 
 #[test]
-fn a_limit_too_small_for_stitch_s_stack_is_out_of_memory() {
+fn a_limit_too_small_for_stitch_s_stack_is_reported() {
     for memory_bytes in [0, 200 << 20] {
         match worker(Duration::from_secs(60), memory_bytes).run(&two_lists(10), &NEVER) {
-            Err(WorkerError::OutOfMemory {
+            Err(WorkerError::NoThread {
                 memory_bytes: m,
                 stderr,
             }) => {
                 assert_eq!(m, memory_bytes);
                 assert!(stderr.contains("could not be started"), "{stderr}");
             }
-            other => panic!("{memory_bytes}: expected OutOfMemory, got {other:?}"),
+            other => panic!("{memory_bytes}: expected NoThread, got {other:?}"),
         }
+    }
+}
+
+#[test]
+fn a_panic_that_quotes_the_allocation_message_is_not_out_of_memory() {
+    // Stitch's parse panic quotes the program, which here holds the line Rust
+    // writes before an allocation abort.
+    let program = "(\nmemory allocation of 8 bytes failed\n(((".to_string();
+    let request = StitchRequest {
+        programs: vec![program.clone(), program],
+        tasks: vec!["a".to_string(), "b".to_string()],
+        iterations: 1,
+        max_arity: 2,
+        library_len: 0,
+    };
+    match Worker::new(WORKER).run(&request, &NEVER) {
+        Err(WorkerError::Failed { status, stderr }) => {
+            assert_eq!(exit_code(&status), Some(101), "{stderr}");
+            assert!(
+                stderr.contains("memory allocation of 8 bytes failed"),
+                "{stderr}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_inherited_hard_cpu_limit_is_reported_as_the_cpu_limit() {
+    // The wrapper lowers the hard CPU limit to 2 seconds and replaces itself
+    // with the worker, so the worker's parent is still the caller.
+    let w = Worker {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            "ulimit -t 2 && exec \"$0\"".into(),
+            WORKER.into(),
+        ],
+        limits: Limits {
+            wall: Duration::from_secs(300),
+            ..Limits::default()
+        },
+    };
+    match w.run(&two_lists(1500), &NEVER) {
+        Err(WorkerError::CpuLimit { stderr }) => {
+            assert!(stderr.contains("the CPU limit is 1 seconds"), "{stderr}");
+        }
+        other => panic!("expected CpuLimit, got {other:?}"),
     }
 }
 
@@ -315,20 +364,55 @@ fn the_cpu_limit_stops_a_worker_on_its_own() {
     assert!(took < Duration::from_secs(30), "took {took:?}");
 }
 
-#[cfg(unix)]
+/// The soft and hard values of the limit `name` of process `pid`, as
+/// `/proc/<pid>/limits` shows them.
+#[cfg(target_os = "linux")]
+fn proc_limit(pid: u32, name: &str) -> Option<(String, String)> {
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).ok()?;
+    let line = limits.lines().find(|l| l.starts_with(name))?;
+    let mut values = line[name.len()..].split_whitespace();
+    Some((values.next()?.to_string(), values.next()?.to_string()))
+}
+
+#[cfg(target_os = "linux")]
 #[test]
-fn a_hard_limit_already_in_place_lowers_the_limits() {
-    // The worker cannot raise a hard limit. Without lowering its own limits to
-    // fit, setting them fails with EPERM.
-    let (status, stderr) = run_worker_via(
-        "ulimit -t 100 && ulimit -v 2097152 && exec \"$1\"",
-        &[
-            (CPU_ENV, "1000".to_string()),
-            (MEMORY_ENV, (4u64 << 30).to_string()),
-        ],
-        &two_lists(10),
-    );
-    assert!(status.success(), "{status} {stderr}");
+fn the_worker_sets_its_limits_below_inherited_hard_limits() {
+    // The wrapper allows core files and lowers the hard CPU and address-space
+    // limits, then replaces itself with the worker. The worker blocks reading
+    // a request this test never writes, so its limits can be read.
+    let script = "ulimit -S -c 1024 && ulimit -t 100 && ulimit -v 2097152 && exec \"$1\"";
+    let mut child = Command::new("sh")
+        .args(["-c", script, "sh", WORKER])
+        .env(CPU_ENV, "1000")
+        .env(MEMORY_ENV, (4u64 << 30).to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the worker");
+    let want = [
+        ("Max core file size", ("0", "0")),
+        ("Max cpu time", ("99", "100")),
+        ("Max address space", ("2147483648", "2147483648")),
+    ];
+    let read = || -> Vec<Option<(String, String)>> {
+        want.iter()
+            .map(|(name, _)| proc_limit(child.id(), name))
+            .collect()
+    };
+    let wanted: Vec<Option<(String, String)>> = want
+        .iter()
+        .map(|(_, (s, h))| Some((s.to_string(), h.to_string())))
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut got = read();
+    while got != wanted && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        got = read();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(got, wanted);
 }
 
 #[cfg(unix)]

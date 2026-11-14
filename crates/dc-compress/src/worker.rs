@@ -10,8 +10,10 @@
 //!   stop a run early with its cancel flag ([`WorkerError::Cancelled`]).
 //! - The worker limits its own address space to [`Limits::memory_bytes`]
 //!   (`RLIMIT_AS`). An allocation over the limit fails, and the worker aborts.
-//!   The result is [`WorkerError::OutOfMemory`]. So is a limit too small for
-//!   the stack of Stitch's thread.
+//!   The result is [`WorkerError::OutOfMemory`]. A limit too small for the
+//!   stack of Stitch's thread gives [`WorkerError::NoThread`].
+//! - The worker limits its own CPU time, as a backstop (see below). A worker
+//!   stopped by a CPU limit gives [`WorkerError::CpuLimit`].
 //! - A panic, an abort or any other exit that is not a success gives
 //!   [`WorkerError::Failed`], with the start and the end of the worker's
 //!   standard error.
@@ -37,7 +39,8 @@
 //! worker writes Stitch's steps as a JSON array of [`StitchStep`]s on its
 //! standard output, and exits with status 0. It exits with status 2 when the
 //! request or a limit is wrong, with 3 when the thread that runs Stitch cannot
-//! start, and with 101 when Stitch panics.
+//! start, and with 101 when Stitch panics. It sets its core file size to 0, so
+//! that a failed run does not write a core file as large as its memory.
 //!
 //! The output is not trusted: [`crate::compress_isolated`] checks the steps with
 //! [`crate::accept_steps`], as it checks the steps of an in-process run. Both
@@ -56,7 +59,12 @@
 //! to whole seconds.
 //!
 //! A hard limit the worker inherits, which it cannot raise, lowers the limit it
-//! sets.
+//! sets. The worker then says so on its standard error. An inherited hard CPU
+//! limit can stop a run before [`Limits::wall`].
+//!
+//! The caller writes the request on a pipe. If the worker exits before it has
+//! read it all, the write fails with `SIGPIPE` unless the caller ignores that
+//! signal. Rust programs ignore it.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -125,14 +133,16 @@ pub struct StitchRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// The longest the caller waits for the worker. A limit too large to add to
-    /// the current time, such as [`Duration::MAX`], sets no wall limit and no
-    /// CPU limit.
+    /// the current time, such as [`Duration::MAX`], sets no wall limit, and a
+    /// CPU limit too large to matter.
     pub wall: Duration,
     /// The worker's address space, in bytes. This counts memory the worker has
     /// reserved, not only what it uses: Stitch's thread reserves a stack of
     /// 256 MiB, and below about 260 MiB the thread cannot start. Set it well
     /// above that. In a release build, two lists of 100 elements took 0.02
     /// seconds under a limit of 400 MiB and 0.8 seconds under 280 MiB.
+    ///
+    /// A lower hard limit that the worker inherits applies in its place.
     pub memory_bytes: u64,
     /// The most bytes the caller keeps of the worker's standard output. The
     /// caller holds the output and the steps parsed from it at the same time.
@@ -189,11 +199,27 @@ pub enum WorkerError {
     },
     /// The cancel flag was set, and the worker was killed.
     Cancelled,
-    /// The worker went over [`Limits::memory_bytes`]: an allocation failed, or
-    /// the thread that runs Stitch could not start.
+    /// An allocation in the worker failed, and the worker aborted. Under the
+    /// memory limit, that means the run went over it.
     OutOfMemory {
-        /// The limit.
+        /// The limit asked for. The worker's standard error says if a lower
+        /// inherited limit applied.
         memory_bytes: u64,
+        /// The start and the end of the worker's standard error.
+        stderr: String,
+    },
+    /// The thread that runs Stitch could not start. Under the memory limit,
+    /// that is usually because the limit is too small for its stack.
+    NoThread {
+        /// The memory limit asked for.
+        memory_bytes: u64,
+        /// The start and the end of the worker's standard error.
+        stderr: String,
+    },
+    /// The worker was stopped by its CPU limit (`SIGXCPU`). The worker's own
+    /// limit comes after [`Limits::wall`], so this means a lower hard limit it
+    /// inherited applied.
+    CpuLimit {
         /// The start and the end of the worker's standard error.
         stderr: String,
     },
@@ -239,6 +265,20 @@ impl fmt::Display for WorkerError {
             } => write!(
                 f,
                 "the Stitch worker went over its memory limit of {memory_bytes} bytes: {}",
+                stderr.trim_end()
+            ),
+            WorkerError::NoThread {
+                memory_bytes,
+                stderr,
+            } => write!(
+                f,
+                "the Stitch worker could not start Stitch's thread under a memory limit of \
+                 {memory_bytes} bytes: {}",
+                stderr.trim_end()
+            ),
+            WorkerError::CpuLimit { stderr } => write!(
+                f,
+                "the Stitch worker was stopped by its CPU limit: {}",
                 stderr.trim_end()
             ),
             WorkerError::Failed { status, stderr } => {
@@ -336,14 +376,19 @@ impl Worker {
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default();
         if !status.success() {
-            // Rust's allocation error handler writes this line, then aborts.
-            let out_of_memory = stderr.contains("memory allocation of ")
-                || status.code() == Some(i32::from(NO_THREAD));
-            return Err(if out_of_memory {
+            let memory_bytes = self.limits.memory_bytes;
+            return Err(if allocation_failed(&status, &stderr) {
                 WorkerError::OutOfMemory {
-                    memory_bytes: self.limits.memory_bytes,
+                    memory_bytes,
                     stderr,
                 }
+            } else if status.code() == Some(i32::from(NO_THREAD)) {
+                WorkerError::NoThread {
+                    memory_bytes,
+                    stderr,
+                }
+            } else if signal_of(&status) == Some(SIGXCPU) {
+                WorkerError::CpuLimit { stderr }
             } else {
                 WorkerError::Failed { status, stderr }
             });
@@ -423,16 +468,37 @@ fn wait_until(
     }
 }
 
-/// Whether `status` is that of a process killed by `SIGKILL`.
+const SIGABRT: i32 = 6;
+const SIGKILL: i32 = 9;
+const SIGXCPU: i32 = 24;
+
+/// The signal that ended a process with `status`, if one did.
 #[cfg(unix)]
-fn killed(status: &ExitStatus) -> bool {
+fn signal_of(status: &ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
-    status.signal() == Some(9)
+    status.signal()
 }
 
 #[cfg(not(unix))]
-fn killed(_status: &ExitStatus) -> bool {
-    true
+fn signal_of(_status: &ExitStatus) -> Option<i32> {
+    None
+}
+
+/// Whether `status` is that of a process killed by `SIGKILL`. Off Unix, any
+/// status after a kill counts.
+fn killed(status: &ExitStatus) -> bool {
+    cfg!(not(unix)) || signal_of(status) == Some(SIGKILL)
+}
+
+/// Whether the worker aborted on a failed allocation. Rust's allocation error
+/// handler writes a line `memory allocation of N bytes failed`, then aborts.
+/// Text from Stitch, such as a panic message that quotes a program, is not
+/// followed by an abort.
+fn allocation_failed(status: &ExitStatus, stderr: &str) -> bool {
+    signal_of(status) == Some(SIGABRT)
+        && stderr
+            .lines()
+            .any(|l| l.starts_with("memory allocation of ") && l.ends_with(" bytes failed"))
 }
 
 /// What [`read_capped`] read.
@@ -574,15 +640,31 @@ fn env_limit(name: &str) -> Result<Option<u64>, String> {
 #[cfg(unix)]
 fn set_limits() -> Result<(), String> {
     use rustix::process::Resource;
+    // Lowering a limit to 0 is always allowed.
+    set_limit(Resource::Core, 0, 0).map_err(|e| format!("setting the core file size: {e}"))?;
     if let Some(bytes) = env_limit(MEMORY_ENV)? {
-        lower_limit(Resource::As, bytes, bytes)
+        let hard = inherited_hard(Resource::As).map_or(bytes, |m| bytes.min(m));
+        set_limit(Resource::As, hard, hard)
             .map_err(|e| format!("setting the memory limit: {e}"))?;
+        if hard < bytes {
+            note(&format!(
+                "the memory limit is {hard} bytes, the inherited hard limit"
+            ));
+        }
     }
     if let Some(seconds) = env_limit(CPU_ENV)? {
         // SIGXCPU at the soft limit; SIGKILL at the hard limit if SIGXCPU is
-        // caught or ignored.
-        lower_limit(Resource::Cpu, seconds, seconds.saturating_add(1))
-            .map_err(|e| format!("setting the CPU limit: {e}"))?;
+        // caught or ignored. The soft limit stays below the hard limit, so that
+        // the caller sees SIGXCPU.
+        let wanted = seconds.saturating_add(1);
+        let hard = inherited_hard(Resource::Cpu).map_or(wanted, |m| wanted.min(m));
+        let soft = seconds.min(hard.saturating_sub(1));
+        set_limit(Resource::Cpu, soft, hard).map_err(|e| format!("setting the CPU limit: {e}"))?;
+        if soft < seconds {
+            note(&format!(
+                "the CPU limit is {soft} seconds, below the inherited hard limit"
+            ));
+        }
     }
     if let Some(parent) = env_limit(PARENT_ENV)? {
         die_with_parent(parent)?;
@@ -590,21 +672,30 @@ fn set_limits() -> Result<(), String> {
     Ok(())
 }
 
-/// Sets the soft and hard limits on `resource` to `soft` and `hard`, or to the
-/// hard limit already in place where that is lower. A process cannot raise its
-/// hard limit.
+/// The hard limit on `resource` the worker inherited, or `None` if there is
+/// none. A process cannot raise its hard limit.
 #[cfg(unix)]
-fn lower_limit(resource: rustix::process::Resource, soft: u64, hard: u64) -> io::Result<()> {
-    use rustix::process::{getrlimit, setrlimit, Rlimit};
-    let cap = |v: u64| getrlimit(resource).maximum.map_or(v, |m| v.min(m));
-    setrlimit(
+fn inherited_hard(resource: rustix::process::Resource) -> Option<u64> {
+    rustix::process::getrlimit(resource).maximum
+}
+
+/// Sets the soft and hard limits on `resource`.
+#[cfg(unix)]
+fn set_limit(resource: rustix::process::Resource, soft: u64, hard: u64) -> io::Result<()> {
+    rustix::process::setrlimit(
         resource,
-        Rlimit {
-            current: Some(cap(soft)),
-            maximum: Some(cap(hard)),
+        rustix::process::Rlimit {
+            current: Some(soft),
+            maximum: Some(hard),
         },
     )
     .map_err(io::Error::from)
+}
+
+/// Writes a line on standard error. A failure to write it is ignored.
+#[cfg(unix)]
+fn note(message: &str) {
+    let _ = writeln!(io::stderr(), "{WORKER_BIN}: {message}");
 }
 
 #[cfg(not(unix))]
