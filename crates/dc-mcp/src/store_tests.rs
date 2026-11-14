@@ -1031,3 +1031,72 @@ fn a_file_that_could_not_be_filled_is_not_left_behind() {
     assert_eq!(again.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(fs::read(&path).unwrap(), b"whole");
 }
+
+#[test]
+fn a_tail_is_put_back_whole_or_not_at_all() {
+    let after_failed_append = |fail: &[usize]| FakeFile {
+        bytes: b"good".to_vec(),
+        fail: fail.to_vec(),
+        ..FakeFile::default()
+    };
+    let mut file = after_failed_append(&[]);
+    put_back(&mut file, 4, b"TORN");
+    assert_eq!(file.calls, ["write", "sync"]);
+    assert_eq!(file.synced, b"goodTORN");
+
+    // The write fails with half of the tail written, or the sync fails.
+    for failing in 0..2 {
+        let mut file = after_failed_append(&[failing]);
+        put_back(&mut file, 4, b"TORN");
+        assert_eq!(file.bytes, b"good", "step {failing}");
+        assert_eq!(file.synced, b"good", "step {failing}");
+    }
+}
+
+#[test]
+fn an_entry_that_is_not_a_plain_file_does_not_stop_a_tail_being_set_aside() {
+    let kinds = [
+        "directory",
+        "dangling link",
+        "link to the same bytes",
+        "pipe",
+        "longer file",
+    ];
+    for kind in kinds {
+        let dir = TempDir::new().unwrap();
+        let run = id("r1");
+        mid_iteration(&Store::open(dir.path()).unwrap(), &run);
+        let path = journal(dir.path(), "r1");
+        let mut bytes = fs::read(&path).unwrap();
+        let at = bytes.len();
+        bytes.extend_from_slice(b"7 half a rec");
+        fs::write(&path, &bytes).unwrap();
+        let taken = dir.path().join("r1").join(format!("torn-{at}-0"));
+        match kind {
+            "directory" => fs::create_dir(&taken).unwrap(),
+            "dangling link" => std::os::unix::fs::symlink("nothing-here", &taken).unwrap(),
+            "link to the same bytes" => {
+                // The link's own length is the tail's, and so is its target's.
+                fs::write(dir.path().join("r1").join("same-bytes-x"), b"7 half a rec").unwrap();
+                std::os::unix::fs::symlink("same-bytes-x", &taken).unwrap();
+            }
+            "pipe" => {
+                let made = std::process::Command::new("mkfifo").arg(&taken).status();
+                assert!(made.unwrap().success());
+            }
+            _ => fs::write(&taken, b"7 half a record of another time").unwrap(),
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        store.append(&run, vec![note(1, "kept")]).unwrap();
+        assert_eq!(
+            store.state(&run).unwrap().log_count(LogKind::Recovery),
+            1,
+            "{kind}"
+        );
+        let next = dir.path().join("r1").join(format!("torn-{at}-1"));
+        assert_eq!(fs::read(next).unwrap(), b"7 half a rec", "{kind}");
+        // What was there is still there.
+        assert!(fs::symlink_metadata(&taken).is_ok(), "{kind}");
+    }
+}

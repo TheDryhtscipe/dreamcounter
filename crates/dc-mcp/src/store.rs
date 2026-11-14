@@ -41,12 +41,16 @@
 //! treat it as lost commits.
 //!
 //! If that commit fails, the store puts the tail back, and the next commit
-//! starts again. It uses the file it already made, so commits that fail do not
-//! add files. The store deletes one thing only: a `torn-*` file that it could
-//! not finish writing.
+//! starts again. It uses the file it already made. The store deletes one thing
+//! only: a `torn-*` file that it could not finish writing.
 //!
-//! One case leaves a `torn-*` file with no log record: the commit fails, and
-//! then the store cannot put the tail back either.
+//! A `torn-*` file can be there with no log record. Treat the file as the same
+//! sign. It happens when:
+//!
+//! * the server stops after it cut the tail off and before its record is on
+//!   disk;
+//! * the commit fails and the store cannot put the whole tail back;
+//! * the commit fails with [`StoreError::OutcomeUnknown`].
 //!
 //! # A journal that is replaced
 //!
@@ -90,7 +94,7 @@ pub enum StoreError {
     /// written.
     Busy(RunId),
     /// The run's directory was removed, or removed and made again, while the
-    /// operation waited for its lock. Nothing was changed.
+    /// operation waited for its lock. No run was changed.
     Replaced(RunId),
     /// The run's journal does not read back. The store does not change it.
     Corrupt {
@@ -139,8 +143,8 @@ impl fmt::Display for StoreError {
             ),
             StoreError::Replaced(run) => write!(
                 f,
-                "the directory of run {:?} was replaced while the call waited for it. Nothing \
-                 was changed. Try again",
+                "the directory of run {:?} was removed or replaced while the call waited for \
+                 it. No run was changed. Try again",
                 run.as_str()
             ),
             StoreError::Corrupt { run, error } => {
@@ -239,6 +243,15 @@ pub(crate) fn append<F: Durable>(file: &mut F, at: u64, record: &[u8]) -> Result
     match file.truncate(at).and_then(|()| file.sync()) {
         Ok(()) => Err(AppendError::NotWritten(error)),
         Err(_) => Err(AppendError::Unknown(error)),
+    }
+}
+
+/// Writes `tail` back at byte `at` of the journal, its end, after an append
+/// that failed cut it off. If it cannot write all of it, it takes the part
+/// out again: a part would be set aside later as a tail of its own.
+pub(crate) fn put_back<F: Durable>(file: &mut F, at: u64, tail: &[u8]) {
+    if file.write_at(at, tail).and_then(|()| file.sync()).is_err() {
+        let _ = file.truncate(at).and_then(|()| file.sync());
     }
 }
 
@@ -467,9 +480,7 @@ impl Store {
                 // commit that does replace it reports it. If this fails, the
                 // file set aside is the only sign of the tail.
                 if !torn.is_empty() {
-                    let journal = &mut locked.journal;
-                    let _ = Durable::write_at(journal, cached.len, &torn)
-                        .and_then(|()| Durable::sync(journal));
+                    put_back(&mut locked.journal, cached.len, &torn);
                 }
                 self.put(run, cached);
                 return Err(io_at(&locked.path)(error).into());
@@ -785,12 +796,21 @@ fn set_aside(locked: &Locked, at: u64, torn: &[u8], iteration: u64) -> Result<Ev
     for n in 0_u32.. {
         let name = format!("torn-{at}-{n}");
         let path = locked.dir_path.join(&name);
-        match fs::read(&path) {
-            // A commit that then failed set these bytes aside before.
-            Ok(old) if old == torn => File::open(&path)
-                .and_then(|file| file.sync_all())
-                .map_err(io_at(&path))?,
-            Ok(_) => continue,
+        match fs::symlink_metadata(&path) {
+            Ok(there) => {
+                // A commit that then failed may have set these bytes aside
+                // before. Anything else under the name is left alone: only a
+                // plain file of the same length is read.
+                let same = there.is_file()
+                    && there.len() == torn.len() as u64
+                    && fs::read(&path).is_ok_and(|old| old == torn);
+                if !same {
+                    continue;
+                }
+                File::open(&path)
+                    .and_then(|file| file.sync_all())
+                    .map_err(io_at(&path))?;
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 write_new(&path, |file| {
                     file.write_all(torn).and_then(|()| file.sync_all())

@@ -80,7 +80,7 @@ pub struct LogCounts {
     pub note: u64,
     /// Reports that the store set aside bytes of the journal that were not a
     /// record. More than 0 can mean lost changes: look at the `torn-*` files
-    /// in the run's directory.
+    /// in the run's directory. Such a file with no report means the same.
     pub recovery: u64,
 }
 
