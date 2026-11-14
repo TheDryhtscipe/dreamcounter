@@ -403,6 +403,9 @@ pub enum DriverError {
     Interrupted(CompressError),
     /// The library has more entries than a library id can number.
     LibraryTooLarge,
+    /// A prelude function's name cannot be a Stitch token, or clashes with
+    /// another name. The shipped prelude has no such name.
+    PreludeName(String),
 }
 
 impl fmt::Display for DriverError {
@@ -419,6 +422,7 @@ impl fmt::Display for DriverError {
             } => write!(f, "member {index} of task {task:?}: {reason}"),
             DriverError::TooLarge => f.write_str("a term is too large to print"),
             DriverError::LibraryTooLarge => f.write_str("the library has too many entries"),
+            DriverError::PreludeName(e) => write!(f, "a prelude function cannot be named: {e}"),
             DriverError::Interrupted(e) => write!(f, "the Stitch run was interrupted: {e}"),
         }
     }
@@ -464,7 +468,7 @@ fn names(len: usize, prelude: Option<&Prelude>) -> Result<LibNames, DriverError>
     for e in prelude.map_or(&[][..], Prelude::entries) {
         names
             .insert(e.lib(), e.name())
-            .map_err(|_| DriverError::LibraryTooLarge)?;
+            .map_err(|err| DriverError::PreludeName(err.to_string()))?;
     }
     Ok(names)
 }

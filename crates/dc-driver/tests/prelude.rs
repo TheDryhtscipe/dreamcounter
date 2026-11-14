@@ -210,7 +210,9 @@ fn stitch_sees_prelude_names_and_rewritten_programs_keep_the_references() {
     assert!(all.iter().any(|t| t.contains(&filter)), "{all:?}");
     assert!(all.iter().all(|t| !t.contains("foldr")), "{all:?}");
     assert!(
-        out.new_library.iter().any(|e| e.term.contains("lib_4294")),
+        out.new_library
+            .iter()
+            .any(|e| e.term.contains(&map) || e.term.contains(&filter)),
         "an abstraction should use a prelude function: {:?}",
         out.new_library
     );
