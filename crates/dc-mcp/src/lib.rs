@@ -20,6 +20,9 @@
 //! to this server.
 
 pub mod journal;
+pub mod prompt;
+pub mod proposer;
 pub mod server;
 pub mod state;
 pub mod store;
+pub mod verify;
