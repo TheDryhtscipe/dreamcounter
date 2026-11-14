@@ -21,6 +21,12 @@ dc-surface = { path = "crates/dc-surface" }
 dc-eval = { path = "crates/dc-eval" }
 dc-stitch = { path = "crates/dc-stitch" }
 dc-tasks = { path = "crates/dc-tasks" }
+rmcp = { version = "3.10", default-features = false }
+schemars = "1.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3"
+tokio = { version = "1", default-features = false }
 # Pinned to one commit: the Stitch bridge (dc-compress) is tested against it.
 stitch_core = { git = "https://github.com/mlb2251/stitch", rev = "350804b7b35807c78bd21c313785ae5152ae2985" }
 

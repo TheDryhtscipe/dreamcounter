@@ -1,0 +1,24 @@
+[package]
+name = "dc-mcp"
+description = "MCP server that owns the state of a DreamCounter run and keeps it on disk"
+version.workspace = true
+edition.workspace = true
+# rmcp needs 1.88, and std::fs::File::lock needs 1.89.
+rust-version = "1.89"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+dc-tasks.workspace = true
+rmcp = { workspace = true, features = ["server", "macros", "schemars", "transport-io"] }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
