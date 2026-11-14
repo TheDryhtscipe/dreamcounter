@@ -30,6 +30,7 @@ The code is a Cargo workspace under `crates/`:
 | `dc-surface` | Surface syntax (lexer, parser, desugarer, and pretty-printer) and the prelude, written in `dc` |
 | `dc-eval` | CEK evaluator with exact step counting and fuel |
 | `dc-stitch` | Serialisation of `dc` terms to and from the Stitch format |
+| `dc-compress` | Library learning: runs Stitch on `dc` programs and decodes the abstractions it finds |
 | `dc-tasks` | Task format, seeded input generators, oracles, growth estimators, and the task families |
 | `dc-bench` | Evaluator throughput benchmark |
 

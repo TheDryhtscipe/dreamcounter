@@ -1,0 +1,20 @@
+[package]
+name = "dc-compress"
+description = "Library learning for dc: runs Stitch on dc programs and decodes the abstractions it finds"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+dc-core.workspace = true
+dc-stitch.workspace = true
+stitch_core = { git = "https://github.com/mlb2251/stitch", rev = "350804b7b35807c78bd21c313785ae5152ae2985" }
+
+[dev-dependencies]
+dc-surface.workspace = true
+
+[lints]
+workspace = true

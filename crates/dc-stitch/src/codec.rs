@@ -2,6 +2,7 @@
 //!
 //! See the crate docs for the encoding table and the abstraction convention.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use dc_core::{Arena, LibId, Prim, Term, TermId};
@@ -79,6 +80,15 @@ pub enum DecodeError {
         /// The abstraction's arity.
         arity: u32,
     },
+    /// A parameter `#index`, with `index < arity`, that does not occur in the
+    /// abstraction body. Every parameter of a Stitch abstraction occurs in its
+    /// body, so this bounds the arity by the size of the body.
+    UnusedParameter {
+        /// The smallest parameter index that does not occur.
+        index: u32,
+        /// The abstraction's arity.
+        arity: u32,
+    },
     /// A reserved token not applied to the operands its special form needs.
     MalformedSpecialForm {
         /// The reserved token.
@@ -110,6 +120,10 @@ impl fmt::Display for DecodeError {
             DecodeError::ParameterOutOfRange { index, arity } => {
                 write!(f, "parameter #{index} in an abstraction of arity {arity}")
             }
+            DecodeError::UnusedParameter { index, arity } => write!(
+                f,
+                "parameter #{index} of an abstraction of arity {arity} does not occur in its body"
+            ),
             DecodeError::MalformedSpecialForm { token, message } => {
                 write!(f, "malformed '{token}': {message}")
             }
@@ -474,9 +488,31 @@ pub fn decode_open(
     from_expr(arena, &e, names, context)
 }
 
+/// The distinct parameters `#i` in `e`, found with a work list.
+fn parameters(e: &Expr) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::IVar(i) => {
+                out.insert(*i);
+            }
+            Expr::Lam(b) | Expr::TaggedLam(_, b) => stack.push(b),
+            Expr::App(f, x) => {
+                stack.push(f);
+                stack.push(x);
+            }
+            Expr::Var(_) | Expr::Sym(_) => {}
+        }
+    }
+    out
+}
+
 /// Decodes the body of a Stitch abstraction of `arity` parameters into the closed
 /// core term `λ^arity. body'`, where `#i` under `d` binders of the body becomes
-/// `$(d + arity - 1 - i)` (see the crate docs). Free `$i` in the body are an error.
+/// `$(d + arity - 1 - i)` (see the crate docs). Free `$i` in the body are an error,
+/// and so is a parameter below `arity` that does not occur in the body
+/// ([`DecodeError::UnusedParameter`]), which bounds the arity by the body's size.
 pub fn decode_abstraction(
     arena: &mut Arena,
     body: &str,
@@ -490,6 +526,15 @@ pub fn decode_abstraction(
         arity: Some(arity),
     };
     let mut out = decoder.term(arena, &e)?;
+    // Decoding succeeded, so every parameter in the body is below `arity`; the
+    // parameters are all used exactly when there are `arity` distinct ones.
+    let used = parameters(&e);
+    if used.len() as u64 != u64::from(arity) {
+        let index = (0..arity)
+            .find(|i| !used.contains(i))
+            .expect("fewer than arity distinct parameters below arity");
+        return Err(DecodeError::UnusedParameter { index, arity });
+    }
     for _ in 0..arity {
         out = arena.lam(out);
     }
@@ -844,6 +889,31 @@ mod tests {
     }
 
     #[test]
+    fn every_parameter_must_occur_in_the_body() {
+        let n = names();
+        let mut a = Arena::new();
+        assert_eq!(
+            decode_abstraction(&mut a, "(add #0 #2)", 3, &n),
+            Err(DecodeError::UnusedParameter { index: 1, arity: 3 })
+        );
+        assert_eq!(
+            decode_abstraction(&mut a, "nil", 1, &n),
+            Err(DecodeError::UnusedParameter { index: 0, arity: 1 })
+        );
+        // The check bounds the arity by the size of the body, so a huge arity is
+        // refused without building its lambdas.
+        assert_eq!(
+            decode_abstraction(&mut a, "(add #0 #1)", u32::MAX, &n),
+            Err(DecodeError::UnusedParameter {
+                index: 2,
+                arity: u32::MAX
+            })
+        );
+        assert!(decode_abstraction(&mut a, "(add #1 #0)", 2, &n).is_ok());
+        assert!(decode_abstraction(&mut a, "nil", 0, &n).is_ok());
+    }
+
+    #[test]
     fn abstraction_errors() {
         let n = names();
         let mut a = Arena::new();
@@ -1109,8 +1179,20 @@ mod tests {
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 let body = expr::print(&abstract_free_vars(&e, 0, arity));
                 let mut a = arena.borrow_mut();
-                let got = decode_abstraction(&mut a, &body, arity, &n)
-                    .map_err(|e| TestCaseError::fail(format!("{body}: {e}")))?;
+                let decoded = decode_abstraction(&mut a, &body, arity, &n);
+                // A free variable of the term that does not occur is a parameter
+                // the body does not use.
+                let used = parameters(&abstract_free_vars(&e, 0, arity));
+                if let Some(index) = (0..arity).find(|i| !used.contains(i)) {
+                    prop_assert_eq!(
+                        decoded,
+                        Err(DecodeError::UnusedParameter { index, arity }),
+                        "{}",
+                        body
+                    );
+                    return Ok(());
+                }
+                let got = decoded.map_err(|e| TestCaseError::fail(format!("{body}: {e}")))?;
                 let mut expected = id;
                 for _ in 0..arity {
                     expected = a.lam(expected);
