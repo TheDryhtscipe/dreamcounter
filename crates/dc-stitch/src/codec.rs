@@ -513,6 +513,8 @@ fn parameters(e: &Expr) -> BTreeSet<u32> {
 /// `$(d + arity - 1 - i)` (see the crate docs). Free `$i` in the body are an error,
 /// and so is a parameter below `arity` that does not occur in the body
 /// ([`DecodeError::UnusedParameter`]), which bounds the arity by the body's size.
+/// That check runs first, so after a parse error it takes precedence over every
+/// other decoding error.
 pub fn decode_abstraction(
     arena: &mut Arena,
     body: &str,
@@ -1221,7 +1223,7 @@ mod tests {
         let n = names();
         let arena = Rc::new(RefCell::new(Arena::new()));
         let multi = std::cell::Cell::new(0usize);
-        // About 3% of cases have two or more parameters and no gap, so run many.
+        // About 2.4% of cases have two or more parameters and no gap, so run many.
         let mut runner =
             proptest::test_runner::TestRunner::new(proptest::test_runner::Config::with_cases(4096));
         runner
