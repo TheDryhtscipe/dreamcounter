@@ -27,9 +27,10 @@
 //! that the same programs give the same result.
 //!
 //! It also sets `--no-mismatch-check`. Stitch otherwise asserts that the
-//! rewritten programs cost what it estimated, and panics when an abstraction is
-//! used inside its own argument, where its estimate is too low. So a step can
-//! compress less than Stitch reported. The rewritten programs are still checked:
+//! rewritten programs cost what it estimated, and panics when the estimate is
+//! too low. That was seen when an abstraction uses a parameter more than once
+//! and is used inside its own argument. So a step can compress less than Stitch
+//! reported. The rewritten programs are still checked:
 //! see the next section.
 //!
 //! # Steps that are dropped
@@ -304,8 +305,8 @@ pub fn stitch_config(cfg: &CompressConfig, library_len: usize) -> MultistepCompr
     s.step.no_curried_metavars = true;
     s.step.eta_long = false;
     // Stitch asserts that the rewritten programs cost what it estimated. Its
-    // estimate is wrong when an abstraction is used inside its own argument, and
-    // the assertion then panics. The rewriting is still right, and
+    // estimate can be too low when an abstraction uses a parameter more than
+    // once and is used inside its own argument, and the assertion then panics. The rewriting is still right, and
     // `accept_steps` checks it by expansion.
     s.step.no_mismatch_check = true;
     s

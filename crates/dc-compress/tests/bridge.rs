@@ -410,7 +410,7 @@ fn an_abstraction_used_inside_its_own_argument_does_not_panic() {
 }
 
 #[test]
-fn a_library_that_does_not_expand_is_refused_before_stitch_runs() {
+fn a_library_that_does_not_expand_is_refused_when_stitch_finds_nothing() {
     // The programs have nothing in common, so Stitch would return no step.
     let mut a = Arena::new();
     let libs = vec![LibDef {
