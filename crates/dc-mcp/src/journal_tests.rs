@@ -87,20 +87,68 @@ fn a_cut_inside_the_last_record_is_a_torn_tail() {
 }
 
 #[test]
-fn a_changed_byte_in_a_complete_record_is_corruption() {
+fn a_changed_byte_is_corruption_unless_only_the_tail_is_damaged() {
     let (bytes, ends) = three();
     let starts = [0, ends[0], ends[1]];
     for i in 0..bytes.len() {
-        if bytes[i] == b'\n' {
-            continue;
-        }
         let mut bad = bytes.clone();
         bad[i] ^= 0x01;
+        // A changed line break joins a record to the next one.
         let record = starts.iter().rposition(|s| *s <= i).unwrap();
+        let last_damaged = if bytes[i] == b'\n' {
+            record + 1
+        } else {
+            record
+        };
         match scan(&bad, 0, 0) {
-            Err(Corrupt { offset, .. }) => assert_eq!(offset, starts[record] as u64, "byte {i}"),
-            Ok(_) => panic!("byte {i} changed and the scan accepted it"),
+            Err(Corrupt { offset, .. }) => {
+                assert!(
+                    last_damaged < 2,
+                    "byte {i}: damage to the tail alone is an error"
+                );
+                assert_eq!(offset, starts[record] as u64, "byte {i}");
+            }
+            Ok(scan) => {
+                assert!(last_damaged >= 2, "byte {i} changed before a good record");
+                assert!(scan.torn, "byte {i}");
+                assert_eq!(scan.valid_len, starts[record], "byte {i}");
+                assert_eq!(scan.records.len(), record, "byte {i}");
+            }
         }
+    }
+}
+
+#[test]
+fn bytes_after_the_last_record_are_a_torn_tail_unless_a_good_record_follows() {
+    let (bytes, ends) = three();
+    for junk in [
+        &b"\0\0\0\0"[..],
+        b"\n",
+        b"junk\n",
+        b"\n\n7 00000000 []\n",
+        b"9 zz",
+    ] {
+        let mut with = bytes.clone();
+        with.extend_from_slice(junk);
+        let scan = scan(&with, 0, 0).unwrap();
+        assert!(scan.torn, "{junk:?}");
+        assert_eq!(scan.valid_len, bytes.len(), "{junk:?}");
+        assert_eq!(scan.records.len(), 3, "{junk:?}");
+        assert_eq!(scan.offsets, [0, ends[0] as u64, ends[1] as u64]);
+    }
+    // Junk, then a record with a right checksum: the junk is not a tail.
+    let mut with = bytes[..ends[1]].to_vec();
+    with.extend_from_slice(b"junk\n");
+    with.extend_from_slice(&bytes[ends[1]..]);
+    assert_eq!(scan(&with, 0, 0).unwrap_err().offset, ends[1] as u64);
+}
+
+#[test]
+fn a_record_with_a_right_checksum_and_bad_events_is_corruption() {
+    for json in ["[", "[{\"nonsense\":1}]", "{}"] {
+        let body = format!("0 {json}");
+        let line = format!("0 {:08x} {json}\n", crc32(body.as_bytes()));
+        assert_eq!(scan(line.as_bytes(), 0, 0).unwrap_err().offset, 0, "{json}");
     }
 }
 

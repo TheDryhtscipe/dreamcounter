@@ -1,16 +1,21 @@
-//! A process that is killed while it writes to a run loses nothing it was told
-//! is written, and the run goes on from there.
+//! A process that is killed while it commits to a run in a loop loses no
+//! commit it was told is written, and the run goes on from there.
 //!
 //! The test runs this test binary again as a child. The child commits to a run
 //! in a loop and prints a line after each commit returns. The parent kills it
-//! with SIGKILL, part of the way through an iteration, and reads the run.
+//! with SIGKILL and reads the run.
+//!
+//! What this does not show: that a commit survives a power cut, which needs
+//! the `fsync` (see `store_tests.rs` for the order of the write and the sync),
+//! or what a torn tail does (SIGKILL does not tear a write in practice; see
+//! the torn-tail tests in `store_tests.rs`).
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use dc_mcp::state::{Arm, Event, FrontierMember, LogKind, LogRecord, RunConfig, RunId, RunState};
-use dc_mcp::store::Store;
+use dc_mcp::store::{Store, StoreError};
 
 const ROOT_ENV: &str = "DC_MCP_KILL_TEST_ROOT";
 const RUN: &str = "killed";
@@ -71,13 +76,11 @@ fn writer_child() {
     let run = RunId::new(RUN).unwrap();
     let mut out = std::io::stdout();
     loop {
-        let mut done = 0;
-        store
-            .commit(&run, |state| {
-                done = state.log_count(LogKind::Note);
-                batch(done)
-            })
-            .unwrap();
+        let done: Result<u64, StoreError> = store.commit(&run, |state| {
+            let done = state.log_count(LogKind::Note);
+            Ok((done, batch(done)))
+        });
+        let done = done.unwrap();
         writeln!(out, "\nack {done}").unwrap();
         out.flush().unwrap();
     }
@@ -130,7 +133,6 @@ fn a_killed_writer_loses_no_acknowledged_commit() {
         assert_eq!(state, expected(commits));
         assert_eq!(store.log(&run).unwrap().len() as u64, commits);
     }
-    // The kills were inside iterations, not only at their ends.
     assert!(total_acked >= 34);
     assert!(
         Store::open(dir.path())

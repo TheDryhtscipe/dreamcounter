@@ -16,13 +16,26 @@
 //!
 //! # Torn tails and corruption
 //!
-//! The store appends a record with one write. If the server dies during the
-//! write, the file can end with part of a line. [`scan`] reports that as a torn
-//! tail. The commit was never acknowledged, so the store drops the part line.
+//! A write that the server or the machine did not finish can leave anything
+//! after the last complete record: part of a line, or a whole line with wrong
+//! bytes. [`scan`] calls that a torn tail when no record with a right
+//! checksum follows it. The commit was never acknowledged, so the store sets
+//! the tail aside and goes on (see [`crate::store`]).
 //!
-//! Anything else that does not read back is corruption, and [`scan`] returns
-//! an error: a complete line with a wrong checksum, a number out of order, or
-//! events that do not parse. The store then refuses to use the run.
+//! Everything else that does not read back is corruption, and [`scan`] returns
+//! an error:
+//!
+//! * a line that fails its checksum, or part of a line, with a good record
+//!   after it;
+//! * a line with a right checksum whose number is out of order or whose events
+//!   do not parse.
+//!
+//! # What the format cannot detect
+//!
+//! Damage to the end of a journal looks like a torn tail. If the last records
+//! are cut off or damaged after they were acknowledged, [`scan`] reads a
+//! shorter run and reports no error. Nothing in the file says how long it
+//! should be.
 
 use std::fmt;
 
@@ -51,26 +64,42 @@ impl std::error::Error for Corrupt {}
 /// What [`scan`] read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Scan {
-    /// The events of each complete record, in order.
+    /// The events of each good record, in order.
     pub records: Vec<Vec<Event>>,
-    /// The length of the complete records, in bytes.
+    /// Where each good record starts, in bytes from the start of the file.
+    pub offsets: Vec<u64>,
+    /// The length of the good records, in bytes.
     pub valid_len: usize,
-    /// Whether part of a line follows the complete records.
+    /// Whether a torn tail follows the good records.
     pub torn: bool,
 }
+
+/// The CRC-32 table for the IEEE polynomial, one entry for each byte value.
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
 
 /// The CRC-32 of `bytes` (the IEEE polynomial, as in zlib and PNG).
 pub fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = u32::MAX;
     for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let low = crc & 1;
-            crc >>= 1;
-            if low == 1 {
-                crc ^= 0xEDB8_8320;
-            }
-        }
+        crc = CRC_TABLE[usize::from((crc as u8) ^ *byte)] ^ (crc >> 8);
     }
     !crc
 }
@@ -90,53 +119,74 @@ pub fn encode(seq: u64, events: &[Event]) -> String {
 /// `first_seq` is the number the first record must have.
 pub fn scan(bytes: &[u8], base: u64, first_seq: u64) -> Result<Scan, Corrupt> {
     let mut records = Vec::new();
+    let mut offsets = Vec::new();
     let mut start = 0;
     let mut seq = first_seq;
     while let Some(len) = bytes[start..].iter().position(|b| *b == b'\n') {
-        let events = decode(&bytes[start..start + len], seq).map_err(|reason| Corrupt {
+        let corrupt = |reason| Corrupt {
             offset: base + start as u64,
             reason,
-        })?;
+        };
+        let Some(json) = verified(&bytes[start..start + len], seq).map_err(corrupt)? else {
+            break;
+        };
+        let events: Vec<Event> = serde_json::from_str(json)
+            .map_err(|_| corrupt("a record whose events do not parse"))?;
+        if events.is_empty() {
+            return Err(corrupt("a record with no events"));
+        }
         records.push(events);
+        offsets.push(base + start as u64);
         start += len + 1;
         seq += 1;
     }
+    // What is left is a torn tail, unless a good record follows it.
+    let mut rest = &bytes[start..];
+    while let Some(len) = rest.iter().position(|b| *b == b'\n') {
+        if checksum_holds(&rest[..len]) {
+            return Err(Corrupt {
+                offset: base + start as u64,
+                reason: "a damaged record with a good record after it",
+            });
+        }
+        rest = &rest[len + 1..];
+    }
     Ok(Scan {
         records,
+        offsets,
         valid_len: start,
         torn: start < bytes.len(),
     })
 }
 
-/// The events of one line, without its line break.
-fn decode(line: &[u8], seq: u64) -> Result<Vec<Event>, &'static str> {
-    let line = std::str::from_utf8(line).map_err(|_| "a record that is not UTF-8")?;
+/// The three fields of a line whose checksum is right.
+fn fields(line: &[u8]) -> Option<(&str, &str)> {
+    let line = std::str::from_utf8(line).ok()?;
     let mut parts = line.splitn(3, ' ');
-    let (Some(number), Some(checksum), Some(json)) = (parts.next(), parts.next(), parts.next())
-    else {
-        return Err("a record with missing fields");
-    };
-    let canonical = |text: &str, radix| {
-        text.bytes()
-            .all(|b| char::from(b).is_digit(radix) && !b.is_ascii_uppercase())
-    };
-    if !canonical(number, 10) || checksum.len() != 8 || !canonical(checksum, 16) {
-        return Err("a record with a malformed number or checksum");
+    let (number, checksum, json) = (parts.next()?, parts.next()?, parts.next()?);
+    let lower_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    if checksum.len() != 8 || !checksum.bytes().all(lower_hex) {
+        return None;
     }
-    let checksum =
-        u32::from_str_radix(checksum, 16).map_err(|_| "a record with a malformed checksum")?;
-    if crc32(format!("{number} {json}").as_bytes()) != checksum {
-        return Err("a record with a wrong checksum");
-    }
-    if number.parse() != Ok(seq) || number != seq.to_string() {
+    let checksum = u32::from_str_radix(checksum, 16).ok()?;
+    (crc32(format!("{number} {json}").as_bytes()) == checksum).then_some((number, json))
+}
+
+/// Whether `line`, without its line break, has a right checksum.
+fn checksum_holds(line: &[u8]) -> bool {
+    fields(line).is_some()
+}
+
+/// The events of record `seq` as JSON text, or `None` if the line's checksum
+/// is wrong. A right checksum with another number is an error.
+fn verified(line: &[u8], seq: u64) -> Result<Option<&str>, &'static str> {
+    let Some((number, json)) = fields(line) else {
+        return Ok(None);
+    };
+    if number != seq.to_string() {
         return Err("a record out of order");
     }
-    let events: Vec<Event> =
-        serde_json::from_str(json).map_err(|_| "a record whose events do not parse")?;
-    if events.is_empty() {
-        return Err("a record with no events");
-    }
-    Ok(events)
+    Ok(Some(json))
 }
 
 #[cfg(test)]

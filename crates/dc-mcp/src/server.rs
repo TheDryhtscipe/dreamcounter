@@ -1,8 +1,11 @@
 //! The MCP tools.
 //!
-//! Every tool reads or writes through the [`Store`], so a tool's answer is the
-//! state on disk. A request the server cannot carry out is a tool error with a
-//! message, and changes nothing.
+//! Every tool reads or writes through the [`Store`], which brings its copy of
+//! the run up to the journal on disk first. A request the server cannot carry
+//! out is a tool error with a message, and changes nothing.
+//!
+//! A tool call runs on a thread of its own, so a call that waits for a run's
+//! lock does not hold up other calls or the protocol.
 
 use std::sync::Arc;
 
@@ -10,8 +13,8 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Arm, LogKind, RunConfig, RunId, RunState};
-use crate::store::Store;
+use crate::state::{Arm, Event, LogKind, LogRecord, RunConfig, RunId, RunState};
+use crate::store::{Store, StoreError};
 
 /// The arguments of `dc_create_run`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -36,6 +39,21 @@ pub struct RunArg {
     /// The run's id.
     pub run: String,
 }
+
+/// The arguments of `dc_add_note`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AddNote {
+    /// The run's id.
+    pub run: String,
+    /// The remark.
+    pub text: String,
+}
+
+/// The arguments of `dc_list_runs`: none.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NoArgs {}
 
 /// One task of a run.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -145,8 +163,30 @@ impl DcServer {
     }
 }
 
+/// The longest text of a refused argument that an error message repeats.
+const MAX_ECHO: usize = 80;
+
 fn run_id(text: &str) -> Result<RunId, String> {
-    RunId::new(text).map_err(|e| format!("{text:?} is not a run id: {e}"))
+    RunId::new(text).map_err(|e| {
+        let shown: String = text.chars().take(MAX_ECHO).collect();
+        let more = if shown.len() < text.len() { "..." } else { "" };
+        format!("{shown:?}{more} is not a run id: {e}")
+    })
+}
+
+impl DcServer {
+    /// Runs `work` on a thread that may block, and waits for it.
+    async fn blocking<T, F>(&self, work: F) -> Result<Json<T>, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Store) -> Result<T, String> + Send + 'static,
+    {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || work(&store))
+            .await
+            .map_err(|e| format!("the tool call did not finish: {e}"))?
+            .map(Json)
+    }
 }
 
 #[tool_router(server_handler)]
@@ -158,7 +198,7 @@ impl DcServer {
                        empty frontier for each task. Fails if a run of that id exists. Returns \
                        the new run's status."
     )]
-    fn create_run(
+    async fn create_run(
         &self,
         Parameters(arg): Parameters<CreateRun>,
     ) -> Result<Json<RunStatus>, String> {
@@ -168,8 +208,9 @@ impl DcServer {
             None => known,
             Some(tasks) => {
                 if let Some(unknown) = tasks.iter().find(|t| !known.contains(t)) {
+                    let shown: String = unknown.chars().take(MAX_ECHO).collect();
                     return Err(format!(
-                        "there is no task {unknown:?}. The tasks are: {}",
+                        "there is no task {shown:?}. The tasks are: {}",
                         known.join(", ")
                     ));
                 }
@@ -181,11 +222,13 @@ impl DcServer {
             seed: arg.seed,
             proposals_per_task: arg.proposals_per_task,
         };
-        let state = self
-            .store
-            .create_run(&run, config, tasks)
-            .map_err(|e| e.to_string())?;
-        Ok(Json(RunStatus::of(&run, &state)))
+        self.blocking(move |store| {
+            let state = store
+                .create_run(&run, config, tasks)
+                .map_err(|e| e.to_string())?;
+            Ok(RunStatus::of(&run, &state))
+        })
+        .await
     }
 
     /// Reports where a run is.
@@ -195,10 +238,46 @@ impl DcServer {
                        of each task's frontier, the size of the library, and how many log \
                        records it has."
     )]
-    fn run_status(&self, Parameters(arg): Parameters<RunArg>) -> Result<Json<RunStatus>, String> {
+    async fn run_status(
+        &self,
+        Parameters(arg): Parameters<RunArg>,
+    ) -> Result<Json<RunStatus>, String> {
         let run = run_id(&arg.run)?;
-        let state = self.store.state(&run).map_err(|e| e.to_string())?;
-        Ok(Json(RunStatus::of(&run, &state)))
+        self.blocking(move |store| {
+            store
+                .read(&run, |state| RunStatus::of(&run, state))
+                .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    /// Adds an operator's remark to a run's log.
+    #[tool(
+        name = "dc_add_note",
+        description = "Add a remark to a DreamCounter run's log, in the run's current iteration. \
+                       Returns the run's status once the remark is on disk."
+    )]
+    async fn add_note(
+        &self,
+        Parameters(arg): Parameters<AddNote>,
+    ) -> Result<Json<RunStatus>, String> {
+        let run = run_id(&arg.run)?;
+        self.blocking(move |store| {
+            let noted: Result<(), StoreError> = store.commit(&run, |state| {
+                let note = Event::Logged(LogRecord {
+                    kind: LogKind::Note,
+                    iteration: state.iteration(),
+                    task: None,
+                    text: arg.text,
+                });
+                Ok(((), vec![note]))
+            });
+            noted.map_err(|e| e.to_string())?;
+            store
+                .read(&run, |state| RunStatus::of(&run, state))
+                .map_err(|e| e.to_string())
+        })
+        .await
     }
 
     /// Lists the runs.
@@ -206,10 +285,16 @@ impl DcServer {
         name = "dc_list_runs",
         description = "List the ids of the DreamCounter runs in the server's state directory."
     )]
-    fn list_runs(&self) -> Result<Json<RunList>, String> {
-        let runs = self.store.runs().map_err(|e| e.to_string())?;
-        Ok(Json(RunList {
-            runs: runs.iter().map(|r| r.as_str().to_owned()).collect(),
-        }))
+    async fn list_runs(
+        &self,
+        Parameters(NoArgs {}): Parameters<NoArgs>,
+    ) -> Result<Json<RunList>, String> {
+        self.blocking(|store| {
+            let runs = store.runs().map_err(|e| e.to_string())?;
+            Ok(RunList {
+                runs: runs.iter().map(|r| r.as_str().to_owned()).collect(),
+            })
+        })
+        .await
     }
 }

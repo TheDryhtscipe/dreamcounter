@@ -32,8 +32,10 @@ fn main() -> ExitCode {
 /// Serves until the client closes the connection.
 fn serve(dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(dir)?;
-    // One thread: every tool call is a short file operation, and the store
-    // makes callers take turns in any case.
+    // A mistyped directory would otherwise look like a store with no runs.
+    let shown = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
+    eprintln!("dc-mcp: serving the runs in {}", shown.display());
+    // One thread for the protocol. Tool calls run on the blocking pool.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
