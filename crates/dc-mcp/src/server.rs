@@ -14,7 +14,7 @@
 //! lock does not hold up other calls or the protocol.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -551,6 +551,9 @@ impl Checker {
     /// that window.
     fn drain(&self, mut check: impl FnMut(), mut idle: impl FnMut()) {
         loop {
+            // With the fence after `drop` below, either this thread sees the
+            // lock free or the holder sees `dirty` set.
+            fence(Ordering::SeqCst);
             let Ok(running) = self.running.try_lock() else {
                 // The thread that holds it looks at `dirty` after it lets go.
                 return;
@@ -561,6 +564,7 @@ impl Checker {
             }
             idle();
             drop(running);
+            fence(Ordering::SeqCst);
             // Work signalled while this thread held the lock was refused the
             // lock: take it up.
             if !self.dirty.load(Ordering::SeqCst) {
@@ -599,8 +603,9 @@ impl ProposerServer {
         tokio::task::spawn_blocking(move || {
             let mut retry = CHECK_RETRY_FIRST;
             checker.drain(
-                || {
-                    if let Err(e) = check_pending(&store, &run) {
+                || match check_pending(&store, &run) {
+                    Ok(_) => retry = CHECK_RETRY_FIRST,
+                    Err(e) => {
                         // Standard error may be closed.
                         let _ = writeln!(
                             std::io::stderr(),

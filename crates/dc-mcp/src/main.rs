@@ -72,6 +72,7 @@ fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn st
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let checks_in_background = proposer.is_some();
     let served = runtime.block_on(async {
         match proposer {
             None => {
@@ -91,6 +92,9 @@ fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn st
     // A background check may be running or waiting to try again. Its work is
     // committed whole or not at all, so it can be left: the next proposer
     // server takes it up.
-    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    // The operator's server waits for its tool calls to finish.
+    if checks_in_background {
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    }
     served
 }
