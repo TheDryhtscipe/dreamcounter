@@ -672,7 +672,7 @@ fn set_limits() -> Result<(), String> {
         set_limit(Resource::Cpu, soft, hard).map_err(|e| format!("setting the CPU limit: {e}"))?;
         if inherited.is_some_and(|m| m < wanted) {
             note(&format!(
-                "the CPU limit is {soft} seconds, below the inherited hard limit"
+                "the CPU limit is {soft} s, below the inherited hard limit of {hard} s"
             ));
         }
     }

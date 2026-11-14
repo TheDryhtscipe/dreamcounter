@@ -189,29 +189,54 @@ fn a_limit_too_small_for_stitch_s_stack_is_reported() {
 /// Runs a stand-in worker that is `sh -c script`.
 #[cfg(unix)]
 fn run_shell(script: &str) -> Result<Vec<dc_compress::StitchStep>, WorkerError> {
-    // A shell that aborts is not the worker, so it would leave a core file or
-    // a crash report. A core limit of 0 stops both.
-    let script = format!("ulimit -c 0; {script}");
-    stand_in("sh", &["-c", &script], Limits::default()).run(&two_lists(1), &NEVER)
+    stand_in("sh", &["-c", script], Limits::default()).run(&two_lists(1), &NEVER)
+}
+
+/// With this set, [`stand_in_that_aborts`] writes its value on standard error
+/// and aborts.
+#[cfg(unix)]
+const ABORT_LINE_ENV: &str = "DC_COMPRESS_TEST_ABORT_LINE";
+
+/// Not a check on its own. [`run_aborting`] runs this test binary with only
+/// this test and [`ABORT_LINE_ENV`] set, as a stand-in worker that writes a
+/// line and aborts, as Rust's allocation error handler does. A shell that
+/// aborts would leave a crash report: apport writes one for a program from a
+/// package even with a core limit of 0. The test binary is from no package.
+#[cfg(unix)]
+#[test]
+fn stand_in_that_aborts() {
+    if let Ok(line) = std::env::var(ABORT_LINE_ENV) {
+        eprintln!("{line}");
+        std::process::abort();
+    }
+}
+
+#[cfg(unix)]
+fn run_aborting(line: &str) -> Result<Vec<dc_compress::StitchStep>, WorkerError> {
+    let me = std::env::current_exe().expect("the test binary's path");
+    let me = me.to_str().expect("a UTF-8 path");
+    let script = format!(
+        "export {ABORT_LINE_ENV}=\"$1\"; \
+         exec \"$0\" --exact stand_in_that_aborts --nocapture --test-threads=1"
+    );
+    stand_in("sh", &["-c", &script, me, line], Limits::default()).run(&two_lists(1), &NEVER)
 }
 
 #[cfg(unix)]
 #[test]
 fn out_of_memory_needs_an_abort_and_the_allocation_line() {
-    // Rust's allocation error handler writes the line and then aborts.
-    let line = "echo 'memory allocation of 8 bytes failed' >&2";
-    match run_shell(&format!("{line}; kill -ABRT $$")) {
+    let line = "memory allocation of 8 bytes failed";
+    match run_aborting(line) {
         Err(WorkerError::OutOfMemory { .. }) => {}
         other => panic!("abort with the line: expected OutOfMemory, got {other:?}"),
     }
     // The line without an abort, as when a panic message quotes it.
-    match run_shell(&format!("{line}; exit 1")) {
+    match run_shell(&format!("echo '{line}' >&2; exit 1")) {
         Err(WorkerError::Failed { status, .. }) => assert_eq!(exit_code(&status), Some(1)),
         other => panic!("line without abort: expected Failed, got {other:?}"),
     }
     // An abort with the words inside a longer line.
-    let quoted = "echo 'parse error in: (memory allocation of 8 bytes failed' >&2";
-    match run_shell(&format!("{quoted}; kill -ABRT $$")) {
+    match run_aborting(&format!("parse error in: ({line}")) {
         Err(WorkerError::Failed { status, .. }) => assert_eq!(signal(&status), Some(6)),
         other => panic!("abort with a quoted line: expected Failed, got {other:?}"),
     }
@@ -236,7 +261,10 @@ fn an_inherited_hard_cpu_limit_is_reported_as_the_cpu_limit() {
     };
     match w.run(&two_lists(1500), &NEVER) {
         Err(WorkerError::CpuLimit { stderr }) => {
-            assert!(stderr.contains("the CPU limit is 1 seconds"), "{stderr}");
+            assert!(
+                stderr.contains("the CPU limit is 1 s, below the inherited hard limit of 2 s"),
+                "{stderr}"
+            );
         }
         other => panic!("expected CpuLimit, got {other:?}"),
     }
