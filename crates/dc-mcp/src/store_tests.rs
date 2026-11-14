@@ -1,4 +1,5 @@
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use tempfile::TempDir;
@@ -93,6 +94,43 @@ fn a_new_store_on_the_same_directory_sees_the_same_run() {
     assert_eq!(second.state(&run).unwrap(), before);
     assert_eq!(second.log(&run).unwrap(), log_before);
     assert_eq!(second.runs().unwrap(), vec![run]);
+}
+
+#[test]
+fn for_each_log_hands_over_the_log_in_order_and_stops_when_told() {
+    let dir = TempDir::new().unwrap();
+    let run = id("r1");
+    let store = Store::open(dir.path()).unwrap();
+    store.create_run(&run, config(), tasks()).unwrap();
+    for text in ["a", "b", "c", "d"] {
+        store
+            .append(&run, vec![note(0, text), frontier("sum", text)])
+            .unwrap();
+    }
+    let mut all = Vec::new();
+    store
+        .for_each_log(&run, |record| {
+            all.push(record.text);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(all, ["a", "b", "c", "d"]);
+
+    let mut some = Vec::new();
+    store
+        .for_each_log(&run, |record| {
+            some.push(record.text);
+            if some.len() == 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+    assert_eq!(some, ["a", "b"]);
+    // The lock is released after a break.
+    store.append(&run, vec![note(0, "e")]).unwrap();
+    assert_eq!(store.log(&run).unwrap().len(), 5);
 }
 
 #[test]
