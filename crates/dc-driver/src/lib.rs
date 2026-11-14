@@ -13,8 +13,9 @@
 //!    [`DriverError`]: the run's state is wrong. A candidate that fails the same
 //!    checks is reported as [`Fate::Invalid`] and left out.
 //! 2. **Frontiers.** Each task's pool is its frontier, then its candidates in
-//!    the order given. A program whose expansion equals that of an earlier one
-//!    in the pool is a [`Fate::Duplicate`]. The pool is sorted by
+//!    the order given. Of the programs with one expansion, the pool keeps the
+//!    cheapest, and the earliest of those on a tie; the others are each a
+//!    [`Fate::Duplicate`] of it. The pool is sorted by
 //!    [`stitch_cost`], stably, and the first [`DriverConfig::frontier_size`]
 //!    programs are kept. This is selection at λ = 0, pure description length
 //!    (D4): Stitch is given every kept program with its task's label, and it
@@ -28,7 +29,7 @@
 //!    the frontiers are still updated, and the library is unchanged.
 //! 4. **Library update.** Each new abstraction gets a type scheme inferred from
 //!    its body with the earlier ones, and the new abstractions are cut at the
-//!    first that does not type. A rewritten program is accepted if it types
+//!    first that does not type or is too large to print. A rewritten program is accepted if it types
 //!    against its task's signature with the library's schemes and expands to
 //!    what its original expands to. Otherwise the program stays as it was:
 //!    the rewriting keeps the expansion but not always the type (see the
@@ -200,9 +201,10 @@ pub enum Source {
 pub enum Fate {
     /// It is in its task's new frontier, perhaps rewritten.
     Kept,
-    /// It expands to the same term as an earlier program of its task.
+    /// It expands to the same term as another program of its task, which is
+    /// cheaper, or costs the same and came earlier.
     Duplicate {
-        /// The earlier program.
+        /// The other program.
         of: Source,
     },
     /// Its task kept [`DriverConfig::frontier_size`] programs that cost less,
@@ -239,16 +241,17 @@ pub struct LeftOut {
     pub reason: String,
 }
 
-/// A new abstraction that does not type.
+/// The first new abstraction that is cut because it does not type or is too
+/// large to print.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Untyped {
     /// Its place among the new abstractions: it would have been
     /// `lib_{library.len() + abstraction}`.
     pub abstraction: usize,
-    /// Its body.
+    /// Its term, or nothing if it is too large to print.
     pub term: String,
-    /// The type error.
+    /// The type error, or why it cannot be printed.
     pub error: String,
 }
 
@@ -295,7 +298,8 @@ pub enum CompressionReport {
         rejected: Option<String>,
         /// The number of abstractions the bridge accepted.
         found: usize,
-        /// The first accepted abstraction that does not type.
+        /// The first accepted abstraction that does not type or is too large
+        /// to print. It and the abstractions after it are cut.
         untyped: Option<Untyped>,
         /// The number of typed abstractions cut because no accepted rewriting
         /// used them.
@@ -358,8 +362,8 @@ pub enum DriverError {
         /// Why.
         reason: String,
     },
-    /// A term is too large to print as text. Every program is checked for
-    /// this before it joins a pool, so this is not expected.
+    /// A term is too large to print as text. Every program and abstraction is
+    /// checked for this first, so this means a bug.
     TooLarge,
     /// The Stitch run was cancelled, or its worker or thread could not be
     /// started or read. This says nothing about the input: do not record the
@@ -425,8 +429,8 @@ fn names(len: usize) -> Result<LibNames, DriverError> {
     LibNames::sequential(ABSTRACTION_PREFIX, len).map_err(|_| DriverError::LibraryTooLarge)
 }
 
-/// `id` as text. Every program in the pool passed the same check, and an
-/// abstraction's body is no larger than the programs it was found in.
+/// `id` as text. Every program in the pool and every abstraction kept is
+/// checked first, so this fails only on a bug.
 fn print(arena: &Arena, id: TermId) -> Result<String, DriverError> {
     sexpr::print(arena, id).map_err(|_| DriverError::TooLarge)
 }
@@ -528,6 +532,9 @@ impl Library {
     }
 }
 
+/// A program and its expansion, or why the program is invalid.
+type Checked = Result<(TermId, TermId), String>;
+
 /// A program in a task's pool that passed its checks.
 #[derive(Clone, Debug)]
 struct Pooled {
@@ -592,50 +599,72 @@ fn select(
             .get(&task.name)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        // Each program's source, and its fate if it is not in the pool.
-        let mut entries: Vec<(Source, Option<Fate>)> = Vec::new();
-        let mut pool: Vec<Pooled> = Vec::new();
-        let mut seen: HashMap<TermId, Source> = HashMap::new();
-        let mut add = |source: Source,
-                       checked: Result<(TermId, TermId), String>,
-                       arena: &Arena|
-         -> Option<Fate> {
-            let (program, expanded) = match checked {
-                Ok(c) => c,
-                Err(reason) => return Some(Fate::Invalid { reason }),
-            };
-            if let Some(of) = seen.get(&expanded) {
-                return Some(Fate::Duplicate { of: of.clone() });
-            }
-            seen.insert(expanded, source.clone());
-            pool.push(Pooled {
-                source,
-                program,
-                expanded,
-                cost: stitch_cost(arena, program, names).map_err(|e| e.to_string()),
-            });
-            None
-        };
+        // Each program in order: its source, and its program and expansion or
+        // why it is invalid.
+        let mut checked: Vec<(Source, Checked)> = Vec::new();
         for (index, text) in members.iter().enumerate() {
             let source = Source::Member {
                 task: task.name.clone(),
                 index,
             };
-            let checked = library
+            let c = library
                 .check(arena, text, &task.signature)
                 .map_err(|reason| DriverError::Member {
                     task: task.name.clone(),
                     index,
                     reason,
                 })?;
-            let fate = add(source.clone(), Ok(checked), arena);
-            entries.push((source, fate));
+            checked.push((source, Ok(c)));
         }
         for &index in &candidates[t] {
-            let source = Source::Candidate { index };
-            let checked = library.check(arena, &input.candidates[index].program, &task.signature);
-            let fate = add(source.clone(), checked, arena);
-            entries.push((source, fate));
+            let c = library.check(arena, &input.candidates[index].program, &task.signature);
+            checked.push((Source::Candidate { index }, c));
+        }
+        // Of the programs with one expansion, the cheapest is pooled, and the
+        // earliest of those if several cost the same. The others are its
+        // duplicates.
+        let costs: Vec<Option<Result<u64, String>>> = checked
+            .iter()
+            .map(|(_, c)| {
+                c.as_ref().ok().map(|&(program, _)| {
+                    stitch_cost(arena, program, names).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        let key = |i: usize| match &costs[i] {
+            Some(Ok(cost)) => *cost,
+            _ => u64::MAX,
+        };
+        let mut best: HashMap<TermId, usize> = HashMap::new();
+        for (i, (_, c)) in checked.iter().enumerate() {
+            if let Ok((_, expanded)) = c {
+                let b = best.entry(*expanded).or_insert(i);
+                if key(i) < key(*b) {
+                    *b = i;
+                }
+            }
+        }
+        let mut entries: Vec<(Source, Option<Fate>)> = Vec::new();
+        let mut pool: Vec<Pooled> = Vec::new();
+        for (i, ((source, c), cost)) in checked.iter().zip(costs).enumerate() {
+            let fate = match (c, cost) {
+                (Err(reason), _) => Some(Fate::Invalid {
+                    reason: reason.clone(),
+                }),
+                (Ok((_, expanded)), _) if best[expanded] != i => Some(Fate::Duplicate {
+                    of: checked[best[expanded]].0.clone(),
+                }),
+                (Ok((program, expanded)), cost) => {
+                    pool.push(Pooled {
+                        source: source.clone(),
+                        program: *program,
+                        expanded: *expanded,
+                        cost: cost.unwrap_or_else(|| Err(String::new())),
+                    });
+                    None
+                }
+            };
+            entries.push((source.clone(), fate));
         }
         // A stable sort: among programs of equal cost, the earlier stays first.
         pool.sort_by_key(Pooled::sort_key);
@@ -663,7 +692,8 @@ fn select(
 enum StitchRun {
     /// No program was left to give Stitch.
     NoPrograms,
-    /// The run failed for a reason that the same input would give again.
+    /// The run failed, but not because it was interrupted: see
+    /// [`is_interruption`].
     Failed(String),
     /// The run finished. `slots` holds the place of each program Stitch was
     /// given, as (task, position in the task's kept programs).
@@ -772,6 +802,16 @@ fn update_library(
     let mut schemes = library.schemes.clone();
     let mut untyped = None;
     for (i, def) in c.new_libs.iter().enumerate() {
+        // An abstraction can be a few lambdas larger than the programs it was
+        // found in, so it may not print.
+        if arena.tree_size(def.term, MAX_PRINT_NODES).is_none() {
+            untyped = Some(Untyped {
+                abstraction: i,
+                term: String::new(),
+                error: format!("it has more than {MAX_PRINT_NODES} nodes written out"),
+            });
+            break;
+        }
         match infer(arena, def.term, &schemes) {
             Ok(s) => schemes.push(s),
             Err(e) => {

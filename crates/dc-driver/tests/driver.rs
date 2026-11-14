@@ -835,7 +835,12 @@ fn bad_input_state_is_an_error() {
         // A frontier member that does not parse, is open, uses an unknown
         // library, or has the wrong type.
         case(vec![], &[("a", &["("])], member),
-        case(vec![], &[("a", &["$0"])], member),
+        // The type checker would refuse it too, so check the reason.
+        case(
+            vec![],
+            &[("a", &["$0"])],
+            |e| matches!(e, DriverError::Member { reason, .. } if reason.contains("not closed")),
+        ),
         case(vec![lib(1, "(lam $0)")], &[("a", &["(lib_1 1)"])], member),
         case(vec![], &[("a", &["true"])], member),
     ];
@@ -1163,4 +1168,70 @@ fn a_library_entry_that_uses_a_missing_library_is_named() {
         matches!(result, Err(DriverError::Library { index: 0, .. })),
         "{result:?}"
     );
+}
+
+#[test]
+fn of_two_programs_with_one_expansion_the_cheaper_is_kept() {
+    // The candidate (lib_0 5) spells the member more cheaply with the library.
+    let tasks = [task("a", "Int")];
+    let library = [lib(1, "(lam (mul (add $0 6) (add $0 6)))")];
+    let fronts = frontiers(&[("a", &["(mul (add 5 6) (add 5 6))"])]);
+    let cands = [candidate("a", "(lib_0 5)"), candidate("a", "(add 1 2)")];
+    let out = run(
+        &tasks,
+        &library,
+        &fronts,
+        &cands,
+        &config(1),
+        &mut Nothing::default(),
+    )
+    .unwrap();
+    assert_eq!(out.frontiers["a"], vec!["(lib_0 5)"]);
+    assert_eq!(
+        *fate_of(
+            &out,
+            Source::Member {
+                task: "a".into(),
+                index: 0
+            }
+        ),
+        Fate::Duplicate {
+            of: Source::Candidate { index: 0 }
+        }
+    );
+    assert_eq!(
+        *fate_of(&out, Source::Candidate { index: 1 }),
+        Fate::Trimmed
+    );
+}
+
+#[test]
+fn an_abstraction_too_large_to_print_is_cut() {
+    let levels = (dc_core::sexpr::MAX_PRINT_NODES / 4) + 1;
+    let body: &'static str = Box::leak(
+        format!("(lam {}$0{})", "(add ".repeat(levels), " 1)".repeat(levels)).into_boxed_str(),
+    );
+    let tasks = [task("a", "Int")];
+    let cands = [candidate("a", "(add 1 1)")];
+    let mut stitch = Fixed {
+        libs: vec![(1, body)],
+        rewritten: vec!["(lib_0 1)"],
+    };
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &config(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert!(out.new_library.is_empty());
+    assert_eq!(out.frontiers["a"], vec!["(add 1 1)"]);
+    let CompressionReport::Ran { untyped, .. } = &out.report.compression else {
+        panic!("{:?}", out.report.compression);
+    };
+    let cut = untyped.as_ref().expect("the abstraction is cut");
+    assert_eq!(cut.abstraction, 0);
+    assert!(cut.error.contains("nodes written out"), "{}", cut.error);
 }
