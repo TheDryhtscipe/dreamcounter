@@ -189,7 +189,10 @@ fn a_limit_too_small_for_stitch_s_stack_is_reported() {
 /// Runs a stand-in worker that is `sh -c script`.
 #[cfg(unix)]
 fn run_shell(script: &str) -> Result<Vec<dc_compress::StitchStep>, WorkerError> {
-    stand_in("sh", &["-c", script], Limits::default()).run(&two_lists(1), &NEVER)
+    // A shell that aborts is not the worker, so it would leave a core file or
+    // a crash report. A core limit of 0 stops both.
+    let script = format!("ulimit -c 0; {script}");
+    stand_in("sh", &["-c", &script], Limits::default()).run(&two_lists(1), &NEVER)
 }
 
 #[cfg(unix)]
@@ -444,16 +447,39 @@ fn the_worker_sets_its_limits_below_inherited_hard_limits() {
     assert!(not_dumpable, "the worker is still dumpable");
 }
 
+/// The largest CPU limit in seconds that the kernel keeps: it counts CPU time
+/// in nanoseconds, in 64 bits.
+#[cfg(target_os = "linux")]
+const MAX_CPU_SECONDS: u64 = u64::MAX / 1_000_000_000;
+
 #[cfg(target_os = "linux")]
 #[test]
-fn a_cpu_limit_too_large_for_the_kernel_sets_none() {
-    // 2^63 + 4 seconds is 4 seconds once the kernel counts it in nanoseconds
-    // in 64 bits.
+fn a_cpu_limit_too_large_for_the_kernel_is_lowered_to_the_largest_it_keeps() {
+    // A hard limit of MAX_CPU_SECONDS + 1 wraps to under a second in the
+    // kernel, and 2^63 + 4 seconds wraps to 4 seconds.
+    let soft = (MAX_CPU_SECONDS - 1).to_string();
+    let hard = MAX_CPU_SECONDS.to_string();
+    for cpu in [MAX_CPU_SECONDS - 1, MAX_CPU_SECONDS, (1u64 << 63) + 4, u64::MAX] {
+        let (got, wanted, _) = worker_limits(
+            "exec \"$1\"",
+            &cpu.to_string(),
+            &(1u64 << 30).to_string(),
+            &[("Max cpu time", (&soft, &hard))],
+        );
+        assert_eq!(got, wanted, "CPU limit {cpu}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cpu_limit_too_large_for_the_kernel_stays_below_an_inherited_hard_limit() {
+    // As Duration::MAX gives. The soft limit stays below the inherited hard
+    // limit, so the run ends with SIGXCPU and not SIGKILL.
     let (got, wanted, _) = worker_limits(
-        "exec \"$1\"",
-        &((1u64 << 63) + 4).to_string(),
+        "ulimit -t 2 && exec \"$1\"",
+        &u64::MAX.to_string(),
         &(1u64 << 30).to_string(),
-        &[("Max cpu time", ("unlimited", "unlimited"))],
+        &[("Max cpu time", ("1", "2"))],
     );
     assert_eq!(got, wanted);
 }
