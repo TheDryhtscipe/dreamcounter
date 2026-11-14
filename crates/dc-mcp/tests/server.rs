@@ -21,12 +21,17 @@ struct Client {
 impl Client {
     /// Starts the server on `dir` and does the MCP handshake.
     fn start(dir: &Path) -> Client {
+        Client::start_with_stderr(dir, Stdio::null())
+    }
+
+    /// As `start`, with the server's standard error connected to `stderr`.
+    fn start_with_stderr(dir: &Path, stderr: Stdio) -> Client {
         let mut child = Command::new(env!("CARGO_BIN_EXE_dc-mcp"))
             .arg("--state-dir")
             .arg(dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
@@ -218,7 +223,7 @@ fn a_run_survives_a_kill_in_the_middle_of_an_iteration() {
     assert_eq!(before["tasks"][1]["frontier_size"], 0);
     assert_eq!(
         before["log_counts"],
-        json!({ "payload": 2, "submission": 1, "evaluation": 0, "compression": 0, "note": 0 })
+        json!({ "payload": 2, "submission": 1, "evaluation": 0, "compression": 0, "note": 0, "recovery": 0 })
     );
 
     client.kill();
@@ -369,6 +374,57 @@ fn a_locked_run_does_not_hold_up_the_rest_of_the_server() {
     let (id, result) = client.next_response();
     assert_eq!(id, waiting);
     assert_eq!(result["structuredContent"]["log_counts"]["note"], 1);
+    client.kill();
+}
+
+#[test]
+fn a_torn_tail_is_reported_in_the_run_even_with_standard_error_closed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let task = dc_tasks::families::development()[0]
+        .family
+        .name()
+        .to_owned();
+    let mut client = Client::start(dir.path());
+    client
+        .call(
+            "dc_create_run",
+            json!({ "run": "r1", "seed": 1, "proposals_per_task": 1, "tasks": [task] }),
+        )
+        .unwrap();
+    client
+        .call("dc_add_note", json!({ "run": "r1", "text": "one" }))
+        .unwrap();
+    client.kill();
+    let journal = dir.path().join("r1").join("journal");
+    let mut bytes = std::fs::read(&journal).unwrap();
+    bytes.extend_from_slice(b"2 0000 half a record");
+    std::fs::write(&journal, bytes).unwrap();
+
+    // A server whose standard error nobody reads: every write to it fails.
+    let mut client = Client::start_with_stderr(dir.path(), Stdio::piped());
+    drop(client.child.stderr.take());
+    let status = client
+        .call("dc_run_status", json!({ "run": "r1" }))
+        .unwrap();
+    assert_eq!(status["log_counts"]["recovery"], 0);
+    for (i, text) in ["two", "three"].into_iter().enumerate() {
+        let status = client
+            .call("dc_add_note", json!({ "run": "r1", "text": text }))
+            .unwrap();
+        assert_eq!(status["log_counts"]["note"], 2 + i);
+        assert_eq!(status["log_counts"]["recovery"], 1);
+    }
+    let mut files: Vec<String> = std::fs::read_dir(dir.path().join("r1"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert_eq!(files[0], "journal");
+    assert_eq!(
+        std::fs::read(dir.path().join("r1").join(&files[1])).unwrap(),
+        b"2 0000 half a record"
+    );
     client.kill();
 }
 

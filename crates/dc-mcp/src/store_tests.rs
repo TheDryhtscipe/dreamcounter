@@ -293,9 +293,11 @@ fn a_journal_of_another_format_version_is_not_called_damaged() {
         .unwrap();
     let path = journal(dir.path(), "r1");
     let text = fs::read_to_string(&path).unwrap();
-    fs::write(&path, text.replacen("journal 1\n", "journal 2\n", 1)).unwrap();
+    fs::write(&path, text.replacen("journal 1 ", "journal 2 ", 1)).unwrap();
     match Store::open(dir.path()).unwrap().state(&run) {
-        Err(StoreError::UnsupportedFormat { header, .. }) => assert_eq!(header, "dc-mcp journal 2"),
+        Err(StoreError::UnsupportedFormat { header, .. }) => {
+            assert!(header.starts_with("dc-mcp journal 2 "), "{header}");
+        }
         other => panic!("{other:?}"),
     }
     fs::write(&path, "").unwrap();
@@ -303,7 +305,7 @@ fn a_journal_of_another_format_version_is_not_called_damaged() {
         Store::open(dir.path()).unwrap().state(&run),
         Err(StoreError::Corrupt { .. })
     ));
-    fs::write(&path, crate::journal::HEADER).unwrap();
+    fs::write(&path, crate::journal::header(5)).unwrap();
     assert!(matches!(
         Store::open(dir.path()).unwrap().state(&run),
         Err(StoreError::Corrupt { .. })
@@ -647,4 +649,292 @@ fn an_append_that_cannot_be_taken_out_has_an_unknown_outcome() {
             "{failing:?}"
         );
     }
+}
+
+/// A journal file whose operations fail when told to. See `Store::faults`.
+pub(crate) struct Faulty<'a> {
+    file: &'a mut fs::File,
+    calls: usize,
+    fail: Vec<usize>,
+}
+
+impl<'a> Faulty<'a> {
+    pub(crate) fn new(file: &'a mut fs::File, fail: Vec<usize>) -> Faulty<'a> {
+        Faulty {
+            file,
+            calls: 0,
+            fail,
+        }
+    }
+
+    fn step(&mut self) -> std::io::Result<()> {
+        self.calls += 1;
+        if self.fail.contains(&(self.calls - 1)) {
+            Err(std::io::Error::other("injected"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Durable for Faulty<'_> {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        self.step()?;
+        self.file.truncate(len)
+    }
+
+    fn write_at(&mut self, at: u64, bytes: &[u8]) -> std::io::Result<()> {
+        self.step()?;
+        self.file.write_at(at, bytes)
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        // A failed sync leaves the bytes in the file.
+        self.step()?;
+        self.file.sync()
+    }
+}
+
+#[test]
+fn a_commit_whose_write_fails_is_not_in_the_run() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = id("r1");
+    mid_iteration(&store, &run);
+    let state = store.state(&run).unwrap();
+    let bytes = fs::read(journal(dir.path(), "r1")).unwrap();
+
+    // The steps of an append are truncate, write, sync. Each fails in turn.
+    for step in 0..3 {
+        *store.faults.lock().unwrap() = vec![step];
+        let failed = store.append(&run, vec![note(1, "lost")]);
+        assert!(
+            matches!(failed, Err(StoreError::Io { .. })),
+            "step {step}: {failed:?}"
+        );
+        assert_eq!(
+            fs::read(journal(dir.path(), "r1")).unwrap(),
+            bytes,
+            "step {step}"
+        );
+        assert_eq!(store.state(&run).unwrap(), state, "step {step}");
+        assert_eq!(Store::open(dir.path()).unwrap().state(&run).unwrap(), state);
+    }
+    store.append(&run, vec![note(1, "kept")]).unwrap();
+    let texts: Vec<String> = store
+        .log(&run)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.text)
+        .collect();
+    assert_eq!(texts, ["first", "payload text", "kept"]);
+}
+
+#[test]
+fn a_commit_with_an_unknown_outcome_is_read_from_the_file_afterwards() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = id("r1");
+    mid_iteration(&store, &run);
+    // The sync fails with the record written, and so does the truncate that
+    // would take it out. The record stays in the file.
+    *store.faults.lock().unwrap() = vec![2, 3];
+    let failed = store.append(&run, vec![note(1, "maybe")]);
+    assert!(
+        matches!(failed, Err(StoreError::OutcomeUnknown { .. })),
+        "{failed:?}"
+    );
+    // The store does not guess: it says what the file says, as a new store does.
+    let fresh = Store::open(dir.path()).unwrap().state(&run).unwrap();
+    assert_eq!(fresh.log_count(LogKind::Note), 2);
+    assert_eq!(store.state(&run).unwrap(), fresh);
+    store.append(&run, vec![note(1, "next")]).unwrap();
+    assert_eq!(
+        Store::open(dir.path())
+            .unwrap()
+            .state(&run)
+            .unwrap()
+            .log_count(LogKind::Note),
+        3
+    );
+}
+
+#[test]
+fn commit_then_sees_the_state_after_the_events_with_the_run_still_locked() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let other =
+        Store::open_with_lock_wait(dir.path(), std::time::Duration::from_millis(20)).unwrap();
+    let run = id("r1");
+    mid_iteration(&store, &run);
+    let seen: Result<(u64, u64, bool), StoreError> = store.commit_then(
+        &run,
+        |state| Ok((state.log_count(LogKind::Note), vec![note(1, "x")])),
+        |before, state| {
+            let busy = matches!(other.state(&run), Err(StoreError::Busy(_)));
+            (before, state.log_count(LogKind::Note), busy)
+        },
+    );
+    assert_eq!(seen.unwrap(), (1, 2, true));
+    // With no events, `then` sees the state as it is.
+    let seen: Result<u64, StoreError> = store.commit_then(
+        &run,
+        |_| Ok(((), vec![])),
+        |(), state| state.log_count(LogKind::Note),
+    );
+    assert_eq!(seen.unwrap(), 2);
+}
+
+#[test]
+fn a_run_removed_and_made_again_is_read_from_its_start() {
+    // The second run's journal is longer, the same length, or shorter.
+    for (seed, notes) in [(999, 2), (12, 1), (12, 0)] {
+        let dir = TempDir::new().unwrap();
+        let run = id("r1");
+        let a = Store::open(dir.path()).unwrap();
+        a.create_run(&run, config(), tasks()).unwrap();
+        a.append(&run, vec![note(0, "from the first run")]).unwrap();
+
+        fs::remove_dir_all(dir.path().join("r1")).unwrap();
+        let b = Store::open(dir.path()).unwrap();
+        let second = RunConfig { seed, ..config() };
+        b.create_run(&run, second.clone(), tasks()).unwrap();
+        for i in 0..notes {
+            b.append(&run, vec![note(0, &format!("second run {i}"))])
+                .unwrap();
+        }
+        let bytes = fs::read(journal(dir.path(), "r1")).unwrap();
+
+        // The first store sees the new run, not the one it remembers.
+        let seen = a.state(&run).unwrap();
+        assert_eq!(seen.config(), &second, "seed {seed}");
+        assert_eq!(seen.log_count(LogKind::Note), notes, "seed {seed}");
+        a.append(&run, vec![note(0, "from a")]).unwrap();
+        let after = fs::read(journal(dir.path(), "r1")).unwrap();
+        assert_eq!(&after[..bytes.len()], &bytes[..], "seed {seed}");
+        assert_eq!(fs::read_dir(dir.path().join("r1")).unwrap().count(), 1);
+        let fresh = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            fresh.state(&run).unwrap().log_count(LogKind::Note),
+            notes + 1
+        );
+        assert_eq!(fresh.state(&run).unwrap().log_count(LogKind::Recovery), 0);
+        assert_eq!(
+            b.state(&run).unwrap(),
+            fresh.state(&run).unwrap(),
+            "seed {seed}"
+        );
+    }
+}
+
+#[test]
+fn a_last_record_that_changed_under_a_store_is_an_error_once() {
+    let dir = TempDir::new().unwrap();
+    let run = id("r1");
+    let store = Store::open(dir.path()).unwrap();
+    store.create_run(&run, config(), tasks()).unwrap();
+    let path = journal(dir.path(), "r1");
+    let start = fs::read(&path).unwrap();
+    store.append(&run, vec![note(0, "aaaa")]).unwrap();
+    // Another record of the same length in its place, and one after it.
+    let mut swapped = start.clone();
+    swapped.extend_from_slice(crate::journal::encode(1, &[note(0, "bbbb")]).as_bytes());
+    swapped.extend_from_slice(crate::journal::encode(2, &[note(0, "cccc")]).as_bytes());
+    fs::write(&path, &swapped).unwrap();
+
+    assert!(matches!(store.state(&run), Err(StoreError::Corrupt { .. })));
+    assert_eq!(fs::read(&path).unwrap(), swapped);
+    let texts: Vec<String> = store
+        .log(&run)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.text)
+        .collect();
+    assert_eq!(texts, ["bbbb", "cccc"]);
+    assert_eq!(store.state(&run).unwrap().log_count(LogKind::Note), 2);
+}
+
+#[test]
+fn a_set_aside_tail_is_reported_first_in_the_commit_that_replaces_it() {
+    let dir = TempDir::new().unwrap();
+    let run = id("r1");
+    mid_iteration(&Store::open(dir.path()).unwrap(), &run);
+    let path = journal(dir.path(), "r1");
+    let mut bytes = fs::read(&path).unwrap();
+    let at = bytes.len();
+    bytes.extend_from_slice(b"7 half a rec");
+    fs::write(&path, &bytes).unwrap();
+
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.state(&run).unwrap().log_count(LogKind::Recovery), 0);
+    // The commit ends the iteration. The report is still in the iteration
+    // the run was in.
+    let seen: Result<u64, StoreError> = store.commit_then(
+        &run,
+        |_| {
+            Ok((
+                (),
+                vec![Event::IterationFinished { iteration: 1 }, note(2, "after")],
+            ))
+        },
+        |(), state| state.log_count(LogKind::Recovery),
+    );
+    assert_eq!(seen.unwrap(), 1);
+    let log = Store::open(dir.path()).unwrap().log(&run).unwrap();
+    let report = &log[log.len() - 2];
+    assert_eq!((report.kind, report.iteration), (LogKind::Recovery, 1));
+    assert!(
+        report.text.contains(&format!("torn-{at}-0")),
+        "{}",
+        report.text
+    );
+    assert!(report.text.starts_with("12 bytes"), "{}", report.text);
+    assert_eq!(log[log.len() - 1].text, "after");
+    // One record holds the report and the commit's events.
+    let lines = fs::read(&path).unwrap()[at..]
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count();
+    assert_eq!(lines, 1);
+    // A later commit has nothing to report.
+    store.append(&run, vec![note(2, "more")]).unwrap();
+    assert_eq!(store.state(&run).unwrap().log_count(LogKind::Recovery), 1);
+}
+
+#[test]
+fn the_longest_lock_wait_does_not_overflow() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open_with_lock_wait(dir.path(), std::time::Duration::MAX).unwrap();
+    let run = id("r1");
+    store.create_run(&run, config(), tasks()).unwrap();
+    assert_eq!(store.state(&run).unwrap().iteration(), 0);
+}
+
+#[test]
+fn a_lock_on_a_removed_directory_does_not_license_a_write_to_its_successor() {
+    let dir = TempDir::new().unwrap();
+    let run = id("r1");
+    let store = Store::open_with_lock_wait(dir.path(), std::time::Duration::from_secs(2)).unwrap();
+    store.create_run(&run, config(), tasks()).unwrap();
+    let old_lock = fs::File::open(dir.path().join("r1")).unwrap();
+    old_lock.lock().unwrap();
+
+    std::thread::scope(|scope| {
+        // This waits for the lock on the directory that is about to go.
+        let waiting = scope.spawn(|| store.append(&run, vec![note(0, "late")]));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        fs::remove_dir_all(dir.path().join("r1")).unwrap();
+        Store::open(dir.path())
+            .unwrap()
+            .create_run(&run, config(), tasks())
+            .unwrap();
+        let bytes = fs::read(journal(dir.path(), "r1")).unwrap();
+        // Another server holds the new run. The old lock is released.
+        let new_lock = fs::File::open(dir.path().join("r1")).unwrap();
+        new_lock.lock().unwrap();
+        drop(old_lock);
+        let result = waiting.join().unwrap();
+        assert!(matches!(result, Err(StoreError::Busy(_))), "{result:?}");
+        assert_eq!(fs::read(journal(dir.path(), "r1")).unwrap(), bytes);
+    });
 }

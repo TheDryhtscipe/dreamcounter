@@ -1,6 +1,7 @@
 //! The format of a run's journal: the file that holds every change to the run.
 //!
-//! A journal is a header line, [`HEADER`], and then one line for each record.
+//! A journal is a header line (see [`header`]) and then one line for each
+//! record.
 //! A record is the events of one commit, which take effect together. Its line
 //! is
 //!
@@ -41,8 +42,52 @@ use std::fmt;
 
 use crate::state::Event;
 
-/// The first line of every journal. The number is the format version.
-pub const HEADER: &str = "dc-mcp journal 1\n";
+/// What the header line of every journal starts with, in every format version.
+pub const HEADER_PREFIX: &str = "dc-mcp journal ";
+
+/// The format version this code reads and writes.
+pub const FORMAT_VERSION: &str = "1";
+
+/// The longest header line, with its line break, in bytes.
+pub const MAX_HEADER_LEN: usize = 64;
+
+/// The header line of a journal: the format version, and an id that is
+/// chosen at random when the journal is made. Two journals with different ids
+/// are different runs, even under the same name.
+pub fn header(id: u64) -> String {
+    format!("{HEADER_PREFIX}{FORMAT_VERSION} {id:016x}\n")
+}
+
+/// Why the start of a file is not a header this code reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeaderError {
+    /// The file does not start with a journal header.
+    NotAJournal,
+    /// The header is of another format version. This is the header line.
+    Unsupported(String),
+}
+
+/// Reads the header at the start of `bytes`: the journal's id, and the
+/// header's length in bytes.
+pub fn parse_header(bytes: &[u8]) -> Result<(u64, usize), HeaderError> {
+    let start = &bytes[..bytes.len().min(MAX_HEADER_LEN)];
+    let line = start
+        .iter()
+        .position(|b| *b == b'\n')
+        .and_then(|end| std::str::from_utf8(&start[..end]).ok())
+        .and_then(|line| line.strip_prefix(HEADER_PREFIX).map(|rest| (line, rest)));
+    let Some((line, rest)) = line else {
+        return Err(HeaderError::NotAJournal);
+    };
+    let unsupported = || HeaderError::Unsupported(line.to_owned());
+    let (version, id) = rest.split_once(' ').ok_or_else(unsupported)?;
+    let lower_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    if version != FORMAT_VERSION || id.len() != 16 || !id.bytes().all(lower_hex) {
+        return Err(unsupported());
+    }
+    let id = u64::from_str_radix(id, 16).map_err(|_| unsupported())?;
+    Ok((id, line.len() + 1))
+}
 
 /// A journal does not read back. See the module docs.
 #[derive(Clone, Debug, PartialEq, Eq)]

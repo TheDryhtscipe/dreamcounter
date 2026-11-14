@@ -2,7 +2,8 @@
 //!
 //! Every tool reads or writes through the [`Store`], which brings its copy of
 //! the run up to the journal on disk first. A request the server cannot carry
-//! out is a tool error with a message, and changes nothing.
+//! out is a tool error with a message. It changes nothing, unless the message
+//! says the outcome is not known.
 //!
 //! A tool call runs on a thread of its own, so a call that waits for a run's
 //! lock does not hold up other calls or the protocol.
@@ -77,6 +78,9 @@ pub struct LogCounts {
     pub compression: u64,
     /// Remarks.
     pub note: u64,
+    /// Reports that the store set aside bytes of the journal that were not a
+    /// record. More than 0 can mean lost changes: read the records.
+    pub recovery: u64,
 }
 
 /// Where a run is.
@@ -127,6 +131,7 @@ impl RunStatus {
                 evaluation: state.log_count(LogKind::Evaluation),
                 compression: state.log_count(LogKind::Compression),
                 note: state.log_count(LogKind::Note),
+                recovery: state.log_count(LogKind::Recovery),
             },
         }
     }
@@ -263,19 +268,20 @@ impl DcServer {
     ) -> Result<Json<RunStatus>, String> {
         let run = run_id(&arg.run)?;
         self.blocking(move |store| {
-            let noted: Result<(), StoreError> = store.commit(&run, |state| {
-                let note = Event::Logged(LogRecord {
-                    kind: LogKind::Note,
-                    iteration: state.iteration(),
-                    task: None,
-                    text: arg.text,
-                });
-                Ok(((), vec![note]))
-            });
-            noted.map_err(|e| e.to_string())?;
-            store
-                .read(&run, |state| RunStatus::of(&run, state))
-                .map_err(|e| e.to_string())
+            let noted: Result<RunStatus, StoreError> = store.commit_then(
+                &run,
+                |state| {
+                    let note = Event::Logged(LogRecord {
+                        kind: LogKind::Note,
+                        iteration: state.iteration(),
+                        task: None,
+                        text: arg.text,
+                    });
+                    Ok(((), vec![note]))
+                },
+                |(), state| RunStatus::of(&run, state),
+            );
+            noted.map_err(|e| e.to_string())
         })
         .await
     }

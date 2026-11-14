@@ -118,6 +118,9 @@ pub enum LogKind {
     Compression,
     /// A remark by the operator or the server.
     Note,
+    /// A report by the store that it set aside bytes of the journal that were
+    /// not a record (see `crate::store`).
+    Recovery,
 }
 
 /// One entry in the run's log.

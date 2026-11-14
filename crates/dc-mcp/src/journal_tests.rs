@@ -181,3 +181,42 @@ fn offsets_in_errors_include_the_base() {
     bad[0] ^= 0x01;
     assert_eq!(scan(&bad, 1000, 1).unwrap_err().offset, 1000);
 }
+
+#[test]
+fn a_header_reads_back_and_other_starts_are_told_apart() {
+    for id in [0, 1, 0xdead_beef, u64::MAX] {
+        let line = header(id);
+        assert!(line.len() <= MAX_HEADER_LEN);
+        assert_eq!(parse_header(line.as_bytes()), Ok((id, line.len())));
+        let mut more = line.clone().into_bytes();
+        more.extend_from_slice(b"0 00000000 []\n");
+        assert_eq!(parse_header(&more), Ok((id, line.len())));
+    }
+    let unsupported = |text: &str| {
+        let line = text.trim_end_matches('\n').to_owned();
+        assert_eq!(
+            parse_header(text.as_bytes()),
+            Err(HeaderError::Unsupported(line)),
+            "{text:?}"
+        );
+    };
+    unsupported("dc-mcp journal 2 0000000000000001\n");
+    unsupported("dc-mcp journal 1\n");
+    unsupported("dc-mcp journal 1 1\n");
+    unsupported("dc-mcp journal 1 000000000000000G\n");
+    unsupported("dc-mcp journal 1 000000000000000A\n");
+    unsupported("dc-mcp journal 1 0000000000000001 extra\n");
+    for not in [
+        "",
+        "dc-mcp journal 1 0000000000000001",
+        "junk\n",
+        "\n",
+        &format!("dc-mcp journal 1 {}\n", "0".repeat(80)),
+    ] {
+        assert_eq!(
+            parse_header(not.as_bytes()),
+            Err(HeaderError::NotAJournal),
+            "{not:?}"
+        );
+    }
+}

@@ -31,28 +31,39 @@
 //! # Torn tails
 //!
 //! A write that did not finish leaves a torn tail after the last good record
-//! (see [`crate::journal`]). Reading ignores it. The next commit moves it to a
-//! file `torn-<offset>-<n>` beside the journal, says so on standard error, and
-//! writes its record in the tail's place. The store deletes nothing. Damage to
-//! the end of a journal looks the same, so an operator who sees such a file
+//! (see [`crate::journal`]). Reading ignores it. The next commit copies it to a
+//! file `torn-<offset>-<n>` beside the journal and writes its record in the
+//! tail's place. It says so in a log record of kind
+//! [`LogKind::Recovery`], which it puts first
+//! in that commit, and on standard error. The store deletes nothing. Damage to
+//! the end of a journal looks the same, so an operator who sees such a record
 //! after a clean stop should treat it as lost commits.
+//!
+//! # A journal that is replaced
+//!
+//! Each journal has a random id in its header. Before a store uses what it
+//! has in memory, it checks that id and the last record it read. If the id is
+//! another, the run was removed and made again, and the store reads the new
+//! journal from the start. If the id is the same and the journal is shorter or
+//! its last record has changed, the operation fails with
+//! [`StoreError::Corrupt`], and the next one reads the journal from the start.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
+use std::hash::{BuildHasher, Hasher, RandomState};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::journal::{self, Corrupt, HEADER};
-use crate::state::Rejected;
+use crate::journal::{self, Corrupt, HeaderError};
 pub use crate::state::{Event, LogRecord, RunConfig, RunId, RunState};
+use crate::state::{LogKind, Rejected};
 
 const JOURNAL: &str = "journal";
 const JOURNAL_NEW: &str = "journal.new";
-/// What every version of the journal header starts with.
-const HEADER_PREFIX: &str = "dc-mcp journal ";
 
 /// How long an operation waits for a run's lock by default.
 pub const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(30);
@@ -91,8 +102,10 @@ pub enum StoreError {
         /// The error.
         error: io::Error,
     },
-    /// A commit's write failed, and so did taking the record out again. The
-    /// commit may or may not be in the run: read the run to find out.
+    /// A write failed at a point where the store cannot tell what is on disk:
+    /// a commit's write failed and so did taking the record out again, or a
+    /// new run's directory could not be synced. The change may or may not be
+    /// in the store: read the run to find out.
     OutcomeUnknown {
         /// The journal.
         path: PathBuf,
@@ -109,7 +122,7 @@ impl fmt::Display for StoreError {
             StoreError::Rejected(why) => write!(f, "{why}"),
             StoreError::Busy(run) => write!(
                 f,
-                "run {:?} is locked by another server. Nothing was changed",
+                "run {:?} is locked by another server or call. Nothing was changed",
                 run.as_str()
             ),
             StoreError::Corrupt { run, error } => {
@@ -214,10 +227,14 @@ pub(crate) fn append<F: Durable>(file: &mut F, at: u64, record: &[u8]) -> Result
 #[derive(Debug)]
 struct Cached {
     state: RunState,
+    /// The id in the journal's header.
+    id: u64,
     /// The length of the journal's good records.
     len: u64,
     /// The number of the journal's next record.
     next_seq: u64,
+    /// Where the last good record starts, and the CRC-32 of its line.
+    last: (u64, u32),
 }
 
 /// A run's files, open and locked. Dropping it releases the lock.
@@ -238,6 +255,9 @@ pub struct Store {
     /// A run's entry is taken out while an operation holds the run's lock,
     /// and put back if the operation leaves it true to the journal.
     cache: Mutex<HashMap<RunId, Cached>>,
+    /// The steps of the next append that fail, for tests of the error paths.
+    #[cfg(test)]
+    faults: Mutex<Vec<usize>>,
 }
 
 impl Store {
@@ -254,6 +274,8 @@ impl Store {
             root: root.to_owned(),
             lock_wait,
             cache: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            faults: Mutex::new(Vec::new()),
         })
     }
 
@@ -291,19 +313,27 @@ impl Store {
         // run that exists always has its first record.
         let new_path = dir_path.join(JOURNAL_NEW);
         let mut file = File::create(&new_path).map_err(io_at(&new_path))?;
+        let id = RandomState::new().build_hasher().finish();
+        let header = journal::header(id);
         let first = journal::encode(0, &[created]);
-        file.write_all(HEADER.as_bytes())
+        file.write_all(header.as_bytes())
             .and_then(|()| file.write_all(first.as_bytes()))
             .and_then(|()| file.sync_all())
             .map_err(io_at(&new_path))?;
         fs::rename(&new_path, &path).map_err(io_at(&path))?;
-        dir.sync_all().map_err(io_at(&dir_path))?;
+        // From here the run exists, whatever the sync says.
+        dir.sync_all().map_err(|error| StoreError::OutcomeUnknown {
+            path: dir_path.clone(),
+            error,
+        })?;
         self.put(
             run,
             Cached {
                 state: state.clone(),
-                len: (HEADER.len() + first.len()) as u64,
+                id,
+                len: (header.len() + first.len()) as u64,
                 next_seq: 1,
+                last: (header.len() as u64, journal::crc32(first.as_bytes())),
             },
         );
         Ok(state)
@@ -365,9 +395,20 @@ impl Store {
         F: FnOnce(&RunState) -> Result<(T, Vec<Event>), E>,
         E: From<StoreError>,
     {
+        self.commit_then(run, change, |value, _| value)
+    }
+
+    /// As [`Store::commit`], and then returns what `then` makes of the value
+    /// and the run's state after the events, while the run is still locked.
+    pub fn commit_then<T, U, E, F, G>(&self, run: &RunId, change: F, then: G) -> Result<U, E>
+    where
+        F: FnOnce(&RunState) -> Result<(T, Vec<Event>), E>,
+        G: FnOnce(T, &RunState) -> U,
+        E: From<StoreError>,
+    {
         let mut locked = self.lock_run(run)?;
         let (mut cached, torn) = self.catch_up(run, &mut locked)?;
-        let (value, events) = match change(&cached.state) {
+        let (value, mut events) = match change(&cached.state) {
             Ok(changed) => changed,
             Err(error) => {
                 self.put(run, cached);
@@ -375,8 +416,9 @@ impl Store {
             }
         };
         if events.is_empty() {
+            let result = then(value, &cached.state);
             self.put(run, cached);
-            return Ok(value);
+            return Ok(result);
         }
         let mut state = cached.state.clone();
         for event in &events {
@@ -386,10 +428,17 @@ impl Store {
             }
         }
         if !torn.is_empty() {
-            set_aside(&locked, cached.len, &torn)?;
+            let report = set_aside(&locked, cached.len, &torn, cached.state.iteration())?;
+            // The report goes first, in the iteration the run is in now. It
+            // always applies, and nothing later in the commit depends on it.
+            state = cached.state.clone();
+            events.insert(0, report);
+            for event in &events {
+                state.apply(event).map_err(StoreError::Rejected)?;
+            }
         }
         let record = journal::encode(cached.next_seq, &events);
-        match append(&mut locked.journal, cached.len, record.as_bytes()) {
+        match self.append_record(&mut locked.journal, cached.len, record.as_bytes()) {
             Ok(()) => {}
             Err(AppendError::NotWritten(error)) => {
                 self.put(run, cached);
@@ -405,10 +454,24 @@ impl Store {
             }
         }
         cached.state = state;
+        cached.last = (cached.len, journal::crc32(record.as_bytes()));
         cached.len += record.len() as u64;
         cached.next_seq += 1;
+        let result = then(value, &cached.state);
         self.put(run, cached);
-        Ok(value)
+        Ok(result)
+    }
+
+    /// Appends a record to the journal. See [`append`].
+    fn append_record(&self, file: &mut File, at: u64, record: &[u8]) -> Result<(), AppendError> {
+        #[cfg(test)]
+        {
+            let fail = std::mem::take(&mut *self.faults.lock().unwrap());
+            if !fail.is_empty() {
+                return append(&mut tests::Faulty::new(file, fail), at, record);
+            }
+        }
+        append(file, at, record)
     }
 
     /// Changes the run by `events`, all of them or none. See [`Store::commit`].
@@ -420,8 +483,9 @@ impl Store {
     /// journal each time.
     pub fn log(&self, run: &RunId) -> Result<Vec<LogRecord>, StoreError> {
         let mut locked = self.lock_run(run)?;
-        let (scan, _) = read_from(&mut locked, run, 0, 0)?;
-        Ok(scan
+        let read = read_from(&mut locked, run, None)?;
+        Ok(read
+            .scan
             .records
             .into_iter()
             .flatten()
@@ -443,7 +507,8 @@ impl Store {
     /// Takes the lock on `dir`, a run's directory, or gives up after the
     /// store's wait.
     fn wait_for_lock(&self, run: &RunId, dir: &File, dir_path: &Path) -> Result<(), StoreError> {
-        let deadline = Instant::now() + self.lock_wait;
+        // No deadline if the wait is too long to add to the time now.
+        let deadline = Instant::now().checked_add(self.lock_wait);
         let mut pause = Duration::from_micros(200);
         loop {
             match dir.try_lock() {
@@ -451,7 +516,7 @@ impl Store {
                 Err(TryLockError::Error(e)) => return Err(io_at(dir_path)(e)),
                 Err(TryLockError::WouldBlock) => {}
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(StoreError::Busy(run.clone()));
             }
             std::thread::sleep(pause);
@@ -474,6 +539,15 @@ impl Store {
             Err(e) => return Err(io_at(&dir_path)(e)),
         };
         self.wait_for_lock(run, &dir, &dir_path)?;
+        // The directory may have been removed, or removed and made again,
+        // since it was opened. Then the lock is on a directory that is gone.
+        let same = |a: &fs::Metadata, b: &fs::Metadata| (a.dev(), a.ino()) == (b.dev(), b.ino());
+        match (dir.metadata(), fs::metadata(&dir_path)) {
+            (Ok(held), Ok(named)) if same(&held, &named) => {}
+            (Ok(_), Ok(_)) => return Err(StoreError::Busy(run.clone())),
+            (_, Err(e)) if missing(&e) => return Err(StoreError::NoSuchRun(run.clone())),
+            (Err(e), _) | (_, Err(e)) => return Err(io_at(&dir_path)(e)),
+        }
         let path = dir_path.join(JOURNAL);
         match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(journal) => Ok(Locked {
@@ -496,8 +570,12 @@ impl Store {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(run);
-        let (from, first_seq) = cached.as_ref().map_or((0, 0), |c| (c.len, c.next_seq));
-        let (scan, torn) = read_from(locked, run, from, first_seq)?;
+        let cached = match cached {
+            Some(cached) => still_true(locked, run, cached)?,
+            None => None,
+        };
+        let read = read_from(locked, run, cached.as_ref())?;
+        let scan = &read.scan;
         let rejected = |index: usize, why: Rejected| StoreError::Corrupt {
             run: run.clone(),
             error: Corrupt {
@@ -509,15 +587,18 @@ impl Store {
             },
         };
         let mut records = scan.records.iter().enumerate();
-        let mut state = match cached {
-            Some(cached) => cached.state,
+        let (mut state, first_seq, mut last) = match cached {
+            Some(cached) => (cached.state, cached.next_seq, cached.last),
             None => match records.next() {
-                Some((index, first)) => RunState::replay(first).map_err(|w| rejected(index, w))?,
+                Some((index, first)) => {
+                    let state = RunState::replay(first).map_err(|w| rejected(index, w))?;
+                    (state, 0, (0, 0))
+                }
                 None => {
                     return Err(StoreError::Corrupt {
                         run: run.clone(),
                         error: Corrupt {
-                            offset: HEADER.len() as u64,
+                            offset: read.base,
                             reason: "a journal with no records",
                         },
                     })
@@ -529,72 +610,123 @@ impl Store {
                 state.apply(event).map_err(|w| rejected(index, w))?;
             }
         }
-        let header = if from == 0 { HEADER.len() as u64 } else { 0 };
+        let len = read.base + scan.valid_len as u64;
+        if let Some(start) = scan.offsets.last() {
+            let line = &read.body[(start - read.base) as usize..scan.valid_len];
+            last = (*start, journal::crc32(line));
+        }
         let cached = Cached {
             state,
-            len: from + header + scan.valid_len as u64,
+            id: read.id,
+            len,
             next_seq: first_seq + scan.records.len() as u64,
+            last,
         };
-        Ok((cached, torn))
+        Ok((cached, read.body[scan.valid_len..].to_vec()))
     }
 }
 
-/// Reads the journal from byte `from`, where record `first_seq` starts or the
-/// header does if `from` is 0. Returns the records and the torn tail.
-fn read_from(
+/// Checks that the journal on disk is still the one `cached` was read from.
+/// Returns `None` if it is another run's journal.
+fn still_true(
     locked: &mut Locked,
     run: &RunId,
-    from: u64,
-    first_seq: u64,
-) -> Result<(journal::Scan, Vec<u8>), StoreError> {
+    cached: Cached,
+) -> Result<Option<Cached>, StoreError> {
     let corrupt = |offset, reason| StoreError::Corrupt {
         run: run.clone(),
         error: Corrupt { offset, reason },
     };
     let file = &mut locked.journal;
     let len = file.metadata().map_err(io_at(&locked.path))?.len();
-    if len < from {
+    let mut start = vec![0; journal::MAX_HEADER_LEN.min(len as usize)];
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_exact(&mut start))
+        .map_err(io_at(&locked.path))?;
+    if journal::parse_header(&start).map(|(id, _)| id) != Ok(cached.id) {
+        return Ok(None);
+    }
+    if len < cached.len {
         return Err(corrupt(len, "a journal that is shorter than it was"));
     }
-    let mut bytes = Vec::new();
-    file.seek(SeekFrom::Start(from))
-        .and_then(|_| file.read_to_end(&mut bytes))
+    let (at, crc) = cached.last;
+    let mut line = vec![0; (cached.len - at) as usize];
+    file.seek(SeekFrom::Start(at))
+        .and_then(|_| file.read_exact(&mut line))
         .map_err(io_at(&locked.path))?;
-    let mut body = &bytes[..];
-    let mut base = from;
-    if from == 0 {
-        body = match body.strip_prefix(HEADER.as_bytes()) {
-            Some(body) => body,
-            None if body.starts_with(HEADER_PREFIX.as_bytes()) => {
-                let line = body.split(|b| *b == b'\n').next().unwrap_or(body);
-                let shown = &line[..line.len().min(64)];
+    if journal::crc32(&line) != crc {
+        return Err(corrupt(at, "a record that changed after it was read"));
+    }
+    Ok(Some(cached))
+}
+
+/// What [`read_from`] read.
+struct ReadJournal {
+    /// The id in the journal's header.
+    id: u64,
+    /// The bytes that were scanned.
+    body: Vec<u8>,
+    /// Where `body` starts in the file.
+    base: u64,
+    scan: journal::Scan,
+}
+
+/// Reads the journal's records: those after what `cached` has, or all of
+/// them if there is no `cached`.
+fn read_from(
+    locked: &mut Locked,
+    run: &RunId,
+    cached: Option<&Cached>,
+) -> Result<ReadJournal, StoreError> {
+    let file = &mut locked.journal;
+    let from = cached.map_or(0, |c| c.len);
+    let mut body = Vec::new();
+    file.seek(SeekFrom::Start(from))
+        .and_then(|_| file.read_to_end(&mut body))
+        .map_err(io_at(&locked.path))?;
+    let (id, base, first_seq) = match cached {
+        Some(cached) => (cached.id, from, cached.next_seq),
+        None => match journal::parse_header(&body) {
+            Ok((id, len)) => {
+                body.drain(..len);
+                (id, len as u64, 0)
+            }
+            Err(HeaderError::Unsupported(header)) => {
                 return Err(StoreError::UnsupportedFormat {
                     run: run.clone(),
-                    header: String::from_utf8_lossy(shown).into_owned(),
-                });
+                    header,
+                })
             }
-            None => {
-                return Err(corrupt(
-                    0,
-                    "a file that does not start with the journal header",
-                ))
+            Err(HeaderError::NotAJournal) => {
+                return Err(StoreError::Corrupt {
+                    run: run.clone(),
+                    error: Corrupt {
+                        offset: 0,
+                        reason: "a file that does not start with a journal header",
+                    },
+                })
             }
-        };
-        base = HEADER.len() as u64;
-    }
-    let scan = journal::scan(body, base, first_seq).map_err(|error| StoreError::Corrupt {
+        },
+    };
+    let scan = journal::scan(&body, base, first_seq).map_err(|error| StoreError::Corrupt {
         run: run.clone(),
         error,
     })?;
-    let torn = body[scan.valid_len..].to_vec();
-    Ok((scan, torn))
+    Ok(ReadJournal {
+        id,
+        body,
+        base,
+        scan,
+    })
 }
 
 /// Copies the journal's torn tail, which starts at byte `at`, to a new file
-/// beside the journal, and says so on standard error.
-fn set_aside(locked: &Locked, at: u64, torn: &[u8]) -> Result<(), StoreError> {
+/// beside the journal, and says so on standard error. Returns the log record
+/// that reports it, for `iteration`.
+fn set_aside(locked: &Locked, at: u64, torn: &[u8], iteration: u64) -> Result<Event, StoreError> {
     for n in 0_u32.. {
-        let path = locked.dir_path.join(format!("torn-{at}-{n}"));
+        let name = format!("torn-{at}-{n}");
+        let path = locked.dir_path.join(&name);
         let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -604,14 +736,20 @@ fn set_aside(locked: &Locked, at: u64, torn: &[u8]) -> Result<(), StoreError> {
             .and_then(|()| file.sync_all())
             .map_err(io_at(&path))?;
         locked.dir.sync_all().map_err(io_at(&locked.dir_path))?;
-        eprintln!(
-            "dc-mcp: {}: {} bytes after the last good record at byte {at} were not a record. \
-             They are now in {}",
-            locked.path.display(),
-            torn.len(),
-            path.display()
+        let text = format!(
+            "{} bytes after the last good record, at byte {at} of the journal, were not a \
+             record. They are now in the file {name}",
+            torn.len()
         );
-        return Ok(());
+        // Standard error may be closed. The log record is the report that
+        // counts.
+        let _ = writeln!(io::stderr(), "dc-mcp: {}: {text}", locked.path.display());
+        return Ok(Event::Logged(LogRecord {
+            kind: LogKind::Recovery,
+            iteration,
+            task: None,
+            text,
+        }));
     }
     unreachable!("the loop ends by returning")
 }

@@ -1,5 +1,6 @@
 //! `dc-mcp --state-dir <dir>`: serves the runs in `<dir>` over stdio.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -34,7 +35,12 @@ fn serve(dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(dir)?;
     // A mistyped directory would otherwise look like a store with no runs.
     let shown = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
-    eprintln!("dc-mcp: serving the runs in {}", shown.display());
+    // Standard error may be closed.
+    let _ = writeln!(
+        std::io::stderr(),
+        "dc-mcp: serving the runs in {}",
+        shown.display()
+    );
     // One thread for the protocol. Tool calls run on the blocking pool.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
