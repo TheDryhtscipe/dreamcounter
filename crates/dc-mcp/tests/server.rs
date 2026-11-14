@@ -650,7 +650,7 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
         .call(
             "dc_submit",
             json!({
-                "worker": "agent-1", "batch": 0,
+                "worker": "agent-1", "batch": 0, "token": first["batch"]["token"],
                 "programs": [solves_merge()], "model": "test-model"
             }),
         )
@@ -658,16 +658,28 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
     let bad = proposer
         .call(
             "dc_submit",
-            json!({ "worker": "agent-2", "batch": 1, "programs": ["let solve = ("] }),
+            json!({
+                "worker": "agent-2", "batch": 1, "token": second["batch"]["token"],
+                "programs": ["let solve = ("]
+            }),
         )
         .unwrap();
     assert_eq!(good, json!({ "batch": 0, "received": 1 }));
     assert_eq!(bad, json!({ "batch": 1, "received": 1 }));
     let unknown = proposer.call(
         "dc_submit",
-        json!({ "worker": "agent-1", "batch": 9, "programs": [] }),
+        json!({ "worker": "agent-1", "batch": 9, "token": "t", "programs": [] }),
     );
     assert!(unknown.unwrap_err().contains("batch 9 was not issued"));
+    // Batch 1's token does not open batch 0, even with batch 0's worker id.
+    let wrong = proposer.call(
+        "dc_submit",
+        json!({
+            "worker": "agent-1", "batch": 0, "token": second["batch"]["token"],
+            "programs": []
+        }),
+    );
+    assert!(wrong.unwrap_err().contains("token"));
 
     // The operator sees what came in, once the server has checked it.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -685,7 +697,8 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
     assert_eq!(it["tasks"][0]["received"], 1);
     assert_eq!(it["quota_in"], true);
     assert_eq!(it["tasks_solved"], 1);
-    assert_eq!(it["submissions"], 2);
+    assert_eq!(it["submissions"], 3);
+    assert_eq!(it["foreign"], 1);
     assert_eq!(it["tasks"][0]["passed"], 1);
     assert_eq!(it["tasks"][1]["compiled"], 0);
     let status = operator
@@ -718,6 +731,7 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
         [
             (vec![solves_merge()], Some("test-model".to_owned())),
             (vec!["let solve = (".to_owned()], None),
+            (vec![], None),
         ]
     );
 }
@@ -738,8 +752,21 @@ fn the_operator_can_check_what_a_stopped_proposer_left() {
     // A proposer server took a submission and stopped before checking it.
     let store = Store::open(dir.path()).unwrap();
     let run = RunId::new("r1").unwrap();
-    dc_mcp::proposer::next_batch(&store, &run, "a", 0).unwrap();
-    dc_mcp::proposer::submit(&store, &run, 0, "a", vec![solves_merge()], None, 1).unwrap();
+    let sent = dc_mcp::proposer::next_batch(&store, &run, "a", 0)
+        .unwrap()
+        .batch
+        .unwrap();
+    dc_mcp::proposer::submit(
+        &store,
+        &run,
+        0,
+        "a",
+        &sent.token,
+        vec![solves_merge()],
+        None,
+        1,
+    )
+    .unwrap();
     let stats = operator
         .call("dc_proposal_stats", json!({ "run": "r1" }))
         .unwrap();

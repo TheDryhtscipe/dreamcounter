@@ -339,6 +339,7 @@ dependencies = [
  "dc-eval",
  "dc-surface",
  "dc-tasks",
+ "getrandom 0.3.4",
  "rmcp",
  "schemars",
  "serde",

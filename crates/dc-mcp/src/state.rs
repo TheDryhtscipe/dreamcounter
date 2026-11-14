@@ -153,6 +153,9 @@ pub struct BatchIssued {
     pub wanted: u32,
     /// The id the proposer gave for itself.
     pub worker: String,
+    /// A random secret, sent only in the payload. A submission must give it,
+    /// so a proposer cannot submit for a batch it was not sent.
+    pub token: String,
     /// When the batch was issued, in milliseconds since the Unix epoch.
     pub issued_ms: u64,
     /// When the lease ends, in milliseconds since the Unix epoch.
@@ -180,11 +183,9 @@ pub enum Standing {
     /// A later submission for the batch from its worker. It is kept but not
     /// checked.
     Repeat,
-    /// A submission that names a worker the batch was not issued to. It is
-    /// kept but not checked, and the batch stays open for the worker it was
-    /// issued to. Worker ids are what the caller says: this guards against a
-    /// wrong batch number, not against a caller that gives another worker's
-    /// id.
+    /// A submission that gives the wrong token for the batch, or names a
+    /// worker the batch was not issued to. It is kept but not checked, and
+    /// the batch stays open for the proposer it was sent to.
     Foreign,
 }
 
@@ -236,6 +237,8 @@ pub struct Submitted {
     pub batch: u64,
     /// The id the submitting proposer gave for itself.
     pub worker: String,
+    /// The token the submitting proposer gave, as it was sent.
+    pub token: String,
     /// The run's iteration when the submission came in.
     pub iteration: u64,
     /// When it came in, in milliseconds since the Unix epoch.
@@ -298,6 +301,17 @@ pub enum Event {
         /// The iteration that ends.
         iteration: u64,
     },
+}
+
+/// Whether `given` is `secret`, taking a time that does not depend on where
+/// they first differ.
+fn same_secret(secret: &str, given: &str) -> bool {
+    secret.len() == given.len()
+        && secret
+            .bytes()
+            .zip(given.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
 }
 
 /// The most programs a batch may ask for. A submission may hold this many
@@ -428,6 +442,8 @@ pub struct Batch {
     pub wanted: u32,
     /// The proposer's id.
     pub worker: String,
+    /// The batch's token.
+    pub token: String,
     /// When its lease ends, in milliseconds since the Unix epoch.
     pub deadline_ms: u64,
     /// Whether a submission for it has come in from its worker.
@@ -600,7 +616,7 @@ impl RunState {
                 given: issued.batch,
             });
         }
-        if issued.wanted == 0 || issued.deadline_ms <= issued.issued_ms {
+        if issued.wanted == 0 || issued.deadline_ms <= issued.issued_ms || issued.token.is_empty() {
             return Err(Rejected::BadBatch);
         }
         self.batches.push(Batch {
@@ -608,6 +624,7 @@ impl RunState {
             task: issued.task.clone(),
             wanted: issued.wanted,
             worker: issued.worker.clone(),
+            token: issued.token.clone(),
             deadline_ms: issued.deadline_ms,
             submitted: false,
             awaiting_check: None,
@@ -623,11 +640,18 @@ impl RunState {
         Ok(())
     }
 
-    /// The standing a submission for `batch` from `worker` has if it comes in
-    /// at `received_ms`, or `None` if the run has no such batch.
-    pub fn standing(&self, batch: u64, worker: &str, received_ms: u64) -> Option<Standing> {
+    /// The standing a submission for `batch` from `worker`, giving `token`,
+    /// has if it comes in at `received_ms`, or `None` if the run has no such
+    /// batch.
+    pub fn standing(
+        &self,
+        batch: u64,
+        worker: &str,
+        token: &str,
+        received_ms: u64,
+    ) -> Option<Standing> {
         let b = self.batches.get(usize::try_from(batch).ok()?)?;
-        Some(if b.worker != worker {
+        Some(if b.worker != worker || !same_secret(&b.token, token) {
             Standing::Foreign
         } else if b.submitted {
             Standing::Repeat
@@ -643,7 +667,7 @@ impl RunState {
     fn submit(&mut self, s: &Submitted) -> Result<(), Rejected> {
         self.check_iteration(s.iteration)?;
         let standing = self
-            .standing(s.batch, &s.worker, s.received_ms)
+            .standing(s.batch, &s.worker, &s.token, s.received_ms)
             .ok_or(Rejected::UnknownBatch(s.batch))?;
         if standing != s.standing {
             return Err(Rejected::BadSubmission(s.batch));
@@ -1067,6 +1091,7 @@ mod tests {
             task: task.into(),
             wanted,
             worker: "w".into(),
+            token: format!("t{batch}"),
             issued_ms,
             deadline_ms: issued_ms + 1000,
             payload: "pay".into(),
@@ -1081,9 +1106,30 @@ mod tests {
         standing: Standing,
         programs: usize,
     ) -> Event {
+        sub_token(
+            batch,
+            worker,
+            &format!("t{batch}"),
+            iteration,
+            received_ms,
+            standing,
+            programs,
+        )
+    }
+
+    fn sub_token(
+        batch: u64,
+        worker: &str,
+        token: &str,
+        iteration: u64,
+        received_ms: u64,
+        standing: Standing,
+        programs: usize,
+    ) -> Event {
         Event::Submitted(Submitted {
             batch,
             worker: worker.into(),
+            token: token.into(),
             iteration,
             received_ms,
             model: None,
@@ -1163,7 +1209,12 @@ mod tests {
         s.apply(&submitted(0, 20, Standing::Repeat, 1)).unwrap();
         s.apply(&sub(2, "intruder", 0, 20, Standing::Foreign, 1))
             .unwrap();
-        assert_eq!(s.standing(2, "w", 30), Some(Standing::OnTime));
+        assert_eq!(s.standing(2, "w", "t2", 30), Some(Standing::OnTime));
+        // The wrong token, or one of another length, makes a submission
+        // foreign.
+        for token in ["t3", "t", "t20", ""] {
+            assert_eq!(s.standing(2, "w", token, 30), Some(Standing::Foreign));
+        }
         assert_eq!(s.pending_checks(), [0, 1]);
         assert!(!s.quota_in());
 
@@ -1249,12 +1300,12 @@ mod tests {
         // counted, and the verified programs start again.
         s.apply(&Event::IterationFinished { iteration: 0 }).unwrap();
         assert!(s.verified().is_empty());
-        assert_eq!(s.standing(2, "w", 10), Some(Standing::Late));
+        assert_eq!(s.standing(2, "w", "t2", 10), Some(Standing::Late));
         s.apply(&sub(2, "w", 1, 10, Standing::Late, 1)).unwrap();
         assert!(s.pending_checks().is_empty());
         assert_eq!(s.task_counts(1, "a"), TaskCounts::default());
         assert_eq!(s.iteration_counts(1).late, 1);
-        assert_eq!(s.standing(2, "w", 10), Some(Standing::Repeat));
+        assert_eq!(s.standing(2, "w", "t2", 10), Some(Standing::Repeat));
     }
 
     #[test]
@@ -1267,6 +1318,7 @@ mod tests {
             submitted(0, 10, Standing::Late, 1),
             submitted(0, 10, Standing::Foreign, 1),
             sub(0, "other", 0, 10, Standing::OnTime, 1),
+            sub_token(0, "w", "t1", 0, 10, Standing::OnTime, 1),
         ] {
             let mut t = s.clone();
             assert_eq!(
@@ -1308,6 +1360,11 @@ mod tests {
             b.deadline_ms = b.issued_ms;
         }
         assert_eq!(s.apply(&no_lease), Err(Rejected::BadBatch));
+        let mut no_token = issued(0, "a", 1, 0);
+        if let Event::BatchIssued(b) = &mut no_token {
+            b.token.clear();
+        }
+        assert_eq!(s.apply(&no_token), Err(Rejected::BadBatch));
         assert_eq!(s, new_state());
     }
 

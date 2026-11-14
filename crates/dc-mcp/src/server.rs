@@ -517,6 +517,8 @@ pub struct SubmitArgs {
     pub worker: String,
     /// The batch's number, from `dc_next_batch`.
     pub batch: u64,
+    /// The batch's token, from `dc_next_batch`.
+    pub token: String,
     /// The programs, one string for each: the full text of a dc program that
     /// defines `solve`. At most 32, each at most 64 KiB.
     pub programs: Vec<String>,
@@ -671,8 +673,9 @@ impl ProposerServer {
     /// Takes in the programs for a batch.
     #[tool(
         name = "dc_submit",
-        description = "Submit the programs for a batch. The reply says how many programs \
-                       were received. It does not say whether they are right."
+        description = "Submit the programs for a batch, with the batch's number and token from \
+                       dc_next_batch. The reply says how many programs were received. It does \
+                       not say whether they are right."
     )]
     async fn submit(
         &self,
@@ -685,6 +688,7 @@ impl ProposerServer {
                     run,
                     arg.batch,
                     &arg.worker,
+                    &arg.token,
                     arg.programs,
                     arg.model,
                     now,

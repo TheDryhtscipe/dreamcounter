@@ -25,9 +25,10 @@
 //! [`next_batch`] says so, so a proposer that polls learns how long the
 //! checks took, though not what they found.
 //!
-//! **Worker ids are not authenticated.** A worker id is what the caller
-//! says it is. The standings stop a proposer that uses the wrong batch number
-//! by mistake; they do not stop one that gives another worker's id.
+//! **Tokens.** Each batch has a random token, sent only in its payload. A
+//! submission must give the batch's token and worker id; one that does not
+//! is kept as foreign and not checked, so a proposer cannot take a batch it
+//! was not sent, whatever worker id it gives.
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,7 +37,9 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 use crate::prompt::{payload, Payload};
-use crate::state::{BatchIssued, Check, Checked, Event, LibraryEntry, RunId, RunState, Submitted};
+use crate::state::{
+    BatchIssued, Check, Checked, Event, LibraryEntry, RunId, RunState, Standing, Submitted,
+};
 use crate::store::{Store, StoreError};
 use crate::verify::{task, Verifier};
 
@@ -164,22 +167,23 @@ pub fn next_batch(
     store.commit(run, |state| {
         // One live batch at a time for each worker, so that one proposer
         // cannot hold every slot.
-        let held = state.batches().iter().position(|b| {
+        let held = state.batches().iter().enumerate().find(|(_, b)| {
             b.iteration == state.iteration()
                 && b.worker == worker
                 && !b.submitted
                 && now_ms <= b.deadline_ms
         });
-        if let Some(held) = held {
+        if let Some((held, b)) = held {
+            let left = (b.deadline_ms - now_ms).div_ceil(1000).max(1);
             let reply = NextBatch {
                 batch: None,
                 wait: Some(Wait {
                     reason: format!(
-                        "you hold batch {held}; submit it with dc_submit before you ask for \
-                         another. If you no longer have it, submit an empty list of programs \
-                         for it"
+                        "you hold batch {held}; submit it with dc_submit, with its token, \
+                         before you ask for another. If you no longer have it, it is released \
+                         when its lease ends, in {left} seconds"
                     ),
-                    retry_after_seconds: 1,
+                    retry_after_seconds: left,
                 }),
             };
             return Ok((reply, Vec::new()));
@@ -195,7 +199,8 @@ pub fn next_batch(
             task(name).ok_or_else(|| Refused::State(format!("there is no task {name:?}")))?;
         let verifier = Verifier::new(state.library()).map_err(|e| Refused::State(e.to_string()))?;
         let batch = state.batches().len() as u64;
-        let sent = payload(state, &verifier, &*family, batch, wanted);
+        let token = new_token()?;
+        let sent = payload(state, &verifier, &*family, batch, &token, wanted);
         let text = serde_json::to_string(&sent)
             .map_err(|e| Refused::State(format!("the payload does not serialise: {e}")))?;
         let event = Event::BatchIssued(BatchIssued {
@@ -204,6 +209,7 @@ pub fn next_batch(
             task: name.to_owned(),
             wanted,
             worker: worker.to_owned(),
+            token,
             issued_ms: now_ms,
             deadline_ms: now_ms.saturating_add(state.config().lease_ms),
             payload: text,
@@ -225,21 +231,36 @@ pub struct Receipt {
     pub received: usize,
 }
 
-/// Takes in `programs` for `batch` of `run` from `worker`, received at
-/// `now_ms`, with the model the proposer named, if any. The submission is
-/// committed as it arrives; its programs are checked later, by
-/// [`check_pending`]. So the reply does not wait for the checks, and does not
-/// take longer for one program than for another.
+/// A new batch token: 128 bits from the operating system, in hex.
+fn new_token() -> Result<String, Refused> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| Refused::State(format!("no random bytes for a batch token: {e}")))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Takes in `programs` for `batch` of `run` from `worker`, with the batch's
+/// `token`, received at `now_ms`, with the model the proposer named, if any.
+/// The submission is committed as it arrives; its programs are checked later,
+/// by [`check_pending`]. So the reply does not wait for the checks, and does
+/// not take longer for one program than for another.
+///
+/// A submission with the wrong token or worker id is committed as
+/// [`Standing::Foreign`] and the reply is an error that says so. It says
+/// nothing about the programs.
+#[allow(clippy::too_many_arguments)]
 pub fn submit(
     store: &Store,
     run: &RunId,
     batch: u64,
     worker: &str,
+    token: &str,
     programs: Vec<String>,
     model: Option<String>,
     now_ms: u64,
 ) -> Result<Receipt, Refused> {
     check_name("worker id", worker)?;
+    check_name("token", token)?;
     if let Some(model) = &model {
         check_name("model name", model)?;
     }
@@ -257,21 +278,29 @@ pub fn submit(
         batch,
         received: programs.len(),
     };
-    store.commit(run, |state| {
+    let standing = store.commit(run, |state| -> Result<_, Refused> {
         let standing = state
-            .standing(batch, worker, now_ms)
+            .standing(batch, worker, token, now_ms)
             .ok_or_else(|| Refused::Request(format!("batch {batch} was not issued in this run")))?;
         let event = Event::Submitted(Submitted {
             batch,
             worker: worker.to_owned(),
+            token: token.to_owned(),
             iteration: state.iteration(),
             received_ms: now_ms,
             model,
             programs,
             standing,
         });
-        Ok((receipt, vec![event]))
-    })
+        Ok((standing, vec![event]))
+    })?;
+    if standing == Standing::Foreign {
+        return Err(Refused::Request(format!(
+            "batch {batch} was not sent to worker {worker:?} with that token; the submission \
+             is kept but will not be checked"
+        )));
+    }
+    Ok(receipt)
 }
 
 /// A submission that waits to be checked, and the library to check it with.
@@ -354,7 +383,7 @@ mod tests {
     use std::ops::ControlFlow;
 
     use super::*;
-    use crate::state::{Arm, RunConfig, Standing};
+    use crate::state::{Arm, RunConfig};
     use tempfile::TempDir;
 
     const MERGE: &str = "collapse/merge";
@@ -424,6 +453,29 @@ mod tests {
             .collect()
     }
 
+    /// The token of `batch`, or a made-up one if the run has no such batch.
+    fn token(store: &Store, run: &RunId, batch: u64) -> String {
+        let state = store.state(run).unwrap();
+        state
+            .batches()
+            .get(batch as usize)
+            .map_or_else(|| "none".to_owned(), |b| b.token.clone())
+    }
+
+    /// Submits with the batch's own token.
+    fn sub(
+        store: &Store,
+        run: &RunId,
+        batch: u64,
+        worker: &str,
+        programs: Vec<String>,
+        model: Option<String>,
+        now_ms: u64,
+    ) -> Result<Receipt, Refused> {
+        let t = token(store, run, batch);
+        submit(store, run, batch, worker, &t, programs, model, now_ms)
+    }
+
     fn checked(store: &Store, run: &RunId) -> Vec<Checked> {
         events(store, run)
             .into_iter()
@@ -472,8 +524,8 @@ mod tests {
         let (_dir, store, run) = setup(1, 1);
         next_batch(&store, &run, "a", 0).unwrap();
         next_batch(&store, &run, "b", 0).unwrap();
-        let good = submit(&store, &run, 0, "a", vec![solves_merge()], None, 10).unwrap();
-        let bad = submit(&store, &run, 1, "b", vec!["let solve = (".into()], None, 10).unwrap();
+        let good = sub(&store, &run, 0, "a", vec![solves_merge()], None, 10).unwrap();
+        let bad = sub(&store, &run, 1, "b", vec!["let solve = (".into()], None, 10).unwrap();
         assert_eq!(
             good,
             Receipt {
@@ -523,8 +575,9 @@ mod tests {
         ];
         // Another worker's submission for batch 0 is kept but does not take
         // the batch.
-        submit(&store, &run, 0, "b", vec!["not mine".into()], None, 9).unwrap();
-        submit(
+        let refused = sub(&store, &run, 0, "b", vec!["not mine".into()], None, 9);
+        assert!(matches!(refused, Err(Refused::Request(_))), "{refused:?}");
+        sub(
             &store,
             &run,
             0,
@@ -536,13 +589,13 @@ mod tests {
         .unwrap();
         // The first submission to arrive takes the batch; a second is a
         // repeat, whether or not the first has been checked.
-        submit(&store, &run, 0, "a", vec!["again".into()], None, 11).unwrap();
+        sub(&store, &run, 0, "a", vec!["again".into()], None, 11).unwrap();
         check_pending(&store, &run).unwrap();
         // After the iteration ends, batch 1's submission is late.
         store
             .append(&run, vec![Event::IterationFinished { iteration: 0 }])
             .unwrap();
-        submit(&store, &run, 1, "b", vec!["late".into()], None, 12).unwrap();
+        sub(&store, &run, 1, "b", vec!["late".into()], None, 12).unwrap();
 
         let subs = submissions(&store, &run);
         assert_eq!(subs.len(), 4);
@@ -577,7 +630,7 @@ mod tests {
     fn a_submission_after_its_lease_is_still_checked_and_counted() {
         let (_dir, store, run) = setup(1, 1);
         next_batch(&store, &run, "a", 0).unwrap();
-        submit(&store, &run, 0, "a", vec![solves_merge()], None, 5000).unwrap();
+        sub(&store, &run, 0, "a", vec![solves_merge()], None, 5000).unwrap();
         check_pending(&store, &run).unwrap();
         assert_eq!(submissions(&store, &run)[0].standing, Standing::Expired);
         assert_eq!(store.state(&run).unwrap().task_counts(0, MERGE).passed, 1);
@@ -587,7 +640,7 @@ mod tests {
     fn checks_use_the_library_as_it_is_when_they_run() {
         let (_dir, store, run) = setup(1, 1);
         next_batch(&store, &run, "a", 0).unwrap();
-        submit(
+        sub(
             &store,
             &run,
             0,
@@ -633,7 +686,7 @@ mod tests {
                 }],
             )
             .unwrap();
-        submit(&store, &run, 0, "a", vec![solves_merge()], None, 1).unwrap();
+        sub(&store, &run, 0, "a", vec![solves_merge()], None, 1).unwrap();
         assert!(matches!(
             check_pending(&store, &run),
             Err(Refused::State(_))
@@ -655,13 +708,15 @@ mod tests {
         );
         let w = next_batch(&store, &run, "a", 10).unwrap().wait.unwrap();
         assert!(w.reason.contains("you hold batch 0"), "{}", w.reason);
-        assert!(w.reason.contains("empty list"), "{}", w.reason);
+        // Its lease ends at 1000.
         assert_eq!(w.retry_after_seconds, 1);
+        let w = next_batch(&store, &run, "a", 10).unwrap().wait.unwrap();
+        assert!(w.reason.contains("in 1 seconds"), "{}", w.reason);
         assert_eq!(issued(&store, &run).len(), 1);
         // Another worker still gets work.
         assert!(next_batch(&store, &run, "b", 10).unwrap().batch.is_some());
         // Once the batch is submitted, or its lease ends, the worker gets more.
-        submit(&store, &run, 0, "a", vec!["x".into()], None, 20).unwrap();
+        sub(&store, &run, 0, "a", vec!["x".into()], None, 20).unwrap();
         assert!(next_batch(&store, &run, "a", 30).unwrap().batch.is_some());
         assert!(next_batch(&store, &run, "b", 500).unwrap().wait.is_some());
         assert!(next_batch(&store, &run, "b", 1011).unwrap().batch.is_some());
@@ -672,10 +727,43 @@ mod tests {
         let (_dir, store, run) = setup(1, 1);
         next_batch(&store, &run, "a", 0).unwrap();
         next_batch(&store, &run, "b", 0).unwrap();
-        submit(&store, &run, 0, "a", vec!["x".into()], None, 1).unwrap();
-        submit(&store, &run, 1, "b", vec!["y".into()], None, 1).unwrap();
+        sub(&store, &run, 0, "a", vec!["x".into()], None, 1).unwrap();
+        sub(&store, &run, 1, "b", vec!["y".into()], None, 1).unwrap();
         let w = next_batch(&store, &run, "c", 2).unwrap().wait.unwrap();
         assert!(w.reason.contains("being checked"), "{}", w.reason);
+    }
+
+    #[test]
+    fn a_submission_without_the_batch_token_is_kept_but_takes_nothing() {
+        let (_dir, store, run) = setup(1, 1);
+        let sent = next_batch(&store, &run, "a", 0).unwrap().batch.unwrap();
+        let real = token(&store, &run, 0);
+        assert_eq!(sent.token, real);
+        assert_eq!(real.len(), 32);
+        assert!(real.bytes().all(|b| b.is_ascii_hexdigit()));
+        // Another batch gets another token.
+        next_batch(&store, &run, "b", 0).unwrap();
+        assert_ne!(token(&store, &run, 1), real);
+
+        // The right worker id with a wrong token, as a proposer that shares
+        // the id could send, is refused and kept as foreign.
+        for wrong in [token(&store, &run, 1), "0".repeat(32), "x".to_owned()] {
+            let got = submit(&store, &run, 0, "a", &wrong, vec![], None, 1);
+            let Err(Refused::Request(why)) = got else {
+                panic!("{got:?}");
+            };
+            assert!(why.contains("token"), "{why}");
+            assert!(!why.contains(&real), "{why}");
+        }
+        let subs = submissions(&store, &run);
+        assert_eq!(subs.len(), 3);
+        assert!(subs.iter().all(|s| s.standing == Standing::Foreign));
+        // The batch is still open for the proposer it was sent to.
+        let got = submit(&store, &run, 0, "a", &real, vec![solves_merge()], None, 2);
+        assert_eq!(got.unwrap().received, 1);
+        assert_eq!(submissions(&store, &run)[3].standing, Standing::OnTime);
+        check_pending(&store, &run).unwrap();
+        assert_eq!(store.state(&run).unwrap().task_counts(0, MERGE).passed, 1);
     }
 
     #[test]
@@ -685,9 +773,9 @@ mod tests {
         let before = events(&store, &run);
         let long = "x".repeat(MAX_PROGRAM_LEN + 1);
         let cases: Vec<Result<Receipt, Refused>> = vec![
-            submit(&store, &run, 9, "a", vec![], None, 1),
-            submit(&store, &run, 0, "a", vec![long], None, 1),
-            submit(
+            sub(&store, &run, 9, "a", vec![], None, 1),
+            sub(&store, &run, 0, "a", vec![long], None, 1),
+            sub(
                 &store,
                 &run,
                 0,
@@ -696,8 +784,8 @@ mod tests {
                 None,
                 1,
             ),
-            submit(&store, &run, 0, "a", vec![], Some(String::new()), 1),
-            submit(
+            sub(&store, &run, 0, "a", vec![], Some(String::new()), 1),
+            sub(
                 &store,
                 &run,
                 0,
@@ -706,7 +794,18 @@ mod tests {
                 Some("m".repeat(MAX_NAME_LEN + 1)),
                 1,
             ),
-            submit(&store, &run, 0, "", vec![], None, 1),
+            sub(&store, &run, 0, "", vec![], None, 1),
+            submit(&store, &run, 0, "a", "", vec![], None, 1),
+            submit(
+                &store,
+                &run,
+                0,
+                "a",
+                &"t".repeat(MAX_NAME_LEN + 1),
+                vec![],
+                None,
+                1,
+            ),
         ];
         for case in cases {
             assert!(matches!(case, Err(Refused::Request(_))), "{case:?}");

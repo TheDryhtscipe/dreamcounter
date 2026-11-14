@@ -14,6 +14,7 @@ dc-core.workspace = true
 dc-eval.workspace = true
 dc-surface.workspace = true
 dc-tasks.workspace = true
+getrandom.workspace = true
 rmcp = { workspace = true, features = ["server", "macros", "schemars", "transport-io"] }
 schemars.workspace = true
 serde.workspace = true

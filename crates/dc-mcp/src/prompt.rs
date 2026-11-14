@@ -33,6 +33,8 @@ const SHOWN_VALUES: u64 = 2000;
 pub struct Payload {
     /// The batch's number. Pass it to `dc_submit`.
     pub batch: u64,
+    /// The batch's token. Pass it to `dc_submit`.
+    pub token: String,
     /// How many programs to write.
     pub programs_wanted: u32,
     /// How long the batch is held for you, in seconds. After that it may be
@@ -85,7 +87,7 @@ Recursion:
 ";
 
 /// The instructions at the top of every prompt.
-fn instructions(wanted: u32, batch: u64) -> String {
+fn instructions(wanted: u32, batch: u64, token: &str) -> String {
     let programs = if wanted == 1 {
         "one program in the dc language that solves".to_owned()
     } else {
@@ -96,8 +98,8 @@ fn instructions(wanted: u32, batch: u64) -> String {
          Each program is the full text of a dc program: one or more `let` definitions, \
          one of which is `{ENTRY}`. `{ENTRY}` takes the task's inputs as arguments, in \
          order, and returns the output.\n\
-         Submit with the dc_submit tool: batch {batch}, and the programs as a list of \
-         strings, one string for each program. You will get an acknowledgement, not \
+         Submit with the dc_submit tool: batch {batch}, token {token}, and the programs as \
+         a list of strings, one string for each program. You will get an acknowledgement, not \
          results: no program is run for you.\n"
     )
 }
@@ -241,10 +243,11 @@ pub fn payload(
     verifier: &Verifier,
     family: &dyn TaskFamily,
     batch: u64,
+    token: &str,
     wanted: u32,
 ) -> Payload {
     let sections = [
-        instructions(wanted, batch),
+        instructions(wanted, batch, token),
         GUIDE.to_owned(),
         primitives(),
         prelude(verifier),
@@ -260,6 +263,7 @@ pub fn payload(
         .join("\n");
     Payload {
         batch,
+        token: token.to_owned(),
         programs_wanted: wanted,
         lease_seconds: state.config().lease_ms / 1000,
         prompt,
@@ -295,7 +299,7 @@ mod tests {
         let s = state(&["collapse/merge", "collapse/cancel"]);
         let v = Verifier::new(&[]).unwrap();
         let family = crate::verify::task("collapse/merge").unwrap();
-        let p = payload(&s, &v, &*family, 4, 1);
+        let p = payload(&s, &v, &*family, 4, "tok", 1);
         assert_eq!((p.batch, p.programs_wanted, p.lease_seconds), (4, 1, 90));
         assert!(p.prompt.contains(family.description()));
         assert!(
@@ -337,7 +341,7 @@ mod tests {
         .unwrap();
         let v = Verifier::new(&[entry]).unwrap();
         let family = crate::verify::task("collapse/merge").unwrap();
-        let p = payload(&s, &v, &*family, 0, 2);
+        let p = payload(&s, &v, &*family, 0, "tok", 2);
         assert!(p
             .prompt
             .contains("Write 2 different programs in the dc language that solve the"));
@@ -372,15 +376,15 @@ mod tests {
         }
         let v = Verifier::new(&[]).unwrap();
         let family = crate::verify::task(names[0]).unwrap();
-        let a = payload(&s, &v, &*family, 3, 1);
-        assert_eq!(a, payload(&s, &v, &*family, 3, 1));
+        let a = payload(&s, &v, &*family, 3, "tok", 1);
+        assert_eq!(a, payload(&s, &v, &*family, 3, "tok", 1));
         // Three other tasks have a program, and at most three are shown.
         let shown = a.prompt.matches("\nTask: ").count();
         assert_eq!(shown, MAX_SOLVED_EXAMPLES);
         // Over many batches, the order of the shown tasks changes.
         let orders: std::collections::BTreeSet<String> = (0..20)
             .map(|b| {
-                let p = payload(&s, &v, &*family, b, 1).prompt;
+                let p = payload(&s, &v, &*family, b, "tok", 1).prompt;
                 let start = p.find("## Programs that solve").unwrap();
                 let end = p.find("## The task").unwrap();
                 p[start..end].to_owned()
@@ -394,13 +398,15 @@ mod tests {
         let s = state(&["collapse/merge"]);
         let v = Verifier::new(&[]).unwrap();
         let family = crate::verify::task("collapse/merge").unwrap();
-        let p = payload(&s, &v, &*family, 0, 1);
+        let p = payload(&s, &v, &*family, 0, "tok", 1);
+        assert!(p.prompt.contains("batch 0, token tok,"), "{}", p.prompt);
         let issued = BatchIssued {
             batch: 0,
             iteration: 0,
             task: "collapse/merge".into(),
             wanted: 1,
             worker: "w".into(),
+            token: "tok".into(),
             issued_ms: 0,
             deadline_ms: 1,
             payload: serde_json::to_string(&p).unwrap(),
