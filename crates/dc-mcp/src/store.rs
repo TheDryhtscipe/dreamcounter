@@ -23,9 +23,10 @@
 //! the records the others added since it last looked, and only then acts. A
 //! store keeps each run's state in memory, so reading a run's state parses
 //! each record once. It reads a journal one record at a time and applies each
-//! record before it reads the next, so a store that reads a run for the first
-//! time holds about one record in memory, not the journal. The lock needs a
-//! local file system.
+//! record before it reads the next. So a store that reads a run for the first
+//! time holds about one record in memory, not the journal. The exception is a
+//! torn tail: the scan holds each of its lines whole, and a damaged tail can be
+//! one line of any length. The lock needs a local file system.
 //!
 //! An operation waits for the lock for a limited time, [`DEFAULT_LOCK_WAIT`]
 //! unless the store was opened with another, and then fails with
@@ -475,7 +476,8 @@ impl Store {
             }
         }
         // Only a commit that writes needs the tail's bytes. A tail that an
-        // unfinished write left is at most one record long.
+        // unfinished write left is at most one record long; damage to the
+        // end of the journal can leave a longer one.
         let torn = if torn_len == 0 {
             Vec::new()
         } else {
