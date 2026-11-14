@@ -86,7 +86,7 @@ pub struct RunConfig {
     pub seed: u64,
     /// How many programs each task gets in one iteration. It is positive.
     pub proposals_per_task: u32,
-    /// The most programs one batch asks for. It is positive.
+    /// The most programs one batch asks for: 1 to [`MAX_PROGRAMS_PER_BATCH`].
     pub programs_per_batch: u32,
     /// How long a proposer has to submit a batch, in milliseconds. After
     /// that the batch's programs can be handed out again. It is positive.

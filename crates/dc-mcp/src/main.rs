@@ -72,7 +72,7 @@ fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn st
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async {
+    let served = runtime.block_on(async {
         match proposer {
             None => {
                 let service = DcServer::new(store).serve(rmcp::transport::stdio()).await?;
@@ -87,5 +87,10 @@ fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn st
             }
         }
         Ok(())
-    })
+    });
+    // A background check may be running or waiting to try again. Its work is
+    // committed whole or not at all, so it can be left: the next proposer
+    // server takes it up.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    served
 }

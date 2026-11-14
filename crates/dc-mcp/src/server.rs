@@ -16,6 +16,7 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{schemars, tool, tool_router};
@@ -39,7 +40,7 @@ pub struct CreateRun {
     /// The names of the run's tasks. If absent, every task of the development
     /// corpus.
     pub tasks: Option<Vec<String>>,
-    /// The most programs one batch asks for. At least 1. If absent, 1: each
+    /// The most programs one batch asks for: 1 to 32. If absent, 1: each
     /// program then comes from its own batch.
     pub programs_per_batch: Option<u32>,
     /// How long a proposer has to submit a batch, in seconds, before its
@@ -543,6 +544,37 @@ struct Checker {
     dirty: AtomicBool,
 }
 
+impl Checker {
+    /// Runs `check` until no new work has been signalled, unless another
+    /// thread is running it already. `idle` runs when this thread has found
+    /// no new work but still holds `running`; tests use it to signal work in
+    /// that window.
+    fn drain(&self, mut check: impl FnMut(), mut idle: impl FnMut()) {
+        loop {
+            let Ok(running) = self.running.try_lock() else {
+                // The thread that holds it looks at `dirty` after it lets go.
+                return;
+            };
+            if self.dirty.swap(false, Ordering::SeqCst) {
+                check();
+                continue;
+            }
+            idle();
+            drop(running);
+            // Work signalled while this thread held the lock was refused the
+            // lock: take it up.
+            if !self.dirty.load(Ordering::SeqCst) {
+                return;
+            }
+        }
+    }
+}
+
+/// How long the background checks wait after an error before they try
+/// again, at first and at most.
+const CHECK_RETRY_FIRST: Duration = Duration::from_secs(5);
+const CHECK_RETRY_MAX: Duration = Duration::from_secs(300);
+
 impl ProposerServer {
     /// A server for proposers of `run` in `store`, with leases timed by
     /// `clock`.
@@ -564,21 +596,25 @@ impl ProposerServer {
         let store = Arc::clone(&self.store);
         let run = self.run.clone();
         let checker = Arc::clone(&self.checker);
-        tokio::task::spawn_blocking(move || loop {
-            // If another thread is checking, it sees `dirty` before it stops.
-            let Ok(_running) = checker.running.try_lock() else {
-                return;
-            };
-            if !checker.dirty.swap(false, Ordering::SeqCst) {
-                return;
-            }
-            if let Err(e) = check_pending(&store, &run) {
-                // Standard error may be closed.
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "dc-mcp: the submissions of run {run} could not be checked: {e}"
-                );
-            }
+        tokio::task::spawn_blocking(move || {
+            let mut retry = CHECK_RETRY_FIRST;
+            checker.drain(
+                || {
+                    if let Err(e) = check_pending(&store, &run) {
+                        // Standard error may be closed.
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "dc-mcp: the submissions of run {run} could not be checked: {e}; \
+                             trying again in {} s",
+                            retry.as_secs()
+                        );
+                        std::thread::sleep(retry);
+                        retry = (retry * 2).min(CHECK_RETRY_MAX);
+                        checker.dirty.store(true, Ordering::SeqCst);
+                    }
+                },
+                || {},
+            );
         });
     }
 
@@ -652,5 +688,56 @@ impl ProposerServer {
             .await?;
         self.check_in_background();
         Ok(receipt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_signalled_while_the_checker_lets_go_is_not_lost() {
+        let checker = Checker::default();
+        checker.dirty.store(true, Ordering::SeqCst);
+        let mut checks = 0;
+        let mut signalled = false;
+        checker.drain(
+            || checks += 1,
+            || {
+                // Another thread signals work and finds the lock held.
+                if !signalled {
+                    signalled = true;
+                    checker.dirty.store(true, Ordering::SeqCst);
+                    assert!(checker.running.try_lock().is_err());
+                }
+            },
+        );
+        assert_eq!(checks, 2);
+        assert!(!checker.dirty.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn work_signalled_during_a_check_is_checked() {
+        let checker = Checker::default();
+        checker.dirty.store(true, Ordering::SeqCst);
+        let mut checks = 0;
+        checker.drain(
+            || {
+                checks += 1;
+                if checks < 3 {
+                    checker.dirty.store(true, Ordering::SeqCst);
+                }
+            },
+            || {},
+        );
+        assert_eq!(checks, 3);
+    }
+
+    #[test]
+    fn a_checker_with_no_work_does_nothing() {
+        let checker = Checker::default();
+        let mut checks = 0;
+        checker.drain(|| checks += 1, || {});
+        assert_eq!(checks, 0);
     }
 }

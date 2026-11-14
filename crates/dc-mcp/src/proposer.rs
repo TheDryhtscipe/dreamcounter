@@ -176,7 +176,8 @@ pub fn next_batch(
                 wait: Some(Wait {
                     reason: format!(
                         "you hold batch {held}; submit it with dc_submit before you ask for \
-                         another"
+                         another. If you no longer have it, submit an empty list of programs \
+                         for it"
                     ),
                     retry_after_seconds: 1,
                 }),
@@ -654,6 +655,7 @@ mod tests {
         );
         let w = next_batch(&store, &run, "a", 10).unwrap().wait.unwrap();
         assert!(w.reason.contains("you hold batch 0"), "{}", w.reason);
+        assert!(w.reason.contains("empty list"), "{}", w.reason);
         assert_eq!(w.retry_after_seconds, 1);
         assert_eq!(issued(&store, &run).len(), 1);
         // Another worker still gets work.
