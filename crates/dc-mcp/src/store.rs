@@ -32,7 +32,8 @@
 //! # Torn tails
 //!
 //! A write that did not finish leaves a torn tail after the last good record
-//! (see [`crate::journal`]). Reading ignores it. The next commit copies it to a
+//! (see [`crate::journal`]). Reading ignores it. The next commit that has
+//! events to write copies it to a
 //! file `torn-<offset>-<n>` beside the journal and writes its record in the
 //! tail's place. It says so in a log record of kind
 //! [`LogKind::Recovery`], which it puts first
@@ -45,12 +46,16 @@
 //! only: a `torn-*` file that it could not finish writing.
 //!
 //! A `torn-*` file can be there with no log record. Treat the file as the same
-//! sign. It happens when:
+//! sign. The commit that made the file did not finish:
 //!
-//! * the server stops after it cut the tail off and before its record is on
-//!   disk;
-//! * the commit fails and the store cannot put the whole tail back;
-//! * the commit fails with [`StoreError::OutcomeUnknown`].
+//! * the commit failed, or the server stopped, with the tail still in the
+//!   journal or put back there. The next commit that writes reports it;
+//! * the server stopped after it cut the tail off and before its record was
+//!   on disk;
+//! * the commit failed and the store could not put the whole tail back;
+//! * the commit failed with [`StoreError::OutcomeUnknown`].
+//!
+//! In the last three cases no later commit reports the tail.
 //!
 //! # A journal that is replaced
 //!

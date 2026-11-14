@@ -948,8 +948,10 @@ fn create_does_not_write_to_the_successor_of_a_removed_directory() {
     for pause in [200, 800, 3200] {
         let dir = TempDir::new().unwrap();
         let run = id("r1");
+        // The lock wait is longer than the longest pause, so a call that is
+        // on time is still waiting when the directory goes.
         let store =
-            Store::open_with_lock_wait(dir.path(), std::time::Duration::from_secs(2)).unwrap();
+            Store::open_with_lock_wait(dir.path(), std::time::Duration::from_secs(5)).unwrap();
         fs::create_dir(dir.path().join("r1")).unwrap();
         let old_lock = fs::File::open(dir.path().join("r1")).unwrap();
         old_lock.lock().unwrap();
