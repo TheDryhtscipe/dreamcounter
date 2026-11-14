@@ -9,7 +9,7 @@
 //! # Library ids and names
 //!
 //! A library is a slice of [`LibDef`]s indexed by [`LibId`], as
-//! [`dc_core::expand`] takes it. The bridge names library `l` as
+//! [`dc_core::expand()`] takes it. The bridge names library `l` as
 //! `fn_{l}` ([`ABSTRACTION_PREFIX`]), and tells Stitch how many abstractions the
 //! library already has. Stitch names its `i`-th new abstraction
 //! `fn_{len + i}` (`previous_abstractions + i`, Stitch's `compression.rs`), so
