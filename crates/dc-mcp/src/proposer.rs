@@ -3,7 +3,8 @@
 //!
 //! [`next_batch`] picks the task with the most open slots (see
 //! [`RunState::next_task`]), builds its payload, and commits a
-//! [`BatchIssued`] event that holds the payload as it is sent.
+//! [`BatchIssued`] event that holds the payload as it is sent. A worker that
+//! holds a batch whose lease has not ended gets no other until it submits.
 //!
 //! [`submit`] commits every submission for a batch the run has issued, as a
 //! [`Submitted`] event with the programs as they were sent, as soon as it
@@ -17,10 +18,16 @@
 //!
 //! **The blind arm.** The reply to a submission is the batch and how many
 //! programs came in, whatever the programs are. It comes before the programs
-//! are checked, so its timing does not depend on them. Checks run in the
-//! background on the same machine, so a long check can slow the replies to
-//! later calls; that is the one path from what programs do to how fast a
-//! reply comes.
+//! are checked, so its timing does not depend on them. Two paths remain from
+//! what programs do to what a proposer sees. Checks run in the background on
+//! the same machine, so a long check can slow the replies to later calls.
+//! And while the last programs an iteration needs are being checked,
+//! [`next_batch`] says so, so a proposer that polls learns how long the
+//! checks took, though not what they found.
+//!
+//! **Worker ids are not authenticated.** A worker id is what the caller
+//! says it is. The standings stop a proposer that uses the wrong batch number
+//! by mistake; they do not stop one that gives another worker's id.
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,7 +45,7 @@ pub const MAX_NAME_LEN: usize = 200;
 /// The longest program, in bytes.
 pub const MAX_PROGRAM_LEN: usize = 64 * 1024;
 /// The most programs one submission may hold.
-pub const MAX_PROGRAMS: usize = 32;
+pub const MAX_PROGRAMS: usize = crate::state::MAX_PROGRAMS_PER_BATCH as usize;
 
 /// The time, for leases.
 pub trait Clock: Send + Sync + fmt::Debug {
@@ -132,8 +139,13 @@ fn wait(state: &RunState, now_ms: u64) -> Wait {
         .iter()
         .filter(|b| b.iteration == state.iteration() && !b.submitted && now_ms <= b.deadline_ms)
         .map(|b| b.deadline_ms)
-        .min()
-        .unwrap_or(now_ms);
+        .min();
+    let Some(first_free) = first_free else {
+        return Wait {
+            reason: "the programs still needed have come in and are being checked".to_owned(),
+            retry_after_seconds: 1,
+        };
+    };
     Wait {
         reason: "every program still needed is held by another batch".to_owned(),
         retry_after_seconds: (first_free - now_ms).div_ceil(1000).max(1),
@@ -150,6 +162,27 @@ pub fn next_batch(
 ) -> Result<NextBatch, Refused> {
     check_name("worker id", worker)?;
     store.commit(run, |state| {
+        // One live batch at a time for each worker, so that one proposer
+        // cannot hold every slot.
+        let held = state.batches().iter().position(|b| {
+            b.iteration == state.iteration()
+                && b.worker == worker
+                && !b.submitted
+                && now_ms <= b.deadline_ms
+        });
+        if let Some(held) = held {
+            let reply = NextBatch {
+                batch: None,
+                wait: Some(Wait {
+                    reason: format!(
+                        "you hold batch {held}; submit it with dc_submit before you ask for \
+                         another"
+                    ),
+                    retry_after_seconds: 1,
+                }),
+            };
+            return Ok((reply, Vec::new()));
+        }
         let Some((name, wanted)) = state.next_task(now_ms) else {
             let reply = NextBatch {
                 batch: None,
@@ -462,7 +495,7 @@ mod tests {
         assert!(!state.quota_in());
         assert!(checked(&store, &run).is_empty());
         let w = next_batch(&store, &run, "c", 20).unwrap().wait.unwrap();
-        assert!(w.reason.contains("held"), "{}", w.reason);
+        assert!(w.reason.contains("being checked"), "{}", w.reason);
 
         assert_eq!(check_pending(&store, &run).unwrap(), 2);
         assert_eq!(check_pending(&store, &run).unwrap(), 0);
@@ -606,6 +639,41 @@ mod tests {
         ));
         assert_eq!(submissions(&store, &run).len(), 1);
         assert_eq!(store.state(&run).unwrap().pending_checks(), [0]);
+    }
+
+    #[test]
+    fn a_worker_holding_a_live_batch_gets_no_other() {
+        let (_dir, store, run) = setup(2, 1);
+        assert_eq!(
+            next_batch(&store, &run, "a", 0)
+                .unwrap()
+                .batch
+                .unwrap()
+                .batch,
+            0
+        );
+        let w = next_batch(&store, &run, "a", 10).unwrap().wait.unwrap();
+        assert!(w.reason.contains("you hold batch 0"), "{}", w.reason);
+        assert_eq!(w.retry_after_seconds, 1);
+        assert_eq!(issued(&store, &run).len(), 1);
+        // Another worker still gets work.
+        assert!(next_batch(&store, &run, "b", 10).unwrap().batch.is_some());
+        // Once the batch is submitted, or its lease ends, the worker gets more.
+        submit(&store, &run, 0, "a", vec!["x".into()], None, 20).unwrap();
+        assert!(next_batch(&store, &run, "a", 30).unwrap().batch.is_some());
+        assert!(next_batch(&store, &run, "b", 500).unwrap().wait.is_some());
+        assert!(next_batch(&store, &run, "b", 1011).unwrap().batch.is_some());
+    }
+
+    #[test]
+    fn a_wait_for_checks_says_so() {
+        let (_dir, store, run) = setup(1, 1);
+        next_batch(&store, &run, "a", 0).unwrap();
+        next_batch(&store, &run, "b", 0).unwrap();
+        submit(&store, &run, 0, "a", vec!["x".into()], None, 1).unwrap();
+        submit(&store, &run, 1, "b", vec!["y".into()], None, 1).unwrap();
+        let w = next_batch(&store, &run, "c", 2).unwrap().wait.unwrap();
+        assert!(w.reason.contains("being checked"), "{}", w.reason);
     }
 
     #[test]

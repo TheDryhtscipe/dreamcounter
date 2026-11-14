@@ -180,8 +180,11 @@ pub enum Standing {
     /// A later submission for the batch from its worker. It is kept but not
     /// checked.
     Repeat,
-    /// A submission from a worker the batch was not issued to. It is kept but
-    /// not checked, and the batch stays open for its own worker.
+    /// A submission that names a worker the batch was not issued to. It is
+    /// kept but not checked, and the batch stays open for the worker it was
+    /// issued to. Worker ids are what the caller says: this guards against a
+    /// wrong batch number, not against a caller that gives another worker's
+    /// id.
     Foreign,
 }
 
@@ -297,6 +300,10 @@ pub enum Event {
     },
 }
 
+/// The most programs a batch may ask for. A submission may hold this many
+/// programs, so every program a batch asks for fits in one submission.
+pub const MAX_PROGRAMS_PER_BATCH: u32 = 32;
+
 /// Why an event cannot be applied to a state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rejected {
@@ -306,6 +313,8 @@ pub enum Rejected {
     DuplicateTask(String),
     /// `proposals_per_task`, `programs_per_batch` or `lease_ms` is zero.
     ZeroSetting(&'static str),
+    /// `programs_per_batch` is over [`MAX_PROGRAMS_PER_BATCH`].
+    TooManyPerBatch(u32),
     /// The first event of a run is not `Created`.
     NotCreated,
     /// A `Created` event came after the first event.
@@ -360,6 +369,10 @@ impl fmt::Display for Rejected {
             Rejected::NoTasks => write!(f, "a run needs at least one task"),
             Rejected::DuplicateTask(t) => write!(f, "task {t:?} is named twice"),
             Rejected::ZeroSetting(name) => write!(f, "{name} must be at least 1"),
+            Rejected::TooManyPerBatch(n) => write!(
+                f,
+                "programs_per_batch is {n}; it must be at most {MAX_PROGRAMS_PER_BATCH}"
+            ),
             Rejected::NotCreated => write!(f, "the first event of a run must create it"),
             Rejected::CreatedTwice => write!(f, "the run is already created"),
             Rejected::UnknownTask(t) => write!(f, "the run has no task {t:?}"),
@@ -492,6 +505,9 @@ impl RunState {
     pub fn create(config: RunConfig, tasks: Vec<String>) -> Result<RunState, Rejected> {
         if tasks.is_empty() {
             return Err(Rejected::NoTasks);
+        }
+        if config.programs_per_batch > MAX_PROGRAMS_PER_BATCH {
+            return Err(Rejected::TooManyPerBatch(config.programs_per_batch));
         }
         for (name, value) in [
             ("proposals_per_task", u64::from(config.proposals_per_task)),
@@ -903,6 +919,17 @@ mod tests {
             RunState::create(zero, vec!["a".into()]),
             Err(Rejected::ZeroSetting("proposals_per_task"))
         );
+        for (n, ok) in [
+            (MAX_PROGRAMS_PER_BATCH, true),
+            (MAX_PROGRAMS_PER_BATCH + 1, false),
+        ] {
+            let c = RunConfig {
+                programs_per_batch: n,
+                ..config()
+            };
+            let got = RunState::create(c, vec!["a".into()]);
+            assert_eq!(got.is_ok(), ok, "{n}: {got:?}");
+        }
     }
 
     #[test]

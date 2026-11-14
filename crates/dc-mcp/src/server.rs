@@ -253,6 +253,18 @@ impl IterationStats {
     }
 }
 
+/// The result of `dc_check_pending`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CheckReport {
+    /// The run's id.
+    pub run: String,
+    /// How many submissions this call checked.
+    pub checked: usize,
+    /// How many submissions still wait to be checked. More than 0 means
+    /// another submission came in meanwhile.
+    pub pending_checks: usize,
+}
+
 /// The result of `dc_proposal_stats`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ProposalStats {
@@ -438,6 +450,33 @@ impl DcServer {
                         .collect(),
                 })
                 .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    /// Checks the submissions of a run that wait to be checked.
+    #[tool(
+        name = "dc_check_pending",
+        description = "Check every submission of a DreamCounter run that waits to be checked, \
+                       and wait until they are done. Proposer servers do this in the \
+                       background; use this when one stopped before it finished, or to see why \
+                       checks fail. Returns how many it checked and how many still wait."
+    )]
+    async fn check_pending(
+        &self,
+        Parameters(arg): Parameters<RunArg>,
+    ) -> Result<Json<CheckReport>, String> {
+        let run = run_id(&arg.run)?;
+        self.blocking(move |store| {
+            let checked = check_pending(store, &run).map_err(|e| e.to_string())?;
+            let pending_checks = store
+                .read(&run, |state| state.pending_checks().len())
+                .map_err(|e| e.to_string())?;
+            Ok(CheckReport {
+                run: run.as_str().to_owned(),
+                checked,
+                pending_checks,
+            })
         })
         .await
     }

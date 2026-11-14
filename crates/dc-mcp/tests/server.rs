@@ -157,6 +157,7 @@ fn the_server_lists_its_tools() {
         names,
         [
             "dc_add_note",
+            "dc_check_pending",
             "dc_create_run",
             "dc_list_runs",
             "dc_proposal_stats",
@@ -719,6 +720,44 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
             (vec!["let solve = (".to_owned()], None),
         ]
     );
+}
+
+#[test]
+fn the_operator_can_check_what_a_stopped_proposer_left() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut operator = Client::start(dir.path());
+    operator
+        .call(
+            "dc_create_run",
+            json!({
+                "run": "r1", "seed": 5, "proposals_per_task": 1,
+                "tasks": ["collapse/merge"]
+            }),
+        )
+        .unwrap();
+    // A proposer server took a submission and stopped before checking it.
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("r1").unwrap();
+    dc_mcp::proposer::next_batch(&store, &run, "a", 0).unwrap();
+    dc_mcp::proposer::submit(&store, &run, 0, "a", vec![solves_merge()], None, 1).unwrap();
+    let stats = operator
+        .call("dc_proposal_stats", json!({ "run": "r1" }))
+        .unwrap();
+    assert_eq!(stats["iterations"][0]["pending_checks"], 1);
+    assert_eq!(stats["iterations"][0]["quota_in"], false);
+
+    let report = operator
+        .call("dc_check_pending", json!({ "run": "r1" }))
+        .unwrap();
+    assert_eq!(
+        report,
+        json!({ "run": "r1", "checked": 1, "pending_checks": 0 })
+    );
+    let stats = operator
+        .call("dc_proposal_stats", json!({ "run": "r1" }))
+        .unwrap();
+    assert_eq!(stats["iterations"][0]["quota_in"], true);
+    assert_eq!(stats["iterations"][0]["tasks"][0]["passed"], 1);
 }
 
 #[test]
