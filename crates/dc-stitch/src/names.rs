@@ -133,6 +133,13 @@ impl LibNames {
         Ok(t)
     }
 
+    /// Removes the name of `id` and returns it, if `id` has one.
+    pub fn remove(&mut self, id: LibId) -> Option<String> {
+        let name = self.by_id.remove(&id)?;
+        self.by_name.remove(&name);
+        Some(name)
+    }
+
     /// The name of `id`, if it has one.
     pub fn name(&self, id: LibId) -> Option<&str> {
         self.by_id.get(&id).map(String::as_str)
@@ -169,6 +176,19 @@ mod tests {
         assert_eq!(t.name(LibId(1)), None);
         assert_eq!(t.id("fn_0"), None);
         assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn a_removed_name_and_id_can_be_used_again() {
+        let mut t = LibNames::sequential("fn_", 2).unwrap();
+        assert_eq!(t.remove(LibId(1)), Some("fn_1".to_string()));
+        assert_eq!(t.remove(LibId(1)), None);
+        assert_eq!(t.name(LibId(1)), None);
+        assert_eq!(t.id("fn_1"), None);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t, LibNames::sequential("fn_", 1).unwrap());
+        t.insert(LibId(1), "fn_1").unwrap();
+        assert_eq!(t, LibNames::sequential("fn_", 2).unwrap());
     }
 
     #[test]

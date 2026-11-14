@@ -3,6 +3,7 @@
 
 use dc_compress::{
     compress, stitch_config, CompressConfig, CompressError, Compression, FrontierProgram,
+    MAX_STITCH_DEPTH,
 };
 use dc_core::{expand, sexpr, Arena, LibDef, LibId, TermId};
 use dc_stitch::{decode, decode_abstraction, encode, DecodeError, LibNames, AND, IF, LET};
@@ -321,4 +322,66 @@ fn an_open_program_is_refused_before_stitch_runs() {
         compress(&mut a, &[], &programs, &CompressConfig::default()),
         Err(CompressError::OpenProgram { index: 1 })
     );
+}
+
+/// `(fst (fst ... (fst k)))`, `n` applications deep.
+fn chain(a: &mut Arena, n: usize, k: i64) -> TermId {
+    let f = parse(a, "fst");
+    let mut t = a.int(k);
+    for _ in 0..n {
+        t = a.app(f, t);
+    }
+    t
+}
+
+#[test]
+fn a_program_too_deep_for_stitch_is_refused() {
+    // Without the limit, Stitch overflows the stack on this program and the
+    // process aborts.
+    let mut a = Arena::new();
+    let programs = vec![
+        FrontierProgram {
+            task: "task_0".to_string(),
+            program: chain(&mut a, 3, 0),
+        },
+        FrontierProgram {
+            task: "task_1".to_string(),
+            program: chain(&mut a, 20_000, 1),
+        },
+    ];
+    assert_eq!(
+        compress(&mut a, &[], &programs, &CompressConfig::default()),
+        Err(CompressError::TooDeep { index: 1 })
+    );
+    // The limit counts the levels of the Stitch expression: an integer under
+    // `MAX_STITCH_DEPTH - 1` applications is the deepest program accepted.
+    let one_over = FrontierProgram {
+        task: "task_0".to_string(),
+        program: chain(&mut a, MAX_STITCH_DEPTH, 0),
+    };
+    assert_eq!(
+        compress(&mut a, &[], &[one_over], &CompressConfig::default()),
+        Err(CompressError::TooDeep { index: 0 })
+    );
+}
+
+#[test]
+fn stitch_runs_off_the_callers_stack() {
+    // A caller with a small stack still gets a result: Stitch runs on its own
+    // thread. Building Stitch's configuration alone overflows a 64 KiB stack.
+    let run = std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(|| {
+            let mut a = Arena::new();
+            let programs: Vec<FrontierProgram> = (0..3)
+                .map(|i| FrontierProgram {
+                    task: format!("task_{i}"),
+                    program: chain(&mut a, 300, i),
+                })
+                .collect();
+            let c = compress(&mut a, &[], &programs, &CompressConfig::default()).expect("compress");
+            expands_back(&mut a, &[], &programs, &c);
+        })
+        .expect("spawn");
+    run.join().expect("compress on a small stack");
 }

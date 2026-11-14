@@ -26,25 +26,39 @@
 //! `--no-curried-metavars`. It runs Stitch on one thread, without shuffling, so
 //! that the same programs give the same result.
 //!
-//! # Steps that do not decode
+//! # Steps that are dropped
 //!
 //! Each Stitch step adds one abstraction and rewrites the programs with it, and
-//! later steps can use earlier abstractions. If a step's abstraction or one of
-//! its rewritten programs does not decode, [`accept_steps`] keeps the steps
-//! before it, drops it and every later step, and reports why in
-//! [`Compression::rejected`].
+//! later steps can use earlier abstractions. [`accept_steps`] keeps a step when
+//! its abstraction and its rewritten programs decode, and each rewritten program
+//! expands to the term its input program expands to. At the first step that
+//! fails, it keeps the steps before it, drops it and every later step, and
+//! reports why in [`Compression::rejected`].
 
+use std::collections::HashMap;
 use std::fmt;
 
-use dc_core::{Arena, LibDef, LibId, TermId};
+use dc_core::term::children;
+use dc_core::{Arena, ExpandError, Expander, LibDef, LibId, Term, TermId};
 use dc_stitch::{
-    decode, decode_abstraction, encode, DecodeError, EncodeError, LibNames, NameError,
+    decode, decode_abstraction, expr, to_expr, DecodeError, EncodeError, Expr, LibNames, NameError,
     LET_LAMBDA_TAG,
 };
 use stitch_core::{multistep_compression, MultistepCompressionConfig};
 
 /// The prefix of every library name the bridge uses: library `l` is `fn_{l}`.
 pub const ABSTRACTION_PREFIX: &str = "fn_";
+
+/// The most levels a program's Stitch expression may have, where a leaf is one
+/// level and a lambda or an application is one more than its deepest child.
+///
+/// Stitch recurses once for each level, so a deeper program could overflow its
+/// stack, which aborts the process. [`compress`] refuses such a program.
+pub const MAX_STITCH_DEPTH: usize = 4096;
+
+/// The stack of the thread Stitch runs on: 64 KiB for each level of a program
+/// at [`MAX_STITCH_DEPTH`].
+const STITCH_STACK_BYTES: usize = 256 << 20;
 
 /// A program to compress, with the task it solves.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,6 +163,23 @@ pub enum RejectReason {
         /// The decoding error.
         error: DecodeError,
     },
+    /// The library does not expand with the step's abstraction added. A body
+    /// that decodes is closed and refers only to earlier abstractions, so this
+    /// is not expected.
+    Library(ExpandError),
+    /// A rewritten program does not expand. A program that decodes refers only
+    /// to named abstractions, so this is not expected.
+    Expand {
+        /// The program's index in the input.
+        index: usize,
+        /// The expansion error.
+        error: ExpandError,
+    },
+    /// A rewritten program does not expand to what its input program expands to.
+    Changed {
+        /// The program's index in the input.
+        index: usize,
+    },
 }
 
 impl fmt::Display for RejectReason {
@@ -168,6 +199,16 @@ impl fmt::Display for RejectReason {
             RejectReason::Program { index, error } => {
                 write!(f, "rewritten program {index} does not decode: {error}")
             }
+            RejectReason::Library(e) => {
+                write!(f, "the library does not expand with the abstraction: {e}")
+            }
+            RejectReason::Expand { index, error } => {
+                write!(f, "rewritten program {index} does not expand: {error}")
+            }
+            RejectReason::Changed { index } => write!(
+                f,
+                "rewritten program {index} does not expand to its input program"
+            ),
         }
     }
 }
@@ -191,6 +232,22 @@ pub enum CompressError {
         /// The encoding error.
         error: EncodeError,
     },
+    /// A program's Stitch expression has more than [`MAX_STITCH_DEPTH`] levels.
+    TooDeep {
+        /// The program's index in the input.
+        index: usize,
+    },
+    /// The thread that runs Stitch could not be started.
+    StitchThread(std::io::ErrorKind),
+    /// The library does not expand.
+    Library(ExpandError),
+    /// An input program does not expand under the library.
+    Expand {
+        /// The program's index in the input.
+        index: usize,
+        /// The expansion error.
+        error: ExpandError,
+    },
 }
 
 impl fmt::Display for CompressError {
@@ -201,6 +258,17 @@ impl fmt::Display for CompressError {
             CompressError::OpenProgram { index } => write!(f, "program {index} is not closed"),
             CompressError::Encode { index, error } => {
                 write!(f, "program {index} cannot be encoded: {error}")
+            }
+            CompressError::TooDeep { index } => write!(
+                f,
+                "program {index} has more than {MAX_STITCH_DEPTH} levels, too deep for Stitch"
+            ),
+            CompressError::StitchThread(kind) => {
+                write!(f, "the Stitch thread could not be started: {kind}")
+            }
+            CompressError::Library(e) => write!(f, "the library does not expand: {e}"),
+            CompressError::Expand { index, error } => {
+                write!(f, "program {index} does not expand: {error}")
             }
         }
     }
@@ -236,14 +304,76 @@ fn library_names(len: u32) -> Result<LibNames, CompressError> {
     LibNames::sequential(ABSTRACTION_PREFIX, len).map_err(CompressError::Names)
 }
 
+/// The number of levels of `e`: 1 for a leaf, and one more than its deepest
+/// child for a lambda or an application. Found with a work list.
+fn depth(e: &Expr) -> usize {
+    let mut deepest = 0;
+    let mut stack = vec![(e, 1usize)];
+    while let Some((e, d)) = stack.pop() {
+        deepest = deepest.max(d);
+        match e {
+            Expr::Lam(b) | Expr::TaggedLam(_, b) => stack.push((b, d + 1)),
+            Expr::App(f, x) => {
+                stack.push((f, d + 1));
+                stack.push((x, d + 1));
+            }
+            Expr::Var(_) | Expr::IVar(_) | Expr::Sym(_) => {}
+        }
+    }
+    deepest
+}
+
+/// Runs Stitch on `text` on its own thread, with a stack of
+/// [`STITCH_STACK_BYTES`], and returns its steps as text. A panic in Stitch
+/// carries on in the caller.
+fn run_stitch(
+    text: &[String],
+    tasks: Vec<String>,
+    cfg: &CompressConfig,
+    library_len: usize,
+) -> Result<Vec<StitchStep>, CompressError> {
+    std::thread::scope(|scope| {
+        let stitch = std::thread::Builder::new()
+            .name("stitch".to_string())
+            .stack_size(STITCH_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                // Stitch builds its configuration with an argument parser, which
+                // also needs more stack than a small caller has.
+                let cfg = stitch_config(cfg, library_len);
+                let (results, _json) =
+                    multistep_compression(text, Some(tasks), None, None, None, &cfg);
+                results
+                    .iter()
+                    .map(|r| StitchStep {
+                        name: r.inv.name.clone(),
+                        arity: r.inv.arity,
+                        body: r.inv.body.to_string(),
+                        rewritten: r.rewritten.iter().map(|p| p.to_string()).collect(),
+                    })
+                    .collect::<Vec<StitchStep>>()
+            })
+            .map_err(|e| CompressError::StitchThread(e.kind()))?;
+        match stitch.join() {
+            Ok(steps) => Ok(steps),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
 /// Runs Stitch on `programs`, which may refer to `libs`, and decodes the result.
 ///
 /// The new abstractions extend `libs`; see [`Compression`]. Stitch is given no
-/// weights. A program with free variables gives [`CompressError::OpenProgram`].
+/// weights. A program with free variables gives [`CompressError::OpenProgram`],
+/// and one whose Stitch expression has more than [`MAX_STITCH_DEPTH`] levels
+/// gives [`CompressError::TooDeep`].
 ///
-/// Stitch's time and memory are not bounded, and grow quickly with the length
-/// of a long list literal. Stitch panics on input it cannot
-/// handle, and this function does not catch the panic.
+/// Stitch runs on its own thread, so it does not use the caller's stack. Its
+/// time and memory are not bounded, and grow quickly with the length of a long
+/// list literal. Stitch panics on input it cannot handle, and this function
+/// does not catch the panic.
+///
+/// The arena gains the new abstractions and the rewritten programs only: the
+/// steps are checked in a scratch arena, as [`accept_steps`] describes.
 pub fn compress(
     arena: &mut Arena,
     libs: &[LibDef],
@@ -257,63 +387,104 @@ pub fn compress(
         if !arena.is_closed(p.program) {
             return Err(CompressError::OpenProgram { index });
         }
-        let encoded = encode(arena, p.program, &names)
+        let e = to_expr(arena, p.program, &names)
             .map_err(|error| CompressError::Encode { index, error })?;
-        text.push(encoded);
+        if depth(&e) > MAX_STITCH_DEPTH {
+            return Err(CompressError::TooDeep { index });
+        }
+        text.push(expr::print(&e));
     }
     let ids: Vec<TermId> = programs.iter().map(|p| p.program).collect();
-    if programs.is_empty() {
-        return accept_steps(arena, len, &ids, &[], cfg.max_arity);
-    }
-    let tasks: Vec<String> = programs.iter().map(|p| p.task.clone()).collect();
-    let (results, _json) = multistep_compression(
-        &text,
-        Some(tasks),
-        None,
-        None,
-        None,
-        &stitch_config(cfg, libs.len()),
-    );
-    let steps: Vec<StitchStep> = results
-        .iter()
-        .map(|r| StitchStep {
-            name: r.inv.name.clone(),
-            arity: r.inv.arity,
-            body: r.inv.body.to_string(),
-            rewritten: r.rewritten.iter().map(|p| p.to_string()).collect(),
-        })
-        .collect();
-    accept_steps(arena, len, &ids, &steps, cfg.max_arity)
+    let steps = if programs.is_empty() {
+        Vec::new()
+    } else {
+        let tasks: Vec<String> = programs.iter().map(|p| p.task.clone()).collect();
+        run_stitch(&text, tasks, cfg, libs.len())?
+    };
+    accept(arena, libs, len, names, &ids, &steps, cfg.max_arity)
 }
 
-/// Decodes Stitch's `steps` for `programs` over a library of `library_len`
-/// entries. Keeps the steps before the first that does not decode, and drops
-/// that step and the rest.
+/// Decodes Stitch's `steps` for `programs` over the library `libs`. Keeps the
+/// steps before the first that fails a check, and drops that step and the rest.
+///
+/// A step is kept when its abstraction and its rewritten programs decode, and
+/// each rewritten program expands, under `libs` and the abstractions kept so
+/// far, to the term its input program expands to under `libs`.
+///
+/// The steps are checked in a scratch arena. `arena` gains only the
+/// abstractions that are kept and the programs of the last step that is kept.
 ///
 /// [`compress`] calls this on Stitch's output. It is public so that recorded
 /// Stitch output can be decoded again.
 pub fn accept_steps(
     arena: &mut Arena,
-    library_len: u32,
+    libs: &[LibDef],
     programs: &[TermId],
     steps: &[StitchStep],
     max_arity: u32,
 ) -> Result<Compression, CompressError> {
-    let mut names = library_names(library_len)?;
-    let mut new_libs = Vec::new();
-    let mut rewritten = programs.to_vec();
+    let len = u32::try_from(libs.len()).map_err(|_| CompressError::LibraryTooLarge)?;
+    let names = library_names(len)?;
+    accept(arena, libs, len, names, programs, steps, max_arity)
+}
+
+/// [`accept_steps`], given the names of the `library_len` entries of `libs`.
+fn accept(
+    arena: &mut Arena,
+    libs: &[LibDef],
+    library_len: u32,
+    mut names: LibNames,
+    programs: &[TermId],
+    steps: &[StitchStep],
+    max_arity: u32,
+) -> Result<Compression, CompressError> {
+    if steps.is_empty() {
+        return Ok(Compression {
+            new_libs: Vec::new(),
+            rewritten: programs.to_vec(),
+            names,
+            stitch_steps: 0,
+            rejected: None,
+        });
+    }
+    // Check the steps in a scratch arena, so that the terms of a dropped step and
+    // of the steps before the last do not stay in the caller's arena.
+    let mut scratch = Arena::new();
+    let mut copied = HashMap::new();
+    let mut all: Vec<LibDef> = libs
+        .iter()
+        .map(|def| LibDef {
+            arity: def.arity,
+            term: copy_term(arena, &mut scratch, def.term, &mut copied),
+        })
+        .collect();
+    let mut expander = Expander::new(&mut scratch, &all).map_err(CompressError::Library)?;
+    let mut want = Vec::with_capacity(programs.len());
+    for (index, p) in programs.iter().enumerate() {
+        let p = copy_term(arena, &mut scratch, *p, &mut copied);
+        let expanded = expander
+            .expand(&mut scratch, p)
+            .map_err(|error| CompressError::Expand { index, error })?;
+        want.push(expanded);
+    }
+    drop(expander);
+    let mut accepted = 0;
     let mut rejected = None;
     for (i, step) in steps.iter().enumerate() {
         let next = u32::try_from(i)
             .ok()
             .and_then(|i| library_len.checked_add(i))
             .map(LibId);
-        match accept_step(arena, next, step, &names, max_arity, programs.len()) {
-            Ok(accepted) => {
-                new_libs.push(accepted.def);
-                names = accepted.names;
-                rewritten = accepted.programs;
-            }
+        match check_step(
+            &mut scratch,
+            next,
+            step,
+            &mut names,
+            max_arity,
+            &mut all,
+            &want,
+        ) {
+            Ok(()) => accepted = i + 1,
             Err(reason) => {
                 rejected = Some(Rejection {
                     step: i,
@@ -325,6 +496,25 @@ pub fn accept_steps(
             }
         }
     }
+    // Decode what is kept into the caller's arena. It decoded in the scratch
+    // arena against the same names.
+    let new_libs = steps[..accepted]
+        .iter()
+        .zip(&all[libs.len()..])
+        .map(|(step, def)| LibDef {
+            arity: def.arity,
+            term: decode_abstraction(arena, &step.body, def.arity, &names)
+                .expect("the body decoded in the scratch arena"),
+        })
+        .collect();
+    let rewritten = match accepted.checked_sub(1) {
+        None => programs.to_vec(),
+        Some(last) => steps[last]
+            .rewritten
+            .iter()
+            .map(|p| decode(arena, p, &names).expect("the program decoded in the scratch arena"))
+            .collect(),
+    };
     Ok(Compression {
         new_libs,
         rewritten,
@@ -334,56 +524,125 @@ pub fn accept_steps(
     })
 }
 
-/// A decoded step.
-struct Accepted {
-    def: LibDef,
-    /// The name table with the step's abstraction added.
-    names: LibNames,
-    programs: Vec<TermId>,
+/// Copies the term `id` of `from` into `to`, with a work list. `copied` maps the
+/// terms of `from` already copied to their copies.
+fn copy_term(
+    from: &Arena,
+    to: &mut Arena,
+    id: TermId,
+    copied: &mut HashMap<TermId, TermId>,
+) -> TermId {
+    let mut stack = vec![id];
+    while let Some(&t) = stack.last() {
+        if copied.contains_key(&t) {
+            stack.pop();
+            continue;
+        }
+        let node = from.get(t);
+        let pending: Vec<TermId> = children(&node)
+            .into_iter()
+            .filter(|c| !copied.contains_key(c))
+            .collect();
+        if !pending.is_empty() {
+            stack.extend(pending);
+            continue;
+        }
+        let c = |child: TermId| copied[&child];
+        let copy = match node {
+            Term::Lam(b) => Term::Lam(c(b)),
+            Term::App(f, x) => Term::App(c(f), c(x)),
+            Term::Let(x, b) => Term::Let(c(x), c(b)),
+            Term::If(i, t, e) => Term::If(c(i), c(t), c(e)),
+            Term::And(x, y) => Term::And(c(x), c(y)),
+            Term::Or(x, y) => Term::Or(c(x), c(y)),
+            leaf @ (Term::Var(_)
+            | Term::Int(_)
+            | Term::Bool(_)
+            | Term::Unit
+            | Term::Prim(_)
+            | Term::Lib(_)) => leaf,
+        };
+        let new = to.intern(copy);
+        copied.insert(t, new);
+        stack.pop();
+    }
+    copied[&id]
 }
 
-/// Decodes one step, whose abstraction should get the id `id`.
-fn accept_step(
-    arena: &mut Arena,
+/// Checks one step in the scratch arena. Its abstraction should get the id `id`.
+/// `libs` is the library with the abstractions kept so far, and `want` holds
+/// what each input program expands to.
+///
+/// If the step passes, its abstraction is added to `libs` and its name to
+/// `names`. If not, both are left as they were.
+fn check_step(
+    scratch: &mut Arena,
     id: Option<LibId>,
     step: &StitchStep,
-    names: &LibNames,
+    names: &mut LibNames,
     max_arity: u32,
-    program_count: usize,
-) -> Result<Accepted, RejectReason> {
-    let expected = id.map(|LibId(l)| format!("{ABSTRACTION_PREFIX}{l}"));
-    let (id, name) = match (id, expected) {
-        (Some(id), Some(name)) if step.name == name => (id, name),
-        (_, expected) => return Err(RejectReason::UnexpectedName { expected }),
+    libs: &mut Vec<LibDef>,
+    want: &[TermId],
+) -> Result<(), RejectReason> {
+    let Some(id) = id else {
+        return Err(RejectReason::UnexpectedName { expected: None });
     };
+    let name = format!("{ABSTRACTION_PREFIX}{}", id.0);
+    if step.name != name {
+        return Err(RejectReason::UnexpectedName {
+            expected: Some(name),
+        });
+    }
     let arity = match u32::try_from(step.arity) {
         Ok(a) if a <= max_arity => a,
         _ => return Err(RejectReason::ArityTooLarge { arity: step.arity }),
     };
     // The body may refer to earlier abstractions, but not to itself.
     let term =
-        decode_abstraction(arena, &step.body, arity, names).map_err(RejectReason::Abstraction)?;
-    if step.rewritten.len() != program_count {
+        decode_abstraction(scratch, &step.body, arity, names).map_err(RejectReason::Abstraction)?;
+    if step.rewritten.len() != want.len() {
         return Err(RejectReason::ProgramCount {
             got: step.rewritten.len(),
-            expected: program_count,
+            expected: want.len(),
         });
     }
-    let mut with_new = names.clone();
-    with_new
+    names
         .insert(id, name)
         .expect("the bridge's names are legal, and the id and name are fresh");
-    let mut programs = Vec::with_capacity(program_count);
+    libs.push(LibDef { arity, term });
+    let checked = check_programs(scratch, step, names, libs, want);
+    if checked.is_err() {
+        names.remove(id);
+        libs.pop();
+    }
+    checked
+}
+
+/// Checks that each rewritten program of `step` decodes, and expands under
+/// `libs` to the term in `want`.
+fn check_programs(
+    scratch: &mut Arena,
+    step: &StitchStep,
+    names: &LibNames,
+    libs: &[LibDef],
+    want: &[TermId],
+) -> Result<(), RejectReason> {
+    let mut programs = Vec::with_capacity(want.len());
     for (index, p) in step.rewritten.iter().enumerate() {
         let decoded =
-            decode(arena, p, &with_new).map_err(|error| RejectReason::Program { index, error })?;
+            decode(scratch, p, names).map_err(|error| RejectReason::Program { index, error })?;
         programs.push(decoded);
     }
-    Ok(Accepted {
-        def: LibDef { arity, term },
-        names: with_new,
-        programs,
-    })
+    let mut expander = Expander::new(scratch, libs).map_err(RejectReason::Library)?;
+    for (index, (p, want)) in programs.iter().zip(want).enumerate() {
+        let got = expander
+            .expand(scratch, *p)
+            .map_err(|error| RejectReason::Expand { index, error })?;
+        if got != *want {
+            return Err(RejectReason::Changed { index });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -404,7 +663,15 @@ mod tests {
         sexpr::parse(a, src).unwrap_or_else(|e| panic!("{src}: {e}"))
     }
 
-    /// Two programs over a library of one entry, and a first step that decodes.
+    /// A library of one entry.
+    fn library(a: &mut Arena) -> Vec<LibDef> {
+        vec![LibDef {
+            arity: 1,
+            term: core(a, "(lam (sub $0 1))"),
+        }]
+    }
+
+    /// Two programs over [`library`], and a first step that decodes.
     fn setup(a: &mut Arena) -> (Vec<TermId>, StitchStep) {
         let programs = vec![
             core(a, "(add (mul 2 3) (lib_0 1))"),
@@ -425,7 +692,8 @@ mod tests {
         let (programs, good) = setup(&mut a);
         // The second step's body uses the first new abstraction.
         let next = step("fn_2", 0, "(fn_1 int_4)", &["(fn_1 (fn_0 int_1))", "fn_2"]);
-        let c = accept_steps(&mut a, 1, &programs, &[good, next], 2).expect("accept");
+        let libs = library(&mut a);
+        let c = accept_steps(&mut a, &libs, &programs, &[good, next], 2).expect("accept");
         assert_eq!(c.rejected, None);
         assert_eq!(c.stitch_steps, 2);
         assert_eq!(
@@ -455,7 +723,9 @@ mod tests {
         let mut a = Arena::new();
         let (programs, good) = setup(&mut a);
         let later = step("fn_3", 1, "(mul #0 #0)", &["(fn_3 int_1)", "(fn_3 int_2)"]);
-        let c = accept_steps(&mut a, 1, &programs, &[good, bad.clone(), later], 2).expect("accept");
+        let libs = library(&mut a);
+        let c =
+            accept_steps(&mut a, &libs, &programs, &[good, bad.clone(), later], 2).expect("accept");
         assert_eq!(
             c.rejected,
             Some(Rejection {
@@ -547,12 +817,88 @@ mod tests {
     fn a_step_whose_id_would_overflow_is_refused() {
         // `accept_steps` passes `None` when the library length plus the step
         // index does not fit in a `u32`. That path is defensive: it needs a name
-        // table of about 2^32 entries, so this test calls `accept_step` directly.
+        // table of about 2^32 entries, so this test calls `check_step` directly.
         let mut a = Arena::new();
         let s = step("fn_0", 0, "int_1", &[]);
         assert_eq!(
-            accept_step(&mut a, None, &s, &LibNames::new(), 2, 0).err(),
-            Some(RejectReason::UnexpectedName { expected: None })
+            check_step(
+                &mut a,
+                None,
+                &s,
+                &mut LibNames::new(),
+                2,
+                &mut Vec::new(),
+                &[]
+            ),
+            Err(RejectReason::UnexpectedName { expected: None })
         );
+    }
+
+    #[test]
+    fn a_rewritten_program_that_expands_to_another_term_is_dropped() {
+        // The step decodes, but its second program is `1`, not `(add (mul 2 3) 4)`.
+        drops_from(
+            step("fn_2", 0, "int_1", &["(fn_1 (fn_0 int_1))", "fn_2"]),
+            RejectReason::Changed { index: 1 },
+        );
+    }
+
+    #[test]
+    fn an_input_program_that_does_not_expand_is_an_error() {
+        let mut a = Arena::new();
+        let libs = library(&mut a);
+        let (mut programs, good) = setup(&mut a);
+        programs[1] = core(&mut a, "(lib_5 1)");
+        assert_eq!(
+            accept_steps(&mut a, &libs, &programs, &[good], 2),
+            Err(CompressError::Expand {
+                index: 1,
+                error: ExpandError::UnknownLib(LibId(5)),
+            })
+        );
+    }
+
+    #[test]
+    fn the_arena_gains_only_what_is_kept() {
+        // Steps that are dropped, and the programs of a step that a later step
+        // replaced, leave nothing in the arena.
+        let mut a = Arena::new();
+        let libs = library(&mut a);
+        let (programs, good) = setup(&mut a);
+        let next = step("fn_2", 0, "(fn_1 int_4)", &["(fn_1 (fn_0 int_1))", "fn_2"]);
+        let bad = step(
+            "fn_3",
+            1,
+            "(pair #0 int_77)",
+            &["(fn_3 int_78)", "(fn_3 int_79)"],
+        );
+        let c = accept_steps(&mut a, &libs, &programs, &[good, next, bad], 2).expect("accept");
+        assert_eq!(c.rejected.as_ref().map(|r| r.step), Some(2));
+        assert_eq!(c.new_libs.len(), 2);
+        // The same library, programs and result, written out in a new arena.
+        let mut b = Arena::new();
+        library(&mut b);
+        setup(&mut b);
+        for src in [
+            "(lam (add (mul 2 3) $0))",
+            "(lib_1 4)",
+            "(lib_1 (lib_0 1))",
+            "lib_2",
+        ] {
+            core(&mut b, src);
+        }
+        assert_eq!(a.len(), b.len());
+    }
+
+    #[test]
+    fn depth_counts_the_levels_of_an_expression() {
+        let d = |src: &str| depth(&expr::parse(src).expect("parse"));
+        assert_eq!(d("int_1"), 1);
+        assert_eq!(d("(fst int_1)"), 2);
+        assert_eq!(d("(lam (lam $0))"), 3);
+        // `(add a b)` is `((add a) b)`.
+        assert_eq!(d("(add int_1 int_2)"), 3);
+        assert_eq!(d("(add int_1 (fst (fst int_2)))"), 4);
+        assert_eq!(d("(let_ int_1 (lam_0 (fst $0)))"), 4);
     }
 }
