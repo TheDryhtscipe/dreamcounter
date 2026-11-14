@@ -1207,15 +1207,20 @@ fn of_two_programs_with_one_expansion_the_cheaper_is_kept() {
 
 #[test]
 fn an_abstraction_too_large_to_print_is_cut() {
-    let levels = (dc_core::sexpr::MAX_PRINT_NODES / 4) + 1;
-    let body: &'static str = Box::leak(
-        format!("(lam {}$0{})", "(add ".repeat(levels), " 1)".repeat(levels)).into_boxed_str(),
-    );
+    // Each `(add x 1)` level is 4 nodes. The body has 4 lambdas, 4 * levels
+    // nodes of `add`, and `$0`: one node over the limit. The candidate is the
+    // core with `$0` replaced by `1`, under the limit, and the rewriting
+    // expands to it, so only the cut stops the abstraction being kept.
+    let levels = dc_core::sexpr::MAX_PRINT_NODES / 4 - 1;
+    let core = |hole: &str| format!("{}{hole}{}", "(add ".repeat(levels), " 1)".repeat(levels));
+    let body: &'static str =
+        Box::leak(format!("(lam (lam (lam (lam {}))))", core("$0")).into_boxed_str());
+    let program: &'static str = Box::leak(core("1").into_boxed_str());
     let tasks = [task("a", "Int")];
-    let cands = [candidate("a", "(add 1 1)")];
+    let cands = [candidate("a", program)];
     let mut stitch = Fixed {
-        libs: vec![(1, body)],
-        rewritten: vec!["(lib_0 1)"],
+        libs: vec![(4, body)],
+        rewritten: vec!["(lib_0 0 0 0 1)"],
     };
     let out = run(
         &tasks,
@@ -1227,11 +1232,20 @@ fn an_abstraction_too_large_to_print_is_cut() {
     )
     .unwrap();
     assert!(out.new_library.is_empty());
-    assert_eq!(out.frontiers["a"], vec!["(add 1 1)"]);
-    let CompressionReport::Ran { untyped, .. } = &out.report.compression else {
+    assert_eq!(out.frontiers["a"], vec![program.to_string()]);
+    let CompressionReport::Ran {
+        untyped, fallbacks, ..
+    } = &out.report.compression
+    else {
         panic!("{:?}", out.report.compression);
     };
     let cut = untyped.as_ref().expect("the abstraction is cut");
     assert_eq!(cut.abstraction, 0);
     assert!(cut.error.contains("nodes written out"), "{}", cut.error);
+    assert_eq!(fallbacks.len(), 1);
+    assert!(
+        fallbacks[0].reason.contains("does not type"),
+        "{}",
+        fallbacks[0].reason
+    );
 }

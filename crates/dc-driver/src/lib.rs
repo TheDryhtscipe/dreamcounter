@@ -29,9 +29,9 @@
 //!    the frontiers are still updated, and the library is unchanged.
 //! 4. **Library update.** Each new abstraction gets a type scheme inferred from
 //!    its body with the earlier ones, and the new abstractions are cut at the
-//!    first that does not type or is too large to print. A rewritten program is accepted if it types
-//!    against its task's signature with the library's schemes and expands to
-//!    what its original expands to. Otherwise the program stays as it was:
+//!    first that does not type or is too large to print. A rewritten program
+//!    is accepted if it types against its task's signature with the library's
+//!    schemes and expands to what its original expands to. Otherwise the program stays as it was:
 //!    the rewriting keeps the expansion but not always the type (see the
 //!    dc-core test `a_parameter_used_at_two_types_can_make_the_refactored_program_untypable`).
 //!    The bridge returns only the programs rewritten with every abstraction it
@@ -204,7 +204,8 @@ pub enum Fate {
     /// It expands to the same term as another program of its task, which is
     /// cheaper, or costs the same and came earlier.
     Duplicate {
-        /// The other program.
+        /// The other program. Its own fate is [`Fate::Kept`] or
+        /// [`Fate::Trimmed`], so it is not always in the new frontier.
         of: Source,
     },
     /// Its task kept [`DriverConfig::frontier_size`] programs that cost less,
