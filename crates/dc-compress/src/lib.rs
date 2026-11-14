@@ -45,17 +45,19 @@
 //! # Running Stitch in a worker process
 //!
 //! Stitch's time and memory are not bounded: they grow quickly with the size of
-//! the programs, and two copies of a list literal of 1,000 elements already take
-//! about 40 seconds. Stitch also panics on input it cannot handle, and an
-//! allocation failure or a stack overflow in it aborts the process.
-//! [`compress_isolated`] runs Stitch in a child process with a time and a memory
-//! limit (see the [`worker`] module), so none of this reaches the caller.
-//! [`compress`] runs Stitch in the caller's process, with no limits.
+//! the programs. In a release build, two copies of a list literal of 1,000
+//! elements took 3 seconds and 217 MB, and of 2,000 elements did not finish in
+//! 5 seconds. Stitch also panics on input it cannot handle, and an allocation
+//! failure or a stack overflow in it aborts the process. [`compress_isolated`]
+//! runs Stitch in a child process with a time and a memory limit (see the
+//! [`worker`] module), so that these stay in that process. [`compress`] runs
+//! Stitch in the caller's process, with no limits.
 
 pub mod worker;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::AtomicBool;
 
 use dc_core::term::children;
 use dc_core::{Arena, ExpandError, Expander, LibDef, LibId, Term, TermId};
@@ -419,18 +421,21 @@ pub fn compress(
 }
 
 /// [`compress`], with Stitch run by `worker` in a child process with the
-/// worker's [`Limits`](worker::Limits).
+/// worker's [`Limits`](worker::Limits). Setting `cancel` from another thread
+/// stops the run.
 ///
-/// A run stopped at a limit, a panic or abort in Stitch, and output that does
-/// not parse give [`CompressError::Worker`]. The worker's output is checked
-/// with [`accept_steps`], as in [`compress`]. The same programs give the same
-/// result as [`compress`].
+/// A run stopped at a limit or cancelled, a panic or abort in Stitch, and
+/// output that does not parse give [`CompressError::Worker`]. The worker's
+/// output is checked with [`accept_steps`], as in [`compress`]. With a worker
+/// built from the same source, the same programs give the same result as
+/// [`compress`].
 pub fn compress_isolated(
     arena: &mut Arena,
     libs: &[LibDef],
     programs: &[FrontierProgram],
     cfg: &CompressConfig,
     worker: &Worker,
+    cancel: &AtomicBool,
 ) -> Result<Compression, CompressError> {
     compress_via(arena, libs, programs, cfg, |text, tasks| {
         let request = StitchRequest {
@@ -440,7 +445,7 @@ pub fn compress_isolated(
             max_arity: cfg.max_arity,
             library_len: libs.len(),
         };
-        worker.run(&request).map_err(CompressError::Worker)
+        worker.run(&request, cancel).map_err(CompressError::Worker)
     })
 }
 
