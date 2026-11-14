@@ -81,6 +81,9 @@
 //! Stitch's eta-long mode does not keep lambda tags (`rewriting.rs`), so do not
 //! use `--eta-long` with this encoding.
 //!
+//! The `dc-compress` crate runs Stitch with these flags. It drops any step whose
+//! abstraction or rewritten programs still do not decode, with the steps after it.
+//!
 //! # Library abstractions
 //!
 //! Stitch reports an abstraction as a name (for example `fn_0`), an arity `k` and

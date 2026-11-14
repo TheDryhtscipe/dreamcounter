@@ -21,6 +21,8 @@ dc-surface = { path = "crates/dc-surface" }
 dc-eval = { path = "crates/dc-eval" }
 dc-stitch = { path = "crates/dc-stitch" }
 dc-tasks = { path = "crates/dc-tasks" }
+# Pinned to one commit: the Stitch bridge (dc-compress) is tested against it.
+stitch_core = { git = "https://github.com/mlb2251/stitch", rev = "350804b7b35807c78bd21c313785ae5152ae2985" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
