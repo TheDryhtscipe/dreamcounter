@@ -134,9 +134,9 @@ pub struct StitchRequest {
 /// The limits on one worker run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// The longest the caller waits for the worker. A limit above about 584
-    /// years sets no CPU limit. One too large to add to the current time, such
-    /// as [`Duration::MAX`], sets no wall limit either.
+    /// The longest the caller waits for the worker. The CPU limit is at most
+    /// about 584 years, the largest the kernel keeps. A wall limit too large to
+    /// add to the current time, such as [`Duration::MAX`], sets none.
     pub wall: Duration,
     /// The worker's address space, in bytes. This counts memory the worker has
     /// reserved, not only what it uses: Stitch's thread reserves a stack of
@@ -658,10 +658,10 @@ fn set_limits() -> Result<(), String> {
             ));
         }
     }
-    // A CPU limit too large for the kernel's count of nanoseconds wraps to a
-    // small one, so a larger limit sets none.
-    let cpu = env_limit(CPU_ENV)?.filter(|&s| s <= MAX_CPU_SECONDS);
-    if let Some(seconds) = cpu {
+    if let Some(asked) = env_limit(CPU_ENV)? {
+        // A limit too large for the kernel's count of nanoseconds wraps to a
+        // small one, so the hard limit is at most MAX_CPU_SECONDS.
+        let seconds = asked.min(MAX_CPU_SECONDS - 1);
         // SIGXCPU at the soft limit; SIGKILL at the hard limit if SIGXCPU is
         // caught or ignored. The soft limit stays below the hard limit, so that
         // the caller sees SIGXCPU.
@@ -683,7 +683,7 @@ fn set_limits() -> Result<(), String> {
 }
 
 /// The largest CPU limit, in seconds, that the kernel keeps: it counts CPU time
-/// in nanoseconds, in 64 bits.
+/// in nanoseconds, in 64 bits. The worker sets no larger hard limit.
 #[cfg(unix)]
 const MAX_CPU_SECONDS: u64 = u64::MAX / 1_000_000_000;
 

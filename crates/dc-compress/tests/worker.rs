@@ -459,7 +459,12 @@ fn a_cpu_limit_too_large_for_the_kernel_is_lowered_to_the_largest_it_keeps() {
     // kernel, and 2^63 + 4 seconds wraps to 4 seconds.
     let soft = (MAX_CPU_SECONDS - 1).to_string();
     let hard = MAX_CPU_SECONDS.to_string();
-    for cpu in [MAX_CPU_SECONDS - 1, MAX_CPU_SECONDS, (1u64 << 63) + 4, u64::MAX] {
+    for cpu in [
+        MAX_CPU_SECONDS - 1,
+        MAX_CPU_SECONDS,
+        (1u64 << 63) + 4,
+        u64::MAX,
+    ] {
         let (got, wanted, _) = worker_limits(
             "exec \"$1\"",
             &cpu.to_string(),
