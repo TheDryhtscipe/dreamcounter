@@ -1,5 +1,10 @@
 //! The MCP tools.
 //!
+//! There are two servers. [`DcServer`] is the operator's: it creates runs and
+//! reports on them. [`ProposerServer`] is a proposer's: it serves one run and
+//! has only `dc_next_batch` and `dc_submit` (see [`crate::proposer`]). The
+//! `dc-mcp` binary serves one or the other.
+//!
 //! Every tool reads or writes through the [`Store`], which brings its copy of
 //! the run up to the journal on disk first. A request the server cannot carry
 //! out is a tool error with a message. It changes nothing in a run's state,
@@ -14,6 +19,7 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
 
+use crate::proposer::{next_batch, submit, Clock, NextBatch, Receipt, Refused};
 use crate::state::{Arm, Event, LogKind, LogRecord, RunConfig, RunId, RunState};
 use crate::store::{Store, StoreError};
 
@@ -109,6 +115,10 @@ pub struct RunStatus {
     pub library_size: usize,
     /// How many log records of each kind the run has.
     pub log_counts: LogCounts,
+    /// How many batches the run has issued, in all iterations.
+    pub batches_issued: usize,
+    /// What came in during the current iteration.
+    pub current: IterationStats,
 }
 
 impl RunStatus {
@@ -136,8 +146,97 @@ impl RunStatus {
                 note: state.log_count(LogKind::Note),
                 recovery: state.log_count(LogKind::Recovery),
             },
+            batches_issued: state.batches().len(),
+            current: IterationStats::of(state, state.iteration()),
         }
     }
+}
+
+/// What came in for one task in one iteration.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TaskStats {
+    /// The task's name.
+    pub name: String,
+    /// Batches issued for it.
+    pub batches: u64,
+    /// Programs checked: those its batches asked for, from submissions that
+    /// came in during the batch's iteration.
+    pub programs: u64,
+    /// Programs that compiled.
+    pub compiled: u64,
+    /// Programs that compiled and had the task's type.
+    pub typed: u64,
+    /// Programs that passed every example.
+    pub passed: u64,
+    /// Whether at least one program passed.
+    pub solved: bool,
+}
+
+/// What came in during one iteration.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct IterationStats {
+    /// The iteration.
+    pub iteration: u64,
+    /// Whether every task has its programs. Only meaningful for the current
+    /// iteration, where it says the iteration can be finished.
+    pub quota_in: bool,
+    /// How many tasks have a program that passed.
+    pub tasks_solved: usize,
+    /// Submissions received, of any standing.
+    pub submissions: u64,
+    /// Submissions for a batch of an earlier iteration: kept, not checked.
+    pub late: u64,
+    /// Submissions for a batch that already had one: kept, not checked.
+    pub repeats: u64,
+    /// Bytes of payload handed out. About four bytes make a token.
+    pub payload_bytes: u64,
+    /// Bytes of program text received.
+    pub submission_bytes: u64,
+    /// Each task, in the run's order.
+    pub tasks: Vec<TaskStats>,
+}
+
+impl IterationStats {
+    fn of(state: &RunState, iteration: u64) -> IterationStats {
+        let tasks: Vec<TaskStats> = state
+            .tasks()
+            .iter()
+            .map(|name| {
+                let c = state.task_counts(iteration, name);
+                TaskStats {
+                    name: name.clone(),
+                    batches: c.batches,
+                    programs: c.programs,
+                    compiled: c.compiled,
+                    typed: c.typed,
+                    passed: c.passed,
+                    solved: c.passed > 0,
+                }
+            })
+            .collect();
+        let counts = state.iteration_counts(iteration);
+        let quota = u64::from(state.config().proposals_per_task);
+        IterationStats {
+            iteration,
+            quota_in: tasks.iter().all(|t| t.programs >= quota),
+            tasks_solved: tasks.iter().filter(|t| t.solved).count(),
+            submissions: counts.submissions,
+            late: counts.late,
+            repeats: counts.repeats,
+            payload_bytes: counts.payload_bytes,
+            submission_bytes: counts.submission_bytes,
+            tasks,
+        }
+    }
+}
+
+/// The result of `dc_proposal_stats`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ProposalStats {
+    /// The run's id.
+    pub run: String,
+    /// Each iteration from 0 to the current one.
+    pub iterations: Vec<IterationStats>,
 }
 
 /// The result of `dc_list_runs`.
@@ -294,6 +393,32 @@ impl DcServer {
         .await
     }
 
+    /// Reports what proposers sent in each iteration.
+    #[tool(
+        name = "dc_proposal_stats",
+        description = "Report, for each iteration of a DreamCounter run, what proposers sent: \
+                       for each task the batches issued, the programs checked, how many \
+                       compiled, typed and passed their examples, and whether the task was \
+                       solved; and the bytes of payload and program text."
+    )]
+    async fn proposal_stats(
+        &self,
+        Parameters(arg): Parameters<RunArg>,
+    ) -> Result<Json<ProposalStats>, String> {
+        let run = run_id(&arg.run)?;
+        self.blocking(move |store| {
+            store
+                .read(&run, |state| ProposalStats {
+                    run: run.as_str().to_owned(),
+                    iterations: (0..=state.iteration())
+                        .map(|i| IterationStats::of(state, i))
+                        .collect(),
+                })
+                .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
     /// Lists the runs.
     #[tool(
         name = "dc_list_runs",
@@ -308,6 +433,99 @@ impl DcServer {
             Ok(RunList {
                 runs: runs.iter().map(|r| r.as_str().to_owned()).collect(),
             })
+        })
+        .await
+    }
+}
+
+/// The arguments of `dc_next_batch`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NextBatchArgs {
+    /// Your id, as your brief gives it: 1 to 200 bytes.
+    pub worker: String,
+}
+
+/// The arguments of `dc_submit`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitArgs {
+    /// The batch's number, from `dc_next_batch`.
+    pub batch: u64,
+    /// The programs, one string for each: the full text of a dc program that
+    /// defines `solve`. At most 32, each at most 64 KiB.
+    pub programs: Vec<String>,
+    /// The model you are, if you know it: 1 to 200 bytes.
+    pub model: Option<String>,
+}
+
+/// The MCP server a proposer connects to (decision D11). It serves one run
+/// and has two tools, `dc_next_batch` and `dc_submit`, so a proposer cannot
+/// list runs or see a run's library, frontiers or results.
+#[derive(Clone, Debug)]
+pub struct ProposerServer {
+    store: Arc<Store>,
+    run: RunId,
+    clock: Arc<dyn Clock>,
+}
+
+impl ProposerServer {
+    /// A server for proposers of `run` in `store`, with leases timed by
+    /// `clock`.
+    pub fn new(store: Store, run: RunId, clock: Arc<dyn Clock>) -> ProposerServer {
+        ProposerServer {
+            store: Arc::new(store),
+            run,
+            clock,
+        }
+    }
+
+    /// Runs `work` on a thread that may block, and waits for it.
+    async fn blocking<T, F>(&self, work: F) -> Result<Json<T>, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Store, &RunId, u64) -> Result<T, Refused> + Send + 'static,
+    {
+        let store = Arc::clone(&self.store);
+        let run = self.run.clone();
+        let clock = Arc::clone(&self.clock);
+        tokio::task::spawn_blocking(move || work(&store, &run, clock.now_ms()))
+            .await
+            .map_err(|e| format!("the tool call did not finish: {e}"))?
+            .map(Json)
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[tool_router(server_handler)]
+impl ProposerServer {
+    /// Hands out a batch of work.
+    #[tool(
+        name = "dc_next_batch",
+        description = "Get a batch of work: a task, and how many programs to write for it. The \
+                       prompt says how to write them. If there is no work now, `batch` is \
+                       null and `wait` says why and when to ask again."
+    )]
+    async fn next_batch(
+        &self,
+        Parameters(arg): Parameters<NextBatchArgs>,
+    ) -> Result<Json<NextBatch>, String> {
+        self.blocking(move |store, run, now| next_batch(store, run, &arg.worker, now))
+            .await
+    }
+
+    /// Takes in the programs for a batch.
+    #[tool(
+        name = "dc_submit",
+        description = "Submit the programs for a batch. The reply says how many programs \
+                       were received. It does not say whether they are right."
+    )]
+    async fn submit(
+        &self,
+        Parameters(arg): Parameters<SubmitArgs>,
+    ) -> Result<Json<Receipt>, String> {
+        self.blocking(move |store, run, now| {
+            submit(store, run, arg.batch, arg.programs, arg.model, now)
         })
         .await
     }

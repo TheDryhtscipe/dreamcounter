@@ -320,18 +320,19 @@ fn a_header_reads_back_and_other_starts_are_told_apart() {
             "{text:?}"
         );
     };
-    unsupported("dc-mcp journal 2 0000000000000001\n");
-    unsupported("dc-mcp journal 1\n");
-    unsupported("dc-mcp journal 1 1\n");
-    unsupported("dc-mcp journal 1 000000000000000G\n");
-    unsupported("dc-mcp journal 1 000000000000000A\n");
-    unsupported("dc-mcp journal 1 0000000000000001 extra\n");
+    unsupported("dc-mcp journal 1 0000000000000001\n");
+    unsupported("dc-mcp journal 3 0000000000000001\n");
+    unsupported("dc-mcp journal 2\n");
+    unsupported("dc-mcp journal 2 1\n");
+    unsupported("dc-mcp journal 2 000000000000000G\n");
+    unsupported("dc-mcp journal 2 000000000000000A\n");
+    unsupported("dc-mcp journal 2 0000000000000001 extra\n");
     for not in [
         "",
-        "dc-mcp journal 1 0000000000000001",
+        "dc-mcp journal 2 0000000000000001",
         "junk\n",
         "\n",
-        &format!("dc-mcp journal 1 {}\n", "0".repeat(80)),
+        &format!("dc-mcp journal 2 {}\n", "0".repeat(80)),
     ] {
         assert_eq!(
             parse_header(not.as_bytes()),

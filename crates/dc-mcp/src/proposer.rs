@@ -298,8 +298,7 @@ pub fn submit(
         }
     }
     Err(Refused::Request(
-        "the run's library kept changing while the programs were checked; submit again"
-            .to_owned(),
+        "the run's library kept changing while the programs were checked; submit again".to_owned(),
     ))
 }
 
@@ -418,8 +417,20 @@ mod tests {
         next_batch(&store, &run, "b", 0).unwrap();
         let good = submit(&store, &run, 0, vec![solves_merge()], None, 10).unwrap();
         let bad = submit(&store, &run, 1, vec!["let solve = (".into()], None, 10).unwrap();
-        assert_eq!(good, Receipt { batch: 0, received: 1 });
-        assert_eq!(bad, Receipt { batch: 1, received: 1 });
+        assert_eq!(
+            good,
+            Receipt {
+                batch: 0,
+                received: 1
+            }
+        );
+        assert_eq!(
+            bad,
+            Receipt {
+                batch: 1,
+                received: 1
+            }
+        );
         // The server knows: the good program is verified, the bad one is not.
         let state = store.state(&run).unwrap();
         assert_eq!(state.task_counts(0, MERGE).passed, 1);
@@ -441,7 +452,15 @@ mod tests {
             solves_merge(),
             "-- an extra one\nlet solve xs = []".to_owned(),
         ];
-        submit(&store, &run, 0, programs.clone(), Some("model-x".into()), 10).unwrap();
+        submit(
+            &store,
+            &run,
+            0,
+            programs.clone(),
+            Some("model-x".into()),
+            10,
+        )
+        .unwrap();
         // A second submission for the batch is a repeat.
         submit(&store, &run, 0, vec!["again".into()], None, 11).unwrap();
         // After the iteration ends, batch 1's submission is late.
@@ -491,9 +510,23 @@ mod tests {
         let cases: Vec<Result<Receipt, Refused>> = vec![
             submit(&store, &run, 9, vec![], None, 1),
             submit(&store, &run, 0, vec![long], None, 1),
-            submit(&store, &run, 0, vec![String::new(); MAX_PROGRAMS + 1], None, 1),
+            submit(
+                &store,
+                &run,
+                0,
+                vec![String::new(); MAX_PROGRAMS + 1],
+                None,
+                1,
+            ),
             submit(&store, &run, 0, vec![], Some(String::new()), 1),
-            submit(&store, &run, 0, vec![], Some("m".repeat(MAX_NAME_LEN + 1)), 1),
+            submit(
+                &store,
+                &run,
+                0,
+                vec![],
+                Some("m".repeat(MAX_NAME_LEN + 1)),
+                1,
+            ),
         ];
         for case in cases {
             assert!(matches!(case, Err(Refused::Request(_))), "{case:?}");

@@ -146,12 +146,7 @@ fn library(state: &RunState, verifier: &Verifier) -> String {
         "## Library\n\nThese functions are in scope. A use of one means exactly its \
          definition written out.\n\n",
     );
-    for (i, (entry, scheme)) in state
-        .library()
-        .iter()
-        .zip(verifier.schemes())
-        .enumerate()
-    {
+    for (i, (entry, scheme)) in state.library().iter().zip(verifier.schemes()).enumerate() {
         let name = library_name(i);
         out.push_str(&format!("{name} : {scheme}\n"));
         match surface(verifier, &entry.term) {
@@ -301,7 +296,11 @@ mod tests {
         let p = payload(&s, &v, &*family, 4, 1);
         assert_eq!((p.batch, p.programs_wanted, p.lease_seconds), (4, 1, 90));
         assert!(p.prompt.contains(family.description()));
-        assert!(p.prompt.contains("solve : List Int -> List Int"), "{}", p.prompt);
+        assert!(
+            p.prompt.contains("solve : List Int -> List Int"),
+            "{}",
+            p.prompt
+        );
         assert!(p.prompt.contains("batch 4"));
         assert!(p.prompt.contains("bfix : "));
         assert!(p.prompt.contains("map : "));
@@ -337,7 +336,9 @@ mod tests {
         let v = Verifier::new(&[entry]).unwrap();
         let family = crate::verify::task("collapse/merge").unwrap();
         let p = payload(&s, &v, &*family, 0, 2);
-        assert!(p.prompt.contains("Write 2 different programs in the dc language that solve the"));
+        assert!(p
+            .prompt
+            .contains("Write 2 different programs in the dc language that solve the"));
         assert!(p.prompt.contains("fn_0 : List "), "{}", p.prompt);
         assert!(p.prompt.contains("let fn_0 = fun"), "{}", p.prompt);
         assert!(p.prompt.contains("reverse (reverse"), "{}", p.prompt);

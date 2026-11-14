@@ -952,7 +952,10 @@ mod tests {
         checks: Vec<Check>,
     ) -> Event {
         let programs = if standing.evaluated() {
-            checks.iter().map(|_| "let solve x = x".to_owned()).collect()
+            checks
+                .iter()
+                .map(|_| "let solve x = x".to_owned())
+                .collect()
         } else {
             vec!["let solve x = x".to_owned()]
         };
@@ -1036,13 +1039,13 @@ mod tests {
                 .apply(&submitted(0, 0, 10, Standing::OnTime, misplaced)),
             Err(Rejected::BadSubmission(0))
         );
-        let all = vec![
+        let fits = vec![
             Check::Compile { error: "c".into() },
             Check::Type { error: "t".into() },
             Check::Extra,
         ];
-        let fits = vec![all[0].clone(), all[1].clone(), Check::Extra];
-        s.apply(&submitted(0, 0, 10, Standing::OnTime, fits)).unwrap();
+        s.apply(&submitted(0, 0, 10, Standing::OnTime, fits))
+            .unwrap();
         s.apply(&submitted(
             1,
             0,
@@ -1051,7 +1054,8 @@ mod tests {
             vec![Check::Run { error: "r".into() }, passed("p1")],
         ))
         .unwrap();
-        s.apply(&submitted(0, 0, 20, Standing::Repeat, vec![])).unwrap();
+        s.apply(&submitted(0, 0, 20, Standing::Repeat, vec![]))
+            .unwrap();
         let counts = s.task_counts(0, "a");
         assert_eq!(
             counts,
@@ -1079,7 +1083,8 @@ mod tests {
         s.apply(&Event::IterationFinished { iteration: 0 }).unwrap();
         assert!(s.verified().is_empty());
         assert_eq!(s.standing(2, 10), Some(Standing::Late));
-        s.apply(&submitted(2, 1, 10, Standing::Late, vec![])).unwrap();
+        s.apply(&submitted(2, 1, 10, Standing::Late, vec![]))
+            .unwrap();
         assert_eq!(s.task_counts(1, "a"), TaskCounts::default());
         assert_eq!(s.task_counts(0, "a").programs, 4);
         assert_eq!(s.iteration_counts(1).late, 1);
@@ -1108,7 +1113,11 @@ mod tests {
         ];
         for event in cases {
             let mut t = s.clone();
-            assert_eq!(t.apply(&event), Err(Rejected::BadSubmission(0)), "{event:?}");
+            assert_eq!(
+                t.apply(&event),
+                Err(Rejected::BadSubmission(0)),
+                "{event:?}"
+            );
             assert_eq!(t, s);
         }
         let mut t = s.clone();
@@ -1158,8 +1167,14 @@ mod tests {
         .unwrap();
         s.apply(&issued(0, "a", 1, 0)).unwrap();
         s.apply(&issued(1, "b", 1, 0)).unwrap();
-        s.apply(&submitted(0, 0, 1, Standing::OnTime, vec![Check::Compile { error: "x".into() }]))
-            .unwrap();
+        s.apply(&submitted(
+            0,
+            0,
+            1,
+            Standing::OnTime,
+            vec![Check::Compile { error: "x".into() }],
+        ))
+        .unwrap();
         assert!(!s.quota_in());
         s.apply(&submitted(1, 0, 1, Standing::OnTime, vec![passed("p")]))
             .unwrap();

@@ -26,9 +26,20 @@ impl Client {
 
     /// As `start`, with the server's standard error connected to `stderr`.
     fn start_with_stderr(dir: &Path, stderr: Stdio) -> Client {
+        Client::start_with(dir, &[], stderr)
+    }
+
+    /// Starts a proposer's server for `run` in `dir`.
+    fn start_proposer(dir: &Path, run: &str) -> Client {
+        Client::start_with(dir, &["--proposer", run], Stdio::null())
+    }
+
+    /// Starts the server on `dir` with `args` after the state directory.
+    fn start_with(dir: &Path, args: &[&str], stderr: Stdio) -> Client {
         let mut child = Command::new(env!("CARGO_BIN_EXE_dc-mcp"))
             .arg("--state-dir")
             .arg(dir)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -84,6 +95,23 @@ impl Client {
         }
     }
 
+    /// Sends a request and returns its whole response, error or not. No
+    /// other request may be waiting for a response.
+    fn raw_request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.start_request(method, params);
+        loop {
+            let line = self
+                .lines
+                .next()
+                .expect("the server closed stdout")
+                .unwrap();
+            let message: Value = serde_json::from_str(&line).unwrap();
+            if message["id"].as_u64() == Some(id) {
+                return message;
+            }
+        }
+    }
+
     /// Sends a request and returns the `result` of its response. No other
     /// request may be waiting for a response.
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -131,6 +159,7 @@ fn the_server_lists_its_tools() {
             "dc_add_note",
             "dc_create_run",
             "dc_list_runs",
+            "dc_proposal_stats",
             "dc_run_status"
         ]
     );
@@ -194,15 +223,16 @@ fn a_run_survives_a_kill_in_the_middle_of_an_iteration() {
     other
         .append(&run, {
             vec![
-                log(LogKind::Payload, 0, &corpus[0]),
-                log(LogKind::Submission, 0, &corpus[0]),
+                log(LogKind::Compression, 0, &corpus[0]),
+                log(LogKind::Note, 0, &corpus[0]),
                 Event::FrontierSet {
                     task: corpus[0].clone(),
                     members: vec![member("(lam 0)"), member("(lam (lam 1))")],
                 },
                 Event::LibraryExtended {
                     entries: vec![LibraryEntry {
-                        body: "(lam 0)".into(),
+                        arity: 1,
+                        term: "(lam 0)".into(),
                     }],
                 },
                 Event::IterationFinished { iteration: 0 },
@@ -210,7 +240,7 @@ fn a_run_survives_a_kill_in_the_middle_of_an_iteration() {
         })
         .unwrap();
     other
-        .append(&run, vec![log(LogKind::Payload, 1, &corpus[1])])
+        .append(&run, vec![log(LogKind::Compression, 1, &corpus[1])])
         .unwrap();
 
     // The first server sees those changes.
@@ -223,7 +253,7 @@ fn a_run_survives_a_kill_in_the_middle_of_an_iteration() {
     assert_eq!(before["tasks"][1]["frontier_size"], 0);
     assert_eq!(
         before["log_counts"],
-        json!({ "payload": 2, "submission": 1, "evaluation": 0, "compression": 0, "note": 0, "recovery": 0 })
+        json!({ "compression": 2, "note": 1, "recovery": 0 })
     );
 
     client.kill();
@@ -539,4 +569,163 @@ fn the_binary_refuses_to_start_without_a_state_directory() {
     let output = Command::new(env!("CARGO_BIN_EXE_dc-mcp")).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--state-dir"));
+}
+
+/// The names of the tools a server lists, sorted.
+fn tool_names(client: &mut Client) -> Vec<String> {
+    let tools = client.request("tools/list", json!({}));
+    let mut names: Vec<String> = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_owned())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+/// A program that solves collapse/merge: its good reference.
+fn solves_merge() -> String {
+    let v = dc_tasks::families::development()
+        .into_iter()
+        .find(|v| v.family.name() == "collapse/merge")
+        .unwrap();
+    format!(
+        "{}\nlet solve = {}\n",
+        v.source,
+        v.references.last().unwrap().entry
+    )
+}
+
+#[test]
+fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut operator = Client::start(dir.path());
+    operator
+        .call(
+            "dc_create_run",
+            json!({
+                "run": "r1", "seed": 5, "proposals_per_task": 1,
+                "tasks": ["collapse/merge", "collapse/cancel"]
+            }),
+        )
+        .unwrap();
+
+    let mut proposer = Client::start_proposer(dir.path(), "r1");
+    assert_eq!(tool_names(&mut proposer), ["dc_next_batch", "dc_submit"]);
+    // An operator's tool is not there for a proposer.
+    for (tool, arguments) in [
+        ("dc_run_status", json!({ "run": "r1" })),
+        ("dc_list_runs", json!({})),
+        ("dc_proposal_stats", json!({ "run": "r1" })),
+    ] {
+        let refused = proposer.raw_request(
+            "tools/call",
+            json!({ "name": tool, "arguments": arguments }),
+        );
+        assert_eq!(refused["error"]["message"], "tool not found", "{refused}");
+    }
+
+    let first = proposer
+        .call("dc_next_batch", json!({ "worker": "agent-1" }))
+        .unwrap();
+    assert_eq!(first["batch"]["batch"], 0);
+    assert_eq!(first["batch"]["programs_wanted"], 1);
+    let prompt = first["batch"]["prompt"].as_str().unwrap();
+    assert!(prompt.contains("solve : List Int -> List Int"), "{prompt}");
+    assert!(!prompt.contains("collapse/"));
+    let second = proposer
+        .call("dc_next_batch", json!({ "worker": "agent-2" }))
+        .unwrap();
+    assert_eq!(second["batch"]["batch"], 1);
+    let none = proposer
+        .call("dc_next_batch", json!({ "worker": "agent-3" }))
+        .unwrap();
+    assert!(none["batch"].is_null(), "{none}");
+    assert!(none["wait"]["retry_after_seconds"].as_u64().unwrap() >= 1);
+
+    // A right and a wrong program get the same kind of reply.
+    let good = proposer
+        .call(
+            "dc_submit",
+            json!({ "batch": 0, "programs": [solves_merge()], "model": "test-model" }),
+        )
+        .unwrap();
+    let bad = proposer
+        .call(
+            "dc_submit",
+            json!({ "batch": 1, "programs": ["let solve = ("] }),
+        )
+        .unwrap();
+    assert_eq!(good, json!({ "batch": 0, "received": 1 }));
+    assert_eq!(bad, json!({ "batch": 1, "received": 1 }));
+    let unknown = proposer.call("dc_submit", json!({ "batch": 9, "programs": [] }));
+    assert!(unknown.unwrap_err().contains("no batch 9"));
+
+    // The operator sees what came in.
+    let stats = operator
+        .call("dc_proposal_stats", json!({ "run": "r1" }))
+        .unwrap();
+    let it = &stats["iterations"][0];
+    assert_eq!(it["quota_in"], true);
+    assert_eq!(it["tasks_solved"], 1);
+    assert_eq!(it["submissions"], 2);
+    assert_eq!(it["tasks"][0]["passed"], 1);
+    assert_eq!(it["tasks"][1]["compiled"], 0);
+    let status = operator
+        .call("dc_run_status", json!({ "run": "r1" }))
+        .unwrap();
+    assert_eq!(status["batches_issued"], 2);
+    assert_eq!(status["current"]["quota_in"], true);
+
+    // Payloads and submissions are in the journal as they were sent.
+    proposer.kill();
+    operator.kill();
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("r1").unwrap();
+    let mut payloads = Vec::new();
+    let mut programs = Vec::new();
+    store
+        .for_each_event(&run, |e| {
+            match e {
+                Event::BatchIssued(b) => payloads.push(b.payload),
+                Event::Submitted(s) => programs.push((s.programs, s.model)),
+                _ => {}
+            }
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+    let sent: Value = serde_json::from_str(&payloads[0]).unwrap();
+    assert_eq!(sent, first["batch"]);
+    assert_eq!(
+        programs,
+        [
+            (vec![solves_merge()], Some("test-model".to_owned())),
+            (vec!["let solve = (".to_owned()], None),
+        ]
+    );
+}
+
+#[test]
+fn a_proposer_server_needs_a_run_that_exists() {
+    let dir = tempfile::TempDir::new().unwrap();
+    for run in ["nosuch", "Not A Run"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_dc-mcp"))
+            .arg("--state-dir")
+            .arg(dir.path())
+            .args(["--proposer", run])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{run}");
+        assert!(!String::from_utf8_lossy(&out.stderr).is_empty());
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_dc-mcp"))
+        .arg("--state-dir")
+        .arg(dir.path())
+        .arg("--proposer")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
 }

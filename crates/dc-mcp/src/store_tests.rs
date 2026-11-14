@@ -334,10 +334,10 @@ fn a_journal_of_another_format_version_is_not_called_damaged() {
         .unwrap();
     let path = journal(dir.path(), "r1");
     let text = fs::read_to_string(&path).unwrap();
-    fs::write(&path, text.replacen("journal 1 ", "journal 2 ", 1)).unwrap();
+    fs::write(&path, text.replacen("journal 2 ", "journal 1 ", 1)).unwrap();
     match Store::open(dir.path()).unwrap().state(&run) {
         Err(StoreError::UnsupportedFormat { header, .. }) => {
-            assert!(header.starts_with("dc-mcp journal 2 "), "{header}");
+            assert!(header.starts_with("dc-mcp journal 1 "), "{header}");
         }
         other => panic!("{other:?}"),
     }

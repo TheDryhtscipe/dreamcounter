@@ -193,9 +193,7 @@ impl Verifier {
 
     fn compile(&mut self, text: &str) -> Result<TermId, String> {
         let mut top = self.top.clone();
-        let names = top
-            .add_source("program", text)
-            .map_err(|e| e.to_string())?;
+        let names = top.add_source("program", text).map_err(|e| e.to_string())?;
         if !names.iter().any(|n| n == ENTRY) {
             return Err(format!("the program has no definition named '{ENTRY}'"));
         }
@@ -290,18 +288,21 @@ mod tests {
     fn each_stage_reports_its_own_failure() {
         let (family, _, _) = merge();
         let mut v = Verifier::new(&[]).unwrap();
-        let cases: [(&str, fn(&Check) -> bool); 5] = [
+        type Expect = fn(&Check) -> bool;
+        let cases: [(&str, Expect); 5] = [
             ("let solve xs = (", |c| matches!(c, Check::Compile { .. })),
-            ("let other xs = xs", |c| {
-                matches!(c, Check::Compile { error } if error.contains("solve"))
-            }),
+            (
+                "let other xs = xs",
+                |c| matches!(c, Check::Compile { error } if error.contains("solve")),
+            ),
             ("let solve xs = nosuchname xs", |c| {
                 matches!(c, Check::Compile { .. })
             }),
             ("let solve xs = true", |c| matches!(c, Check::Type { .. })),
-            ("let solve xs = xs", |c| {
-                matches!(c, Check::Run { error } if error.starts_with("example"))
-            }),
+            (
+                "let solve xs = xs",
+                |c| matches!(c, Check::Run { error } if error.starts_with("example")),
+            ),
         ];
         for (text, ok) in cases {
             let c = v.check(&*family, text);
