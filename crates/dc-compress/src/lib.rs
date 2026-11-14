@@ -26,6 +26,12 @@
 //! `--no-curried-metavars`. It runs Stitch on one thread, without shuffling, so
 //! that the same programs give the same result.
 //!
+//! It also sets `--no-mismatch-check`. Stitch otherwise asserts that the
+//! rewritten programs cost what it estimated, and panics when an abstraction is
+//! used inside its own argument, where its estimate is too low. So a step can
+//! compress less than Stitch reported. The rewritten programs are still checked:
+//! see the next section.
+//!
 //! # Steps that are dropped
 //!
 //! Each Stitch step adds one abstraction and rewrites the programs with it, and
@@ -56,8 +62,9 @@ pub const ABSTRACTION_PREFIX: &str = "fn_";
 /// stack, which aborts the process. [`compress`] refuses such a program.
 pub const MAX_STITCH_DEPTH: usize = 4096;
 
-/// The stack of the thread Stitch runs on: 64 KiB for each level of a program
-/// at [`MAX_STITCH_DEPTH`].
+/// The stack of the thread Stitch runs on. Divided by [`MAX_STITCH_DEPTH`], it
+/// is 64 KiB for each level. No test fixes this size: a program deep enough to
+/// need it takes Stitch minutes.
 const STITCH_STACK_BYTES: usize = 256 << 20;
 
 /// A program to compress, with the task it solves.
@@ -296,6 +303,11 @@ pub fn stitch_config(cfg: &CompressConfig, library_len: usize) -> MultistepCompr
     s.step.no_curried_bodies = true;
     s.step.no_curried_metavars = true;
     s.step.eta_long = false;
+    // Stitch asserts that the rewritten programs cost what it estimated. Its
+    // estimate is wrong when an abstraction is used inside its own argument, and
+    // the assertion then panics. The rewriting is still right, and
+    // `accept_steps` checks it by expansion.
+    s.step.no_mismatch_check = true;
     s
 }
 
@@ -395,17 +407,23 @@ pub fn compress(
         text.push(expr::print(&e));
     }
     let ids: Vec<TermId> = programs.iter().map(|p| p.program).collect();
+    // Check the library and the programs before Stitch runs, which can take long.
+    let inputs = check_inputs(arena, libs, &ids)?;
     let steps = if programs.is_empty() {
         Vec::new()
     } else {
         let tasks: Vec<String> = programs.iter().map(|p| p.task.clone()).collect();
         run_stitch(&text, tasks, cfg, libs.len())?
     };
-    accept(arena, libs, len, names, &ids, &steps, cfg.max_arity)
+    accept(arena, inputs, names, &ids, &steps, cfg.max_arity)
 }
 
 /// Decodes Stitch's `steps` for `programs` over the library `libs`. Keeps the
 /// steps before the first that fails a check, and drops that step and the rest.
+///
+/// The library and each input program must expand, whether or not there are
+/// steps: if not, the result is [`CompressError::Library`] or
+/// [`CompressError::Expand`].
 ///
 /// A step is kept when its abstraction and its rewritten programs decode, and
 /// each rewritten program expands, under `libs` and the abstractions kept so
@@ -425,40 +443,39 @@ pub fn accept_steps(
 ) -> Result<Compression, CompressError> {
     let len = u32::try_from(libs.len()).map_err(|_| CompressError::LibraryTooLarge)?;
     let names = library_names(len)?;
-    accept(arena, libs, len, names, programs, steps, max_arity)
+    let inputs = check_inputs(arena, libs, programs)?;
+    accept(arena, inputs, names, programs, steps, max_arity)
 }
 
-/// [`accept_steps`], given the names of the `library_len` entries of `libs`.
-fn accept(
-    arena: &mut Arena,
+/// The library and the input programs of a run, copied into a scratch arena and
+/// checked.
+struct Inputs {
+    /// The arena the steps are checked in, so that the terms of a dropped step
+    /// and of the steps before the last do not stay in the caller's arena.
+    scratch: Arena,
+    /// The library, in `scratch`.
+    libs: Vec<LibDef>,
+    /// What each input program expands to under the library, in `scratch`.
+    want: Vec<TermId>,
+}
+
+/// Copies `libs` and `programs` into a scratch arena, and checks that the
+/// library and each program expand.
+fn check_inputs(
+    arena: &Arena,
     libs: &[LibDef],
-    library_len: u32,
-    mut names: LibNames,
     programs: &[TermId],
-    steps: &[StitchStep],
-    max_arity: u32,
-) -> Result<Compression, CompressError> {
-    if steps.is_empty() {
-        return Ok(Compression {
-            new_libs: Vec::new(),
-            rewritten: programs.to_vec(),
-            names,
-            stitch_steps: 0,
-            rejected: None,
-        });
-    }
-    // Check the steps in a scratch arena, so that the terms of a dropped step and
-    // of the steps before the last do not stay in the caller's arena.
+) -> Result<Inputs, CompressError> {
     let mut scratch = Arena::new();
     let mut copied = HashMap::new();
-    let mut all: Vec<LibDef> = libs
+    let libs: Vec<LibDef> = libs
         .iter()
         .map(|def| LibDef {
             arity: def.arity,
             term: copy_term(arena, &mut scratch, def.term, &mut copied),
         })
         .collect();
-    let mut expander = Expander::new(&mut scratch, &all).map_err(CompressError::Library)?;
+    let mut expander = Expander::new(&mut scratch, &libs).map_err(CompressError::Library)?;
     let mut want = Vec::with_capacity(programs.len());
     for (index, p) in programs.iter().enumerate() {
         let p = copy_term(arena, &mut scratch, *p, &mut copied);
@@ -467,13 +484,34 @@ fn accept(
             .map_err(|error| CompressError::Expand { index, error })?;
         want.push(expanded);
     }
-    drop(expander);
+    Ok(Inputs {
+        scratch,
+        libs,
+        want,
+    })
+}
+
+/// [`accept_steps`], given the checked inputs and the names of the library.
+fn accept(
+    arena: &mut Arena,
+    inputs: Inputs,
+    mut names: LibNames,
+    programs: &[TermId],
+    steps: &[StitchStep],
+    max_arity: u32,
+) -> Result<Compression, CompressError> {
+    let Inputs {
+        mut scratch,
+        libs: mut all,
+        want,
+    } = inputs;
+    let library_len = all.len();
     let mut accepted = 0;
     let mut rejected = None;
     for (i, step) in steps.iter().enumerate() {
-        let next = u32::try_from(i)
-            .ok()
-            .and_then(|i| library_len.checked_add(i))
+        let next = library_len
+            .checked_add(i)
+            .and_then(|l| u32::try_from(l).ok())
             .map(LibId);
         match check_step(
             &mut scratch,
@@ -500,7 +538,7 @@ fn accept(
     // arena against the same names.
     let new_libs = steps[..accepted]
         .iter()
-        .zip(&all[libs.len()..])
+        .zip(&all[library_len..])
         .map(|(step, def)| LibDef {
             arity: def.arity,
             term: decode_abstraction(arena, &step.body, def.arity, &names)
@@ -855,6 +893,31 @@ mod tests {
                 index: 1,
                 error: ExpandError::UnknownLib(LibId(5)),
             })
+        );
+    }
+
+    #[test]
+    fn the_inputs_are_checked_when_there_are_no_steps() {
+        let mut a = Arena::new();
+        let libs = library(&mut a);
+        let unknown = core(&mut a, "(lib_9 1)");
+        assert_eq!(
+            accept_steps(&mut a, &libs, &[unknown], &[], 2),
+            Err(CompressError::Expand {
+                index: 0,
+                error: ExpandError::UnknownLib(LibId(9)),
+            })
+        );
+        let open = vec![LibDef {
+            arity: 1,
+            term: core(&mut a, "(lam (add $0 $5))"),
+        }];
+        assert_eq!(
+            accept_steps(&mut a, &open, &[], &[], 2),
+            Err(CompressError::Library(ExpandError::NotClosed {
+                lib: LibId(0),
+                free_depth: 5,
+            }))
         );
     }
 

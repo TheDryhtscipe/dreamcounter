@@ -5,7 +5,7 @@ use dc_compress::{
     compress, stitch_config, CompressConfig, CompressError, Compression, FrontierProgram,
     MAX_STITCH_DEPTH,
 };
-use dc_core::{expand, sexpr, Arena, LibDef, LibId, TermId};
+use dc_core::{expand, sexpr, Arena, ExpandError, LibDef, LibId, TermId};
 use dc_stitch::{decode, decode_abstraction, encode, DecodeError, LibNames, AND, IF, LET};
 use stitch_core::{multistep_compression, MultistepCompressionConfig};
 
@@ -299,6 +299,7 @@ fn the_config_sets_the_bridge_flags() {
     assert!(!s.shuffle);
     assert!(s.step.no_curried_bodies);
     assert!(s.step.no_curried_metavars);
+    assert!(s.step.no_mismatch_check);
     assert!(!s.step.eta_long);
     // The tag set is private; its Debug form shows it.
     assert_eq!(
@@ -336,8 +337,8 @@ fn chain(a: &mut Arena, n: usize, k: i64) -> TermId {
 
 #[test]
 fn a_program_too_deep_for_stitch_is_refused() {
-    // Without the limit, Stitch overflows the stack on this program and the
-    // process aborts.
+    // Run on the caller's 2 MiB stack, Stitch overflowed it on the second
+    // program and the process aborted.
     let mut a = Arena::new();
     let programs = vec![
         FrontierProgram {
@@ -354,7 +355,7 @@ fn a_program_too_deep_for_stitch_is_refused() {
         Err(CompressError::TooDeep { index: 1 })
     );
     // The limit counts the levels of the Stitch expression: an integer under
-    // `MAX_STITCH_DEPTH - 1` applications is the deepest program accepted.
+    // `MAX_STITCH_DEPTH` applications has one level too many.
     let one_over = FrontierProgram {
         task: "task_0".to_string(),
         program: chain(&mut a, MAX_STITCH_DEPTH, 0),
@@ -384,4 +385,44 @@ fn stitch_runs_off_the_callers_stack() {
         })
         .expect("spawn");
     run.join().expect("compress on a small stack");
+}
+
+#[test]
+fn an_abstraction_used_inside_its_own_argument_does_not_panic() {
+    // Stitch's check of its own utility estimate fails on this corpus: the
+    // abstraction's parameter occurs twice, and one use sits inside the argument
+    // of another. With the check on, Stitch panics.
+    let mut a = Arena::new();
+    let programs = frontier(
+        &mut a,
+        &[
+            "(pair (foldl (lam (lam 2)) 2 nil) (foldl (lam (lam 0)) 0 nil))",
+            "(cons (foldl (lam (lam true)) true nil) (foldl (lam (lam 1)) 1 nil))",
+            "(foldl (lam (lam (foldl (lam (lam 2)) 2 nil))) (foldl (lam (lam 2)) 2 nil) nil)",
+        ],
+    );
+    let cfg = CompressConfig {
+        iterations: 1,
+        max_arity: 1,
+    };
+    let c = compress(&mut a, &[], &programs, &cfg).expect("compress");
+    expands_back(&mut a, &[], &programs, &c);
+}
+
+#[test]
+fn a_library_that_does_not_expand_is_refused_before_stitch_runs() {
+    // The programs have nothing in common, so Stitch would return no step.
+    let mut a = Arena::new();
+    let libs = vec![LibDef {
+        arity: 1,
+        term: parse(&mut a, "(lam (add $0 $5))"),
+    }];
+    let programs = frontier(&mut a, &["(add 1 2)", "(lt 3 4)"]);
+    assert_eq!(
+        compress(&mut a, &libs, &programs, &CompressConfig::default()),
+        Err(CompressError::Library(ExpandError::NotClosed {
+            lib: LibId(0),
+            free_depth: 5,
+        }))
+    );
 }
