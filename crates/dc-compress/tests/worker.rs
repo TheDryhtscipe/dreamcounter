@@ -186,27 +186,31 @@ fn a_limit_too_small_for_stitch_s_stack_is_reported() {
     }
 }
 
+/// Runs a stand-in worker that is `sh -c script`.
+#[cfg(unix)]
+fn run_shell(script: &str) -> Result<Vec<dc_compress::StitchStep>, WorkerError> {
+    stand_in("sh", &["-c", script], Limits::default()).run(&two_lists(1), &NEVER)
+}
+
+#[cfg(unix)]
 #[test]
-fn a_panic_that_quotes_the_allocation_message_is_not_out_of_memory() {
-    // Stitch's parse panic quotes the program, which here holds the line Rust
-    // writes before an allocation abort.
-    let program = "(\nmemory allocation of 8 bytes failed\n(((".to_string();
-    let request = StitchRequest {
-        programs: vec![program.clone(), program],
-        tasks: vec!["a".to_string(), "b".to_string()],
-        iterations: 1,
-        max_arity: 2,
-        library_len: 0,
-    };
-    match Worker::new(WORKER).run(&request, &NEVER) {
-        Err(WorkerError::Failed { status, stderr }) => {
-            assert_eq!(exit_code(&status), Some(101), "{stderr}");
-            assert!(
-                stderr.contains("memory allocation of 8 bytes failed"),
-                "{stderr}"
-            );
-        }
-        other => panic!("expected Failed, got {other:?}"),
+fn out_of_memory_needs_an_abort_and_the_allocation_line() {
+    // Rust's allocation error handler writes the line and then aborts.
+    let line = "echo 'memory allocation of 8 bytes failed' >&2";
+    match run_shell(&format!("{line}; kill -ABRT $$")) {
+        Err(WorkerError::OutOfMemory { .. }) => {}
+        other => panic!("abort with the line: expected OutOfMemory, got {other:?}"),
+    }
+    // The line without an abort, as when a panic message quotes it.
+    match run_shell(&format!("{line}; exit 1")) {
+        Err(WorkerError::Failed { status, .. }) => assert_eq!(exit_code(&status), Some(1)),
+        other => panic!("line without abort: expected Failed, got {other:?}"),
+    }
+    // An abort with the words inside a longer line.
+    let quoted = "echo 'parse error in: (memory allocation of 8 bytes failed' >&2";
+    match run_shell(&format!("{quoted}; kill -ABRT $$")) {
+        Err(WorkerError::Failed { status, .. }) => assert_eq!(signal(&status), Some(6)),
+        other => panic!("abort with a quoted line: expected Failed, got {other:?}"),
     }
 }
 
@@ -374,44 +378,83 @@ fn proc_limit(pid: u32, name: &str) -> Option<(String, String)> {
     Some((values.next()?.to_string(), values.next()?.to_string()))
 }
 
+/// Soft and hard values, as `/proc/<pid>/limits` shows them.
 #[cfg(target_os = "linux")]
-#[test]
-fn the_worker_sets_its_limits_below_inherited_hard_limits() {
-    // The wrapper allows core files and lowers the hard CPU and address-space
-    // limits, then replaces itself with the worker. The worker blocks reading
-    // a request this test never writes, so its limits can be read.
-    let script = "ulimit -S -c 1024 && ulimit -t 100 && ulimit -v 2097152 && exec \"$1\"";
+type Shown = Vec<Option<(String, String)>>;
+
+/// Starts the worker through `sh -c script` with `cpu` and `memory` in its
+/// environment. The worker blocks reading a request this test never writes, so
+/// its limits can be read. Returns the limits in `want` as the worker shows
+/// them once they match, or after 5 seconds, and whether
+/// `/proc/<pid>/status` was owned by root then: the kernel does that for a process that is not
+/// dumpable.
+#[cfg(target_os = "linux")]
+fn worker_limits(
+    script: &str,
+    cpu: &str,
+    memory: &str,
+    want: &[(&str, (&str, &str))],
+) -> (Shown, Shown, bool) {
+    use std::os::unix::fs::MetadataExt;
     let mut child = Command::new("sh")
         .args(["-c", script, "sh", WORKER])
-        .env(CPU_ENV, "1000")
-        .env(MEMORY_ENV, (4u64 << 30).to_string())
+        .env(CPU_ENV, cpu)
+        .env(MEMORY_ENV, memory)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("start the worker");
-    let want = [
-        ("Max core file size", ("0", "0")),
-        ("Max cpu time", ("99", "100")),
-        ("Max address space", ("2147483648", "2147483648")),
-    ];
-    let read = || -> Vec<Option<(String, String)>> {
-        want.iter()
-            .map(|(name, _)| proc_limit(child.id(), name))
-            .collect()
-    };
-    let wanted: Vec<Option<(String, String)>> = want
+    let pid = child.id();
+    let read = || -> Shown { want.iter().map(|(name, _)| proc_limit(pid, name)).collect() };
+    let wanted: Shown = want
         .iter()
         .map(|(_, (s, h))| Some((s.to_string(), h.to_string())))
         .collect();
+    let root_owned =
+        || std::fs::metadata(format!("/proc/{pid}/status")).is_ok_and(|m| m.uid() == 0);
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut got = read();
-    while got != wanted && Instant::now() < deadline {
+    while (got != wanted || !root_owned()) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
         got = read();
     }
+    let not_dumpable = root_owned();
     let _ = child.kill();
     let _ = child.wait();
+    (got, wanted, not_dumpable)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_worker_sets_its_limits_below_inherited_hard_limits() {
+    // The wrapper allows core files and lowers the hard CPU and address-space
+    // limits, then replaces itself with the worker.
+    let (got, wanted, not_dumpable) = worker_limits(
+        "ulimit -S -c 1024 && ulimit -t 100 && ulimit -v 2097152 && exec \"$1\"",
+        "1000",
+        &(4u64 << 30).to_string(),
+        &[
+            ("Max core file size", ("0", "0")),
+            ("Max cpu time", ("99", "100")),
+            ("Max address space", ("2147483648", "2147483648")),
+        ],
+    );
+    assert_eq!(got, wanted);
+    assert!(not_dumpable, "the worker is still dumpable");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cpu_limit_too_large_for_the_kernel_sets_none() {
+    // 2^63 + 4 seconds is 4 seconds once the kernel counts it in nanoseconds
+    // in 64 bits.
+    let (got, wanted, _) = worker_limits(
+        "exec \"$1\"",
+        &((1u64 << 63) + 4).to_string(),
+        &(1u64 << 30).to_string(),
+        &[("Max cpu time", ("unlimited", "unlimited"))],
+    );
     assert_eq!(got, wanted);
 }
 

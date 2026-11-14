@@ -39,8 +39,9 @@
 //! worker writes Stitch's steps as a JSON array of [`StitchStep`]s on its
 //! standard output, and exits with status 0. It exits with status 2 when the
 //! request or a limit is wrong, with 3 when the thread that runs Stitch cannot
-//! start, and with 101 when Stitch panics. It sets its core file size to 0, so
-//! that a failed run does not write a core file as large as its memory.
+//! start, and with 101 when Stitch panics. It sets its core file size to 0
+//! and, on Linux, marks itself as not dumpable, so that a failed run does not
+//! dump core.
 //!
 //! The output is not trusted: [`crate::compress_isolated`] checks the steps with
 //! [`crate::accept_steps`], as it checks the steps of an in-process run. Both
@@ -60,7 +61,8 @@
 //!
 //! A hard limit the worker inherits, which it cannot raise, lowers the limit it
 //! sets. The worker then says so on its standard error. An inherited hard CPU
-//! limit can stop a run before [`Limits::wall`].
+//! limit can stop a run before [`Limits::wall`]. The worker replaces the soft
+//! limits it inherits with its own.
 //!
 //! The caller writes the request on a pipe. If the worker exits before it has
 //! read it all, the write fails with `SIGPIPE` unless the caller ignores that
@@ -132,9 +134,9 @@ pub struct StitchRequest {
 /// The limits on one worker run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// The longest the caller waits for the worker. A limit too large to add to
-    /// the current time, such as [`Duration::MAX`], sets no wall limit, and a
-    /// CPU limit too large to matter.
+    /// The longest the caller waits for the worker. A limit above about 584
+    /// years sets no CPU limit. One too large to add to the current time, such
+    /// as [`Duration::MAX`], sets no wall limit either.
     pub wall: Duration,
     /// The worker's address space, in bytes. This counts memory the worker has
     /// reserved, not only what it uses: Stitch's thread reserves a stack of
@@ -218,7 +220,9 @@ pub enum WorkerError {
     },
     /// The worker was stopped by its CPU limit (`SIGXCPU`). The worker's own
     /// limit comes after [`Limits::wall`], so this means a lower hard limit it
-    /// inherited applied.
+    /// inherited applied. A worker that ignores `SIGXCPU`, or whose inherited
+    /// hard limit is 0, is killed at the hard limit instead, and gives
+    /// [`WorkerError::Failed`].
     CpuLimit {
         /// The start and the end of the worker's standard error.
         stderr: String,
@@ -640,8 +644,10 @@ fn env_limit(name: &str) -> Result<Option<u64>, String> {
 #[cfg(unix)]
 fn set_limits() -> Result<(), String> {
     use rustix::process::Resource;
-    // Lowering a limit to 0 is always allowed.
+    // Lowering a limit to 0 is always allowed. A core limit of 0 stops a core
+    // file, but not a core piped to a handler such as apport.
     set_limit(Resource::Core, 0, 0).map_err(|e| format!("setting the core file size: {e}"))?;
+    not_dumpable()?;
     if let Some(bytes) = env_limit(MEMORY_ENV)? {
         let hard = inherited_hard(Resource::As).map_or(bytes, |m| bytes.min(m));
         set_limit(Resource::As, hard, hard)
@@ -652,15 +658,19 @@ fn set_limits() -> Result<(), String> {
             ));
         }
     }
-    if let Some(seconds) = env_limit(CPU_ENV)? {
+    // A CPU limit too large for the kernel's count of nanoseconds wraps to a
+    // small one, so a larger limit sets none.
+    let cpu = env_limit(CPU_ENV)?.filter(|&s| s <= MAX_CPU_SECONDS);
+    if let Some(seconds) = cpu {
         // SIGXCPU at the soft limit; SIGKILL at the hard limit if SIGXCPU is
         // caught or ignored. The soft limit stays below the hard limit, so that
         // the caller sees SIGXCPU.
-        let wanted = seconds.saturating_add(1);
-        let hard = inherited_hard(Resource::Cpu).map_or(wanted, |m| wanted.min(m));
+        let wanted = seconds + 1;
+        let inherited = inherited_hard(Resource::Cpu);
+        let hard = inherited.map_or(wanted, |m| wanted.min(m));
         let soft = seconds.min(hard.saturating_sub(1));
         set_limit(Resource::Cpu, soft, hard).map_err(|e| format!("setting the CPU limit: {e}"))?;
-        if soft < seconds {
+        if inherited.is_some_and(|m| m < wanted) {
             note(&format!(
                 "the CPU limit is {soft} seconds, below the inherited hard limit"
             ));
@@ -669,6 +679,24 @@ fn set_limits() -> Result<(), String> {
     if let Some(parent) = env_limit(PARENT_ENV)? {
         die_with_parent(parent)?;
     }
+    Ok(())
+}
+
+/// The largest CPU limit, in seconds, that the kernel keeps: it counts CPU time
+/// in nanoseconds, in 64 bits.
+#[cfg(unix)]
+const MAX_CPU_SECONDS: u64 = u64::MAX / 1_000_000_000;
+
+/// Asks the kernel not to dump core for this process, by any means.
+#[cfg(target_os = "linux")]
+fn not_dumpable() -> Result<(), String> {
+    use rustix::process::{set_dumpable_behavior, DumpableBehavior};
+    set_dumpable_behavior(DumpableBehavior::NotDumpable)
+        .map_err(|e| format!("turning off core dumps: {e}"))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn not_dumpable() -> Result<(), String> {
     Ok(())
 }
 
