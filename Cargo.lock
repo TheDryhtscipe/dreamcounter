@@ -294,6 +294,9 @@ dependencies = [
  "dc-core",
  "dc-stitch",
  "dc-surface",
+ "rustix",
+ "serde",
+ "serde_json",
  "stitch_core",
 ]
 

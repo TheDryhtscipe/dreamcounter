@@ -41,9 +41,23 @@
 //! expands to the term its input program expands to. At the first step that
 //! fails, it keeps the steps before it, drops it and every later step, and
 //! reports why in [`Compression::rejected`].
+//!
+//! # Running Stitch in a worker process
+//!
+//! Stitch's time and memory are not bounded: they grow quickly with the size of
+//! the programs. In a release build, two copies of a list literal of 1,000
+//! elements took 3 seconds and 217 MB, and of 2,000 elements did not finish in
+//! 5 seconds. Stitch also panics on input it cannot handle, and an allocation
+//! failure or a stack overflow in it aborts the process. [`compress_isolated`]
+//! runs Stitch in a child process with a time and a memory limit (see the
+//! [`worker`] module), so that these stay in that process. [`compress`] runs
+//! Stitch in the caller's process, with no limits.
+
+pub mod worker;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::AtomicBool;
 
 use dc_core::term::children;
 use dc_core::{Arena, ExpandError, Expander, LibDef, LibId, Term, TermId};
@@ -51,7 +65,9 @@ use dc_stitch::{
     decode, decode_abstraction, expr, to_expr, DecodeError, EncodeError, Expr, LibNames, NameError,
     LET_LAMBDA_TAG,
 };
+use serde::{Deserialize, Serialize};
 use stitch_core::{multistep_compression, MultistepCompressionConfig};
+use worker::{StitchRequest, Worker, WorkerError};
 
 /// The prefix of every library name the bridge uses: library `l` is `fn_{l}`.
 pub const ABSTRACTION_PREFIX: &str = "fn_";
@@ -99,7 +115,8 @@ impl Default for CompressConfig {
 }
 
 /// One step of Stitch's output, as text.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StitchStep {
     /// The abstraction's name.
     pub name: String,
@@ -247,6 +264,9 @@ pub enum CompressError {
     },
     /// The thread that runs Stitch could not be started.
     StitchThread(std::io::ErrorKind),
+    /// The Stitch worker process gave no steps: it was stopped at a limit, it
+    /// failed, or its output does not parse.
+    Worker(WorkerError),
     /// The library does not expand.
     Library(ExpandError),
     /// An input program does not expand under the library.
@@ -274,6 +294,7 @@ impl fmt::Display for CompressError {
             CompressError::StitchThread(kind) => {
                 write!(f, "the Stitch thread could not be started: {kind}")
             }
+            CompressError::Worker(e) => e.fmt(f),
             CompressError::Library(e) => write!(f, "the library does not expand: {e}"),
             CompressError::Expand { index, error } => {
                 write!(f, "program {index} does not expand: {error}")
@@ -373,7 +394,8 @@ fn run_stitch(
     })
 }
 
-/// Runs Stitch on `programs`, which may refer to `libs`, and decodes the result.
+/// Runs Stitch on `programs`, which may refer to `libs`, in the caller's
+/// process, and decodes the result.
 ///
 /// The new abstractions extend `libs`; see [`Compression`]. Stitch is given no
 /// weights. A program with free variables gives [`CompressError::OpenProgram`],
@@ -383,7 +405,7 @@ fn run_stitch(
 /// Stitch runs on its own thread, so it does not use the caller's stack. Its
 /// time and memory are not bounded, and grow quickly with the length of a long
 /// list literal. Stitch panics on input it cannot handle, and this function
-/// does not catch the panic.
+/// does not catch the panic. [`compress_isolated`] bounds and isolates it.
 ///
 /// The arena gains the new abstractions and the rewritten programs only: the
 /// steps are checked in a scratch arena, as [`accept_steps`] describes.
@@ -392,6 +414,49 @@ pub fn compress(
     libs: &[LibDef],
     programs: &[FrontierProgram],
     cfg: &CompressConfig,
+) -> Result<Compression, CompressError> {
+    compress_via(arena, libs, programs, cfg, |text, tasks| {
+        run_stitch(&text, tasks, cfg, libs.len())
+    })
+}
+
+/// [`compress`], with Stitch run by `worker` in a child process with the
+/// worker's [`Limits`](worker::Limits). Setting `cancel` from another thread
+/// stops the run.
+///
+/// A run stopped at a limit or cancelled, a panic or abort in Stitch, and
+/// output that does not parse give [`CompressError::Worker`]. The worker's
+/// output is checked with [`accept_steps`], as in [`compress`]. With a worker
+/// built from the same source, the same programs give the same result as
+/// [`compress`].
+pub fn compress_isolated(
+    arena: &mut Arena,
+    libs: &[LibDef],
+    programs: &[FrontierProgram],
+    cfg: &CompressConfig,
+    worker: &Worker,
+    cancel: &AtomicBool,
+) -> Result<Compression, CompressError> {
+    compress_via(arena, libs, programs, cfg, |text, tasks| {
+        let request = StitchRequest {
+            programs: text,
+            tasks,
+            iterations: cfg.iterations,
+            max_arity: cfg.max_arity,
+            library_len: libs.len(),
+        };
+        worker.run(&request, cancel).map_err(CompressError::Worker)
+    })
+}
+
+/// [`compress`], with Stitch run by `stitch` on the encoded programs and their
+/// task labels.
+fn compress_via(
+    arena: &mut Arena,
+    libs: &[LibDef],
+    programs: &[FrontierProgram],
+    cfg: &CompressConfig,
+    stitch: impl FnOnce(Vec<String>, Vec<String>) -> Result<Vec<StitchStep>, CompressError>,
 ) -> Result<Compression, CompressError> {
     let len = u32::try_from(libs.len()).map_err(|_| CompressError::LibraryTooLarge)?;
     let names = library_names(len)?;
@@ -414,7 +479,7 @@ pub fn compress(
         Vec::new()
     } else {
         let tasks: Vec<String> = programs.iter().map(|p| p.task.clone()).collect();
-        run_stitch(&text, tasks, cfg, libs.len())?
+        stitch(text, tasks)?
     };
     accept(arena, inputs, names, &ids, &steps, cfg.max_arity)
 }
