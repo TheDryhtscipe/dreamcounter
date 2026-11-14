@@ -5,6 +5,9 @@
 //! [`RunState::next_task`]), builds its payload, and commits a
 //! [`BatchIssued`] event that holds the payload as it is sent. A worker that
 //! holds a batch whose lease has not ended gets no other until it submits.
+//! One that lost the payload waits for the lease to end: the payload is not
+//! sent again, because another session using the same id would get the
+//! token.
 //!
 //! [`submit`] commits every submission for a batch the run has issued, as a
 //! [`Submitted`] event with the programs as they were sent, as soon as it
@@ -165,8 +168,9 @@ pub fn next_batch(
 ) -> Result<NextBatch, Refused> {
     check_name("worker id", worker)?;
     store.commit(run, |state| {
-        // One live batch at a time for each worker, so that one proposer
-        // cannot hold every slot.
+        // One live batch at a time for each worker id, so that a proposer
+        // that keeps asking under one id cannot hold every slot. Ids are what
+        // the caller says, so one that uses many ids still can.
         let held = state.batches().iter().enumerate().find(|(_, b)| {
             b.iteration == state.iteration()
                 && b.worker == worker
