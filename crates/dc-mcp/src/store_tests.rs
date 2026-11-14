@@ -12,6 +12,8 @@ fn config() -> RunConfig {
         arm: Arm::Blind,
         seed: 11,
         proposals_per_task: 3,
+        programs_per_batch: 1,
+        lease_ms: 60_000,
     }
 }
 
@@ -55,7 +57,8 @@ fn mid_iteration(store: &Store, run: &RunId) {
                 frontier("sum", "(lam 0)"),
                 Event::LibraryExtended {
                     entries: vec![LibraryEntry {
-                        body: "(lam (lam 1))".into(),
+                        arity: 2,
+                        term: "(lam (lam 1))".into(),
                     }],
                 },
                 Event::IterationFinished { iteration: 0 },
@@ -65,7 +68,7 @@ fn mid_iteration(store: &Store, run: &RunId) {
     store
         .append(run, {
             vec![Event::Logged(LogRecord {
-                kind: LogKind::Payload,
+                kind: LogKind::Compression,
                 iteration: 1,
                 task: Some("sort".into()),
                 text: "payload text".into(),
@@ -84,7 +87,7 @@ fn a_new_store_on_the_same_directory_sees_the_same_run() {
     assert_eq!(before.iteration(), 1);
     assert_eq!(before.library().len(), 1);
     assert_eq!(before.frontier("sum").unwrap().len(), 1);
-    assert_eq!(before.log_count(LogKind::Payload), 1);
+    assert_eq!(before.log_count(LogKind::Compression), 1);
     let log_before = first.log(&run).unwrap();
     assert_eq!(log_before.len(), 2);
     assert_eq!(log_before[1].text, "payload text");

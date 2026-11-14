@@ -31,7 +31,18 @@ pub struct CreateRun {
     /// The names of the run's tasks. If absent, every task of the development
     /// corpus.
     pub tasks: Option<Vec<String>>,
+    /// The most programs one batch asks for. At least 1. If absent, 1: each
+    /// program then comes from its own batch.
+    pub programs_per_batch: Option<u32>,
+    /// How long a proposer has to submit a batch, in seconds, before its
+    /// programs can be handed out again. At least 1. If absent, 1800.
+    pub lease_seconds: Option<u64>,
 }
+
+/// The most programs one batch asks for when `dc_create_run` does not say.
+pub const DEFAULT_PROGRAMS_PER_BATCH: u32 = 1;
+/// The lease of a batch, in seconds, when `dc_create_run` does not say.
+pub const DEFAULT_LEASE_SECONDS: u64 = 1800;
 
 /// The arguments of `dc_run_status`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -68,12 +79,6 @@ pub struct TaskStatus {
 /// How many log records of each kind a run has.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct LogCounts {
-    /// Prompt payloads handed to proposers.
-    pub payload: u64,
-    /// Submissions received.
-    pub submission: u64,
-    /// Evaluation results.
-    pub evaluation: u64,
     /// Compression results.
     pub compression: u64,
     /// Remarks.
@@ -127,9 +132,6 @@ impl RunStatus {
                 .collect(),
             library_size: state.library().len(),
             log_counts: LogCounts {
-                payload: state.log_count(LogKind::Payload),
-                submission: state.log_count(LogKind::Submission),
-                evaluation: state.log_count(LogKind::Evaluation),
                 compression: state.log_count(LogKind::Compression),
                 note: state.log_count(LogKind::Note),
                 recovery: state.log_count(LogKind::Recovery),
@@ -227,6 +229,11 @@ impl DcServer {
             arm: Arm::Blind,
             seed: arg.seed,
             proposals_per_task: arg.proposals_per_task,
+            programs_per_batch: arg.programs_per_batch.unwrap_or(DEFAULT_PROGRAMS_PER_BATCH),
+            lease_ms: arg
+                .lease_seconds
+                .unwrap_or(DEFAULT_LEASE_SECONDS)
+                .saturating_mul(1000),
         };
         self.blocking(move |store| {
             let state = store

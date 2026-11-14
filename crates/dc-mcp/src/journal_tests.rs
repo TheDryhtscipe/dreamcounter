@@ -7,6 +7,8 @@ fn created() -> Event {
             arm: Arm::Blind,
             seed: 1,
             proposals_per_task: 2,
+            programs_per_batch: 1,
+            lease_ms: 60_000,
         },
         tasks: vec!["a".into()],
     }
