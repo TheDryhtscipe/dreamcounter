@@ -7,11 +7,11 @@
 //! [`IterationReport`] that says what happened to each program. It does this
 //! in four steps:
 //!
-//! 1. **Check.** Each library entry must parse, expand and type, and each
-//!    frontier member must parse, be closed, expand under the library, and
-//!    type against its task's signature. A failure is a [`DriverError`]: the
-//!    run's state is wrong. A candidate that fails the same checks is
-//!    reported as [`Fate::Invalid`] and left out.
+//! 1. **Check.** Each library entry must parse, expand and type. Each frontier
+//!    member must parse, be small enough to print again, be closed, expand
+//!    under the library, and type against its task's signature. A failure is a
+//!    [`DriverError`]: the run's state is wrong. A candidate that fails the same
+//!    checks is reported as [`Fate::Invalid`] and left out.
 //! 2. **Frontiers.** Each task's pool is its frontier, then its candidates in
 //!    the order given. A program whose expansion equals that of an earlier one
 //!    in the pool is a [`Fate::Duplicate`]. The pool is sorted by
@@ -21,46 +21,53 @@
 //!    counts only the cheapest rewrite of each task.
 //! 3. **Compression.** The kept programs of every task, in task order, go to a
 //!    [`Stitch`] runner. A program the bridge refuses before Stitch runs (it
-//!    cannot be encoded, or is too deep) is left out, and the run is tried
-//!    again without it. Any other error, such as a worker stopped at its time
-//!    limit, skips compression for the iteration: the frontiers are still
-//!    updated, and the library is unchanged.
+//!    cannot be encoded, or is too deep) is left out and stays in its frontier
+//!    as it is. If the run is cancelled, or its worker cannot be started, the
+//!    step returns [`DriverError::Interrupted`]. Any other error, such as a
+//!    worker stopped at its time limit, skips compression for the iteration:
+//!    the frontiers are still updated, and the library is unchanged.
 //! 4. **Library update.** Each new abstraction gets a type scheme inferred from
 //!    its body with the earlier ones, and the new abstractions are cut at the
-//!    first that does not type. Each rewritten program must type against its
-//!    task's signature with the library's schemes. A rewritten program that
-//!    does not, or that uses a cut abstraction, falls back to its original
-//!    (the rewriting keeps the expansion but not always the type: see the
+//!    first that does not type. A rewritten program is accepted if it types
+//!    against its task's signature with the library's schemes and expands to
+//!    what its original expands to. Otherwise the program stays as it was:
+//!    the rewriting keeps the expansion but not always the type (see the
 //!    dc-core test `a_parameter_used_at_two_types_can_make_the_refactored_program_untypable`).
-//!    New abstractions after the last one a kept program uses are cut too.
+//!    The bridge returns only the programs rewritten with every abstraction it
+//!    accepted. So a program that uses a cut abstraction stays as it was, even
+//!    when a rewriting with the earlier abstractions alone would type. New
+//!    abstractions after the last one an accepted rewriting uses are cut too.
 //!    Each frontier is sorted again by cost under the new library.
 //!
 //! # Determinism
 //!
-//! The result is a function of the input. Programs are handled in a fixed
-//! order, ties keep the earlier program, and the bridge runs Stitch on one
-//! thread without shuffling (dc-compress). So an iteration can be replayed
-//! from the run's log and gives the same result.
+//! Programs are handled in a fixed order, ties keep the earlier program, and
+//! the bridge runs Stitch on one thread without shuffling (dc-compress). So
+//! when Stitch finishes, the same input gives the same outcome. A run in a
+//! worker process can also end at its time or memory limit, and whether it does
+//! depends on the machine. To replay an iteration exactly, read its outcome
+//! from the run's log; do not run the step again.
 //!
 //! # What the caller checks
 //!
 //! The candidates must be verified: [`run_iteration`] checks their syntax,
-//! expansion and type, not their behaviour on the task's examples. The cost
-//! of a program's growth plays no part yet: that is the cost-aware objective
-//! of P5.
+//! expansion and type, not their behaviour on the task's examples. How fast a
+//! program's cost grows with its input plays no part yet: that is the
+//! cost-aware objective of P5.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::AtomicBool;
 
-use dc_compress::worker::Worker;
+use dc_compress::worker::{Worker, WorkerError};
 use dc_compress::{
     compress, compress_isolated, CompressConfig, CompressError, Compression, FrontierProgram,
     ABSTRACTION_PREFIX,
 };
+use dc_core::sexpr::MAX_PRINT_NODES;
 use dc_core::term::children;
 use dc_core::types::{check, infer};
-use dc_core::{sexpr, Arena, Expander, LibDef, LibId, Scheme, Term, TermId};
+use dc_core::{sexpr, Arena, ExpandError, Expander, LibDef, LibId, Scheme, Term, TermId};
 use dc_stitch::{to_expr, EncodeError, Expr, LibNames};
 use serde::{Deserialize, Serialize};
 
@@ -198,11 +205,12 @@ pub enum Fate {
         /// The earlier program.
         of: Source,
     },
-    /// Its task kept [`DriverConfig::frontier_size`] shorter programs.
+    /// Its task kept [`DriverConfig::frontier_size`] programs that cost less,
+    /// or that cost the same and came earlier.
     Trimmed,
-    /// The candidate names no task of the run, or does not parse, is not
-    /// closed, does not expand under the library, or does not type against its
-    /// task's signature.
+    /// The candidate names no task of the run, or does not parse, is too large
+    /// to print, is not closed, does not expand under the library, or does not
+    /// type against its task's signature.
     Invalid {
         /// Why.
         reason: String,
@@ -289,8 +297,8 @@ pub enum CompressionReport {
         found: usize,
         /// The first accepted abstraction that does not type.
         untyped: Option<Untyped>,
-        /// The number of typed abstractions cut because no kept program used
-        /// them.
+        /// The number of typed abstractions cut because no accepted rewriting
+        /// used them.
         unused: usize,
         /// The number of abstractions that join the library.
         kept: usize,
@@ -299,7 +307,8 @@ pub enum CompressionReport {
     },
 }
 
-/// What one step did, for the run's log.
+/// What happened to each program in one step, for the run's log. The new
+/// library and frontiers are in [`IterationOutcome`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IterationReport {
@@ -322,7 +331,8 @@ pub struct IterationOutcome {
     pub report: IterationReport,
 }
 
-/// The input state is wrong, so the step cannot run.
+/// Why the step gave no outcome. Most variants mean the input state is wrong;
+/// [`DriverError::Interrupted`] means the step should be run again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DriverError {
     /// [`DriverConfig::frontier_size`] is zero.
@@ -348,8 +358,13 @@ pub enum DriverError {
         /// Why.
         reason: String,
     },
-    /// A term is too large to print as text.
+    /// A term is too large to print as text. Every program is checked for
+    /// this before it joins a pool, so this is not expected.
     TooLarge,
+    /// The Stitch run was cancelled, or its worker or thread could not be
+    /// started or read. This says nothing about the input: do not record the
+    /// iteration as finished, and run the step again.
+    Interrupted(CompressError),
     /// The library has more entries than a library id can number.
     LibraryTooLarge,
 }
@@ -368,6 +383,7 @@ impl fmt::Display for DriverError {
             } => write!(f, "member {index} of task {task:?}: {reason}"),
             DriverError::TooLarge => f.write_str("a term is too large to print"),
             DriverError::LibraryTooLarge => f.write_str("the library has too many entries"),
+            DriverError::Interrupted(e) => write!(f, "the Stitch run was interrupted: {e}"),
         }
     }
 }
@@ -409,12 +425,8 @@ fn names(len: usize) -> Result<LibNames, DriverError> {
     LibNames::sequential(ABSTRACTION_PREFIX, len).map_err(|_| DriverError::LibraryTooLarge)
 }
 
-/// The cost of `program` for sorting: [`stitch_cost`], or [`u64::MAX`] for a
-/// program Stitch cannot be given, which then sorts last.
-fn sort_cost(arena: &Arena, program: TermId, names: &LibNames) -> u64 {
-    stitch_cost(arena, program, names).unwrap_or(u64::MAX)
-}
-
+/// `id` as text. Every program in the pool passed the same check, and an
+/// abstraction's body is no larger than the programs it was found in.
 fn print(arena: &Arena, id: TermId) -> Result<String, DriverError> {
     sexpr::print(arena, id).map_err(|_| DriverError::TooLarge)
 }
@@ -450,10 +462,15 @@ impl Library {
     fn load(arena: &mut Arena, entries: &[LibraryEntry]) -> Result<Library, DriverError> {
         let mut defs = Vec::with_capacity(entries.len());
         for (index, e) in entries.iter().enumerate() {
-            let term = sexpr::parse(arena, &e.term).map_err(|err| DriverError::Library {
-                index,
-                reason: err.to_string(),
-            })?;
+            let bad = |reason: String| DriverError::Library { index, reason };
+            let term = sexpr::parse(arena, &e.term).map_err(|err| bad(err.to_string()))?;
+            // The expander names the entry that uses a library, except when the
+            // library does not exist. So check that here, for each entry.
+            if let Some(l) = max_lib(arena, term).filter(|&l| l >= index) {
+                return Err(bad(format!(
+                    "it uses lib_{l}, which is not an earlier entry"
+                )));
+            }
             defs.push(LibDef {
                 arity: e.arity,
                 term,
@@ -461,10 +478,10 @@ impl Library {
         }
         let expander = Expander::new(arena, &defs).map_err(|err| DriverError::Library {
             index: match err {
-                dc_core::ExpandError::UnknownLib(LibId(l))
-                | dc_core::ExpandError::ForwardReference { lib: LibId(l), .. }
-                | dc_core::ExpandError::NotClosed { lib: LibId(l), .. }
-                | dc_core::ExpandError::TooFewLambdas { lib: LibId(l), .. } => l as usize,
+                ExpandError::UnknownLib(LibId(l))
+                | ExpandError::ForwardReference { lib: LibId(l), .. }
+                | ExpandError::NotClosed { lib: LibId(l), .. }
+                | ExpandError::TooFewLambdas { lib: LibId(l), .. } => l as usize,
             },
             reason: err.to_string(),
         })?;
@@ -483,8 +500,9 @@ impl Library {
         })
     }
 
-    /// Parses `text` and checks that it is closed, expands, and types against
-    /// `signature`. Returns the program and its expansion.
+    /// Parses `text` and checks that it can be printed again, is closed,
+    /// expands, and types against `signature`. Returns the program and its
+    /// expansion.
     fn check(
         &mut self,
         arena: &mut Arena,
@@ -492,6 +510,12 @@ impl Library {
         signature: &Scheme,
     ) -> Result<(TermId, TermId), String> {
         let program = sexpr::parse(arena, text).map_err(|e| e.to_string())?;
+        // The new frontier is text, so a program must print.
+        if arena.tree_size(program, MAX_PRINT_NODES).is_none() {
+            return Err(format!(
+                "the program has more than {MAX_PRINT_NODES} nodes written out"
+            ));
+        }
         if !arena.is_closed(program) {
             return Err("the program is not closed".to_owned());
         }
@@ -511,7 +535,16 @@ struct Pooled {
     program: TermId,
     /// The program's expansion. A rewriting must keep it.
     expanded: TermId,
-    cost: u64,
+    /// [`stitch_cost`] under the library, or why Stitch cannot be given the
+    /// program.
+    cost: Result<u64, String>,
+}
+
+impl Pooled {
+    /// The cost to sort by. A program Stitch cannot be given sorts last.
+    fn sort_key(&self) -> u64 {
+        *self.cost.as_ref().unwrap_or(&u64::MAX)
+    }
 }
 
 /// Builds each task's new frontier from its members and candidates (step 2 of
@@ -521,7 +554,7 @@ fn select(
     arena: &mut Arena,
     library: &mut Library,
     names: &LibNames,
-    input: &IterationInput<'_>,
+    input: IterationInput<'_>,
     frontier_size: usize,
 ) -> Result<(Vec<Vec<Pooled>>, Vec<ProgramFate>), DriverError> {
     let mut by_task: HashMap<&str, usize> = HashMap::new();
@@ -579,7 +612,7 @@ fn select(
                 source,
                 program,
                 expanded,
-                cost: sort_cost(arena, program, names),
+                cost: stitch_cost(arena, program, names).map_err(|e| e.to_string()),
             });
             None
         };
@@ -605,7 +638,7 @@ fn select(
             entries.push((source, fate));
         }
         // A stable sort: among programs of equal cost, the earlier stays first.
-        pool.sort_by_key(|p| p.cost);
+        pool.sort_by_key(Pooled::sort_key);
         let trimmed: HashSet<Source> = pool
             .iter()
             .skip(frontier_size)
@@ -626,10 +659,36 @@ fn select(
     Ok((kept, fates))
 }
 
+/// How the Stitch run of step 3 ended.
+enum StitchRun {
+    /// No program was left to give Stitch.
+    NoPrograms,
+    /// The run failed for a reason that the same input would give again.
+    Failed(String),
+    /// The run finished. `slots` holds the place of each program Stitch was
+    /// given, as (task, position in the task's kept programs).
+    Ran {
+        slots: Vec<(usize, usize)>,
+        compression: Box<Compression>,
+    },
+}
+
+/// Whether `e` says nothing about the input: the run was cancelled, or the
+/// worker or Stitch's thread could not be started or read.
+fn is_interruption(e: &CompressError) -> bool {
+    matches!(
+        e,
+        CompressError::StitchThread(_)
+            | CompressError::Worker(
+                WorkerError::Cancelled | WorkerError::Spawn(_) | WorkerError::Io(_)
+            )
+    )
+}
+
 /// Runs Stitch on the kept programs, leaving out each program the bridge
-/// refuses before Stitch runs (step 3 of the crate docs). Returns the place of
-/// each program Stitch was given, as (task, position), and the result.
-#[allow(clippy::type_complexity)]
+/// refuses before Stitch runs (step 3 of the crate docs). Programs that cannot
+/// be encoded are left out first; the bridge's other refusals are found one
+/// run at a time. Adds the programs left out to `left_out`.
 fn run_stitch(
     arena: &mut Arena,
     libs: &[LibDef],
@@ -638,15 +697,28 @@ fn run_stitch(
     cfg: &CompressConfig,
     stitch: &mut dyn Stitch,
     left_out: &mut Vec<LeftOut>,
-) -> Result<(Vec<(usize, usize)>, Option<Result<Compression, String>>), DriverError> {
-    let mut slots: Vec<(usize, usize)> = kept
-        .iter()
-        .enumerate()
-        .flat_map(|(t, pool)| (0..pool.len()).map(move |p| (t, p)))
-        .collect();
+) -> Result<StitchRun, DriverError> {
+    let mut leave_out = |arena: &Arena, t: usize, p: usize, reason: String| {
+        print(arena, kept[t][p].program).map(|program| {
+            left_out.push(LeftOut {
+                task: tasks[t].name.clone(),
+                program,
+                reason,
+            })
+        })
+    };
+    let mut slots = Vec::new();
+    for (t, pool) in kept.iter().enumerate() {
+        for (p, pooled) in pool.iter().enumerate() {
+            match &pooled.cost {
+                Ok(_) => slots.push((t, p)),
+                Err(e) => leave_out(arena, t, p, format!("it cannot be encoded: {e}"))?,
+            }
+        }
+    }
     loop {
         if slots.is_empty() {
-            return Ok((slots, None));
+            return Ok(StitchRun::NoPrograms);
         }
         let programs: Vec<FrontierProgram> = slots
             .iter()
@@ -656,14 +728,18 @@ fn run_stitch(
             })
             .collect();
         match stitch.run(arena, libs, &programs, cfg) {
-            Ok(c) if c.rewritten.len() == slots.len() => return Ok((slots, Some(Ok(c)))),
+            Ok(c) if c.rewritten.len() == slots.len() => {
+                return Ok(StitchRun::Ran {
+                    slots,
+                    compression: Box::new(c),
+                })
+            }
             Ok(c) => {
-                let error = format!(
-                    "the bridge returned {} rewritten programs for {} inputs",
+                return Ok(StitchRun::Failed(format!(
+                    "the runner returned {} rewritten programs for {} inputs",
                     c.rewritten.len(),
                     slots.len()
-                );
-                return Ok((slots, Some(Err(error))));
+                )))
             }
             Err(
                 e @ (CompressError::OpenProgram { index }
@@ -671,20 +747,129 @@ fn run_stitch(
                 | CompressError::TooDeep { index }),
             ) if index < slots.len() => {
                 let (t, p) = slots.remove(index);
-                left_out.push(LeftOut {
-                    task: tasks[t].name.clone(),
-                    program: print(arena, kept[t][p].program)?,
-                    reason: e.to_string(),
-                });
+                leave_out(arena, t, p, e.to_string())?;
             }
-            Err(e) => return Ok((slots, Some(Err(e.to_string())))),
+            Err(e) if is_interruption(&e) => return Err(DriverError::Interrupted(e)),
+            Err(e) => return Ok(StitchRun::Failed(e.to_string())),
         }
     }
 }
 
+/// Step 4 of the crate docs: types the new abstractions, accepts each
+/// rewriting that types and keeps its program's expansion, and cuts the
+/// abstractions that are not used. Changes the accepted programs in `kept`
+/// and returns the new library entries and the report.
+fn update_library(
+    arena: &mut Arena,
+    library: &Library,
+    tasks: &[TaskSpec],
+    kept: &mut [Vec<Pooled>],
+    slots: &[(usize, usize)],
+    c: &Compression,
+    left_out: Vec<LeftOut>,
+) -> Result<(Vec<LibraryEntry>, CompressionReport), DriverError> {
+    let old_len = library.defs.len();
+    let mut schemes = library.schemes.clone();
+    let mut untyped = None;
+    for (i, def) in c.new_libs.iter().enumerate() {
+        match infer(arena, def.term, &schemes) {
+            Ok(s) => schemes.push(s),
+            Err(e) => {
+                untyped = Some(Untyped {
+                    abstraction: i,
+                    term: print(arena, def.term)?,
+                    error: e.to_string(),
+                });
+                break;
+            }
+        }
+    }
+    let typed = schemes.len() - old_len;
+    // The bridge checks that each rewriting keeps the expansion. It is checked
+    // again here, against the typed abstractions, so that a runner that skips
+    // the check cannot change a program.
+    let typed_libs: Vec<LibDef> = library
+        .defs
+        .iter()
+        .chain(&c.new_libs[..typed])
+        .copied()
+        .collect();
+    let mut expander = match Expander::new(arena, &typed_libs) {
+        Ok(x) => x,
+        Err(e) => {
+            let error = format!("the new abstractions do not expand: {e}");
+            return Ok((Vec::new(), CompressionReport::Failed { left_out, error }));
+        }
+    };
+    let mut fallbacks = Vec::new();
+    // The largest library id an accepted rewriting uses.
+    let mut used: Option<usize> = None;
+    for (&(t, p), &rewritten) in slots.iter().zip(&c.rewritten) {
+        let task = &tasks[t];
+        let uses = max_lib(arena, rewritten);
+        let text = sexpr::print(arena, rewritten);
+        let refused = if text.is_err() {
+            Some(format!(
+                "it has more than {MAX_PRINT_NODES} nodes written out"
+            ))
+        } else if uses.is_some_and(|l| l >= schemes.len()) {
+            Some("it uses a new abstraction that does not type, or one after it".to_owned())
+        } else if let Err(e) = check(arena, rewritten, &schemes, &task.signature) {
+            Some(e.to_string())
+        } else {
+            match expander.expand(arena, rewritten) {
+                Err(e) => Some(format!("it does not expand: {e}")),
+                Ok(e) if e != kept[t][p].expanded => {
+                    Some("it does not expand to its original".to_owned())
+                }
+                Ok(_) => None,
+            }
+        };
+        match refused {
+            Some(reason) => fallbacks.push(Fallback {
+                task: task.name.clone(),
+                program: print(arena, kept[t][p].program)?,
+                rewritten: text.unwrap_or_default(),
+                reason,
+            }),
+            None => {
+                kept[t][p].program = rewritten;
+                used = used.max(uses);
+            }
+        }
+    }
+    // Cut the new abstractions after the last one used. A kept one uses only
+    // earlier ones, so those before it stay.
+    let kept_new = used.map_or(0, |l| (l + 1).saturating_sub(old_len));
+    let new_library = c.new_libs[..kept_new]
+        .iter()
+        .map(|def| {
+            Ok(LibraryEntry {
+                arity: def.arity,
+                term: print(arena, def.term)?,
+            })
+        })
+        .collect::<Result<Vec<LibraryEntry>, DriverError>>()?;
+    let report = CompressionReport::Ran {
+        left_out,
+        programs: slots.len(),
+        stitch_steps: c.stitch_steps,
+        rejected: c
+            .rejected
+            .as_ref()
+            .map(|r| format!("step {} ({}): {}", r.step, r.name, r.reason)),
+        found: c.new_libs.len(),
+        untyped,
+        unused: typed - kept_new,
+        kept: kept_new,
+        fallbacks,
+    };
+    Ok((new_library, report))
+}
+
 /// Runs one step. See the crate docs.
 pub fn run_iteration(
-    input: &IterationInput<'_>,
+    input: IterationInput<'_>,
     cfg: &DriverConfig,
     stitch: &mut dyn Stitch,
 ) -> Result<IterationOutcome, DriverError> {
@@ -704,7 +889,7 @@ pub fn run_iteration(
     )?;
 
     let mut left_out = Vec::new();
-    let (slots, result) = run_stitch(
+    let run = run_stitch(
         &mut arena,
         &library.defs,
         input.tasks,
@@ -713,100 +898,18 @@ pub fn run_iteration(
         stitch,
         &mut left_out,
     )?;
-    let mut new_library = Vec::new();
-    let compression = match result {
-        None => CompressionReport::NoPrograms { left_out },
-        Some(Err(error)) => CompressionReport::Failed { left_out, error },
-        Some(Ok(c)) => {
-            // Step 4: type the new abstractions, cut at the first that does
-            // not type.
-            let mut schemes = library.schemes.clone();
-            let mut untyped = None;
-            for (i, def) in c.new_libs.iter().enumerate() {
-                match infer(&arena, def.term, &schemes) {
-                    Ok(s) => schemes.push(s),
-                    Err(e) => {
-                        untyped = Some(Untyped {
-                            abstraction: i,
-                            term: print(&arena, def.term)?,
-                            error: e.to_string(),
-                        });
-                        break;
-                    }
-                }
-            }
-            let typed = schemes.len() - old_len;
-            // The bridge checks that each rewriting keeps the expansion. It is
-            // checked again here, against the typed abstractions, so that a
-            // runner that skips the check cannot change a program.
-            let typed_libs: Vec<LibDef> = library
-                .defs
-                .iter()
-                .chain(&c.new_libs[..typed])
-                .copied()
-                .collect();
-            let mut expander = Expander::new(&mut arena, &typed_libs).map_err(|e| e.to_string());
-            // Accept each rewriting that types and keeps the expansion; note
-            // the largest library id the accepted programs use.
-            let mut fallbacks = Vec::new();
-            let mut used: Option<usize> = None;
-            for (&(t, p), &rewritten) in slots.iter().zip(&c.rewritten) {
-                let task = &input.tasks[t];
-                let uses = max_lib(&arena, rewritten);
-                let refused = if uses.is_some_and(|l| l >= schemes.len()) {
-                    Some("it uses a new abstraction that does not type, or one after it".to_owned())
-                } else if let Err(e) = check(&arena, rewritten, &schemes, &task.signature) {
-                    Some(e.to_string())
-                } else {
-                    match &mut expander {
-                        Err(e) => Some(format!("the new abstractions do not expand: {e}")),
-                        Ok(x) => match x.expand(&mut arena, rewritten) {
-                            Err(e) => Some(format!("it does not expand: {e}")),
-                            Ok(e) if e != kept[t][p].expanded => {
-                                Some("it does not expand to its original".to_owned())
-                            }
-                            Ok(_) => None,
-                        },
-                    }
-                };
-                let original = kept[t][p].program;
-                match refused {
-                    Some(reason) => fallbacks.push(Fallback {
-                        task: task.name.clone(),
-                        program: print(&arena, original)?,
-                        rewritten: print(&arena, rewritten)?,
-                        reason,
-                    }),
-                    None => {
-                        kept[t][p].program = rewritten;
-                        used = used.max(uses);
-                    }
-                }
-            }
-            // Cut the new abstractions after the last one used. A kept one
-            // uses only earlier ones, so those before it stay.
-            let kept_new = used.map_or(0, |l| (l + 1).saturating_sub(old_len));
-            for def in &c.new_libs[..kept_new] {
-                new_library.push(LibraryEntry {
-                    arity: def.arity,
-                    term: print(&arena, def.term)?,
-                });
-            }
-            CompressionReport::Ran {
-                left_out,
-                programs: slots.len(),
-                stitch_steps: c.stitch_steps,
-                rejected: c
-                    .rejected
-                    .as_ref()
-                    .map(|r| format!("step {} ({}): {}", r.step, r.name, r.reason)),
-                found: c.new_libs.len(),
-                untyped,
-                unused: typed - kept_new,
-                kept: kept_new,
-                fallbacks,
-            }
-        }
+    let (new_library, compression) = match run {
+        StitchRun::NoPrograms => (Vec::new(), CompressionReport::NoPrograms { left_out }),
+        StitchRun::Failed(error) => (Vec::new(), CompressionReport::Failed { left_out, error }),
+        StitchRun::Ran { slots, compression } => update_library(
+            &mut arena,
+            &library,
+            input.tasks,
+            &mut kept,
+            &slots,
+            &compression,
+            left_out,
+        )?,
     };
 
     // Sort each frontier again under the new library.
@@ -814,9 +917,9 @@ pub fn run_iteration(
     let mut frontiers = BTreeMap::new();
     for (task, pool) in input.tasks.iter().zip(&mut kept) {
         for p in pool.iter_mut() {
-            p.cost = sort_cost(&arena, p.program, &new_names);
+            p.cost = stitch_cost(&arena, p.program, &new_names).map_err(|e| e.to_string());
         }
-        pool.sort_by_key(|p| p.cost);
+        pool.sort_by_key(Pooled::sort_key);
         let texts = pool
             .iter()
             .map(|p| print(&arena, p.program))

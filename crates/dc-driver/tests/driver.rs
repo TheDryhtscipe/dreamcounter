@@ -153,7 +153,7 @@ fn run(
     stitch: &mut dyn Stitch,
 ) -> Result<IterationOutcome, DriverError> {
     run_iteration(
-        &IterationInput {
+        IterationInput {
             tasks,
             library,
             frontiers,
@@ -452,8 +452,7 @@ fn the_same_input_gives_the_same_outcome() {
     // Not two empty results: Stitch found something to repeat.
     assert!(!first.new_library.is_empty(), "{:?}", first.report);
     assert_eq!(first, second);
-    // The report reads back from its JSON, so a logged report is the whole
-    // record of what the step did.
+    // The report reads back from its JSON.
     let json = serde_json::to_string(&first.report).unwrap();
     assert_eq!(
         serde_json::from_str::<dc_driver::IterationReport>(&json).unwrap(),
@@ -694,6 +693,12 @@ fn the_library_is_cut_at_the_first_abstraction_that_does_not_type() {
     assert_eq!(untyped.as_ref().map(|u| u.abstraction), Some(1));
     let fell_back: Vec<&str> = fallbacks.iter().map(|f| f.task.as_str()).collect();
     assert_eq!(fell_back, vec!["b", "c"]);
+    // c's rewriting types on its own, but uses lib_2, which comes after the cut.
+    assert!(
+        fallbacks[1].reason.contains("one after it"),
+        "{}",
+        fallbacks[1].reason
+    );
 }
 
 #[test]
@@ -873,4 +878,289 @@ fn new_abstractions_are_numbered_after_the_given_library() {
         assert!(p.contains("lib_1") && !p.contains("lib_0"), "{p}");
     }
     check_sound(&tasks, &library, &shared_input(), &out);
+}
+
+#[test]
+fn a_candidate_too_large_to_print_is_invalid_and_the_step_goes_on() {
+    // Each level of (add ... 1) is four nodes written out, so this is over
+    // dc_core::sexpr::MAX_PRINT_NODES.
+    let levels = (dc_core::sexpr::MAX_PRINT_NODES / 4) + 1;
+    let huge = format!("{}1{}", "(add ".repeat(levels), " 1)".repeat(levels));
+    let tasks = [task("a", "Int"), task("b", "Int")];
+    let cands = [candidate("a", &huge), candidate("b", "(add 1 2)")];
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &config(5),
+        &mut Nothing::default(),
+    )
+    .unwrap();
+    match fate_of(&out, Source::Candidate { index: 0 }) {
+        Fate::Invalid { reason } => assert!(reason.contains("nodes written out"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(out.frontiers["a"], Vec::<String>::new());
+    assert_eq!(out.frontiers["b"], vec!["(add 1 2)"]);
+}
+
+#[test]
+fn an_interrupted_stitch_run_is_an_error_not_a_finished_iteration() {
+    for error in [
+        WorkerError::Cancelled,
+        WorkerError::Spawn(std::io::ErrorKind::NotFound),
+        WorkerError::Io(std::io::ErrorKind::BrokenPipe),
+    ] {
+        let mut stitch = Failing {
+            errors: vec![CompressError::Worker(error.clone())],
+            inner: Nothing::default(),
+        };
+        let result = run(
+            &shared_tasks(),
+            &[],
+            &BTreeMap::new(),
+            &shared_candidates(),
+            &config(5),
+            &mut stitch,
+        );
+        assert_eq!(
+            result,
+            Err(DriverError::Interrupted(CompressError::Worker(error)))
+        );
+    }
+}
+
+#[test]
+fn each_frontier_is_sorted_again_under_the_new_library() {
+    // Before: (add 1 2) costs 302, the mul program far more. After the
+    // rewriting, (lib_0 5) costs 201 and comes first.
+    let tasks = [task("a", "Int")];
+    let long = "(mul (add 5 6) (add 5 6))";
+    let cands = [candidate("a", long), candidate("a", "(add 1 2)")];
+    let mut stitch = Fixed {
+        libs: vec![(1, "(lam (mul (add $0 6) (add $0 6)))")],
+        rewritten: vec!["(add 1 2)", "(lib_0 5)"],
+    };
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &config(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert_eq!(out.frontiers["a"], vec!["(lib_0 5)", "(add 1 2)"]);
+}
+
+#[test]
+fn the_report_lists_programs_by_task_then_strays() {
+    let tasks = [task("a", "Int"), task("b", "Int")];
+    let fronts = frontiers(&[("a", &["1"]), ("b", &["2"])]);
+    let cands = [
+        candidate("b", "3"),
+        candidate("zz", "4"),
+        candidate("a", "5"),
+    ];
+    let out = run(
+        &tasks,
+        &[],
+        &fronts,
+        &cands,
+        &config(5),
+        &mut Nothing::default(),
+    )
+    .unwrap();
+    let order: Vec<Source> = out
+        .report
+        .programs
+        .iter()
+        .map(|p| p.source.clone())
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            Source::Member {
+                task: "a".into(),
+                index: 0
+            },
+            Source::Candidate { index: 2 },
+            Source::Member {
+                task: "b".into(),
+                index: 0
+            },
+            Source::Candidate { index: 0 },
+            Source::Candidate { index: 1 },
+        ]
+    );
+}
+
+#[test]
+fn refusals_in_a_row_count_from_the_shorter_list() {
+    let mut stitch = Failing {
+        errors: vec![
+            CompressError::TooDeep { index: 3 },
+            CompressError::TooDeep { index: 0 },
+        ],
+        inner: Nothing::default(),
+    };
+    let out = run(
+        &shared_tasks(),
+        &[],
+        &BTreeMap::new(),
+        &shared_candidates(),
+        &config(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert_eq!(
+        stitch.inner.calls,
+        vec![
+            vec!["t0", "t1", "t2", "t3"],
+            vec!["t0", "t1", "t2"],
+            vec!["t1", "t2"]
+        ]
+    );
+    let CompressionReport::Ran { left_out, .. } = &out.report.compression else {
+        panic!("{:?}", out.report.compression);
+    };
+    let tasks: Vec<&str> = left_out.iter().map(|l| l.task.as_str()).collect();
+    assert_eq!(tasks, vec!["t3", "t0"]);
+}
+
+#[test]
+fn a_refusal_that_names_no_program_fails_the_run() {
+    let mut stitch = Failing {
+        errors: vec![CompressError::TooDeep { index: 4 }],
+        inner: Nothing::default(),
+    };
+    let out = run(
+        &shared_tasks(),
+        &[],
+        &BTreeMap::new(),
+        &shared_candidates(),
+        &config(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert!(matches!(
+        out.report.compression,
+        CompressionReport::Failed { .. }
+    ));
+    assert_eq!(stitch.inner.calls.len(), 1);
+}
+
+#[test]
+fn a_runner_that_returns_the_wrong_number_of_programs_fails_the_run() {
+    let tasks = [task("a", "Int"), task("b", "Int")];
+    let cands = [candidate("a", "1"), candidate("b", "2")];
+    /// Returns one rewritten program, whatever it is given.
+    struct Short;
+    impl Stitch for Short {
+        fn run(
+            &mut self,
+            _arena: &mut Arena,
+            _libs: &[LibDef],
+            programs: &[FrontierProgram],
+            _cfg: &CompressConfig,
+        ) -> Result<Compression, CompressError> {
+            Ok(Compression {
+                new_libs: Vec::new(),
+                rewritten: vec![programs[0].program],
+                names: LibNames::new(),
+                stitch_steps: 0,
+                rejected: None,
+            })
+        }
+    }
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &config(5),
+        &mut Short,
+    )
+    .unwrap();
+    assert!(matches!(
+        out.report.compression,
+        CompressionReport::Failed { .. }
+    ));
+    assert_eq!(out.frontiers["b"], vec!["2"]);
+}
+
+#[test]
+fn new_abstractions_that_do_not_expand_fail_the_run() {
+    // Arity 2 with one lambda types, as λx. x, but does not expand.
+    let tasks = [task("a", "Int")];
+    let cands = [candidate("a", "(add 1 1)")];
+    let mut stitch = Fixed {
+        libs: vec![(2, "(lam $0)")],
+        rewritten: vec!["(add 1 1)"],
+    };
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &config(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert!(out.new_library.is_empty());
+    match &out.report.compression {
+        CompressionReport::Failed { error, .. } => {
+            assert!(error.contains("do not expand"), "{error}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_frontier_member_repeated_is_a_duplicate() {
+    let tasks = [task("a", "Int")];
+    let fronts = frontiers(&[("a", &["(add 3 3)", "(add 3 3)"])]);
+    let out = run(
+        &tasks,
+        &[],
+        &fronts,
+        &[],
+        &config(5),
+        &mut Nothing::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        *fate_of(
+            &out,
+            Source::Member {
+                task: "a".into(),
+                index: 1
+            }
+        ),
+        Fate::Duplicate {
+            of: Source::Member {
+                task: "a".into(),
+                index: 0
+            }
+        }
+    );
+    assert_eq!(out.frontiers["a"], vec!["(add 3 3)"]);
+}
+
+#[test]
+fn a_library_entry_that_uses_a_missing_library_is_named() {
+    // The entry is 0, though it names lib_7.
+    let result = run(
+        &[task("a", "Int")],
+        &[lib(0, "lib_7")],
+        &BTreeMap::new(),
+        &[],
+        &config(1),
+        &mut Nothing::default(),
+    );
+    assert!(
+        matches!(result, Err(DriverError::Library { index: 0, .. })),
+        "{result:?}"
+    );
 }
