@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Lines, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use dc_mcp::state::{Event, FrontierMember, LibraryEntry, LogKind, LogRecord, RunId};
+use dc_mcp::state::{Check, Event, FrontierMember, LibraryEntry, LogKind, LogRecord, RunId};
 use dc_mcp::store::Store;
 use serde_json::{json, Value};
 
@@ -743,6 +743,209 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
             (vec![], None),
         ]
     );
+}
+
+/// The largest program a proposer may send, in bytes
+/// (`dc_mcp::proposer::MAX_PROGRAM_LEN`).
+const PROGRAM_LIMIT: usize = dc_mcp::proposer::MAX_PROGRAM_LEN;
+
+/// `prefix`, then `open` and `close` around `middle` as many times as fit in
+/// [`PROGRAM_LIMIT`], then `suffix`.
+fn nested(prefix: &str, open: &str, middle: &str, close: &str, suffix: &str) -> String {
+    let room = PROGRAM_LIMIT - prefix.len() - middle.len() - suffix.len();
+    let n = room / (open.len() + close.len());
+    format!(
+        "{prefix}{}{middle}{}{suffix}",
+        open.repeat(n),
+        close.repeat(n)
+    )
+}
+
+/// `first`, then as many definitions `let a<i> <step>` as fit in
+/// [`PROGRAM_LIMIT`], each using the one before it, then `solve` as the last.
+/// In `step`, `{p}` is the name of the definition before.
+fn definition_chain(first: &str, step: &str) -> String {
+    let mut text = format!("{first}\n");
+    let mut i = 1;
+    loop {
+        let line = format!("let a{i} {}\n", step.replace("{p}", &format!("a{}", i - 1)));
+        let entry = format!("let solve = a{i}\n");
+        if text.len() + line.len() + entry.len() > PROGRAM_LIMIT {
+            text.push_str(&format!("let solve = a{}\n", i - 1));
+            return text;
+        }
+        text.push_str(&line);
+        i += 1;
+    }
+}
+
+/// Programs as deep as a submission can make them, each with the stage its
+/// check must stop at.
+fn deepest_programs() -> Vec<(String, &'static str)> {
+    let v = dc_tasks::families::development()
+        .into_iter()
+        .find(|v| v.family.name() == "collapse/merge")
+        .unwrap();
+    let solves = format!(
+        "{}\nlet a0 = {}",
+        v.source,
+        v.references.last().unwrap().entry
+    );
+    let deep = |open: &str, middle: &str, close: &str, suffix: &str| {
+        nested("let solve xs = ", open, middle, close, suffix)
+    };
+    vec![
+        // The surface syntax refuses more than 100 levels in one definition.
+        (deep("(", "xs", ")", "\n"), "compile"),
+        (deep("fun a -> ", "xs", "", "\n"), "compile"),
+        (deep("let a = 1 in ", "xs", "", "\n"), "compile"),
+        (deep("if true then xs else ", "xs", "", "\n"), "compile"),
+        (deep("1 :: ", "xs", "", "\n"), "compile"),
+        (deep("let a = [", "1", "]", " in xs\n"), "compile"),
+        (deep("let a = 1", "", " + 1", " in xs\n"), "compile"),
+        (deep("(fun a -> xs)", "", " 1", "\n"), "compile"),
+        (deep("let a = [", "1", ";1", "] in xs\n"), "compile"),
+        // As deep as one definition may be.
+        (
+            format!("let solve xs = {}xs{}\n", "(".repeat(99), ")".repeat(99)),
+            "run",
+        ),
+        // Definitions nest in one another, one `let` each, with no limit but
+        // the program's length: a core term thousands of levels deep, which
+        // passes, stays in the frontier, and is shown to other tasks.
+        (definition_chain(&solves, "= {p}"), "passed"),
+        // A type that grows with each definition.
+        (definition_chain("let a0 xs = xs", "xs = [{p} xs]"), "type"),
+        // A run that doubles with each definition.
+        (
+            definition_chain("let a0 xs = xs", "xs = {p} ({p} xs)"),
+            "run",
+        ),
+    ]
+}
+
+/// The task and the kind of each check of the run's checked submissions, in
+/// the order they were checked.
+fn check_kinds(dir: &Path, run: &str) -> Vec<(String, Vec<&'static str>)> {
+    let store = Store::open(dir).unwrap();
+    let mut tasks = Vec::new();
+    let mut kinds = Vec::new();
+    store
+        .for_each_event(&RunId::new(run).unwrap(), |e| {
+            match e {
+                Event::BatchIssued(b) => tasks.push(b.task),
+                Event::Checked(c) => {
+                    let k = c.checks.iter().map(|c| match c {
+                        Check::Compile { .. } => "compile",
+                        Check::Type { .. } => "type",
+                        Check::Run { .. } => "run",
+                        Check::Passed { .. } => "passed",
+                        Check::Extra => "extra",
+                    });
+                    let task = tasks[usize::try_from(c.batch).unwrap()].clone();
+                    kinds.push((task, k.collect()));
+                }
+                _ => {}
+            }
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+    kinds
+}
+
+/// Waits until the run has no submission waiting to be checked.
+fn wait_for_checks(operator: &mut Client, proposer: &mut Client, run: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        // A stack overflow in a check aborts the proposer's server.
+        assert!(
+            proposer.child.try_wait().unwrap().is_none(),
+            "the proposer's server stopped"
+        );
+        let stats = operator
+            .call("dc_proposal_stats", json!({ "run": run }))
+            .unwrap();
+        if stats["iterations"][0]["pending_checks"] == 0 {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "{stats}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn the_deepest_programs_a_proposer_can_send_do_not_crash_the_server() {
+    let programs = deepest_programs();
+    let texts: Vec<String> = programs.iter().map(|(t, _)| t.clone()).collect();
+    let expected: Vec<&str> = programs.iter().map(|(_, k)| *k).collect();
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut operator = Client::start(dir.path());
+    operator
+        .call(
+            "dc_create_run",
+            json!({
+                "run": "r1", "seed": 5, "proposals_per_task": 32,
+                "programs_per_batch": 32,
+                "tasks": ["collapse/merge", "collapse/cancel"]
+            }),
+        )
+        .unwrap();
+
+    // Sent to a live server, which checks them in the background.
+    let mut proposer = Client::start_proposer(dir.path(), "r1");
+    let first = proposer
+        .call("dc_next_batch", json!({ "worker": "agent-1" }))
+        .unwrap();
+    proposer
+        .call(
+            "dc_submit",
+            json!({
+                "worker": "agent-1", "batch": 0, "token": first["batch"]["token"],
+                "programs": texts
+            }),
+        )
+        .unwrap();
+    wait_for_checks(&mut operator, &mut proposer, "r1");
+    let merge = "collapse/merge".to_owned();
+    assert_eq!(
+        check_kinds(dir.path(), "r1"),
+        [(merge.clone(), expected.clone())]
+    );
+    // The next batch's prompt may show the deep program that passed.
+    let second = proposer
+        .call("dc_next_batch", json!({ "worker": "agent-2" }))
+        .unwrap();
+    assert_eq!(second["batch"]["batch"], 1, "{second}");
+    proposer.kill();
+
+    // Left unchecked by a server that stopped, and checked when the next one
+    // starts.
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("r1").unwrap();
+    let held = dc_mcp::proposer::next_batch(&store, &run, "agent-3", 0)
+        .unwrap()
+        .batch
+        .unwrap();
+    dc_mcp::proposer::submit(
+        &store,
+        &run,
+        held.batch,
+        "agent-3",
+        &held.token,
+        texts.clone(),
+        None,
+        1,
+    )
+    .unwrap();
+    let mut proposer = Client::start_proposer(dir.path(), "r1");
+    wait_for_checks(&mut operator, &mut proposer, "r1");
+    // That batch is collapse/merge's again, so its checks stop where they did.
+    assert_eq!(
+        check_kinds(dir.path(), "r1"),
+        [(merge.clone(), expected.clone()), (merge, expected)]
+    );
+    proposer.kill();
+    operator.kill();
 }
 
 #[test]
