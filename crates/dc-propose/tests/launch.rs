@@ -18,8 +18,9 @@ const SUBMIT: &str = "mcp__dc__dc_submit";
 /// file left in `queue/` (in name order), or `default` when the queue is
 /// empty. In a played file, `@CWD@` becomes the working directory; a line
 /// `@SLEEP n` sleeps, a line `@TOUCH name` makes a file, a line `@CLOSE`
-/// closes standard output, and a line `@BG` starts a background `sleep 300`
-/// that holds no pipe of the call and records its pid in `bg.<pid>`.
+/// closes standard output, a line `@BG` starts a background `sleep 300`
+/// that holds no pipe of the call and records its pid in `bg.<pid>`, and a
+/// line `@BGOUT` does the same with a `sleep 300` that keeps standard output.
 const FAKE: &str = r#"#!/usr/bin/env bash
 set -u
 d="$FAKE_DIR"
@@ -41,6 +42,7 @@ while IFS= read -r line; do
     @TOUCH*) touch "${line#@TOUCH }" ;;
     @BG) sleep 300 </dev/null >/dev/null 2>&1 & echo $! > "$d/bg.$id" ;;
     @CLOSE) exec 1>&- ;;
+    @BGOUT) sleep 300 </dev/null 2>/dev/null & echo $! > "$d/bg.$id" ;;
     *) printf '%s\n' "${line//@CWD@/$cwd}" ;;
   esac
 done < "$out"
@@ -798,7 +800,7 @@ fn the_batch_a_session_leased_is_recorded_whatever_its_outcome() {
     assert!(!out.status.success(), "{out:?}");
     let summary = f.summary();
     assert_eq!(outcomes(&summary), ["failed"]);
-    assert_eq!(summary["sessions"][0]["leased_batch"], 4);
+    assert_eq!(summary["sessions"][0]["leased_batches"], json!([4]));
 }
 
 #[test]
@@ -854,5 +856,47 @@ fn a_first_request_without_usage_is_stopped() {
 fn zero_parallel_sessions_is_a_usage_error() {
     let f = Fixture::new();
     let out = f.run(&["--sessions", "1", "--parallel", "0"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+}
+
+#[test]
+fn every_batch_a_session_leased_is_recorded() {
+    let f = Fixture::new();
+    let mut lines = submitted(3);
+    let again = submitted(6);
+    // A second dc_next_batch call and reply, then no submission.
+    lines.truncate(3);
+    lines.push(again[1].clone());
+    lines.push(again[2].clone());
+    lines.push(result("gave up"));
+    f.set_default(&lines);
+    let out = f.run(&["--sessions", "1"]);
+    assert!(!out.status.success(), "{out:?}");
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["failed"]);
+    assert_eq!(summary["sessions"][0]["leased_batches"], json!([3, 6]));
+    assert_eq!(summary["sessions"][0]["next_batch_calls"], 2);
+}
+
+#[test]
+fn a_session_that_exits_while_its_output_is_held_open_ends_at_once() {
+    let f = Fixture::new();
+    // The session exits without a result; a process it started keeps the
+    // pipe open.
+    f.set_default(&[good_init(), "@BGOUT".to_owned()]);
+    let started = Instant::now();
+    let out = f.run(&["--sessions", "1", "--session-timeout", "60"]);
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert!(!out.status.success(), "{out:?}");
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["failed"]);
+    assert_eq!(summary["sessions"][0]["timed_out"], false);
+    f.assert_no_background_left();
+}
+
+#[test]
+fn zero_sessions_is_a_usage_error() {
+    let f = Fixture::new();
+    let out = f.run(&["--sessions", "0"]);
     assert_eq!(out.status.code(), Some(2), "{out:?}");
 }

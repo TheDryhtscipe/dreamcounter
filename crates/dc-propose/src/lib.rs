@@ -29,6 +29,9 @@
 //! asked for, or until a session finds no batch to take. Worker ids are
 //! unique, so "no batch" means every open slot is leased or being checked.
 //!
+//! With the environment allowlisted, Claude Code 2.1.318 makes no scratch
+//! directory for a session outside the session's own directory.
+//!
 //! A session's processes are one process group, killed with it. A process
 //! that leaves the group (`setsid`) outlives the kill. If the launcher itself
 //! is killed with SIGKILL, its sessions run on.
@@ -168,9 +171,9 @@ pub struct Session {
     pub result: Map<String, Value>,
     /// How many times it called `dc_next_batch` and `dc_submit`.
     pub calls: (u64, u64),
-    /// The batch `dc_next_batch` gave it, if it gave one. Its slots stay
-    /// leased until the lease ends, whatever the session did.
-    pub leased: Option<u64>,
+    /// The batches `dc_next_batch` gave it, in order. Their slots stay
+    /// leased until each lease ends, whatever the session did.
+    pub leased: Vec<u64>,
     /// How long it ran, in milliseconds, as the launcher saw it.
     pub elapsed_ms: u64,
 }
@@ -184,7 +187,7 @@ impl Session {
             model: None,
             result: Map::new(),
             calls: (0, 0),
-            leased: None,
+            leased: Vec::new(),
             elapsed_ms: 0,
         }
     }
@@ -197,7 +200,7 @@ impl Session {
         s.insert("model".into(), json!(self.model));
         s.insert("next_batch_calls".into(), json!(self.calls.0));
         s.insert("submit_calls".into(), json!(self.calls.1));
-        s.insert("leased_batch".into(), json!(self.leased));
+        s.insert("leased_batches".into(), json!(self.leased));
         s.insert("elapsed_ms".into(), json!(self.elapsed_ms));
         match &self.outcome {
             Outcome::Submitted { batch, received } => {
@@ -380,13 +383,13 @@ fn result_text(content: &Value) -> String {
 }
 
 /// How a session ended, from its events; how many times it called
-/// `dc_next_batch` and `dc_submit`; and the last batch it was given. A received submission wins over
+/// `dc_next_batch` and `dc_submit`; and the batches it was given, in order. A received submission wins over
 /// anything else; then a reply with no batch; otherwise the session failed,
 /// and the last tool error or its last words say how.
-pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Option<u64>) {
+pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
     let mut names: Vec<(String, String)> = Vec::new();
     let mut calls = (0, 0);
-    let mut leased = None;
+    let mut leased = Vec::new();
     let mut submitted = None;
     let mut no_batch = None;
     let mut error = None;
@@ -423,7 +426,7 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Option<u64>) {
                         }
                     } else if let Some(b) = reply["batch"]["batch"].as_u64() {
                         if name == NEXT_BATCH {
-                            leased = Some(b);
+                            leased.push(b);
                         }
                     } else if name == NEXT_BATCH && reply.get("batch").is_some_and(Value::is_null) {
                         let wait = &reply["wait"];
@@ -514,7 +517,8 @@ impl Group {
             let until = Instant::now() + GRACE;
             loop {
                 // The session is reaped: once its group is empty, its id may
-                // be reused, so it is not signalled again.
+                // be reused, so it is not signalled again. (The group can
+                // still empty between this check and the kill below.)
                 if test_kill_process_group(self.id).is_err() {
                     return ending;
                 }
@@ -822,6 +826,11 @@ impl Launcher {
                     break;
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    // A session that exited while a process it started holds
+                    // its output open sends nothing more.
+                    if matches!(group.child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
                     if Instant::now() >= deadline {
                         stopped = Some(Outcome::Timeout);
                         break;
