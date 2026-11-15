@@ -301,7 +301,10 @@ fn prompt_parts(state: &RunState, pieces: Vec<Piece>, events: &mut Vec<Event>) -
             }
             continue;
         }
-        // A piece stored by this batch's own events is found among them.
+        // A piece stored by this batch's own events is found among them, by
+        // its text. One the run stored before is found by the digest of its
+        // text alone: the state does not hold the text, so a match is not
+        // compared byte for byte (D18 item 17).
         let stored_here = events.iter().find_map(|e| match e {
             Event::PromptStored(s) if s.text == piece.text => Some(s.id),
             _ => None,
@@ -901,6 +904,53 @@ mod tests {
             payloads(&fresh, &run),
             [old_text, serde_json::to_string(&new).unwrap()]
         );
+    }
+
+    /// A shared text that comes twice in one prompt is stored once, by the
+    /// first piece, and both pieces name it; a text the run already stored is
+    /// named and not stored again. The events apply to the run.
+    #[test]
+    fn a_shared_text_twice_in_one_prompt_is_stored_once() {
+        let (_dir, store, run) = setup(1, 1);
+        store
+            .append(
+                &run,
+                vec![Event::PromptStored(PromptStored {
+                    id: 0,
+                    text: "old".into(),
+                })],
+            )
+            .unwrap();
+        let state = store.state(&run).unwrap();
+        let piece = |text: &str, shared| Piece {
+            text: text.into(),
+            shared,
+        };
+        let pieces = vec![
+            piece("same", true),
+            piece("own", false),
+            piece("same", true),
+            piece("old", true),
+        ];
+        let mut events = Vec::new();
+        let parts = prompt_parts(&state, pieces, &mut events);
+        assert_eq!(
+            events,
+            [Event::PromptStored(PromptStored {
+                id: 1,
+                text: "same".into(),
+            })]
+        );
+        assert_eq!(
+            parts,
+            [
+                PromptPart::Stored(1),
+                PromptPart::Text("own".into()),
+                PromptPart::Stored(1),
+                PromptPart::Stored(0),
+            ]
+        );
+        store.append(&run, events).unwrap();
     }
 
     /// A proposer that asks for a batch and submits nothing, again and
