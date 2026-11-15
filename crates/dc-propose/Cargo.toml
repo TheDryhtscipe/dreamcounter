@@ -1,0 +1,18 @@
+[package]
+name = "dc-propose"
+description = "Starts locked-down Claude Code sessions that propose programs to a dc-mcp run"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+getrandom.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

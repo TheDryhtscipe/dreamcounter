@@ -351,6 +351,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-propose"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "rustix",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "dc-stitch"
 version = "0.1.0"
 dependencies = [
