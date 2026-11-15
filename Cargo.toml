@@ -30,6 +30,8 @@ tempfile = "3"
 # The Stitch worker sets its own resource limits (dc-compress).
 rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 tokio = { version = "1", default-features = false }
+# dc-propose kills its sessions when it is interrupted.
+signal-hook = { version = "0.4", default-features = false }
 # Batch tokens for proposers (dc-mcp).
 getrandom = "0.3"
 # Digests of stored prompts (dc-mcp). rmcp already brings this version in.
