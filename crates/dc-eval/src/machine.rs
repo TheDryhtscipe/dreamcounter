@@ -465,7 +465,7 @@ impl<'a> Machine<'a> {
     /// evaluated in order, partial application charges nothing, and the
     /// primitive runs, and is charged, when the last argument is done.
     ///
-    /// The search looks at no more than `MAX_PRIM_ARITY + 1` terms, so it adds
+    /// The search looks at no more than `MAX_PRIM_ARITY` terms, so it adds
     /// constant work to an application however long its chain of arguments.
     fn whole_prim_call(&self, f: TermId, a: TermId) -> Option<(Prim, [TermId; MAX_PRIM_ARITY])> {
         // The arguments found so far, last first.
@@ -1146,6 +1146,63 @@ mod tests {
             let (got, partials) = run_counting_partials(src);
             assert_eq!(got, outcome, "{src}");
             assert_eq!(partials, 0, "{src}");
+        }
+    }
+
+    #[test]
+    fn a_whole_call_and_one_argument_at_a_time_agree_at_every_fuel() {
+        // Each call is run as written, and with the primitive bound by a `let`,
+        // so that it is applied to one argument at a time. The arguments are
+        // closed, so the `let` does not change them. The two must agree at
+        // every fuel up to one more than the steps of the call, which covers a
+        // timeout before, between and after the arguments, and in the primitive.
+        let outcome = |src: &str, fuel: u64| -> (String, u64) {
+            let mut arena = Arena::new();
+            let t = sexpr::parse(&mut arena, src).expect("parse");
+            let mut m = Machine::new(&arena, fuel);
+            let o = m.run(Control::Eval(t, Env::empty()));
+            (format!("{o:?}"), m.partials_built)
+        };
+        for (prim, args) in [
+            ("not", "(not true)"),
+            ("add", "(add 1 2) (mul 3 4)"),
+            ("add", "(div 1 0) (div 2 0)"),
+            ("add", "(mul 2 3) (div 2 0)"),
+            ("add", "(add 1 2) true"),
+            ("add", "(lam $0) (div 1 0)"),
+            ("eq", "(pair 1 (pair 2 3)) (pair 1 (pair 2 4))"),
+            ("eq", "(lam $0) (add 1 2)"),
+            ("cons", "(add 1 2) (cons 4 nil)"),
+            ("node", "leaf (add 1 2) (node leaf 5 leaf)"),
+            ("node", "(add 1 2) (add 3 4) (div 1 0)"),
+            ("option_case", "(some (add 1 2)) (lam 0) (lam (mul $0 $0))"),
+            ("option_case", "(add 1 2) (lam 0) (div 1 0)"),
+            ("loop", "(add 2 2) (mul 1 0) (lam (lam (add $1 $0)))"),
+            ("loop", "true (add 1 2) (lam (lam $0))"),
+            ("foldl", "add (add 0 0) (cons 1 (cons 2 nil))"),
+            ("array_set", "(array_tabulate 4 (lam $0)) (add 1 9) (add 1 1)"),
+            ("bfix", "(add 2 3) (lam (lam (if (le $0 0) 0 ($1 (sub $0 1))))) (add 1 2)"),
+            (
+                "memorec",
+                "(add 5 5) (lam (lam (if (le $0 1) $0 (add ($1 (sub $0 1)) ($1 (sub $0 2)))))) (add 3 3)",
+            ),
+        ] {
+            let whole = format!("({prim} {args})");
+            let one_at_a_time = format!("(let {prim} ($0 {args}))");
+            let steps = {
+                let mut arena = Arena::new();
+                let t = sexpr::parse(&mut arena, &whole).expect("parse");
+                Machine::new(&arena, UNLIMITED)
+                    .run(Control::Eval(t, Env::empty()))
+                    .steps()
+            };
+            for fuel in 0..=steps + 1 {
+                let (a, _) = outcome(&whole, fuel);
+                let (b, built) = outcome(&one_at_a_time, fuel);
+                assert_eq!(a, b, "{whole} at fuel {fuel}");
+                // The second form does go one argument at a time.
+                assert!(built > 0, "{one_at_a_time} at fuel {fuel}");
+            }
         }
     }
 
