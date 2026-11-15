@@ -565,8 +565,8 @@ fn check_pending_with(
 ) -> Result<Checks, Refused> {
     // Claim files left by checkers that stopped, listed before the run is
     // read, so that a batch read as settled was settled when it was listed.
-    // The programs are compiled with this build's prelude, so the run's
-    // must be the same.
+    // A run of another prelude is refused even if nothing waits; each
+    // submission's read below checks again, in case the run was replaced.
     store
         .read(run, |state| {
             check_prelude(state.config(), shipped_prelude())
@@ -596,8 +596,19 @@ fn check_pending_with(
             break waiting;
         };
         // Another checker may have checked it since the run was read.
-        let (p, journal) =
-            store.read_journal(run, |state| pending(state, claim.batch(), verifiers))?;
+        // The programs are compiled with this build's prelude, so the run
+        // they are read from must have the same.
+        let (p, journal) = store.read_journal(run, |state| {
+            check_prelude(state.config(), shipped_prelude())
+                .map(|()| pending(state, claim.batch(), verifiers))
+        })?;
+        let p = match p {
+            Ok(p) => p,
+            Err(changed) => {
+                claim.release();
+                return Err(Refused::State(changed.to_string()));
+            }
+        };
         let Some(p) = p else {
             claim.release();
             continue;

@@ -25,15 +25,16 @@
 //! The commit is written only if the run is still in the iteration the step
 //! read, in the journal it read. If another server ended the iteration
 //! first, the result is [`FinishError::AlreadyFinished`] and nothing is
-//! written: the other server's step read the same state, and its outcome
-//! stands. Nothing stops two servers from running the step at the same
-//! time; the second to commit has run Stitch for nothing.
+//! written: the other server's outcome stands. The two steps may have read
+//! different programs, if one was checked between the two reads. Nothing
+//! stops two servers from running the step at the same time; the second to
+//! commit has run Stitch for nothing.
 //!
 //! An iteration cannot end while a submission waits to be checked. If one
 //! came in during the step, this server checks it
-//! ([`crate::proposer::check_pending`]) and tries the commit again, up to
-//! [`COMMIT_TRIES`] times, without running the step again: the step's
-//! outcome depends only on what it read.
+//! ([`crate::proposer::check_pending`]) and tries the commit again, without
+//! running the step again: the step's outcome depends only on what it read.
+//! It checks up to [`COMMIT_TRIES`] times, and tries the commit after each.
 //!
 //! # A step that is interrupted
 //!
@@ -42,12 +43,16 @@
 //! again. A Stitch run that ends at its time or memory limit is not an
 //! interruption: the iteration ends without new abstractions, and the log
 //! record says why (D19, item 6).
+//!
+//! The cancel flag of [`finish_iteration_in_worker`] is read while Stitch
+//! runs and once more before the first commit. A flag set after that does
+//! not stop the commit.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use dc_compress::worker::{Limits, Worker};
@@ -65,8 +70,9 @@ use crate::state::{
 use crate::store::{Store, StoreError};
 use crate::verify::{check_prelude, shipped_prelude, task, PreludeChanged, VerifierCache};
 
-/// How many times [`finish_iteration`] tries its commit while submissions
-/// that came in during the step wait to be checked.
+/// How many times [`finish_iteration`] checks submissions that came in
+/// during the step. It tries its commit before the first check and after
+/// each.
 pub const COMMIT_TRIES: usize = 8;
 
 /// How long [`finish_iteration`] waits before it tries its commit again when
@@ -118,8 +124,8 @@ pub enum FinishError {
         /// The iteration the step read.
         iteration: u64,
     },
-    /// Submissions that came in during the step still wait to be checked
-    /// after [`COMMIT_TRIES`] tries, or checking them failed.
+    /// Submissions that came in during the step still wait after
+    /// [`COMMIT_TRIES`] checks, or checking them failed.
     ChecksPending(String),
 }
 
@@ -262,6 +268,11 @@ fn snapshot(state: &RunState) -> Result<Snapshot, FinishError> {
 /// it alone, the binary calls `dc_compress::worker::serve`.
 pub const WORKER_ARG: &str = "--stitch-worker";
 
+/// The file a Linux process runs, by a name that does not change when the
+/// file's path is given to another file. A child is started from it before
+/// the child becomes another program, so it names the parent's file.
+const RUNNING_BINARY: &str = "/proc/self/exe";
+
 /// How to start the Stitch worker process of a step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerStart {
@@ -274,11 +285,22 @@ pub struct WorkerStart {
 
 impl WorkerStart {
     /// The running binary, started again with [`WORKER_ARG`]. For the
-    /// `dc-mcp` binary, whose `main` serves the worker then. So the worker
-    /// is always built from the source the server is.
+    /// `dc-mcp` binary, whose `main` serves the worker then.
+    ///
+    /// Where `/proc/self/exe` exists (Linux), the worker is started from
+    /// it: that is the file this process runs, even after another file has
+    /// taken its path, so the worker is the build the server is. Elsewhere
+    /// the worker is started from the path of the binary, and is whatever
+    /// file is at that path when the step runs.
     pub fn this_binary() -> std::io::Result<WorkerStart> {
+        let running = PathBuf::from(RUNNING_BINARY);
+        let program = if running.exists() {
+            running
+        } else {
+            std::env::current_exe()?
+        };
         Ok(WorkerStart {
-            program: std::env::current_exe()?,
+            program,
             args: vec![OsString::from(WORKER_ARG)],
         })
     }
@@ -312,7 +334,8 @@ pub fn finish_iteration(
 /// `start` says, under the time and memory limits of the run's settings
 /// ([`StitchSettings`]). Setting `cancel` from another thread stops the
 /// worker within about 50 milliseconds; the result is then
-/// [`FinishError::Interrupted`].
+/// [`FinishError::Interrupted`]. If `cancel` is set when the step is done
+/// and nothing is committed yet, the result is the same.
 pub fn finish_iteration_in_worker(
     store: &Store,
     run: &RunId,
@@ -335,8 +358,7 @@ fn finish(store: &Store, run: &RunId, runner: Runner<'_>) -> Result<Finished, Fi
     }
     // The fingerprint was compared under the lock, so this is the prelude
     // the run's programs were compiled with.
-    let prelude = Prelude::load()
-        .map_err(|e| FinishError::Interrupted(format!("the prelude does not load: {e}")))?;
+    let prelude = Prelude::load().expect("the shipped prelude loads");
     let input = IterationInput {
         tasks: &tasks,
         library: &snap.library,
@@ -344,9 +366,11 @@ fn finish(store: &Store, run: &RunId, runner: Runner<'_>) -> Result<Finished, Fi
         candidates: &snap.candidates,
         prelude: Some(&prelude),
     };
+    let mut cancelled: Option<&AtomicBool> = None;
     let stepped = match runner {
         Runner::Given(stitch) => run_iteration(input, &snap.config, stitch),
         Runner::Worker { start, cancel } => {
+            cancelled = Some(cancel);
             let worker = Worker {
                 program: start.program.clone(),
                 args: start.args.clone(),
@@ -367,6 +391,13 @@ fn finish(store: &Store, run: &RunId, runner: Runner<'_>) -> Result<Finished, Fi
         DriverError::Interrupted(why) => FinishError::Interrupted(why.to_string()),
         other => FinishError::State(other),
     })?;
+    // A step with no programs for Stitch starts no worker, and a cancel may
+    // come after the worker is done.
+    if cancelled.is_some_and(|c| c.load(Ordering::SeqCst)) {
+        return Err(FinishError::Interrupted(
+            "the call was cancelled".to_owned(),
+        ));
+    }
 
     let used = snap.candidates.len() as u64;
     let mut events = Vec::with_capacity(snap.tasks.len() + 3);
@@ -408,7 +439,7 @@ fn finish(store: &Store, run: &RunId, runner: Runner<'_>) -> Result<Finished, Fi
         iteration: snap.iteration,
     };
     let mut waiting = String::new();
-    for _ in 0..COMMIT_TRIES {
+    for check in 0..=COMMIT_TRIES {
         // Written only to the journal the step read, and only if the run
         // is where the step read it. The frontiers and the library change
         // only when an iteration ends, so they are as the step read them.
@@ -433,6 +464,9 @@ fn finish(store: &Store, run: &RunId, runner: Runner<'_>) -> Result<Finished, Fi
             }
             Some(Some(batch)) => batch,
         };
+        if check == COMMIT_TRIES {
+            break;
+        }
         // A submission came in during the step. It is of this iteration, so
         // it is checked with the library the step read.
         let checks = check_pending(store, run, &VerifierCache::default())

@@ -40,7 +40,12 @@ impl Client {
 
     /// Starts the server on `dir` with `args` after the state directory.
     fn start_with(dir: &Path, args: &[&str], stderr: Stdio) -> Client {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_dc-mcp"))
+        Client::start_binary(Path::new(env!("CARGO_BIN_EXE_dc-mcp")), dir, args, stderr)
+    }
+
+    /// As `start_with`, with the server started from the file `binary`.
+    fn start_binary(binary: &Path, dir: &Path, args: &[&str], stderr: Stdio) -> Client {
+        let mut child = Command::new(binary)
             .arg("--state-dir")
             .arg(dir)
             .args(args)
@@ -485,6 +490,34 @@ fn bad_requests_are_tool_errors_and_change_nothing() {
 
     let error = client
         .call("dc_run_status", json!({ "run": "none" }))
+        .unwrap_err();
+    assert!(error.contains("no run"), "{error}");
+    // A Stitch setting that is refused is named as the tool names it, in
+    // the tool's unit.
+    for (setting, value, said) in [
+        (
+            "stitch_iterations",
+            0,
+            "stitch_iterations must be at least 1",
+        ),
+        (
+            "stitch_wall_seconds",
+            0,
+            "stitch_wall_seconds must be at least 1",
+        ),
+        (
+            "stitch_memory_mib",
+            511,
+            "stitch_memory_mib must be at least 512",
+        ),
+    ] {
+        let mut arguments = create("s1", json!([first]));
+        arguments[setting] = json!(value);
+        let error = client.call("dc_create_run", arguments).unwrap_err();
+        assert_eq!(error, said);
+    }
+    let error = client
+        .call("dc_run_status", json!({ "run": "s1" }))
         .unwrap_err();
     assert!(error.contains("no run"), "{error}");
     let error = client
@@ -1206,6 +1239,73 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     assert_eq!(passed, 1);
+}
+
+/// Makes the run `r1` of three tasks and gives each task one program that
+/// solves it, through a proposer's server.
+fn a_run_ready_to_end(dir: &Path, operator: &mut Client) {
+    let tasks = ["collapse/merge", "collapse/cancel", "collapse/absorb"];
+    operator
+        .call(
+            "dc_create_run",
+            json!({
+                "run": "r1", "seed": 5, "proposals_per_task": 1, "frontier_size": 2,
+                "stitch_wall_seconds": 120, "stitch_memory_mib": 2048,
+                "tasks": tasks
+            }),
+        )
+        .unwrap();
+    let store = Store::open(dir).unwrap();
+    let run = RunId::new("r1").unwrap();
+    let mut proposer = Client::start_proposer(dir, "r1");
+    for i in 0..tasks.len() {
+        let worker = format!("agent-{i}");
+        let got = proposer
+            .call("dc_next_batch", json!({ "worker": worker }))
+            .unwrap();
+        let batch = got["batch"]["batch"].as_u64().unwrap();
+        let task = store
+            .read(&run, |s| s.batch(batch).unwrap().task.clone())
+            .unwrap();
+        proposer
+            .call(
+                "dc_submit",
+                json!({
+                    "worker": worker, "batch": batch, "token": got["batch"]["token"],
+                    "programs": [solves(&task)]
+                }),
+            )
+            .unwrap();
+    }
+    wait_for_checks(operator, &mut proposer, "r1");
+}
+
+/// A server whose file was replaced after it started, as an upgrade does,
+/// still starts its own build as the worker.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_server_whose_file_was_replaced_still_runs_its_own_worker() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = tempfile::TempDir::new().unwrap();
+    let binary = bin.path().join("dc-mcp");
+    std::fs::copy(env!("CARGO_BIN_EXE_dc-mcp"), &binary).unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut operator = Client::start_binary(&binary, dir.path(), &[], Stdio::null());
+    a_run_ready_to_end(dir.path(), &mut operator);
+
+    // Another program takes the path. Started as the worker, it would fail.
+    let other = bin.path().join("other");
+    std::fs::write(&other, "#!/bin/sh\nexit 2\n").unwrap();
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&other, &binary).unwrap();
+    assert_eq!(Command::new(&binary).status().unwrap().code(), Some(2));
+
+    let done = operator
+        .call("dc_finish_iteration", json!({ "run": "r1" }))
+        .unwrap();
+    assert_eq!(done["compression"], "ran", "{done}");
+    assert!(done["new_abstractions"].as_u64().unwrap() > 0, "{done}");
 }
 
 #[test]

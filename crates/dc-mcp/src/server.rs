@@ -13,6 +13,7 @@
 //! A tool call runs on a thread of its own, so a call that waits for a run's
 //! lock does not hold up other calls or the protocol.
 
+use std::future::Future;
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{fence, AtomicBool, Ordering};
@@ -21,14 +22,15 @@ use std::time::Duration;
 
 use dc_driver::CompressionReport;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::{schemars, tool, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{schemars, tool, tool_router, RoleServer};
 use serde::{Deserialize, Serialize};
 
 use crate::iterate::{finish_iteration_in_worker, WorkerStart};
 use crate::proposer::{check_pending, next_batch, submit, Clock, NextBatch, Receipt, Refused};
 use crate::state::{
     Arm, Event, LogKind, LogRecord, RunConfig, RunId, RunState, StitchSettings,
-    DEFAULT_MAX_UNCHECKED_PER_BATCH,
+    DEFAULT_MAX_UNCHECKED_PER_BATCH, MIN_STITCH_MEMORY_BYTES,
 };
 use crate::store::{Refusals, Store, StoreError};
 use crate::verify::{shipped_prelude, VerifierCache};
@@ -382,8 +384,69 @@ pub struct DcServer {
     store: Arc<Store>,
     /// How `dc_finish_iteration` starts its Stitch worker.
     worker: Arc<WorkerStart>,
-    /// Set when the server shuts down, to stop a Stitch run.
-    stopping: Arc<AtomicBool>,
+    /// What stops the Stitch runs of this server's calls.
+    stops: Arc<Stops>,
+}
+
+/// The cancel flags of the `dc_finish_iteration` calls that are running.
+#[derive(Debug, Default)]
+struct Stops {
+    /// Whether the server shut down, and the flag of each running call.
+    /// Both under one lock, so that a call that starts while the server
+    /// shuts down is stopped.
+    calls: Mutex<(bool, Vec<Arc<AtomicBool>>)>,
+}
+
+impl Stops {
+    fn calls(&self) -> std::sync::MutexGuard<'_, (bool, Vec<Arc<AtomicBool>>)> {
+        // The lock guards plain values: one that a panic left is still good.
+        self.calls.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The cancel flag of a new call. It is set already if the server shut
+    /// down.
+    fn call(self: &Arc<Stops>) -> CallStop {
+        let mut calls = self.calls();
+        let flag = Arc::new(AtomicBool::new(calls.0));
+        calls.1.push(Arc::clone(&flag));
+        CallStop {
+            flag,
+            stops: Arc::clone(self),
+        }
+    }
+
+    /// Sets the flag of every call, running or still to come.
+    fn stop_all(&self) {
+        let mut calls = self.calls();
+        calls.0 = true;
+        for flag in &calls.1 {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The cancel flag of one `dc_finish_iteration` call. Dropping it sets the
+/// flag: a call whose future is dropped stops its Stitch run.
+#[derive(Debug)]
+struct CallStop {
+    flag: Arc<AtomicBool>,
+    stops: Arc<Stops>,
+}
+
+impl CallStop {
+    fn stop(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for CallStop {
+    fn drop(&mut self) {
+        self.stop();
+        self.stops
+            .calls()
+            .1
+            .retain(|flag| !Arc::ptr_eq(flag, &self.flag));
+    }
 }
 
 impl DcServer {
@@ -393,7 +456,7 @@ impl DcServer {
         DcServer {
             store: Arc::new(store),
             worker: Arc::new(worker),
-            stopping: Arc::default(),
+            stops: Arc::default(),
         }
     }
 
@@ -402,18 +465,24 @@ impl DcServer {
     /// interrupted and writes nothing. Call it when the client is gone, so
     /// that a call does not go on for as long as its Stitch run may take.
     pub fn shut_down(&self) {
-        self.stopping.store(true, Ordering::SeqCst);
+        self.stops.stop_all();
     }
 }
 
 #[cfg(test)]
 impl DcServer {
+    /// How many `dc_finish_iteration` calls are running.
+    pub(crate) fn finish_calls_running(&self) -> usize {
+        self.stops.calls().1.len()
+    }
+
     /// `dc_finish_iteration`, for tests in other modules.
     pub(crate) async fn finish_iteration_for_test(
         &self,
-        arg: Parameters<RunArg>,
+        arg: RunArg,
+        cancelled: impl Future<Output = ()>,
     ) -> Result<FinishReport, String> {
-        self.finish_iteration(arg).await.map(|Json(report)| report)
+        self.finish(arg, cancelled).await.map(|Json(report)| report)
     }
 }
 
@@ -440,6 +509,56 @@ impl DcServer {
             .await
             .map_err(|e| format!("the tool call did not finish: {e}"))?
             .map(Json)
+    }
+
+    /// `dc_finish_iteration`. When `cancelled` is done, or this future is
+    /// dropped, the call's Stitch run stops and the call writes nothing.
+    async fn finish(
+        &self,
+        arg: RunArg,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<Json<FinishReport>, String> {
+        let run = run_id(&arg.run)?;
+        let worker = Arc::clone(&self.worker);
+        let stop = self.stops.call();
+        let stopping = Arc::clone(&stop.flag);
+        let work = self.blocking(move |store| {
+            let done = finish_iteration_in_worker(store, &run, &worker, &stopping)
+                .map_err(|e| e.to_string())?;
+            let (compression, compression_error) = match &done.report.compression {
+                CompressionReport::Ran { .. } => ("ran", None),
+                CompressionReport::Failed { error, .. } => ("failed", Some(error.clone())),
+                CompressionReport::NoPrograms { .. } => ("no_programs", None),
+            };
+            // The step is committed. If this read fails, say so, not that
+            // the step failed.
+            let status = store
+                .read_with_refusals(&run, |state, refusals| RunStatus::of(&run, state, refusals))
+                .map_err(|e| {
+                    format!(
+                        "iteration {} ended, but the run's status could not be read: {e}",
+                        done.iteration
+                    )
+                })?;
+            Ok(FinishReport {
+                finished_iteration: done.iteration,
+                programs_used: done.used,
+                new_abstractions: done.new_abstractions,
+                compression: compression.to_owned(),
+                compression_error,
+                status,
+            })
+        });
+        tokio::pin!(work);
+        tokio::pin!(cancelled);
+        tokio::select! {
+            done = &mut work => done,
+            () = &mut cancelled => {
+                stop.stop();
+                // The step ends as interrupted, or it was past stopping.
+                work.await
+            }
+        }
     }
 }
 
@@ -471,6 +590,17 @@ impl DcServer {
                 tasks
             }
         };
+        // Refused here, in the tool's own names and units.
+        if arg.stitch_iterations == Some(0) {
+            return Err("stitch_iterations must be at least 1".to_owned());
+        }
+        if arg.stitch_wall_seconds == Some(0) {
+            return Err("stitch_wall_seconds must be at least 1".to_owned());
+        }
+        let least_mib = MIN_STITCH_MEMORY_BYTES >> 20;
+        if arg.stitch_memory_mib.is_some_and(|m| m < least_mib) {
+            return Err(format!("stitch_memory_mib must be at least {least_mib}"));
+        }
         let defaults = StitchSettings::default();
         let config = RunConfig {
             arm: Arm::Blind,
@@ -622,46 +752,21 @@ impl DcServer {
                        programs and all are checked (quota_in in dc_run_status). It keeps each \
                        task's best programs as its frontier, runs Stitch on them to find new \
                        abstractions for the library, and starts the next iteration, all in one \
-                       change to the run. The call waits for Stitch, at most the run's \
-                       stitch.wall_seconds. If Stitch is stopped at a limit the iteration still \
-                       ends, with the library unchanged. Returns what the step did and the \
-                       run's status; the full report is in the run's log."
+                       change to the run. The call first measures every program, then waits for \
+                       Stitch for at most the run's stitch.wall_seconds, then checks what \
+                       proposers submitted meanwhile, up to 8 times. If Stitch is stopped at a \
+                       limit the iteration still ends, with the library unchanged. If you \
+                       cancel the call while Stitch runs, Stitch stops and the run is not \
+                       changed; a cancel that comes later may not stop the change, so read \
+                       dc_run_status. Returns what the step did and the run's status; the full \
+                       report is in the run's log."
     )]
     async fn finish_iteration(
         &self,
         Parameters(arg): Parameters<RunArg>,
+        context: RequestContext<RoleServer>,
     ) -> Result<Json<FinishReport>, String> {
-        let run = run_id(&arg.run)?;
-        let worker = Arc::clone(&self.worker);
-        let stopping = Arc::clone(&self.stopping);
-        self.blocking(move |store| {
-            let done = finish_iteration_in_worker(store, &run, &worker, &stopping)
-                .map_err(|e| e.to_string())?;
-            let (compression, compression_error) = match &done.report.compression {
-                CompressionReport::Ran { .. } => ("ran", None),
-                CompressionReport::Failed { error, .. } => ("failed", Some(error.clone())),
-                CompressionReport::NoPrograms { .. } => ("no_programs", None),
-            };
-            // The step is committed. If this read fails, say so, not that
-            // the step failed.
-            let status = store
-                .read_with_refusals(&run, |state, refusals| RunStatus::of(&run, state, refusals))
-                .map_err(|e| {
-                    format!(
-                        "iteration {} ended, but the run's status could not be read: {e}",
-                        done.iteration
-                    )
-                })?;
-            Ok(FinishReport {
-                finished_iteration: done.iteration,
-                programs_used: done.used,
-                new_abstractions: done.new_abstractions,
-                compression: compression.to_owned(),
-                compression_error,
-                status,
-            })
-        })
-        .await
+        self.finish(arg, context.ct.cancelled_owned()).await
     }
 
     /// Lists the runs.

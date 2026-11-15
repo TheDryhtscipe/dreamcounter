@@ -124,7 +124,8 @@ fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn st
     // committed whole or not at all, so it can be left: the next proposer
     // server takes it up.
     // The operator's server waits for its tool calls to finish. A call that
-    // was running Stitch finishes at once: `shut_down` stopped its worker.
+    // was running Stitch ends once its worker has stopped, and `shut_down`
+    // stopped it.
     if checks_in_background {
         runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     }

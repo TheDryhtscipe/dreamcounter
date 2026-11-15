@@ -68,6 +68,11 @@ fn check(store: &Store, run: &RunId) -> usize {
 /// its own, submits a solution for each, and checks them. The `n`-th batch
 /// of a task gets the task's reference `n`.
 fn fill(store: &Store, run: &RunId, now_ms: u64) {
+    fill_with(store, run, now_ms, solution);
+}
+
+/// As `fill`, with `program(task, n)` sent for the `n`-th batch of `task`.
+fn fill_with(store: &Store, run: &RunId, now_ms: u64, program: impl Fn(&str, usize) -> String) {
     let verifiers = VerifierCache::default();
     let mut per_task: BTreeMap<String, usize> = BTreeMap::new();
     loop {
@@ -80,7 +85,7 @@ fn fill(store: &Store, run: &RunId, now_ms: u64) {
             .read(run, |s| s.batch(payload.batch).unwrap().task.clone())
             .unwrap();
         let n = per_task.entry(task.clone()).or_insert(0);
-        let program = solution(&task, *n);
+        let program = program(&task, *n);
         *n += 1;
         submit(
             store,
@@ -501,7 +506,6 @@ fn a_worker_stopped_at_the_runs_time_limit_ends_the_iteration_without_abstractio
 #[test]
 fn a_server_that_shuts_down_stops_its_step() {
     use crate::server::{DcServer, RunArg};
-    use rmcp::handler::server::wrapper::Parameters;
 
     let (dir, store, run) = setup(1);
     fill(&store, &run, 0);
@@ -516,14 +520,198 @@ fn a_server_that_shuts_down_stops_its_step() {
         stopper.shut_down();
     });
     let started = std::time::Instant::now();
-    let reply = runtime.block_on(server.finish_iteration_for_test(Parameters(RunArg {
-        run: "r".to_owned(),
-    })));
+    let reply = runtime.block_on(server.finish_iteration_for_test(
+        RunArg {
+            run: "r".to_owned(),
+        },
+        std::future::pending(),
+    ));
     stop.join().unwrap();
     let why = reply.unwrap_err();
     assert!(why.contains("interrupted"), "{why}");
     assert!(started.elapsed() >= Duration::from_millis(300));
     assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(journal(&dir), before);
+    assert_eq!(store.read(&run, RunState::iteration).unwrap(), 0);
+}
+
+/// A server whose worker never answers, on a run that is ready to end, and
+/// a runtime with a clock.
+fn stuck_server() -> (
+    TempDir,
+    Store,
+    RunId,
+    crate::server::DcServer,
+    tokio::runtime::Runtime,
+) {
+    let (dir, store, run) = setup(1);
+    fill(&store, &run, 0);
+    let server = crate::server::DcServer::new(Store::open(dir.path()).unwrap(), sleeper());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    (dir, store, run, server, runtime)
+}
+
+#[test]
+fn a_call_the_client_cancels_stops_its_step_and_writes_nothing() {
+    use crate::server::RunArg;
+
+    let (dir, store, run, server, runtime) = stuck_server();
+    let before = journal(&dir);
+    let started = std::time::Instant::now();
+    // The worker would run for the run's 600 seconds.
+    let reply = runtime.block_on(server.finish_iteration_for_test(
+        RunArg {
+            run: "r".to_owned(),
+        },
+        async { tokio::time::sleep(Duration::from_millis(300)).await },
+    ));
+    let why = reply.unwrap_err();
+    assert!(why.contains("interrupted"), "{why}");
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(journal(&dir), before);
+    assert_eq!(store.read(&run, RunState::iteration).unwrap(), 0);
+}
+
+#[test]
+fn a_call_whose_future_is_dropped_stops_its_step_and_writes_nothing() {
+    use crate::server::RunArg;
+
+    let (dir, store, run, server, runtime) = stuck_server();
+    let before = journal(&dir);
+    let started = std::time::Instant::now();
+    let dropped = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            server.finish_iteration_for_test(
+                RunArg {
+                    run: "r".to_owned(),
+                },
+                std::future::pending(),
+            ),
+        )
+        .await
+    });
+    assert!(dropped.is_err(), "the call ended before it was dropped");
+    // Dropping the runtime waits for the step's thread, which ends once its
+    // worker is stopped.
+    drop(runtime);
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(journal(&dir), before);
+    assert_eq!(store.read(&run, RunState::iteration).unwrap(), 0);
+}
+
+#[test]
+fn a_cancel_that_comes_when_no_worker_runs_still_stops_the_commit() {
+    let (dir, store, run) = setup(1);
+    // No program solves its task, so the step has nothing for Stitch and
+    // starts no worker that the flag could stop.
+    fill_with(&store, &run, 0, |_, _| "let solve = 1\n".to_owned());
+    assert!(store.read(&run, |s| s.verified().is_empty()).unwrap());
+    let before = journal(&dir);
+    let cancel = AtomicBool::new(true);
+    let stopped = finish_iteration_in_worker(&store, &run, &sleeper(), &cancel).unwrap_err();
+    assert!(
+        matches!(stopped, FinishError::Interrupted(_)),
+        "{stopped:?}"
+    );
+    assert_eq!(journal(&dir), before);
+}
+
+#[test]
+fn a_step_on_a_run_that_was_removed_and_made_again_writes_nothing() {
+    let (dir, store, run) = setup(1);
+    fill(&store, &run, 0);
+    let other = Store::open(dir.path()).unwrap();
+    let mut remade = Vec::new();
+    // While this server runs Stitch, the run is removed and a run of the
+    // same id is made and filled: iteration 0 again, with an empty library.
+    let mut stitch = Hooked::new(|| {
+        std::fs::remove_dir_all(dir.path().join("r")).unwrap();
+        let tasks = TASKS.iter().map(|t| (*t).to_owned()).collect();
+        other
+            .create_run(&run, config(1, shipped_prelude()), tasks)
+            .unwrap();
+        fill(&other, &run, 0);
+        remade = journal(&dir);
+    });
+    let lost = finish_iteration(&store, &run, &mut stitch).unwrap_err();
+    drop(stitch);
+    assert!(
+        matches!(lost, FinishError::AlreadyFinished { iteration: 0 }),
+        "{lost:?}"
+    );
+    assert!(!remade.is_empty());
+    assert_eq!(journal(&dir), remade, "the step wrote to the new run");
+    assert_eq!(store.read(&run, RunState::iteration).unwrap(), 0);
+}
+
+#[test]
+fn a_cancelled_notification_stops_the_step_of_its_call() {
+    use rmcp::ServiceExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (dir, store, run, server, runtime) = stuck_server();
+    let before = journal(&dir);
+    runtime.block_on(async {
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let (read, mut write) = tokio::io::split(ours);
+        let mut lines = BufReader::new(read).lines();
+        let serving = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let service = server.serve(tokio::io::split(theirs)).await.unwrap();
+                let _ = service.waiting().await;
+            }
+        });
+        let mut send = async |message: serde_json::Value| {
+            write
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .unwrap();
+        };
+        send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0" }
+            }
+        }))
+        .await;
+        let hello = lines.next_line().await.unwrap().unwrap();
+        assert!(hello.contains("\"id\":1"), "{hello}");
+        send(serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
+        send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "dc_finish_iteration", "arguments": { "run": "r" } }
+        }))
+        .await;
+        // The call runs: its worker would go on for the run's 600 seconds.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while server.finish_calls_running() != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the call did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(server.finish_calls_running(), 1);
+        send(serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": { "requestId": 2, "reason": "test" }
+        }))
+        .await;
+        while server.finish_calls_running() != 0 {
+            assert!(tokio::time::Instant::now() < deadline, "the call went on");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        serving.abort();
+    });
+    drop(runtime);
     assert_eq!(journal(&dir), before);
     assert_eq!(store.read(&run, RunState::iteration).unwrap(), 0);
 }
