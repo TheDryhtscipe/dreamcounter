@@ -1557,3 +1557,59 @@ fn two_stores_keep_the_journal_s_state_over_a_long_run() {
         two_stores_agree_with_the_journal(seed, 2000);
     }
 }
+
+/// Counts one refused repeat in the run's current iteration.
+fn refuse_one(store: &Store, run: &RunId) -> Result<(), StoreError> {
+    store.commit_or_refuse(run, |state| {
+        let refuse = Change::Refuse {
+            iteration: state.iteration(),
+            kind: RefusalKind::Repeat,
+        };
+        Ok(((), refuse))
+    })
+}
+
+#[test]
+fn a_damaged_refused_file_counts_as_none_and_is_written_over() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = id("r1");
+    store.create_run(&run, config(), tasks()).unwrap();
+    for _ in 0..3 {
+        refuse_one(&store, &run).unwrap();
+    }
+    assert_eq!(store.refusals(&run).unwrap().iteration(0).repeats, 3);
+    let path = dir.path().join("r1").join("refused");
+    let whole = fs::read(&path).unwrap();
+    fs::write(&path, &whole[..whole.len() / 2]).unwrap();
+
+    // The run still reads, with no refusals, and the next refusal is
+    // counted from none, over the damaged file.
+    let got = store.read_with_refusals(&run, |state, refusals| {
+        (state.iteration(), refusals.iteration(0))
+    });
+    assert_eq!(got.unwrap(), (0, RefusedCounts::default()));
+    refuse_one(&store, &run).unwrap();
+    assert_eq!(store.refusals(&run).unwrap().iteration(0).repeats, 1);
+    let again = Store::open(dir.path()).unwrap();
+    assert_eq!(again.refusals(&run).unwrap().iteration(0).repeats, 1);
+}
+
+#[test]
+fn a_refused_file_of_another_journal_counts_as_none_whatever_its_fields() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = id("r1");
+    store.create_run(&run, config(), tasks()).unwrap();
+    // A file another journal's run left, written by another version.
+    let path = dir.path().join("r1").join("refused");
+    let other = r#"{"journal":"0000000000000001","iterations":{"0":{"repeats":5,"foreign":2,"late":1}},"more":true}"#;
+    fs::write(&path, other).unwrap();
+
+    assert_eq!(store.refusals(&run).unwrap(), Refusals::default());
+    refuse_one(&store, &run).unwrap();
+    let counts = store.refusals(&run).unwrap().iteration(0);
+    assert_eq!((counts.repeats, counts.foreign), (1, 0));
+    let again = Store::open(dir.path()).unwrap();
+    assert_eq!(again.refusals(&run).unwrap().iteration(0), counts);
+}

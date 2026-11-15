@@ -26,8 +26,9 @@
 //! It is written whole to `refused.new`, synced, and renamed over
 //! `refused`, under the run's lock, so a crash leaves the old count or the
 //! new one. A count is on disk before the refusal is answered. A `refused`
-//! file with another journal's id counts as none. The journal does not
-//! depend on the file.
+//! file with another journal's id, or one that does not read, counts as none
+//! (the second is reported on standard error), and the next refusal writes
+//! over it. The journal does not depend on the file.
 //!
 //! # More than one server
 //!
@@ -1395,7 +1396,8 @@ fn journal_id(id: u64) -> String {
 
 /// The refusals in the `refused` file of the run in `dir_path`, whose
 /// journal has id `id`. None if there is no file or it is for another
-/// journal.
+/// journal. None too if it does not read, which is reported on standard
+/// error; the next refusal writes over it. Only a failed read is an error.
 fn read_refusals(dir_path: &Path, id: u64) -> Result<Refusals, StoreError> {
     let path = dir_path.join(REFUSED);
     let bytes = match fs::read(&path) {
@@ -1403,14 +1405,33 @@ fn read_refusals(dir_path: &Path, id: u64) -> Result<Refusals, StoreError> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Refusals::default()),
         Err(e) => return Err(io_at(&path)(e)),
     };
-    let refusals: Refusals = serde_json::from_slice(&bytes).map_err(|e| StoreError::Io {
-        path: path.clone(),
-        error: io::Error::new(io::ErrorKind::InvalidData, e),
-    })?;
-    if refusals.journal != journal_id(id) {
+    // The journal's id first, with any other fields, so that a file of
+    // another journal counts as none whatever else it holds.
+    #[derive(Deserialize)]
+    struct Owner {
+        journal: String,
+    }
+    let unreadable = |e: serde_json::Error| {
+        // Standard error may be closed; the counts start again from none,
+        // and the next refusal writes over the file.
+        let _ = writeln!(
+            io::stderr(),
+            "dc-mcp: {}: the refusal counts do not read ({e}); they count as none",
+            path.display()
+        );
+        Ok(Refusals::default())
+    };
+    let owner: Owner = match serde_json::from_slice(&bytes) {
+        Ok(owner) => owner,
+        Err(e) => return unreadable(e),
+    };
+    if owner.journal != journal_id(id) {
         return Ok(Refusals::default());
     }
-    Ok(refusals)
+    match serde_json::from_slice(&bytes) {
+        Ok(refusals) => Ok(refusals),
+        Err(e) => unreadable(e),
+    }
 }
 
 /// Adds one refusal of a submission of `kind` in `iteration` to the
