@@ -937,13 +937,98 @@ fn the_operator_can_check_what_a_stopped_proposer_left() {
         .unwrap();
     assert_eq!(
         report,
-        json!({ "run": "r1", "checked": 1, "pending_checks": 0 })
+        json!({ "run": "r1", "checked": 1, "pending_checks": 0, "claimed_elsewhere": [] })
     );
     let stats = operator
         .call("dc_proposal_stats", json!({ "run": "r1" }))
         .unwrap();
     assert_eq!(stats["iterations"][0]["quota_in"], true);
     assert_eq!(stats["iterations"][0]["tasks"][0]["passed"], 1);
+}
+
+/// A check whose claimant stopped is taken up when a proposer waits for it,
+/// though no submission comes in and no server starts.
+#[test]
+fn a_proposer_that_waits_for_an_abandoned_check_gets_it_done() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut operator = Client::start(dir.path());
+    operator
+        .call(
+            "dc_create_run",
+            json!({
+                "run": "r1", "seed": 5, "proposals_per_task": 1,
+                "tasks": ["collapse/merge"]
+            }),
+        )
+        .unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("r1").unwrap();
+    let sent = dc_mcp::proposer::next_batch(&store, &run, "a", 0, &Default::default())
+        .unwrap()
+        .batch
+        .unwrap();
+    dc_mcp::proposer::submit(
+        &store,
+        &run,
+        0,
+        "a",
+        &sent.token,
+        vec![solves_merge()],
+        None,
+        1,
+    )
+    .unwrap();
+    // Another checker claims the check, so the new server's first checks
+    // leave it alone.
+    let claim = store.try_claim_check(&run, 0).unwrap().unwrap();
+    let mut proposer = Client::start_proposer(dir.path(), "r1");
+    let wait = proposer
+        .call("dc_next_batch", json!({ "worker": "b" }))
+        .unwrap();
+    assert!(
+        wait["wait"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("being checked"),
+        "{wait}"
+    );
+    // Time for the server's checks so far to finish.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let pending = |operator: &mut Client| {
+        operator
+            .call("dc_proposal_stats", json!({ "run": "r1" }))
+            .unwrap()["iterations"][0]["pending_checks"]
+            .clone()
+    };
+    assert_eq!(pending(&mut operator), 1);
+    // The operator sees which batch another checker holds.
+    let report = operator
+        .call("dc_check_pending", json!({ "run": "r1" }))
+        .unwrap();
+    assert_eq!(
+        report,
+        json!({ "run": "r1", "checked": 0, "pending_checks": 1, "claimed_elsewhere": [0] })
+    );
+
+    // The claimant stops without checking.
+    drop(claim);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        proposer
+            .call("dc_next_batch", json!({ "worker": "b" }))
+            .unwrap();
+        if pending(&mut operator) == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the abandoned check was not taken up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(checks(dir.path(), "r1").len(), 1);
+    proposer.kill();
+    operator.kill();
 }
 
 #[test]

@@ -44,7 +44,7 @@ use crate::prompt::{payload, Payload};
 use crate::state::{
     BatchIssued, Check, Checked, Event, LibraryEntry, RunId, RunState, Standing, Submitted,
 };
-use crate::store::{Store, StoreError};
+use crate::store::{CheckClaim, Store, StoreError};
 use crate::verify::{task, Verifier, VerifierCache};
 
 /// The longest worker id or model name, in bytes.
@@ -378,9 +378,11 @@ struct Pending {
     library: Library,
 }
 
-fn first_pending(state: &RunState, verifiers: &VerifierCache) -> Option<Pending> {
-    let batch = state.first_pending_check()?;
+/// The submission of `batch` if it waits to be checked, and the library to
+/// check it with.
+fn pending(state: &RunState, batch: u64, verifiers: &VerifierCache) -> Option<Pending> {
     let b = state.batch(batch)?;
+    let programs = b.awaiting_check.clone()?;
     // The library is copied only when the cache has no verifier for it.
     let library = match verifiers.get(state.library()) {
         Some(kept) => Library::Kept(kept),
@@ -390,10 +392,28 @@ fn first_pending(state: &RunState, verifiers: &VerifierCache) -> Option<Pending>
         batch,
         task: b.task.clone(),
         wanted: b.wanted as usize,
-        programs: b.awaiting_check.clone().unwrap_or_default(),
+        programs,
         library_len: state.library().len(),
         library,
     })
+}
+
+/// Whether `batch`'s submission was checked: it came in and waits no more.
+/// Such a batch is never checked again.
+fn settled(state: &RunState, batch: u64) -> bool {
+    state
+        .batch(batch)
+        .is_some_and(|b| b.submitted && b.awaiting_check.is_none())
+}
+
+/// A claim on the first of `batches` that no other checker holds.
+fn claim_first(store: &Store, run: &RunId, batches: &[u64]) -> Result<Option<CheckClaim>, Refused> {
+    for &batch in batches {
+        if let Some(claim) = store.try_claim_check(run, batch)? {
+            return Ok(Some(claim));
+        }
+    }
+    Ok(None)
 }
 
 /// Checks `programs` for a batch of `task` that asked for `wanted`, with a
@@ -420,51 +440,129 @@ fn checks(
         .collect())
 }
 
+/// What [`check_pending`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Checks {
+    /// How many submissions it checked.
+    pub checked: usize,
+    /// The batches whose submissions still waited at the end, each claimed
+    /// by another checker, in order.
+    pub claimed_elsewhere: Vec<u64>,
+}
+
 /// Checks every submission of `run` that waits to be checked, oldest first,
-/// and commits a [`Checked`] event for each. Returns how many it checked.
-/// The checks use the verifier `verifiers` keeps for the run's library; if
-/// it keeps none, one is built and kept.
+/// and commits a [`Checked`] event for each. The checks use the verifier
+/// `verifiers` keeps for the run's library; if it keeps none, one is built
+/// and kept.
+///
+/// Each check is claimed first (see [`Store::try_claim_check`]), so several
+/// servers check different submissions and each submission once. A
+/// submission another checker holds is left to it, and this call goes on to
+/// the next; so it can return while submissions still wait. The claim files
+/// of submissions that were checked are removed.
 ///
 /// Checking runs the programs, so it runs without the run's lock, and so
 /// does a build of the verifier. If the library changed in the meantime, the
 /// commit is refused and the submission is checked again. If another server
-/// checked it first, nothing is written. An error leaves the rest waiting: a
-/// library that does not load stops every check until it is put right.
+/// checked it first, or the run was removed and made again, nothing is
+/// written. An error leaves the rest waiting: a library that does not load
+/// stops every check until it is put right.
 pub fn check_pending(
     store: &Store,
     run: &RunId,
     verifiers: &VerifierCache,
-) -> Result<usize, Refused> {
+) -> Result<Checks, Refused> {
+    check_pending_with(store, run, verifiers, &mut |verifier, p| {
+        checks(verifier, &p.task, p.wanted, &p.programs)
+    })
+}
+
+/// How [`check_pending_with`] checks a pending submission's programs.
+type CheckWith<'a> = dyn FnMut(&Verifier, &Pending) -> Result<Vec<Check>, Refused> + 'a;
+
+/// [`check_pending`], with the programs of each pending submission checked
+/// by `check`. Tests use it to see and slow the checks.
+fn check_pending_with(
+    store: &Store,
+    run: &RunId,
+    verifiers: &VerifierCache,
+    check: &mut CheckWith<'_>,
+) -> Result<Checks, Refused> {
+    // Claim files left by checkers that stopped, listed before the run is
+    // read, so that a batch read as settled was settled when it was listed.
+    let left = store.check_claims(run)?;
+    let mut sweep = true;
     let mut done = 0;
-    while let Some(p) = store.read(run, |state| first_pending(state, verifiers))? {
-        let verifier = match p.library {
-            Library::Kept(kept) => kept,
+    let claimed_elsewhere: Vec<u64> = loop {
+        let (waiting, stale) = store.read(run, |state| {
+            let stale: Vec<u64> = if sweep {
+                left.iter()
+                    .copied()
+                    .filter(|&b| settled(state, b))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (state.pending_checks(), stale)
+        })?;
+        if sweep {
+            store.remove_settled_claims(run, &stale)?;
+            sweep = false;
+        }
+        // Batches another checker holds are left to it.
+        let Some(claim) = claim_first(store, run, &waiting)? else {
+            break waiting;
+        };
+        // Another checker may have checked it since the run was read.
+        let (p, journal) =
+            store.read_journal(run, |state| pending(state, claim.batch(), verifiers))?;
+        let Some(p) = p else {
+            claim.release();
+            continue;
+        };
+        let verifier = match &p.library {
+            Library::Kept(kept) => Arc::clone(kept),
             Library::Copied(library) => verifiers
-                .get_or_build(&library)
+                .get_or_build(library)
                 .map_err(|e| Refused::State(e.to_string()))?,
         };
-        let checks = checks(&verifier, &p.task, p.wanted, &p.programs)?;
+        let checks = check(&verifier, &p)?;
         let event = Event::Checked(Checked {
             batch: p.batch,
             library_len: p.library_len as u64,
             checks,
         });
-        let wrote: bool = store.commit(run, |state| -> Result<_, Refused> {
-            let still = state.awaits_check(p.batch) && state.library().len() == p.library_len;
+        // Written only to the journal the programs were read from: if the
+        // run was removed and made again, its batch with this number is
+        // another batch. And only if the batch still waits with the programs
+        // that were checked.
+        let wrote: Option<bool> = store.commit_to(run, journal, |state| -> Result<_, Refused> {
+            let same = state
+                .batch(p.batch)
+                .and_then(|b| b.awaiting_check.as_ref())
+                .is_some_and(|programs| *programs == p.programs);
+            let still = same && state.library().len() == p.library_len;
             Ok(if still {
                 (true, vec![event])
             } else {
                 (false, Vec::new())
             })
         })?;
-        done += usize::from(wrote);
-    }
-    Ok(done)
+        // A refused commit leaves the batch waiting; it is claimed again.
+        claim.release();
+        done += usize::from(wrote == Some(true));
+    };
+    Ok(Checks {
+        checked: done,
+        claimed_elsewhere,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::ops::ControlFlow;
+
+    use std::time::Duration;
 
     use super::*;
     use crate::state::{Arm, RunConfig};
@@ -487,8 +585,11 @@ mod tests {
         VERIFIERS.with(|v| super::next_batch(store, run, worker, now_ms, v))
     }
 
+    /// How many submissions [`super::check_pending`] checked.
     fn check_pending(store: &Store, run: &RunId) -> Result<usize, Refused> {
-        VERIFIERS.with(|v| super::check_pending(store, run, v))
+        VERIFIERS
+            .with(|v| super::check_pending(store, run, v))
+            .map(|c| c.checked)
     }
 
     fn setup(quota: u32, per_batch: u32) -> (TempDir, Store, RunId) {
@@ -891,6 +992,235 @@ mod tests {
                 }],
             )
             .unwrap();
+    }
+
+    /// Two checkers of one run, as two proposer servers have, with their own
+    /// verifiers. While one checks the oldest pending submission, the other
+    /// checks the next one, without waiting, and each is checked once.
+    #[test]
+    fn a_submission_another_checker_is_checking_is_left_to_it() {
+        use std::sync::mpsc;
+        use std::sync::Mutex;
+
+        let (_dir, store, run) = setup(1, 1);
+        next_batch(&store, &run, "a", 0).unwrap();
+        next_batch(&store, &run, "b", 0).unwrap();
+        sub(&store, &run, 0, "a", vec![solves_merge()], None, 1).unwrap();
+        sub(
+            &store,
+            &run,
+            1,
+            "b",
+            vec!["let solve xs = xs".into()],
+            None,
+            1,
+        )
+        .unwrap();
+
+        // Each check, as (checker, batch).
+        let seen: Mutex<Vec<(char, u64)>> = Mutex::new(Vec::new());
+        let (entered, on_entry) = mpsc::channel::<()>();
+        let (release, on_release) = mpsc::channel::<()>();
+        let (store, run, seen) = (&store, &run, &seen);
+        let first = std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                let verifiers = VerifierCache::default();
+                let mut released = true;
+                let done = check_pending_with(store, run, &verifiers, &mut |v, p| {
+                    seen.lock().unwrap().push(('A', p.batch));
+                    if p.batch == 0 {
+                        entered.send(()).unwrap();
+                        // A slow check, until the other checker is done.
+                        released = on_release.recv_timeout(Duration::from_secs(60)).is_ok();
+                    }
+                    checks(v, &p.task, p.wanted, &p.programs)
+                })
+                .unwrap();
+                (done.checked, released)
+            });
+            on_entry.recv_timeout(Duration::from_secs(60)).unwrap();
+            let verifiers = VerifierCache::default();
+            let second = check_pending_with(store, run, &verifiers, &mut |v, p| {
+                seen.lock().unwrap().push(('B', p.batch));
+                checks(v, &p.task, p.wanted, &p.programs)
+            })
+            .unwrap();
+            let by_second: Vec<u64> = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(who, _)| *who == 'B')
+                .map(|&(_, batch)| batch)
+                .collect();
+            // Released before asserting, so a failure does not hang the test.
+            release.send(()).unwrap();
+            assert_eq!(by_second, [1], "the second checker checks only batch 1");
+            assert_eq!(
+                second,
+                Checks {
+                    checked: 1,
+                    claimed_elsewhere: vec![0]
+                }
+            );
+            first.join().unwrap()
+        });
+        assert_eq!(first, (1, true), "the first checker checks batch 0 only");
+        let mut batches: Vec<u64> = seen.lock().unwrap().iter().map(|&(_, b)| b).collect();
+        batches.sort_unstable();
+        assert_eq!(batches, [0, 1], "each submission is checked once");
+        assert!(store.state(run).unwrap().pending_checks().is_empty());
+        let mut written: Vec<u64> = checked(store, run).iter().map(|c| c.batch).collect();
+        written.sort_unstable();
+        assert_eq!(written, [0, 1]);
+    }
+
+    #[test]
+    fn a_claim_is_held_by_one_checker_and_its_file_goes_with_its_release() {
+        let (_dir, store, run) = setup(1, 1);
+        let held = store.try_claim_check(&run, 0).unwrap().unwrap();
+        assert!(store.try_claim_check(&run, 0).unwrap().is_none());
+        assert!(store.try_claim_check(&run, 1).unwrap().is_some());
+        assert_eq!(store.check_claims(&run).unwrap(), [0, 1]);
+        held.release();
+        assert_eq!(store.check_claims(&run).unwrap(), [1]);
+        // A claim that is dropped, as by a holder that stopped, can be taken.
+        drop(store.try_claim_check(&run, 1).unwrap().unwrap());
+        assert!(store.try_claim_check(&run, 1).unwrap().is_some());
+    }
+
+    /// The config of `setup(1, 1)`, for a run made again.
+    fn config() -> RunConfig {
+        RunConfig {
+            arm: Arm::Blind,
+            seed: 3,
+            proposals_per_task: 1,
+            programs_per_batch: 1,
+            lease_ms: 1000,
+        }
+    }
+
+    /// While checkers each with a store of their own take and release one
+    /// claim, never two hold it at once.
+    #[test]
+    fn a_claim_is_held_by_one_checker_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (dir, _store, run) = setup(1, 1);
+        let inside = AtomicUsize::new(0);
+        let both = AtomicUsize::new(0);
+        let taken = AtomicUsize::new(0);
+        // Until 2000 claims are taken, or for a second at most.
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let (inside, both, taken, run) = (&inside, &both, &taken, &run);
+                let root = dir.path().to_path_buf();
+                scope.spawn(move || {
+                    let store = Store::open(&root).unwrap();
+                    while taken.load(SeqCst) < 2000 && std::time::Instant::now() < until {
+                        if let Some(claim) = store.try_claim_check(run, 0).unwrap() {
+                            taken.fetch_add(1, SeqCst);
+                            if inside.fetch_add(1, SeqCst) != 0 {
+                                both.fetch_add(1, SeqCst);
+                            }
+                            std::thread::sleep(Duration::from_micros(200));
+                            inside.fetch_sub(1, SeqCst);
+                            claim.release();
+                        }
+                    }
+                });
+            }
+        });
+        let taken = taken.into_inner();
+        assert!(taken > 100, "{taken} claims taken");
+        assert_eq!(both.into_inner(), 0, "two checkers held one claim");
+    }
+
+    /// A claimant of a removed run does not remove the claim file of the run
+    /// made in its place, which another checker holds.
+    #[test]
+    fn a_claim_of_a_removed_run_leaves_its_successor_s_claim_alone() {
+        let (dir, store, run) = setup(1, 1);
+        let old = store.try_claim_check(&run, 0).unwrap().unwrap();
+        std::fs::remove_dir_all(dir.path().join("r")).unwrap();
+        store
+            .create_run(&run, config(), vec![MERGE.into(), CANCEL.into()])
+            .unwrap();
+        let held = store.try_claim_check(&run, 0).unwrap().unwrap();
+        assert!(store.try_claim_check(&run, 0).unwrap().is_none());
+        old.release();
+        assert!(
+            store.try_claim_check(&run, 0).unwrap().is_none(),
+            "a third checker claimed batch 0 while another holds it"
+        );
+        assert_eq!(store.check_claims(&run).unwrap(), [0]);
+        held.release();
+    }
+
+    /// A checker of a run that is removed and made again while it checks
+    /// writes nothing to the new run.
+    #[test]
+    fn checks_of_a_removed_run_do_not_land_in_its_successor() {
+        use std::sync::mpsc;
+        let (dir, store, run) = setup(1, 1);
+        next_batch(&store, &run, "a", 0).unwrap();
+        assert_eq!(store.state(&run).unwrap().batches()[0].task, MERGE);
+        sub(&store, &run, 0, "a", vec![solves_merge()], None, 1).unwrap();
+        let (entered, on_entry) = mpsc::channel::<()>();
+        let (release, on_release) = mpsc::channel::<()>();
+        let root = dir.path().to_path_buf();
+        let (store, run) = (&store, &run);
+        let first = std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                let store = Store::open(&root).unwrap();
+                let verifiers = VerifierCache::default();
+                let mut slow = true;
+                check_pending_with(&store, run, &verifiers, &mut |v, p| {
+                    let checks = checks(v, &p.task, p.wanted, &p.programs);
+                    // The first check, of the old run's program, is slow.
+                    if std::mem::take(&mut slow) {
+                        entered.send(()).unwrap();
+                        on_release.recv_timeout(Duration::from_secs(60)).unwrap();
+                    }
+                    checks
+                })
+            });
+            on_entry.recv_timeout(Duration::from_secs(60)).unwrap();
+            std::fs::remove_dir_all(dir.path().join("r")).unwrap();
+            store
+                .create_run(run, config(), vec![MERGE.into(), CANCEL.into()])
+                .unwrap();
+            next_batch(store, run, "z", 0).unwrap();
+            sub(store, run, 0, "z", vec!["let solve = 0".into()], None, 1).unwrap();
+            release.send(()).unwrap();
+            first.join().unwrap()
+        });
+        // The checker went on to check the new run's own submission.
+        assert_eq!(first.unwrap().checked, 1);
+        let state = store.state(run).unwrap();
+        assert!(state.pending_checks().is_empty());
+        assert_eq!(checked(store, run).len(), 1);
+        assert!(
+            state.verified().is_empty(),
+            "the old run's checks were written to the new run"
+        );
+        assert_eq!(state.task_counts(0, MERGE).passed, 0);
+    }
+
+    #[test]
+    fn a_claim_file_left_for_a_checked_submission_is_removed() {
+        let (_dir, store, run) = setup(1, 1);
+        next_batch(&store, &run, "a", 0).unwrap();
+        next_batch(&store, &run, "b", 0).unwrap();
+        sub(&store, &run, 0, "a", vec![solves_merge()], None, 1).unwrap();
+        assert_eq!(check_pending(&store, &run).unwrap(), 1);
+        assert!(store.check_claims(&run).unwrap().is_empty());
+        // A holder stopped after its commit and before it removed the file.
+        drop(store.try_claim_check(&run, 0).unwrap().unwrap());
+        // Batch 1 has no submission: its file is not removed.
+        drop(store.try_claim_check(&run, 1).unwrap().unwrap());
+        assert_eq!(store.check_claims(&run).unwrap(), [0, 1]);
+        assert_eq!(check_pending(&store, &run).unwrap(), 0);
+        assert_eq!(store.check_claims(&run).unwrap(), [1]);
     }
 
     #[test]

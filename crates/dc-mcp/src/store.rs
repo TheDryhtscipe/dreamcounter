@@ -46,8 +46,10 @@
 //! treat it as lost commits.
 //!
 //! If that commit fails, the store puts the tail back, and the next commit
-//! starts again. It uses the file it already made. The store deletes one thing
-//! only: a `torn-*` file that it could not finish writing.
+//! starts again. It uses the file it already made. Of the run's records, the
+//! store deletes one thing only: a `torn-*` file that it could not finish
+//! writing. (It also removes claim files, which hold nothing: see "Claims on
+//! checks".)
 //!
 //! A `torn-*` file can be there with no log record. Treat the file as the same
 //! sign. The commit that made the file did not finish:
@@ -60,6 +62,37 @@
 //! * the commit failed with [`StoreError::OutcomeUnknown`].
 //!
 //! In the last three cases no later commit reports the tail.
+//!
+//! # Claims on checks
+//!
+//! Several servers check a run's pending submissions (see
+//! [`crate::proposer::check_pending`]). So that each submission is checked by
+//! one of them, a checker first claims the submission's batch with
+//! [`Store::try_claim_check`]: an exclusive, non-blocking `flock` on the file
+//! `checks/<batch>.lock` in the run's directory. A checker that cannot take a
+//! claim leaves the batch to its holder. The claim is held while the programs
+//! run, without the run's lock.
+//!
+//! The operating system releases a claim when its holder's file is closed,
+//! also when the holder is killed, so a claim cannot outlive its process. A
+//! holder that is done removes the file before it releases the lock
+//! ([`CheckClaim::release`]), if the file at the path is still the one it
+//! locked: after the run was removed and made again, the path can name a
+//! file another checker holds. A claim is only taken on the file that is at
+//! the path once the lock is held, so a checker that opened the removed file
+//! takes no claim on it. A file left by a holder that stopped is taken by the
+//! next checker of its batch, or removed by [`Store::remove_settled_claims`]
+//! once the batch is checked. The files hold nothing, and the journal does
+//! not depend on them.
+//!
+//! Claims need a local file system, as the run's lock does. On NFS, Linux
+//! emulates `flock` with POSIX locks, which belong to a process, so two
+//! checkers in one process would both get a claim.
+//!
+//! A claim does not tie a check to the run: a checker that reads a pending
+//! submission with [`Store::read_journal`] commits its checks with
+//! [`Store::commit_to`], which writes nothing if the run was removed and made
+//! again in the meantime.
 //!
 //! # A journal that is replaced
 //!
@@ -87,6 +120,10 @@ use crate::state::{LogKind, Rejected};
 
 const JOURNAL: &str = "journal";
 const JOURNAL_NEW: &str = "journal.new";
+/// The directory of the claims on checks, in a run's directory.
+const CHECKS: &str = "checks";
+/// How many times a claim is tried when its file is removed meanwhile.
+const CLAIM_TRIES: usize = 8;
 
 /// How much of a journal a scan reads from the file at a time.
 const READ_BUFFER: usize = 1 << 16;
@@ -292,6 +329,42 @@ struct Locked {
     dir: File,
 }
 
+/// A claim on checking one batch's submission. See the module docs.
+/// Dropping it releases the claim and leaves its file, for the next checker.
+#[derive(Debug)]
+pub struct CheckClaim {
+    /// The open claim file. The lock is on it.
+    file: File,
+    path: PathBuf,
+    batch: u64,
+}
+
+impl CheckClaim {
+    /// The batch it claims.
+    pub fn batch(&self) -> u64 {
+        self.batch
+    }
+
+    /// Removes the claim's file, then releases the claim. Call it when the
+    /// batch needs no more checking. A file that cannot be removed is left
+    /// for [`Store::remove_settled_claims`].
+    pub fn release(self) {
+        // Removed while the lock is held: see `Store::try_claim_check`. Only
+        // the file this claim locked is removed. If the run's directory was
+        // removed and made again, the path can name a file of the new run
+        // that another checker holds.
+        if still_at(&self.file, &self.path).ok() == Some(Some(true)) {
+            let _ = fs::remove_file(&self.path);
+        }
+        drop(self.file);
+    }
+}
+
+/// One journal of a run. A run that is removed and made again has a journal
+/// with another id. See [`Store::read_journal`] and [`Store::commit_to`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalId(u64);
+
 /// A directory of runs. See the module docs.
 #[derive(Debug)]
 pub struct Store {
@@ -387,6 +460,91 @@ impl Store {
         Ok(state)
     }
 
+    /// The file of the claim on checking `batch` of `run`.
+    fn claim_path(&self, run: &RunId, batch: u64) -> PathBuf {
+        self.root
+            .join(run.as_str())
+            .join(CHECKS)
+            .join(format!("{batch}.lock"))
+    }
+
+    /// Claims the check of `batch`'s submission in `run` for the caller,
+    /// without waiting. `None` if another checker holds the claim. See the
+    /// module docs.
+    pub fn try_claim_check(
+        &self,
+        run: &RunId,
+        batch: u64,
+    ) -> Result<Option<CheckClaim>, StoreError> {
+        let path = self.claim_path(run, batch);
+        let checks = path.parent().unwrap_or(&self.root);
+        // Not `create_dir_all`: a run's directory that is gone is not made.
+        match fs::create_dir(checks) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(StoreError::NoSuchRun(run.clone()))
+            }
+            Err(e) => return Err(io_at(checks)(e)),
+        }
+        for _ in 0..CLAIM_TRIES {
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(io_at(&path))?;
+            match file.try_lock() {
+                Ok(()) => {}
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Error(e)) => return Err(io_at(&path)(e)),
+            }
+            // The holder before may have removed the file after this call
+            // opened it. Then the lock is on a file no other checker sees.
+            if still_at(&file, &path).map_err(io_at(&path))? == Some(true) {
+                return Ok(Some(CheckClaim { file, path, batch }));
+            }
+        }
+        // Each try found its file removed by a holder that was done.
+        Ok(None)
+    }
+
+    /// The batches of `run` that have a claim file, held or not, in order.
+    pub fn check_claims(&self, run: &RunId) -> Result<Vec<u64>, StoreError> {
+        let dir = self.root.join(run.as_str()).join(CHECKS);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_at(&dir)(e)),
+        };
+        let mut batches = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(io_at(&dir))?;
+            let name = entry.file_name();
+            let batch = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".lock"))
+                .and_then(|n| n.parse::<u64>().ok());
+            batches.extend(batch);
+        }
+        batches.sort_unstable();
+        Ok(batches)
+    }
+
+    /// Removes the claim files of `batches` of `run` that no checker holds.
+    /// Call it only for batches listed by [`Store::check_claims`] whose
+    /// submission was checked when the run was read after that. A file is
+    /// only made for a batch whose submission waits to be checked, and a
+    /// batch's submission is checked once, so no checker wants these claims.
+    pub fn remove_settled_claims(&self, run: &RunId, batches: &[u64]) -> Result<(), StoreError> {
+        for &batch in batches {
+            if let Some(claim) = self.try_claim_check(run, batch)? {
+                claim.release();
+            }
+        }
+        Ok(())
+    }
+
     /// The ids of the store's runs, in order.
     pub fn runs(&self) -> Result<Vec<RunId>, StoreError> {
         let mut runs = Vec::new();
@@ -416,11 +574,21 @@ impl Store {
     where
         F: FnOnce(&RunState) -> T,
     {
+        self.read_journal(run, read).map(|(result, _)| result)
+    }
+
+    /// As [`Store::read`], and the journal that was read. Pass it to
+    /// [`Store::commit_to`] to write only to that journal.
+    pub fn read_journal<T, F>(&self, run: &RunId, read: F) -> Result<(T, JournalId), StoreError>
+    where
+        F: FnOnce(&RunState) -> T,
+    {
         let mut locked = self.lock_run(run)?;
         let (cached, _) = self.catch_up(run, &mut locked)?;
         let result = read(&cached.state);
+        let journal = JournalId(cached.id);
         self.put(run, cached);
-        Ok(result)
+        Ok((result, journal))
     }
 
     /// A copy of the run's state now.
@@ -454,9 +622,45 @@ impl Store {
         G: FnOnce(T, &RunState) -> U,
         E: From<StoreError>,
     {
+        self.commit_in(run, |state, _| change(state), then)
+    }
+
+    /// As [`Store::commit`], if the run's journal is still `journal`.
+    /// Otherwise the run was removed and made again since `journal` was read:
+    /// `change` is not called, nothing is written, and the result is `None`.
+    pub fn commit_to<T, E, F>(
+        &self,
+        run: &RunId,
+        journal: JournalId,
+        change: F,
+    ) -> Result<Option<T>, E>
+    where
+        F: FnOnce(&RunState) -> Result<(T, Vec<Event>), E>,
+        E: From<StoreError>,
+    {
+        self.commit_in(
+            run,
+            |state, now| {
+                if now == journal {
+                    change(state).map(|(value, events)| (Some(value), events))
+                } else {
+                    Ok((None, Vec::new()))
+                }
+            },
+            |value, _| value,
+        )
+    }
+
+    /// [`Store::commit_then`], with `change` told which journal it sees.
+    fn commit_in<T, U, E, F, G>(&self, run: &RunId, change: F, then: G) -> Result<U, E>
+    where
+        F: FnOnce(&RunState, JournalId) -> Result<(T, Vec<Event>), E>,
+        G: FnOnce(T, &RunState) -> U,
+        E: From<StoreError>,
+    {
         let mut locked = self.lock_run(run)?;
         let (mut cached, torn_len) = self.catch_up(run, &mut locked)?;
-        let (value, mut events) = match change(&cached.state) {
+        let (value, mut events) = match change(&cached.state, JournalId(cached.id)) {
             Ok(changed) => changed,
             Err(error) => {
                 self.put(run, cached);
