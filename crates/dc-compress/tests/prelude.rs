@@ -236,17 +236,24 @@ fn a_prelude_name_that_looks_like_an_abstraction_is_refused() {
             matches!(e, CompressError::Names(NameError::Illegal { .. })),
             "{src}: {e:?}"
         );
-        let mut a = Arena::new();
-        let t = compile(&prelude, &mut a, "fun x -> x");
-        let step = StitchStep {
-            name: "fn_0".to_owned(),
-            arity: 0,
-            body: "1".to_owned(),
-            rewritten: vec!["(lam $0)".to_owned()],
-        };
-        let e = accept_steps_with(&mut a, Some(&prelude), &[], &[t], &[step], 2).unwrap_err();
-        assert!(matches!(e, CompressError::Names(_)), "{src}: {e:?}");
     }
+}
+
+#[test]
+fn a_step_named_like_a_prelude_function_is_an_error_not_a_panic() {
+    // Without the prefix check, naming the step's abstraction would find the
+    // name taken by the prelude function and panic.
+    let prelude = Prelude::from_source("p", "let fn_0 x = x + 1").unwrap();
+    let mut a = Arena::new();
+    let t = compile(&prelude, &mut a, "fun x -> x");
+    let step = StitchStep {
+        name: "fn_0".to_owned(),
+        arity: 0,
+        body: "1".to_owned(),
+        rewritten: vec!["(lam $0)".to_owned()],
+    };
+    let e = accept_steps_with(&mut a, Some(&prelude), &[], &[t], &[step], 2).unwrap_err();
+    assert!(matches!(e, CompressError::Names(_)), "{e:?}");
 }
 
 #[test]

@@ -463,7 +463,8 @@ fn expr_cost(e: &Expr) -> u64 {
 /// the bridge gives them to Stitch ([`dc_compress::library_names`]).
 fn names(len: usize, prelude: Option<&Prelude>) -> Result<LibNames, DriverError> {
     let len = u32::try_from(len).map_err(|_| DriverError::LibraryTooLarge)?;
-    // The learned names cannot fail, so an error is about a prelude name.
+    // The learned names fail only for a library that reaches PRELUDE_LIB_BASE
+    // entries, so an error is about a prelude name.
     library_names(len, prelude).map_err(|err| DriverError::PreludeName(err.to_string()))
 }
 
