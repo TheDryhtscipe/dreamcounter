@@ -10,7 +10,10 @@
 //! functions after the word "except", and so on. A rewrite that changes the
 //! shape makes an extractor below fail with a message that names it; then
 //! change the extractor, not the claim. The few code spans in backticks that
-//! are not expressions are in [`OTHER_SPANS`], each with its own check.
+//! are not expressions are in [`OTHER_SPANS`], each with its own check. The
+//! types the placeholder names stand for (`n` an Int, `f` a function) are in
+//! [`PLACEHOLDERS`], and the number of expression forms is
+//! [`EXPRESSION_FORMS`].
 //!
 //! Programs are compiled as the verifier compiles them: with the prelude on,
 //! through [`TopLevel::add_source`] and [`TopLevel::close_definition`], and
@@ -18,7 +21,7 @@
 
 use super::*;
 use dc_core::types::infer;
-use dc_core::{Scheme, TermId};
+use dc_core::{Scheme, TermId, Type};
 use dc_surface::prelude::{Prelude, PreludeMode};
 
 /// The name of the definition each snippet is compiled as.
@@ -28,6 +31,27 @@ const PROBE: &str = "guide_probe";
 const KEYWORDS: &[&str] = &[
     "let", "rec", "in", "fun", "if", "then", "else", "match", "with", "true", "false", "mod",
 ];
+
+/// Whether a type is of the kind a placeholder stands for.
+type IsType = fn(&Type) -> bool;
+
+/// What the guide's placeholder names stand for, where the name says so:
+/// `n` is a count, `f` a function, `xs` a list, and so on. A placeholder that
+/// is free in a snippet (not bound by it) must have this type there, so a
+/// form written with its arguments in the wrong order, such as `loop n f z`,
+/// fails. Other placeholders, such as `z` or `e1`, may have any type.
+const PLACEHOLDERS: &[(&str, &str, IsType)] = &[
+    ("n", "Int", |t| *t == Type::Int),
+    ("f", "a function", |t| matches!(t, Type::Arrow(..))),
+    ("xs", "a list", |t| matches!(t, Type::List(_))),
+    ("o", "an option", |t| matches!(t, Type::Option(_))),
+    ("t", "a tree", |t| matches!(t, Type::Tree(_))),
+];
+
+/// How many code forms the `Expressions:` block shows. If the guide changes,
+/// change this to match; it is here so that two forms run together into one
+/// column are noticed.
+const EXPRESSION_FORMS: usize = 13;
 
 /// A check of one code span that is not an expression.
 type SpanCheck = fn(&Probe);
@@ -122,10 +146,39 @@ impl Probe {
         self.infer_program(&format!("let {PROBE} = {text}\n"))
     }
 
-    /// The type of `snippet` with each of its holes a parameter.
+    /// The type of `snippet` with each of its free holes a parameter. A free
+    /// hole whose name is in [`PLACEHOLDERS`] must have the type given there.
     fn infer_open(&self, snippet: &str) -> Result<Scheme, String> {
-        let params = self.holes(snippet).join(" ");
-        self.infer_program(&format!("let {PROBE} {params} = {snippet}\n"))
+        let holes = self.holes(snippet);
+        let with = |params: &[&String]| {
+            let params: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
+            format!("let {PROBE} {} = {snippet}\n", params.join(" "))
+        };
+        // A hole is free if the snippet does not compile without it as a
+        // parameter; otherwise the snippet binds it, as `x` in `fun x -> e`.
+        let free: Vec<&String> = holes
+            .iter()
+            .filter(|h| {
+                let others: Vec<&String> = holes.iter().filter(|o| o != h).collect();
+                self.compile_program(&with(&others), PROBE).is_err()
+            })
+            .collect();
+        let scheme = self.infer_program(&with(&free))?;
+        let mut ty = scheme.ty();
+        for hole in free {
+            let Type::Arrow(param, rest) = ty else {
+                return Err(format!("`{snippet}` has fewer parameters than holes"));
+            };
+            if let Some((_, what, ok)) = PLACEHOLDERS.iter().find(|(n, _, _)| n == hole) {
+                if !ok(param) {
+                    return Err(format!(
+                        "in `{snippet}`, `{hole}` should be {what} but has type {param}"
+                    ));
+                }
+            }
+            ty = rest;
+        }
+        Ok(scheme)
     }
 }
 
@@ -188,7 +241,13 @@ fn expression_forms() -> Vec<&'static str> {
         .flat_map(columns)
         .filter(|c| !is_operator_column(c))
         .collect();
-    assert!(forms.len() >= 10, "too few expression forms: {forms:?}");
+    assert_eq!(
+        forms.len(),
+        EXPRESSION_FORMS,
+        "the Expressions block shows {} forms, not {EXPRESSION_FORMS}: if the guide \
+         changed, change EXPRESSION_FORMS; else two columns ran together: {forms:?}",
+        forms.len()
+    );
     forms
 }
 
@@ -318,9 +377,9 @@ fn the_operators_the_guide_passes_as_functions_can_be_and_the_excluded_cannot() 
         let result = p.infer_closed(&as_function);
         if excluded.contains(&op) {
             assert!(
-                result.is_err(),
+                matches!(&result, Err(e) if e.contains("is not available as a function")),
                 "the guide says `{as_function}` cannot be passed as a function, \
-                 but it compiles: {result:?}"
+                 but it gives: {result:?}"
             );
             continue;
         }
@@ -354,7 +413,10 @@ fn the_recursion_combinators_are_primitives_with_the_arguments_shown() {
     let mut said: Vec<&str> = spans(sentence_from("recursion goes only through"));
     said.sort_unstable();
     names.sort_unstable();
-    assert_eq!(said, names);
+    assert_eq!(
+        said, names,
+        "the combinators the guide names differ from the Recursion block's"
+    );
 }
 
 /// "A `Key` type is Int, Bool, Unit, or a tuple of those."
@@ -398,7 +460,10 @@ fn the_types_the_guide_names_are_the_type_checkers() {
         .skip(1) // "Types"
         .filter(|w| w.starts_with(|c: char| c.is_ascii_uppercase()))
         .collect();
-    assert!(named.len() >= 7, "{named:?}");
+    assert!(
+        named.len() >= 7,
+        "too few type names in the guide: {named:?}"
+    );
     for name in named {
         assert!(shown.contains(&name), "no primitive's type has {name}");
     }
@@ -427,10 +492,8 @@ fn every_code_span_in_the_guide_is_checked() {
 #[test]
 fn the_operator_names_in_primitives_are_primitives() {
     let text = primitives();
-    let from = text
-        .find("The operators are ")
-        .expect("the operator sentence")
-        + 18;
+    const START: &str = "The operators are ";
+    let from = text.find(START).expect("the operator sentence") + START.len();
     let list = &text[from..from + text[from..].find(".\n").expect("its full stop")];
     let p = Probe::new();
     let mut named: Vec<&str> = Vec::new();
@@ -468,4 +531,23 @@ fn the_operator_names_in_primitives_are_primitives() {
             "primitives() names `{op}`, which the guide does not show"
         );
     }
+}
+
+#[test]
+fn every_primitive_can_be_used_by_its_name() {
+    // primitives(): "Each can be used by its name."
+    assert!(primitives().contains("Each can be used by its name."));
+    let p = Probe::new();
+    let failing: Vec<String> = Prim::ALL
+        .iter()
+        // Left out: `mod` is a reserved word, so the primitive `mod` cannot
+        // be used by its name, only as `( mod )`. The claim is false for it
+        // today; the prompt text is left as it is here.
+        .filter(|prim| prim.name() != "mod")
+        .filter_map(|prim| {
+            let e = p.infer_closed(prim.name()).err()?;
+            Some(format!("{}: {e}", prim.name()))
+        })
+        .collect();
+    assert!(failing.is_empty(), "cannot be used by name: {failing:?}");
 }
