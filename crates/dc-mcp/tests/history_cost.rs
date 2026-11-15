@@ -21,6 +21,7 @@ use dc_mcp::state::{
     Submitted,
 };
 use dc_mcp::store::Store;
+use dc_mcp::verify::VerifierCache;
 use tempfile::TempDir;
 
 const MERGE: &str = "collapse/merge";
@@ -147,12 +148,13 @@ fn hot_calls_on_long_runs() {
     );
     for past in [10_u64, 1_000, 10_000] {
         let (_dir, store, run) = build(past);
+        let verifiers = VerifierCache::default();
         let held = mean_us(|| {
-            let reply = next_batch(&store, &run, "w0", NOW_MS).unwrap();
+            let reply = next_batch(&store, &run, "w0", NOW_MS, &verifiers).unwrap();
             assert!(reply.batch.is_none());
         });
         let wait = mean_us(|| {
-            let reply = next_batch(&store, &run, "someone else", NOW_MS).unwrap();
+            let reply = next_batch(&store, &run, "someone else", NOW_MS, &verifiers).unwrap();
             assert!(reply.wait.is_some());
         });
         let read = mean_us(|| {
