@@ -12,13 +12,20 @@ use std::process::Command;
 use common::{assert_checks, deepest_programs};
 use dc_mcp::verify::{task, Verifier};
 
-/// The child's stack, in bytes. The checks need between 64 and 80 KiB at the
-/// test profile's opt-level. A plain recursive walk over the compiled term of
-/// the deepest program, more than 5000 levels, does not fit in it.
+/// The child's stack, in bytes, sized for the test profile (opt-level 1, as
+/// CI runs it). There the checks need between 64 and 72 KiB, and a plain
+/// recursive walk over the compiled term of the deepest program, more than
+/// 5000 levels, does not fit. A larger stack would let such a walk through.
+/// An opt-level-0 build needs between 224 and 256 KiB, so there the test is
+/// at its limit.
 const SMALL_STACK: usize = 256 * 1024;
 
 /// Set in the child to the size of its stack, in bytes.
 const STACK_ENV: &str = "DC_MCP_DEEP_TEST_STACK";
+
+/// What the child prints, with the number of programs, once their checks are
+/// as expected.
+const CHECKED: &str = "dc-mcp deep test: checked";
 
 /// The child: checks the programs on a thread with the stack `STACK_ENV`
 /// says. It is not a test of its own, so it does nothing unless the parent
@@ -45,6 +52,7 @@ fn checker_child() {
         .join()
         .unwrap();
     assert_checks(&programs, &checks);
+    println!("{CHECKED} {}", programs.len());
 }
 
 #[test]
@@ -65,10 +73,8 @@ fn the_deepest_programs_are_checked_on_a_small_stack() {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
-    // The child ran its checks: a child that did nothing passes too.
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("1 passed"),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
+    // The child ran every check: a child that did nothing passes too.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let want = format!("{CHECKED} {}", deepest_programs().len());
+    assert!(stdout.contains(&want), "{stdout}");
 }
