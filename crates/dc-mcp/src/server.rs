@@ -264,7 +264,8 @@ pub struct CheckReport {
     /// How many submissions this call checked.
     pub checked: usize,
     /// How many submissions still wait to be checked. More than 0 means
-    /// another submission came in meanwhile.
+    /// another submission came in meanwhile, or another server is checking
+    /// one.
     pub pending_checks: usize,
 }
 
@@ -461,9 +462,10 @@ impl DcServer {
     #[tool(
         name = "dc_check_pending",
         description = "Check every submission of a DreamCounter run that waits to be checked, \
-                       and wait until they are done. Proposer servers do this in the \
-                       background; use this when one stopped before it finished, or to see why \
-                       checks fail. Returns how many it checked and how many still wait."
+                       and wait until they are done. A submission that another server is \
+                       checking is left to it. Proposer servers do this in the background; use \
+                       this when one stopped before it finished, or to see why checks fail. \
+                       Returns how many it checked and how many still wait."
     )]
     async fn check_pending(
         &self,
@@ -724,8 +726,16 @@ impl ProposerServer {
         Parameters(arg): Parameters<NextBatchArgs>,
     ) -> Result<Json<NextBatch>, String> {
         let verifiers = Arc::clone(&self.verifiers);
-        self.blocking(move |store, run, now| next_batch(store, run, &arg.worker, now, &verifiers))
-            .await
+        let reply = self
+            .blocking(move |store, run, now| next_batch(store, run, &arg.worker, now, &verifiers))
+            .await;
+        // A proposer that waits may wait for a check whose claimant stopped
+        // (see `check_pending`); a check here takes it up. A claim that is
+        // held is skipped, so this does not wait for other servers' checks.
+        if reply.as_ref().is_ok_and(|r| r.0.wait.is_some()) {
+            self.check_in_background();
+        }
+        reply
     }
 
     /// Takes in the programs for a batch.
