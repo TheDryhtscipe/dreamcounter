@@ -49,8 +49,11 @@ use crate::state::Event;
 /// What the header line of every journal starts with, in every format version.
 pub const HEADER_PREFIX: &str = "dc-mcp journal ";
 
-/// The format version this code reads and writes.
-pub const FORMAT_VERSION: &str = "1";
+/// The format version this code reads and writes. Version 2 (P4.2) added
+/// batches and submissions, gave library entries an arity, and dropped the
+/// log kinds for payloads, submissions and evaluations. No run was started
+/// in version 1, so this code does not read it.
+pub const FORMAT_VERSION: &str = "2";
 
 /// The longest header line, with its line break, in bytes.
 pub const MAX_HEADER_LEN: usize = 64;

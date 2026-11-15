@@ -335,7 +335,11 @@ dependencies = [
 name = "dc-mcp"
 version = "0.1.0"
 dependencies = [
+ "dc-core",
+ "dc-eval",
+ "dc-surface",
  "dc-tasks",
+ "getrandom 0.3.4",
  "rmcp",
  "schemars",
  "serde",

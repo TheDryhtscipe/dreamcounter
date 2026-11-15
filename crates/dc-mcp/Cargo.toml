@@ -10,7 +10,11 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+dc-core.workspace = true
+dc-eval.workspace = true
+dc-surface.workspace = true
 dc-tasks.workspace = true
+getrandom.workspace = true
 rmcp = { workspace = true, features = ["server", "macros", "schemars", "transport-io"] }
 schemars.workspace = true
 serde.workspace = true
@@ -18,6 +22,7 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
 
 [dev-dependencies]
+dc-tasks.workspace = true
 tempfile.workspace = true
 
 [lints]

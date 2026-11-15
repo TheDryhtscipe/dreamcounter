@@ -12,6 +12,8 @@ fn config() -> RunConfig {
         arm: Arm::Blind,
         seed: 11,
         proposals_per_task: 3,
+        programs_per_batch: 1,
+        lease_ms: 60_000,
     }
 }
 
@@ -55,17 +57,21 @@ fn mid_iteration(store: &Store, run: &RunId) {
                 frontier("sum", "(lam 0)"),
                 Event::LibraryExtended {
                     entries: vec![LibraryEntry {
-                        body: "(lam (lam 1))".into(),
+                        arity: 2,
+                        term: "(lam (lam 1))".into(),
                     }],
                 },
-                Event::IterationFinished { iteration: 0 },
+                Event::IterationFinished {
+                    iteration: 0,
+                    used: 0,
+                },
             ]
         })
         .unwrap();
     store
         .append(run, {
             vec![Event::Logged(LogRecord {
-                kind: LogKind::Payload,
+                kind: LogKind::Compression,
                 iteration: 1,
                 task: Some("sort".into()),
                 text: "payload text".into(),
@@ -84,7 +90,7 @@ fn a_new_store_on_the_same_directory_sees_the_same_run() {
     assert_eq!(before.iteration(), 1);
     assert_eq!(before.library().len(), 1);
     assert_eq!(before.frontier("sum").unwrap().len(), 1);
-    assert_eq!(before.log_count(LogKind::Payload), 1);
+    assert_eq!(before.log_count(LogKind::Compression), 1);
     let log_before = first.log(&run).unwrap();
     assert_eq!(log_before.len(), 2);
     assert_eq!(log_before[1].text, "payload text");
@@ -216,7 +222,10 @@ fn commit_shows_the_closure_the_current_state() {
     mid_iteration(&store, &run);
     let seen: Result<u64, StoreError> = store.commit(&run, |state| {
         let iteration = state.iteration();
-        Ok((iteration, vec![Event::IterationFinished { iteration }]))
+        Ok((
+            iteration,
+            vec![Event::IterationFinished { iteration, used: 0 }],
+        ))
     });
     assert_eq!(seen.unwrap(), 1);
     assert_eq!(store.state(&run).unwrap().iteration(), 2);
@@ -331,10 +340,10 @@ fn a_journal_of_another_format_version_is_not_called_damaged() {
         .unwrap();
     let path = journal(dir.path(), "r1");
     let text = fs::read_to_string(&path).unwrap();
-    fs::write(&path, text.replacen("journal 1 ", "journal 2 ", 1)).unwrap();
+    fs::write(&path, text.replacen("journal 2 ", "journal 1 ", 1)).unwrap();
     match Store::open(dir.path()).unwrap().state(&run) {
         Err(StoreError::UnsupportedFormat { header, .. }) => {
-            assert!(header.starts_with("dc-mcp journal 2 "), "{header}");
+            assert!(header.starts_with("dc-mcp journal 1 "), "{header}");
         }
         other => panic!("{other:?}"),
     }
@@ -446,7 +455,10 @@ fn two_stores_on_one_run_see_each_other_s_commits() {
         let seen: Result<u64, StoreError> = store.commit(&run, |state| {
             let events = vec![
                 note(i, &format!("n{i}")),
-                Event::IterationFinished { iteration: i },
+                Event::IterationFinished {
+                    iteration: i,
+                    used: 0,
+                },
             ];
             Ok((state.iteration(), events))
         });
@@ -912,7 +924,13 @@ fn a_set_aside_tail_is_reported_first_in_the_commit_that_replaces_it() {
         |_| {
             Ok((
                 (),
-                vec![Event::IterationFinished { iteration: 1 }, note(2, "after")],
+                vec![
+                    Event::IterationFinished {
+                        iteration: 1,
+                        used: 0,
+                    },
+                    note(2, "after"),
+                ],
             ))
         },
         |(), state| state.log_count(LogKind::Recovery),

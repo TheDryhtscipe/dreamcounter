@@ -7,6 +7,8 @@ fn created() -> Event {
             arm: Arm::Blind,
             seed: 1,
             proposals_per_task: 2,
+            programs_per_batch: 1,
+            lease_ms: 60_000,
         },
         tasks: vec!["a".into()],
     }
@@ -28,7 +30,13 @@ fn three() -> (Vec<u8>, Vec<usize>) {
     for (seq, events) in [
         vec![created()],
         vec![note("line\nbreak \u{1F980} \"quoted\"")],
-        vec![note("x"), Event::IterationFinished { iteration: 0 }],
+        vec![
+            note("x"),
+            Event::IterationFinished {
+                iteration: 0,
+                used: 0,
+            },
+        ],
     ]
     .into_iter()
     .enumerate()
@@ -63,7 +71,13 @@ fn scan_reads_back_what_encode_wrote() {
     assert_eq!(scan.records[0], vec![created()]);
     assert_eq!(
         scan.records[2],
-        vec![note("x"), Event::IterationFinished { iteration: 0 }]
+        vec![
+            note("x"),
+            Event::IterationFinished {
+                iteration: 0,
+                used: 0
+            }
+        ]
     );
 
     // A scan can start at any record boundary, given that record's number.
@@ -318,18 +332,19 @@ fn a_header_reads_back_and_other_starts_are_told_apart() {
             "{text:?}"
         );
     };
-    unsupported("dc-mcp journal 2 0000000000000001\n");
-    unsupported("dc-mcp journal 1\n");
-    unsupported("dc-mcp journal 1 1\n");
-    unsupported("dc-mcp journal 1 000000000000000G\n");
-    unsupported("dc-mcp journal 1 000000000000000A\n");
-    unsupported("dc-mcp journal 1 0000000000000001 extra\n");
+    unsupported("dc-mcp journal 1 0000000000000001\n");
+    unsupported("dc-mcp journal 3 0000000000000001\n");
+    unsupported("dc-mcp journal 2\n");
+    unsupported("dc-mcp journal 2 1\n");
+    unsupported("dc-mcp journal 2 000000000000000G\n");
+    unsupported("dc-mcp journal 2 000000000000000A\n");
+    unsupported("dc-mcp journal 2 0000000000000001 extra\n");
     for not in [
         "",
-        "dc-mcp journal 1 0000000000000001",
+        "dc-mcp journal 2 0000000000000001",
         "junk\n",
         "\n",
-        &format!("dc-mcp journal 1 {}\n", "0".repeat(80)),
+        &format!("dc-mcp journal 2 {}\n", "0".repeat(80)),
     ] {
         assert_eq!(
             parse_header(not.as_bytes()),
