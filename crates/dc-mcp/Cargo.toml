@@ -10,7 +10,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+dc-compress.workspace = true
 dc-core.workspace = true
+dc-driver.workspace = true
 dc-eval.workspace = true
 dc-surface.workspace = true
 dc-tasks.workspace = true
@@ -25,6 +27,7 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 [dev-dependencies]
 dc-tasks.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "time"] }
 
 [lints]
 workspace = true

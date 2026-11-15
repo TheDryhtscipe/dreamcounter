@@ -3,6 +3,10 @@
 //!
 //! `dc-mcp --state-dir <dir> --proposer <run>`: serves a proposer's tools for
 //! the run `<run>` in `<dir>` over stdio. The run must exist.
+//!
+//! `dc-mcp --stitch-worker`: runs Stitch once, as the worker process of the
+//! operator's `dc_finish_iteration` (`dc_compress::worker`). The server
+//! starts it; it reads a request on standard input.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -10,13 +14,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use dc_mcp::iterate::{WorkerStart, WORKER_ARG};
 use dc_mcp::proposer::SystemClock;
 use dc_mcp::server::{DcServer, ProposerServer};
 use dc_mcp::state::RunId;
 use dc_mcp::store::Store;
 use rmcp::ServiceExt;
 
-const USAGE: &str = "usage: dc-mcp --state-dir <dir> [--proposer <run>]";
+const USAGE: &str = "usage: dc-mcp --state-dir <dir> [--proposer <run>]\n       \
+                     dc-mcp --stitch-worker";
 
 /// The stack of the runtime's threads, where tool calls and the checks of
 /// submitted programs run. A stack overflow aborts the server, and a proposer's
@@ -41,6 +47,12 @@ fn arguments() -> Option<(PathBuf, Option<String>)> {
 }
 
 fn main() -> ExitCode {
+    // Before anything else: a worker sets its own limits and reads only
+    // its request.
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_some_and(|a| a == WORKER_ARG) && args.next().is_none() {
+        return dc_compress::worker::serve();
+    }
     let Some((dir, proposer)) = arguments() else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
@@ -87,8 +99,18 @@ fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn st
     let served = runtime.block_on(async {
         match proposer {
             None => {
-                let service = DcServer::new(store).serve(rmcp::transport::stdio()).await?;
-                service.waiting().await?;
+                let server = DcServer::new(store, WorkerStart::this_binary()?);
+                let service = server.clone().serve(rmcp::transport::stdio()).await;
+                let served = match service {
+                    Ok(service) => service.waiting().await.map(|_| ()).map_err(Into::into),
+                    Err(e) => Err(e.into()),
+                };
+                // The client is gone, and rmcp has waited some seconds for
+                // the calls that were running. A Stitch run would go on for
+                // as long as its limit allows; stop it. Its call then writes
+                // nothing. A call that ended during rmcp's wait has written.
+                server.shut_down();
+                return served;
             }
             Some(run) => {
                 let server = ProposerServer::new(store, run, Arc::new(SystemClock));
@@ -103,7 +125,9 @@ fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn st
     // A background check may be running or waiting to try again. Its work is
     // committed whole or not at all, so it can be left: the next proposer
     // server takes it up.
-    // The operator's server waits for its tool calls to finish.
+    // The operator's server waits for its tool calls to finish. A call that
+    // was running Stitch ends once its worker has stopped, and `shut_down`
+    // stopped it.
     if checks_in_background {
         runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     }

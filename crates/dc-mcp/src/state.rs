@@ -98,6 +98,54 @@ pub struct RunConfig {
     /// setting has [`DEFAULT_MAX_UNCHECKED_PER_BATCH`].
     #[serde(default = "default_max_unchecked_per_batch")]
     pub max_unchecked_per_batch: u32,
+    /// The most programs a task's frontier keeps when an iteration ends
+    /// (K of decision D19). It is positive.
+    pub frontier_size: u32,
+    /// The settings of the Stitch run that ends each iteration.
+    pub stitch: StitchSettings,
+    /// The fingerprint (`dc_surface::prelude::Prelude::fingerprint`) of the
+    /// prelude the run's programs are compiled with. A stored program names
+    /// a prelude function by its position, so it keeps its meaning only
+    /// under that prelude: see [`crate::verify::check_prelude`].
+    pub prelude: u64,
+}
+
+/// The settings of the Stitch run that ends each iteration: what Stitch
+/// looks for, and the limits on its worker process
+/// (`dc_compress::worker::Limits`). A run that ends at a limit ends the
+/// iteration without new abstractions (decision D19), so the limits are the
+/// run's, not the server's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StitchSettings {
+    /// The most abstractions one run finds. It is positive.
+    pub iterations: u32,
+    /// The largest arity of an abstraction.
+    pub max_arity: u32,
+    /// The longest the server waits for the worker, in milliseconds. It is
+    /// positive.
+    pub wall_ms: u64,
+    /// The worker's address space, in bytes. Stitch's thread reserves a
+    /// stack of 256 MiB, so this is at least [`MIN_STITCH_MEMORY_BYTES`].
+    pub memory_bytes: u64,
+}
+
+/// The least address space a run may give its Stitch worker: below about
+/// 260 MiB Stitch's thread cannot start, and a little above it Stitch runs
+/// many times slower (`dc_compress::worker::Limits::memory_bytes`).
+pub const MIN_STITCH_MEMORY_BYTES: u64 = 512 << 20;
+
+impl Default for StitchSettings {
+    /// Stitch's own defaults, 3 abstractions of arity at most 2, and the
+    /// worker's default limits: ten minutes and 4 GiB.
+    fn default() -> StitchSettings {
+        StitchSettings {
+            iterations: 3,
+            max_arity: 2,
+            wall_ms: 600_000,
+            memory_bytes: 4 << 30,
+        }
+    }
 }
 
 /// The most submissions kept for one batch that are not checked, of each
@@ -515,9 +563,12 @@ pub enum Rejected {
     NoTasks,
     /// The task is named twice in the task set.
     DuplicateTask(String),
-    /// `proposals_per_task`, `programs_per_batch`, `lease_ms` or
-    /// `max_unchecked_per_batch` is zero.
+    /// A setting that must be positive is zero: `proposals_per_task`,
+    /// `programs_per_batch`, `lease_ms`, `max_unchecked_per_batch`,
+    /// `frontier_size`, or the Stitch run's `iterations` or `wall_ms`.
     ZeroSetting(&'static str),
+    /// The Stitch worker's memory is under [`MIN_STITCH_MEMORY_BYTES`].
+    TooLittleStitchMemory(u64),
     /// `programs_per_batch` is over [`MAX_PROGRAMS_PER_BATCH`].
     TooManyPerBatch(u32),
     /// The first event of a run is not `Created`.
@@ -596,6 +647,11 @@ impl fmt::Display for Rejected {
             Rejected::TooManyPerBatch(n) => write!(
                 f,
                 "programs_per_batch is {n}; it must be at most {MAX_PROGRAMS_PER_BATCH}"
+            ),
+            Rejected::TooLittleStitchMemory(bytes) => write!(
+                f,
+                "the Stitch worker's memory is {bytes} bytes; it must be at least \
+                 {MIN_STITCH_MEMORY_BYTES}"
             ),
             Rejected::NotCreated => write!(f, "the first event of a run must create it"),
             Rejected::CreatedTwice => write!(f, "the run is already created"),
@@ -807,10 +863,16 @@ impl RunState {
                 "max_unchecked_per_batch",
                 u64::from(config.max_unchecked_per_batch),
             ),
+            ("frontier_size", u64::from(config.frontier_size)),
+            ("stitch.iterations", u64::from(config.stitch.iterations)),
+            ("stitch.wall_ms", config.stitch.wall_ms),
         ] {
             if value == 0 {
                 return Err(Rejected::ZeroSetting(name));
             }
+        }
+        if config.stitch.memory_bytes < MIN_STITCH_MEMORY_BYTES {
+            return Err(Rejected::TooLittleStitchMemory(config.stitch.memory_bytes));
         }
         let mut frontiers = BTreeMap::new();
         for task in &tasks {
@@ -1335,6 +1397,9 @@ mod tests {
             programs_per_batch: 2,
             lease_ms: 1000,
             max_unchecked_per_batch: 3,
+            frontier_size: 5,
+            stitch: crate::state::StitchSettings::default(),
+            prelude: 0,
         }
     }
 
@@ -1378,12 +1443,63 @@ mod tests {
         );
         let zero = RunConfig {
             max_unchecked_per_batch: 0,
+            frontier_size: 5,
+            stitch: crate::state::StitchSettings::default(),
+            prelude: 0,
             ..config()
         };
         assert_eq!(
             RunState::create(zero, vec!["a".into()]),
             Err(Rejected::ZeroSetting("max_unchecked_per_batch"))
         );
+        for (name, zero) in [
+            (
+                "frontier_size",
+                RunConfig {
+                    frontier_size: 0,
+                    ..config()
+                },
+            ),
+            (
+                "stitch.iterations",
+                RunConfig {
+                    stitch: StitchSettings {
+                        iterations: 0,
+                        ..StitchSettings::default()
+                    },
+                    ..config()
+                },
+            ),
+            (
+                "stitch.wall_ms",
+                RunConfig {
+                    stitch: StitchSettings {
+                        wall_ms: 0,
+                        ..StitchSettings::default()
+                    },
+                    ..config()
+                },
+            ),
+        ] {
+            assert_eq!(
+                RunState::create(zero, vec!["a".into()]),
+                Err(Rejected::ZeroSetting(name))
+            );
+        }
+        for (bytes, ok) in [
+            (MIN_STITCH_MEMORY_BYTES, true),
+            (MIN_STITCH_MEMORY_BYTES - 1, false),
+        ] {
+            let c = RunConfig {
+                stitch: StitchSettings {
+                    memory_bytes: bytes,
+                    ..StitchSettings::default()
+                },
+                ..config()
+            };
+            let got = RunState::create(c, vec!["a".into()]);
+            assert_eq!(got.is_ok(), ok, "{bytes}: {got:?}");
+        }
         for (n, ok) in [
             (MAX_PROGRAMS_PER_BATCH, true),
             (MAX_PROGRAMS_PER_BATCH + 1, false),

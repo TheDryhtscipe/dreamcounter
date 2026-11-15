@@ -40,7 +40,12 @@ impl Client {
 
     /// Starts the server on `dir` with `args` after the state directory.
     fn start_with(dir: &Path, args: &[&str], stderr: Stdio) -> Client {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_dc-mcp"))
+        Client::start_binary(Path::new(env!("CARGO_BIN_EXE_dc-mcp")), dir, args, stderr)
+    }
+
+    /// As `start_with`, with the server started from the file `binary`.
+    fn start_binary(binary: &Path, dir: &Path, args: &[&str], stderr: Stdio) -> Client {
+        let mut child = Command::new(binary)
             .arg("--state-dir")
             .arg(dir)
             .args(args)
@@ -163,6 +168,7 @@ fn the_server_lists_its_tools() {
             "dc_add_note",
             "dc_check_pending",
             "dc_create_run",
+            "dc_finish_iteration",
             "dc_list_runs",
             "dc_proposal_stats",
             "dc_run_status"
@@ -190,7 +196,7 @@ fn a_run_survives_a_kill_in_the_middle_of_an_iteration() {
     let created = client
         .call(
             "dc_create_run",
-            json!({ "run": "r1", "seed": 5, "proposals_per_task": 2 }),
+            json!({ "run": "r1", "seed": 5, "proposals_per_task": 2, "frontier_size": 5 }),
         )
         .unwrap();
     assert_eq!(created["run"], "r1");
@@ -291,7 +297,7 @@ fn a_server_killed_while_it_writes_keeps_every_note_it_acknowledged() {
     client
         .call(
             "dc_create_run",
-            json!({ "run": "r1", "seed": 5, "proposals_per_task": 2, "tasks": [task] }),
+            json!({ "run": "r1", "seed": 5, "proposals_per_task": 2, "frontier_size": 5, "tasks": [task] }),
         )
         .unwrap();
     // Take the run into its second iteration, so the kill is inside one.
@@ -382,7 +388,7 @@ fn a_locked_run_does_not_hold_up_the_rest_of_the_server() {
         client
             .call(
                 "dc_create_run",
-                json!({ "run": run, "seed": 1, "proposals_per_task": 1, "tasks": [task] }),
+                json!({ "run": run, "seed": 1, "proposals_per_task": 1, "frontier_size": 5, "tasks": [task] }),
             )
             .unwrap();
     }
@@ -432,7 +438,7 @@ fn a_torn_tail_is_reported_in_the_run_even_with_standard_error_closed() {
     client
         .call(
             "dc_create_run",
-            json!({ "run": "r1", "seed": 1, "proposals_per_task": 1, "tasks": [task] }),
+            json!({ "run": "r1", "seed": 1, "proposals_per_task": 1, "frontier_size": 5, "tasks": [task] }),
         )
         .unwrap();
     client
@@ -480,10 +486,38 @@ fn bad_requests_are_tool_errors_and_change_nothing() {
         .family
         .name()
         .to_owned();
-    let create = |run: &str, tasks: Value| json!({ "run": run, "seed": 1, "proposals_per_task": 1, "tasks": tasks });
+    let create = |run: &str, tasks: Value| json!({ "run": run, "seed": 1, "proposals_per_task": 1, "frontier_size": 5, "tasks": tasks });
 
     let error = client
         .call("dc_run_status", json!({ "run": "none" }))
+        .unwrap_err();
+    assert!(error.contains("no run"), "{error}");
+    // A Stitch setting that is refused is named as the tool names it, in
+    // the tool's unit.
+    for (setting, value, said) in [
+        (
+            "stitch_iterations",
+            0,
+            "stitch_iterations must be at least 1",
+        ),
+        (
+            "stitch_wall_seconds",
+            0,
+            "stitch_wall_seconds must be at least 1",
+        ),
+        (
+            "stitch_memory_mib",
+            511,
+            "stitch_memory_mib must be at least 512",
+        ),
+    ] {
+        let mut arguments = create("s1", json!([first]));
+        arguments[setting] = json!(value);
+        let error = client.call("dc_create_run", arguments).unwrap_err();
+        assert_eq!(error, said);
+    }
+    let error = client
+        .call("dc_run_status", json!({ "run": "s1" }))
         .unwrap_err();
     assert!(error.contains("no run"), "{error}");
     let error = client
@@ -547,7 +581,7 @@ fn bad_requests_are_tool_errors_and_change_nothing() {
     let error = client
         .call(
             "dc_create_run",
-            json!({ "run": "r1", "seed": 1, "proposals_per_task": 0 }),
+            json!({ "run": "r1", "seed": 1, "proposals_per_task": 0, "frontier_size": 5 }),
         )
         .unwrap_err();
     assert!(error.contains("proposals_per_task"), "{error}");
@@ -619,7 +653,7 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
         .call(
             "dc_create_run",
             json!({
-                "run": "r1", "seed": 5, "proposals_per_task": 1,
+                "run": "r1", "seed": 5, "proposals_per_task": 1, "frontier_size": 5,
                 "tasks": ["collapse/merge", "collapse/cancel"]
             }),
         )
@@ -817,7 +851,7 @@ fn the_deepest_programs_a_proposer_can_send_do_not_crash_the_server() {
         .call(
             "dc_create_run",
             json!({
-                "run": "r1", "seed": 5, "proposals_per_task": 64,
+                "run": "r1", "seed": 5, "proposals_per_task": 64, "frontier_size": 5,
                 "programs_per_batch": 32, "tasks": ["collapse/merge"]
             }),
         )
@@ -882,7 +916,7 @@ fn the_deepest_programs_a_proposer_can_send_do_not_crash_the_server() {
         .call(
             "dc_create_run",
             json!({
-                "run": "r2", "seed": 5, "proposals_per_task": 1,
+                "run": "r2", "seed": 5, "proposals_per_task": 1, "frontier_size": 5,
                 "tasks": ["collapse/merge", "collapse/cancel"]
             }),
         )
@@ -925,7 +959,7 @@ fn the_operator_can_check_what_a_stopped_proposer_left() {
         .call(
             "dc_create_run",
             json!({
-                "run": "r1", "seed": 5, "proposals_per_task": 1,
+                "run": "r1", "seed": 5, "proposals_per_task": 1, "frontier_size": 5,
                 "tasks": ["collapse/merge"]
             }),
         )
@@ -978,7 +1012,7 @@ fn a_proposer_that_waits_for_an_abandoned_check_gets_it_done() {
         .call(
             "dc_create_run",
             json!({
-                "run": "r1", "seed": 5, "proposals_per_task": 1,
+                "run": "r1", "seed": 5, "proposals_per_task": 1, "frontier_size": 5,
                 "tasks": ["collapse/merge"]
             }),
         )
@@ -1075,4 +1109,234 @@ fn a_proposer_server_needs_a_run_that_exists() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
+}
+
+/// A program that solves `task`: its good reference.
+fn solves(task: &str) -> String {
+    let v = dc_tasks::families::development()
+        .into_iter()
+        .find(|v| v.family.name() == task)
+        .unwrap();
+    format!(
+        "{}\nlet solve = {}\n",
+        v.source,
+        v.references.last().unwrap().entry
+    )
+}
+
+/// The whole loop through the binaries: proposers fill an iteration, the
+/// operator ends it, Stitch runs in a worker process that is this binary
+/// started again, and proposers then work against the new library.
+#[test]
+fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut operator = Client::start(dir.path());
+    let tasks = ["collapse/merge", "collapse/cancel", "collapse/absorb"];
+    let created = operator
+        .call(
+            "dc_create_run",
+            json!({
+                "run": "r1", "seed": 5, "proposals_per_task": 1, "frontier_size": 2,
+                "stitch_wall_seconds": 120, "stitch_memory_mib": 2048,
+                "tasks": tasks
+            }),
+        )
+        .unwrap();
+    assert_eq!(created["frontier_size"], 2);
+    assert_eq!(
+        created["stitch"],
+        json!({ "iterations": 3, "max_arity": 2, "wall_seconds": 120, "memory_mib": 2048 })
+    );
+
+    // Not before the iteration's programs are in.
+    let early = operator
+        .call("dc_finish_iteration", json!({ "run": "r1" }))
+        .unwrap_err();
+    assert!(early.contains("cannot end yet"), "{early}");
+
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("r1").unwrap();
+    let mut proposer = Client::start_proposer(dir.path(), "r1");
+    for i in 0..tasks.len() {
+        let worker = format!("agent-{i}");
+        let got = proposer
+            .call("dc_next_batch", json!({ "worker": worker }))
+            .unwrap();
+        let batch = got["batch"]["batch"].as_u64().unwrap();
+        assert!(!got["batch"]["prompt"].as_str().unwrap().contains("fn_0"));
+        let task = store
+            .read(&run, |s| s.batch(batch).unwrap().task.clone())
+            .unwrap();
+        proposer
+            .call(
+                "dc_submit",
+                json!({
+                    "worker": worker, "batch": batch, "token": got["batch"]["token"],
+                    "programs": [solves(&task)]
+                }),
+            )
+            .unwrap();
+    }
+    wait_for_checks(&mut operator, &mut proposer, "r1");
+
+    let done = operator
+        .call("dc_finish_iteration", json!({ "run": "r1" }))
+        .unwrap();
+    assert_eq!(done["finished_iteration"], 0);
+    assert_eq!(done["programs_used"], 3);
+    // The worker process ran Stitch to the end. A worker that could not be
+    // started is an error, and one that failed says "failed".
+    assert_eq!(done["compression"], "ran", "{done}");
+    assert_eq!(done["compression_error"], Value::Null);
+    let found = done["new_abstractions"].as_u64().unwrap();
+    assert!(found > 0, "{done}");
+    let status = &done["status"];
+    assert_eq!(status["iteration"], 1);
+    assert_eq!(status["library_size"].as_u64().unwrap(), found);
+    assert_eq!(status["log_counts"]["compression"], 1);
+    for task in status["tasks"].as_array().unwrap() {
+        assert_eq!(task["frontier_size"], 1, "{task}");
+    }
+    assert_eq!(status["current"]["quota_in"], false);
+
+    // The same again is refused: iteration 1 has no programs yet.
+    let again = operator
+        .call("dc_finish_iteration", json!({ "run": "r1" }))
+        .unwrap_err();
+    assert!(again.contains("iteration 1 cannot end yet"), "{again}");
+
+    // The proposer's server, which was running all along, hands out work
+    // for iteration 1 with the new library, and checks a program that uses
+    // it.
+    let got = proposer
+        .call("dc_next_batch", json!({ "worker": "agent-9" }))
+        .unwrap();
+    let prompt = got["batch"]["prompt"].as_str().unwrap();
+    assert!(prompt.contains("fn_0"), "{prompt}");
+    let batch = got["batch"]["batch"].as_u64().unwrap();
+    let task = store
+        .read(&run, |s| s.batch(batch).unwrap().task.clone())
+        .unwrap();
+    proposer
+        .call(
+            "dc_submit",
+            json!({
+                "worker": "agent-9", "batch": batch, "token": got["batch"]["token"],
+                "programs": [format!("{}\nlet unused = fn_0\n", solves(&task))]
+            }),
+        )
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let passed = loop {
+        let stats = operator
+            .call("dc_proposal_stats", json!({ "run": "r1" }))
+            .unwrap();
+        let now = &stats["iterations"][1];
+        if now["pending_checks"] == 0 && now["submissions"] == 1 {
+            break now["tasks_solved"].clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "{stats}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(passed, 1);
+}
+
+/// Makes the run `r1` of three tasks and gives each task one program that
+/// solves it, through a proposer's server.
+fn a_run_ready_to_end(dir: &Path, operator: &mut Client) {
+    let tasks = ["collapse/merge", "collapse/cancel", "collapse/absorb"];
+    operator
+        .call(
+            "dc_create_run",
+            json!({
+                "run": "r1", "seed": 5, "proposals_per_task": 1, "frontier_size": 2,
+                "stitch_wall_seconds": 120, "stitch_memory_mib": 2048,
+                "tasks": tasks
+            }),
+        )
+        .unwrap();
+    let store = Store::open(dir).unwrap();
+    let run = RunId::new("r1").unwrap();
+    let mut proposer = Client::start_proposer(dir, "r1");
+    for i in 0..tasks.len() {
+        let worker = format!("agent-{i}");
+        let got = proposer
+            .call("dc_next_batch", json!({ "worker": worker }))
+            .unwrap();
+        let batch = got["batch"]["batch"].as_u64().unwrap();
+        let task = store
+            .read(&run, |s| s.batch(batch).unwrap().task.clone())
+            .unwrap();
+        proposer
+            .call(
+                "dc_submit",
+                json!({
+                    "worker": worker, "batch": batch, "token": got["batch"]["token"],
+                    "programs": [solves(&task)]
+                }),
+            )
+            .unwrap();
+    }
+    wait_for_checks(operator, &mut proposer, "r1");
+}
+
+/// A server whose file was replaced after it started, as an upgrade does,
+/// still starts its own build as the worker.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_server_whose_file_was_replaced_still_runs_its_own_worker() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = tempfile::TempDir::new().unwrap();
+    let binary = bin.path().join("dc-mcp");
+    std::fs::copy(env!("CARGO_BIN_EXE_dc-mcp"), &binary).unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut operator = Client::start_binary(&binary, dir.path(), &[], Stdio::null());
+    a_run_ready_to_end(dir.path(), &mut operator);
+
+    // Another program takes the path. Started as the worker, it would fail.
+    let other = bin.path().join("other");
+    std::fs::write(&other, "#!/bin/sh\nexit 2\n").unwrap();
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&other, &binary).unwrap();
+    assert_eq!(Command::new(&binary).status().unwrap().code(), Some(2));
+
+    let done = operator
+        .call("dc_finish_iteration", json!({ "run": "r1" }))
+        .unwrap();
+    assert_eq!(done["compression"], "ran", "{done}");
+    assert!(done["new_abstractions"].as_u64().unwrap() > 0, "{done}");
+}
+
+#[test]
+fn the_binary_is_its_own_stitch_worker() {
+    // A worker reads a request on standard input and refuses one that does
+    // not parse, as `dc-stitch-worker` does.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dc-mcp"))
+        .arg("--stitch-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"not a request")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("dc-stitch-worker"), "{stderr}");
+    assert!(!stderr.contains("usage"), "{stderr}");
+    assert!(output.stdout.is_empty());
+
+    // With anything after it, the argument is not the worker's.
+    let output = Command::new(env!("CARGO_BIN_EXE_dc-mcp"))
+        .args(["--stitch-worker", "--state-dir"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("usage"));
 }

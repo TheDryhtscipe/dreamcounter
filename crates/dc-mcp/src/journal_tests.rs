@@ -10,6 +10,9 @@ fn created() -> Event {
             programs_per_batch: 1,
             lease_ms: 60_000,
             max_unchecked_per_batch: 3,
+            frontier_size: 5,
+            stitch: crate::state::StitchSettings::default(),
+            prelude: 0,
         },
         tasks: vec!["a".into()],
     }
@@ -334,18 +337,19 @@ fn a_header_reads_back_and_other_starts_are_told_apart() {
         );
     };
     unsupported("dc-mcp journal 1 0000000000000001\n");
-    unsupported("dc-mcp journal 3 0000000000000001\n");
-    unsupported("dc-mcp journal 2\n");
-    unsupported("dc-mcp journal 2 1\n");
-    unsupported("dc-mcp journal 2 000000000000000G\n");
-    unsupported("dc-mcp journal 2 000000000000000A\n");
-    unsupported("dc-mcp journal 2 0000000000000001 extra\n");
+    unsupported("dc-mcp journal 2 0000000000000001\n");
+    unsupported("dc-mcp journal 4 0000000000000001\n");
+    unsupported("dc-mcp journal 3\n");
+    unsupported("dc-mcp journal 3 1\n");
+    unsupported("dc-mcp journal 3 000000000000000G\n");
+    unsupported("dc-mcp journal 3 000000000000000A\n");
+    unsupported("dc-mcp journal 3 0000000000000001 extra\n");
     for not in [
         "",
-        "dc-mcp journal 2 0000000000000001",
+        "dc-mcp journal 3 0000000000000001",
         "junk\n",
         "\n",
-        &format!("dc-mcp journal 2 {}\n", "0".repeat(80)),
+        &format!("dc-mcp journal 3 {}\n", "0".repeat(80)),
     ] {
         assert_eq!(
             parse_header(not.as_bytes()),

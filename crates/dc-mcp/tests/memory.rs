@@ -117,6 +117,9 @@ fn check_cold_reads(notes: u64, note_bytes: usize) {
         programs_per_batch: 1,
         lease_ms: 60_000,
         max_unchecked_per_batch: 3,
+        frontier_size: 5,
+        stitch: dc_mcp::state::StitchSettings::default(),
+        prelude: dc_mcp::verify::shipped_prelude(),
     };
     store.create_run(&run, config, vec!["t".into()]).unwrap();
     for i in 0..notes {

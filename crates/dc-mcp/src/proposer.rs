@@ -49,7 +49,7 @@ use crate::state::{
     PromptStored, RunId, RunState, Standing, Submitted,
 };
 use crate::store::{Change, CheckClaim, RefusalKind, Store, StoreError};
-use crate::verify::{task, Verifier, VerifierCache};
+use crate::verify::{check_prelude, shipped_prelude, task, Verifier, VerifierCache};
 
 /// The longest worker id or model name, in bytes.
 pub const MAX_NAME_LEN: usize = 200;
@@ -225,6 +225,7 @@ fn issue(
     verifiers: &VerifierCache,
     build_here: bool,
 ) -> Result<(Attempt, Vec<Event>), Refused> {
+    check_prelude(state.config(), shipped_prelude()).map_err(|e| Refused::State(e.to_string()))?;
     // One live batch at a time for each worker id, so that a proposer
     // that keeps asking under one id cannot hold every slot. Ids are what
     // the caller says, so one that uses many ids still can.
@@ -564,6 +565,13 @@ fn check_pending_with(
 ) -> Result<Checks, Refused> {
     // Claim files left by checkers that stopped, listed before the run is
     // read, so that a batch read as settled was settled when it was listed.
+    // A run of another prelude is refused even if nothing waits; each
+    // submission's read below checks again, in case the run was replaced.
+    store
+        .read(run, |state| {
+            check_prelude(state.config(), shipped_prelude())
+        })?
+        .map_err(|e| Refused::State(e.to_string()))?;
     let left = store.check_claims(run)?;
     let mut sweep = true;
     let mut done = 0;
@@ -588,8 +596,19 @@ fn check_pending_with(
             break waiting;
         };
         // Another checker may have checked it since the run was read.
-        let (p, journal) =
-            store.read_journal(run, |state| pending(state, claim.batch(), verifiers))?;
+        // The programs are compiled with this build's prelude, so the run
+        // they are read from must have the same.
+        let (p, journal) = store.read_journal(run, |state| {
+            check_prelude(state.config(), shipped_prelude())
+                .map(|()| pending(state, claim.batch(), verifiers))
+        })?;
+        let p = match p {
+            Ok(p) => p,
+            Err(changed) => {
+                claim.release();
+                return Err(Refused::State(changed.to_string()));
+            }
+        };
         let Some(p) = p else {
             claim.release();
             continue;
@@ -681,6 +700,9 @@ mod tests {
                     programs_per_batch: per_batch,
                     lease_ms: 1000,
                     max_unchecked_per_batch: 3,
+                    frontier_size: 5,
+                    stitch: crate::state::StitchSettings::default(),
+                    prelude: crate::verify::shipped_prelude(),
                 },
                 vec![MERGE.into(), CANCEL.into()],
             )
@@ -854,6 +876,9 @@ mod tests {
             programs_per_batch: 1,
             lease_ms: 1000,
             max_unchecked_per_batch: 3,
+            frontier_size: 5,
+            stitch: crate::state::StitchSettings::default(),
+            prelude: crate::verify::shipped_prelude(),
         };
         let tasks = vec![MERGE.to_owned(), CANCEL.to_owned()];
         let created = Event::Created {
@@ -1373,6 +1398,9 @@ mod tests {
             programs_per_batch: 1,
             lease_ms: 1000,
             max_unchecked_per_batch: 3,
+            frontier_size: 5,
+            stitch: crate::state::StitchSettings::default(),
+            prelude: crate::verify::shipped_prelude(),
         }
     }
 

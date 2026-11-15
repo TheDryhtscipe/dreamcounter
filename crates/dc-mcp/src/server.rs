@@ -13,22 +13,27 @@
 //! A tool call runs on a thread of its own, so a call that waits for a run's
 //! lock does not hold up other calls or the protocol.
 
+use std::future::Future;
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, TryLockError};
 use std::time::Duration;
 
+use dc_driver::CompressionReport;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::{schemars, tool, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{schemars, tool, tool_router, RoleServer};
 use serde::{Deserialize, Serialize};
 
+use crate::iterate::{finish_iteration_in_worker, WorkerStart};
 use crate::proposer::{check_pending, next_batch, submit, Clock, NextBatch, Receipt, Refused};
 use crate::state::{
-    Arm, Event, LogKind, LogRecord, RunConfig, RunId, RunState, DEFAULT_MAX_UNCHECKED_PER_BATCH,
+    Arm, Event, LogKind, LogRecord, RunConfig, RunId, RunState, StitchSettings,
+    DEFAULT_MAX_UNCHECKED_PER_BATCH, MIN_STITCH_MEMORY_BYTES,
 };
 use crate::store::{Refusals, Store, StoreError};
-use crate::verify::VerifierCache;
+use crate::verify::{shipped_prelude, VerifierCache};
 
 /// The arguments of `dc_create_run`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -55,6 +60,22 @@ pub struct CreateRun {
     /// worker. Past it a submission is counted but not kept. At least 1. If
     /// absent, 3.
     pub max_unchecked_per_batch: Option<u32>,
+    /// The most programs a task's frontier keeps when an iteration ends. At
+    /// least 1.
+    pub frontier_size: u32,
+    /// The most abstractions the Stitch run that ends an iteration finds.
+    /// At least 1. If absent, 3.
+    pub stitch_iterations: Option<u32>,
+    /// The largest arity of an abstraction. If absent, 2.
+    pub stitch_max_arity: Option<u32>,
+    /// How long the Stitch run that ends an iteration may take, in seconds.
+    /// A run stopped at this limit ends the iteration with no new
+    /// abstractions. At least 1. If absent, 600.
+    pub stitch_wall_seconds: Option<u64>,
+    /// The memory of the Stitch run's process, in MiB, counted as address
+    /// space. A run stopped at this limit ends the iteration with no new
+    /// abstractions. At least 512. If absent, 4096.
+    pub stitch_memory_mib: Option<u64>,
 }
 
 /// The most programs one batch asks for when `dc_create_run` does not say.
@@ -119,6 +140,10 @@ pub struct RunStatus {
     pub seed: u64,
     /// How many proposals each task gets in one iteration.
     pub proposals_per_task: u32,
+    /// The most programs a task's frontier keeps when an iteration ends.
+    pub frontier_size: u32,
+    /// The settings of the Stitch run that ends an iteration.
+    pub stitch: StitchStatus,
     /// The current iteration. The first is 0.
     pub iteration: u64,
     /// The run's tasks, in the order given at creation.
@@ -133,6 +158,19 @@ pub struct RunStatus {
     pub current: IterationStats,
 }
 
+/// The settings of the Stitch run that ends an iteration.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct StitchStatus {
+    /// The most abstractions one run finds.
+    pub iterations: u32,
+    /// The largest arity of an abstraction.
+    pub max_arity: u32,
+    /// How long a run may take, in seconds, rounded up.
+    pub wall_seconds: u64,
+    /// The memory of a run's process, in MiB, rounded down.
+    pub memory_mib: u64,
+}
+
 impl RunStatus {
     fn of(run: &RunId, state: &RunState, refusals: &Refusals) -> RunStatus {
         let config = state.config();
@@ -143,6 +181,13 @@ impl RunStatus {
             },
             seed: config.seed,
             proposals_per_task: config.proposals_per_task,
+            frontier_size: config.frontier_size,
+            stitch: StitchStatus {
+                iterations: config.stitch.iterations,
+                max_arity: config.stitch.max_arity,
+                wall_seconds: config.stitch.wall_ms.div_ceil(1000),
+                memory_mib: config.stitch.memory_bytes >> 20,
+            },
             iteration: state.iteration(),
             tasks: state
                 .tasks()
@@ -289,6 +334,25 @@ pub struct CheckReport {
     pub claimed_elsewhere: Vec<u64>,
 }
 
+/// The result of `dc_finish_iteration`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FinishReport {
+    /// The iteration that ended.
+    pub finished_iteration: u64,
+    /// How many verified programs the step took.
+    pub programs_used: u64,
+    /// How many abstractions joined the library.
+    pub new_abstractions: usize,
+    /// What the Stitch run did. `ran`: it finished. `failed`: it was
+    /// stopped at a limit or went wrong, so the library is unchanged.
+    /// `no_programs`: there was no program to compress, so it did not run.
+    pub compression: String,
+    /// Why the Stitch run failed, if it did.
+    pub compression_error: Option<String>,
+    /// The run after the step, in its next iteration.
+    pub status: RunStatus,
+}
+
 /// The result of `dc_proposal_stats`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ProposalStats {
@@ -318,14 +382,109 @@ pub fn known_tasks() -> Vec<String> {
 #[derive(Clone, Debug)]
 pub struct DcServer {
     store: Arc<Store>,
+    /// How `dc_finish_iteration` starts its Stitch worker.
+    worker: Arc<WorkerStart>,
+    /// What stops the Stitch runs of this server's calls.
+    stops: Arc<Stops>,
+}
+
+/// The cancel flags of the `dc_finish_iteration` calls that are running.
+#[derive(Debug, Default)]
+struct Stops {
+    /// Whether the server shut down, and the flag of each running call.
+    /// Both under one lock, so that a call that starts while the server
+    /// shuts down is stopped.
+    calls: Mutex<(bool, Vec<Arc<AtomicBool>>)>,
+}
+
+impl Stops {
+    fn calls(&self) -> std::sync::MutexGuard<'_, (bool, Vec<Arc<AtomicBool>>)> {
+        // The lock guards plain values: one that a panic left is still good.
+        self.calls.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The cancel flag of a new call. It is set already if the server shut
+    /// down.
+    fn call(self: &Arc<Stops>) -> CallStop {
+        let mut calls = self.calls();
+        let flag = Arc::new(AtomicBool::new(calls.0));
+        calls.1.push(Arc::clone(&flag));
+        CallStop {
+            flag,
+            stops: Arc::clone(self),
+        }
+    }
+
+    /// Sets the flag of every call, running or still to come.
+    fn stop_all(&self) {
+        let mut calls = self.calls();
+        calls.0 = true;
+        for flag in &calls.1 {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The cancel flag of one `dc_finish_iteration` call. Dropping it sets the
+/// flag: a call whose future is dropped stops its Stitch run.
+#[derive(Debug)]
+struct CallStop {
+    flag: Arc<AtomicBool>,
+    stops: Arc<Stops>,
+}
+
+impl CallStop {
+    fn stop(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for CallStop {
+    fn drop(&mut self) {
+        self.stop();
+        self.stops
+            .calls()
+            .1
+            .retain(|flag| !Arc::ptr_eq(flag, &self.flag));
+    }
 }
 
 impl DcServer {
-    /// A server for the runs in `store`.
-    pub fn new(store: Store) -> DcServer {
+    /// A server for the runs in `store`, whose `dc_finish_iteration` starts
+    /// its Stitch worker as `worker` says.
+    pub fn new(store: Store, worker: WorkerStart) -> DcServer {
         DcServer {
             store: Arc::new(store),
+            worker: Arc::new(worker),
+            stops: Arc::default(),
         }
+    }
+
+    /// Stops every `dc_finish_iteration` call of this server and its
+    /// clones, running or still to come: its Stitch run stops, and the call
+    /// fails as interrupted and writes nothing, unless it had already read
+    /// its cancel flag for the commit (`crate::iterate`). Call it when the
+    /// client is gone, so that a call does not go on for as long as its
+    /// Stitch run may take.
+    pub fn shut_down(&self) {
+        self.stops.stop_all();
+    }
+}
+
+#[cfg(test)]
+impl DcServer {
+    /// How many `dc_finish_iteration` calls are running.
+    pub(crate) fn finish_calls_running(&self) -> usize {
+        self.stops.calls().1.len()
+    }
+
+    /// `dc_finish_iteration`, for tests in other modules.
+    pub(crate) async fn finish_iteration_for_test(
+        &self,
+        arg: RunArg,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<FinishReport, String> {
+        self.finish(arg, cancelled).await.map(|Json(report)| report)
     }
 }
 
@@ -352,6 +511,58 @@ impl DcServer {
             .await
             .map_err(|e| format!("the tool call did not finish: {e}"))?
             .map(Json)
+    }
+
+    /// `dc_finish_iteration`. When `cancelled` is done, or this future is
+    /// dropped, the call's cancel flag is set: its Stitch run stops, and
+    /// the call writes nothing unless its commit had already read the flag
+    /// (`crate::iterate`).
+    async fn finish(
+        &self,
+        arg: RunArg,
+        cancelled: impl Future<Output = ()>,
+    ) -> Result<Json<FinishReport>, String> {
+        let run = run_id(&arg.run)?;
+        let worker = Arc::clone(&self.worker);
+        let stop = self.stops.call();
+        let stopping = Arc::clone(&stop.flag);
+        let work = self.blocking(move |store| {
+            let done = finish_iteration_in_worker(store, &run, &worker, &stopping)
+                .map_err(|e| e.to_string())?;
+            let (compression, compression_error) = match &done.report.compression {
+                CompressionReport::Ran { .. } => ("ran", None),
+                CompressionReport::Failed { error, .. } => ("failed", Some(error.clone())),
+                CompressionReport::NoPrograms { .. } => ("no_programs", None),
+            };
+            // The step is committed. If this read fails, say so, not that
+            // the step failed.
+            let status = store
+                .read_with_refusals(&run, |state, refusals| RunStatus::of(&run, state, refusals))
+                .map_err(|e| {
+                    format!(
+                        "iteration {} ended, but the run's status could not be read: {e}",
+                        done.iteration
+                    )
+                })?;
+            Ok(FinishReport {
+                finished_iteration: done.iteration,
+                programs_used: done.used,
+                new_abstractions: done.new_abstractions,
+                compression: compression.to_owned(),
+                compression_error,
+                status,
+            })
+        });
+        tokio::pin!(work);
+        tokio::pin!(cancelled);
+        tokio::select! {
+            done = &mut work => done,
+            () = &mut cancelled => {
+                stop.stop();
+                // The step ends as interrupted, or it was past stopping.
+                work.await
+            }
+        }
     }
 }
 
@@ -383,6 +594,18 @@ impl DcServer {
                 tasks
             }
         };
+        // Refused here, in the tool's own names and units.
+        if arg.stitch_iterations == Some(0) {
+            return Err("stitch_iterations must be at least 1".to_owned());
+        }
+        if arg.stitch_wall_seconds == Some(0) {
+            return Err("stitch_wall_seconds must be at least 1".to_owned());
+        }
+        let least_mib = MIN_STITCH_MEMORY_BYTES >> 20;
+        if arg.stitch_memory_mib.is_some_and(|m| m < least_mib) {
+            return Err(format!("stitch_memory_mib must be at least {least_mib}"));
+        }
+        let defaults = StitchSettings::default();
         let config = RunConfig {
             arm: Arm::Blind,
             seed: arg.seed,
@@ -395,6 +618,18 @@ impl DcServer {
             max_unchecked_per_batch: arg
                 .max_unchecked_per_batch
                 .unwrap_or(DEFAULT_MAX_UNCHECKED_PER_BATCH),
+            frontier_size: arg.frontier_size,
+            stitch: StitchSettings {
+                iterations: arg.stitch_iterations.unwrap_or(defaults.iterations),
+                max_arity: arg.stitch_max_arity.unwrap_or(defaults.max_arity),
+                wall_ms: arg
+                    .stitch_wall_seconds
+                    .map_or(defaults.wall_ms, |s| s.saturating_mul(1000)),
+                memory_bytes: arg
+                    .stitch_memory_mib
+                    .map_or(defaults.memory_bytes, |m| m.saturating_mul(1 << 20)),
+            },
+            prelude: shipped_prelude(),
         };
         self.blocking(move |store| {
             let state = store
@@ -512,6 +747,30 @@ impl DcServer {
             })
         })
         .await
+    }
+
+    /// Ends a run's current iteration.
+    #[tool(
+        name = "dc_finish_iteration",
+        description = "End the current iteration of a DreamCounter run, once every task has its \
+                       programs and all are checked (quota_in in dc_run_status). It keeps each \
+                       task's best programs as its frontier, runs Stitch on them to find new \
+                       abstractions for the library, and starts the next iteration, all in one \
+                       change to the run. The call first measures every program, then waits for \
+                       Stitch for at most the run's stitch.wall_seconds, then checks what \
+                       proposers submitted meanwhile, up to 8 times. If Stitch is stopped at a \
+                       limit the iteration still ends, with the library unchanged. If you \
+                       cancel the call before its change is written, Stitch stops and the run \
+                       is not changed. A cancelled call gets no reply, and a cancel may come \
+                       too late, so read dc_run_status afterwards. Returns what the step did and the run's status; the full \
+                       report is in the run's log."
+    )]
+    async fn finish_iteration(
+        &self,
+        Parameters(arg): Parameters<RunArg>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<FinishReport>, String> {
+        self.finish(arg, context.ct.cancelled_owned()).await
     }
 
     /// Lists the runs.
@@ -1046,6 +1305,9 @@ mod tests {
                         programs_per_batch: 1,
                         lease_ms: 1_000_000,
                         max_unchecked_per_batch: 3,
+                        frontier_size: 5,
+                        stitch: crate::state::StitchSettings::default(),
+                        prelude: crate::verify::shipped_prelude(),
                     },
                     vec!["collapse/merge".into()],
                 )

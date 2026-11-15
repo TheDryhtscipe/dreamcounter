@@ -52,8 +52,11 @@ pub const HEADER_PREFIX: &str = "dc-mcp journal ";
 /// The format version this code reads and writes. Version 2 (P4.2) added
 /// batches and submissions, gave library entries an arity, and dropped the
 /// log kinds for payloads, submissions and evaluations. No run was started
-/// in version 1, so this code does not read it.
-pub const FORMAT_VERSION: &str = "2";
+/// in version 1, so this code does not read it. Version 3 (P4.4b) put the
+/// frontier size, the Stitch settings and the prelude's fingerprint in a
+/// run's settings. A run needs all three to end an iteration, and no run of
+/// version 2 has them, so this code does not read version 2 either.
+pub const FORMAT_VERSION: &str = "3";
 
 /// The longest header line, with its line break, in bytes.
 pub const MAX_HEADER_LEN: usize = 64;

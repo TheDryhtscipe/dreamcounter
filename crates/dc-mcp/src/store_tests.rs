@@ -15,6 +15,9 @@ fn config() -> RunConfig {
         programs_per_batch: 1,
         lease_ms: 60_000,
         max_unchecked_per_batch: 3,
+        frontier_size: 5,
+        stitch: crate::state::StitchSettings::default(),
+        prelude: 0,
     }
 }
 
@@ -341,10 +344,10 @@ fn a_journal_of_another_format_version_is_not_called_damaged() {
         .unwrap();
     let path = journal(dir.path(), "r1");
     let text = fs::read_to_string(&path).unwrap();
-    fs::write(&path, text.replacen("journal 2 ", "journal 1 ", 1)).unwrap();
+    fs::write(&path, text.replacen("journal 3 ", "journal 2 ", 1)).unwrap();
     match Store::open(dir.path()).unwrap().state(&run) {
         Err(StoreError::UnsupportedFormat { header, .. }) => {
-            assert!(header.starts_with("dc-mcp journal 1 "), "{header}");
+            assert!(header.starts_with("dc-mcp journal 2 "), "{header}");
         }
         other => panic!("{other:?}"),
     }
@@ -1387,6 +1390,9 @@ fn two_stores_agree_with_the_journal(seed: u64, steps: u32) -> Outcomes {
     // A cap of 1, so that refusals are common.
     let capped = RunConfig {
         max_unchecked_per_batch: 1,
+        frontier_size: 5,
+        stitch: crate::state::StitchSettings::default(),
+        prelude: 0,
         ..config()
     };
     a.create_run(&run, capped, tasks()).unwrap();

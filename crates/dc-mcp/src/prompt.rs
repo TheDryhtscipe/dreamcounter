@@ -438,6 +438,9 @@ mod tests {
                 programs_per_batch: 1,
                 lease_ms: 90_000,
                 max_unchecked_per_batch: 3,
+                frontier_size: 5,
+                stitch: crate::state::StitchSettings::default(),
+                prelude: crate::verify::shipped_prelude(),
             },
             tasks.iter().map(|t| (*t).to_owned()).collect(),
         )
