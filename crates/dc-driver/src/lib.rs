@@ -77,8 +77,8 @@ use std::sync::atomic::AtomicBool;
 
 use dc_compress::worker::{Worker, WorkerError};
 use dc_compress::{
-    compress_isolated_with, compress_with, CompressConfig, CompressError, Compression,
-    FrontierProgram, IsolatedRun, ABSTRACTION_PREFIX,
+    compress_isolated_with, compress_with, expand_prelude, library_names, CompressConfig,
+    CompressError, Compression, FrontierProgram, IsolatedRun,
 };
 use dc_core::sexpr::MAX_PRINT_NODES;
 use dc_core::term::children;
@@ -459,18 +459,14 @@ fn expr_cost(e: &Expr) -> u64 {
     total
 }
 
-/// The names of a library of `len` entries, as the bridge names them, and of
-/// the prelude's functions, each under its own name.
+/// The names of a library of `len` entries and of the prelude's functions, as
+/// the bridge gives them to Stitch ([`dc_compress::library_names`]).
 fn names(len: usize, prelude: Option<&Prelude>) -> Result<LibNames, DriverError> {
     let len = u32::try_from(len).map_err(|_| DriverError::LibraryTooLarge)?;
-    let mut names =
-        LibNames::sequential(ABSTRACTION_PREFIX, len).map_err(|_| DriverError::LibraryTooLarge)?;
-    for e in prelude.map_or(&[][..], Prelude::entries) {
-        names
-            .insert(e.lib(), e.name())
-            .map_err(|err| DriverError::PreludeName(err.to_string()))?;
-    }
-    Ok(names)
+    library_names(len, prelude).map_err(|err| match err {
+        CompressError::Names(e) => DriverError::PreludeName(e.to_string()),
+        _ => DriverError::LibraryTooLarge,
+    })
 }
 
 /// `id` as text. Every program in the pool and every abstraction kept is
@@ -513,15 +509,6 @@ struct Library<'a> {
     /// expanded.
     expander: Expander,
     schemes: Vec<Scheme>,
-}
-
-/// `term` with the prelude's references replaced by their definitions: the first
-/// step of expansion (`dc_surface::prelude`).
-fn expand_prelude(prelude: Option<&Prelude>, arena: &mut Arena, term: TermId) -> TermId {
-    match prelude {
-        Some(p) => p.expand(arena, term),
-        None => term,
-    }
 }
 
 impl<'a> Library<'a> {

@@ -334,10 +334,18 @@ pub fn stitch_config(cfg: &CompressConfig, library_len: usize) -> MultistepCompr
     s
 }
 
-/// The names of a library of `len` entries.
+/// The names the bridge gives a library of `len` entries (`fn_0`, `fn_1`, ...).
 /// With a `prelude`, each of its functions is named as the prelude names it,
 /// so Stitch sees it as an opaque token.
-fn library_names(len: u32, prelude: Option<&Prelude>) -> Result<LibNames, CompressError> {
+///
+/// Anything that prices or prints programs the way Stitch sees them uses this
+/// table, so that it agrees with the text given to Stitch.
+///
+/// # Errors
+///
+/// [`CompressError::Names`] if a prelude name is not a legal Stitch token or
+/// clashes with another name. The shipped prelude has no such name.
+pub fn library_names(len: u32, prelude: Option<&Prelude>) -> Result<LibNames, CompressError> {
     let mut names = LibNames::sequential(ABSTRACTION_PREFIX, len).map_err(CompressError::Names)?;
     for e in prelude.map_or(&[][..], Prelude::entries) {
         names
@@ -349,8 +357,8 @@ fn library_names(len: u32, prelude: Option<&Prelude>) -> Result<LibNames, Compre
 
 /// `term` with the prelude's functions replaced by their definitions. This is
 /// the first step of expansion: the learned-abstraction expander never sees a
-/// prelude id (`dc_surface::prelude`).
-fn expand_prelude(prelude: Option<&Prelude>, arena: &mut Arena, term: TermId) -> TermId {
+/// prelude id (`dc_surface::prelude`). With no prelude, `term` is returned.
+pub fn expand_prelude(prelude: Option<&Prelude>, arena: &mut Arena, term: TermId) -> TermId {
     match prelude {
         Some(p) => p.expand(arena, term),
         None => term,
@@ -668,7 +676,7 @@ fn accept(
             .map(LibId);
         match check_step(
             &mut scratch,
-            (prelude, max_arity),
+            StepRules { prelude, max_arity },
             next,
             step,
             &mut names,
@@ -760,24 +768,30 @@ fn copy_term(
     copied[&id]
 }
 
+/// What a step may use: the prelude its terms may refer to, and the largest
+/// arity its abstraction may have.
+#[derive(Clone, Copy, Debug)]
+struct StepRules<'a> {
+    prelude: Option<&'a Prelude>,
+    max_arity: u32,
+}
+
 /// Checks one step in the scratch arena. Its abstraction should get the id `id`.
 /// `libs` is the library with the abstractions kept so far, and `want` holds
 /// what each input program expands to.
 ///
 /// If the step passes, its abstraction is added to `libs` and its name to
 /// `names`. If not, both are left as they were.
-///
-/// `limits` is the prelude the step may use and the largest arity it may have.
 fn check_step(
     scratch: &mut Arena,
-    limits: (Option<&Prelude>, u32),
+    rules: StepRules<'_>,
     id: Option<LibId>,
     step: &StitchStep,
     names: &mut LibNames,
     libs: &mut Vec<LibDef>,
     want: &[TermId],
 ) -> Result<(), RejectReason> {
-    let (prelude, max_arity) = limits;
+    let StepRules { prelude, max_arity } = rules;
     let Some(id) = id else {
         return Err(RejectReason::UnexpectedName { expected: None });
     };
@@ -1019,7 +1033,10 @@ mod tests {
         assert_eq!(
             check_step(
                 &mut a,
-                (None, 2),
+                StepRules {
+                    prelude: None,
+                    max_arity: 2
+                },
                 None,
                 &s,
                 &mut LibNames::new(),

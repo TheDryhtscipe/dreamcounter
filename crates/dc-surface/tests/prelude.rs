@@ -931,3 +931,52 @@ fn learned_expander_rejects_unexpanded_prelude_references() {
         Err(ExpandError::UnknownLib(map))
     );
 }
+
+/// The fingerprint of a prelude compiled from `text`.
+fn fingerprint_of(text: &str) -> u64 {
+    Prelude::from_source("fp", text)
+        .unwrap_or_else(|e| panic!("{text}: {e}"))
+        .fingerprint()
+}
+
+const TWO: &str = "let max a b = if a <= b then b else a\nlet min a b = if a <= b then a else b";
+
+#[test]
+fn the_fingerprint_does_not_depend_on_comments_or_layout() {
+    let spaced = "-- two\nlet max a b =\n  if a <= b then b else a\n\nlet min a b = if a <= b then a else b\n";
+    assert_eq!(fingerprint_of(TWO), fingerprint_of(spaced));
+    assert_eq!(
+        prelude().fingerprint(),
+        Prelude::load().unwrap().fingerprint()
+    );
+}
+
+#[test]
+fn reordering_two_definitions_of_the_same_type_changes_the_fingerprint() {
+    // After the swap, LibId(PRELUDE_LIB_BASE) means min, not max, and a stored
+    // program still type-checks: only the fingerprint tells them apart.
+    let swapped = "let min a b = if a <= b then a else b\nlet max a b = if a <= b then b else a";
+    assert_ne!(fingerprint_of(TWO), fingerprint_of(swapped));
+}
+
+#[test]
+fn changing_a_body_or_a_name_changes_the_fingerprint() {
+    let body = "let max a b = if a < b then b else a\nlet min a b = if a <= b then a else b";
+    let name = "let biggest a b = if a <= b then b else a\nlet min a b = if a <= b then a else b";
+    let added = format!("{TWO}\nlet id x = x");
+    let base = fingerprint_of(TWO);
+    assert_ne!(base, fingerprint_of(body));
+    assert_ne!(base, fingerprint_of(name));
+    assert_ne!(base, fingerprint_of(&added));
+}
+
+#[test]
+fn the_fingerprint_is_the_same_in_every_process() {
+    // A run stores the fingerprint and compares it after a restart, so it must
+    // not depend on a per-process hash seed. The value is pinned.
+    assert_eq!(fingerprint_of("let id x = x"), ID_FINGERPRINT);
+}
+
+/// The fingerprint of `let id x = x`, pinned by
+/// [`the_fingerprint_is_the_same_in_every_process`].
+const ID_FINGERPRINT: u64 = 18_178_742_751_958_671_124;
