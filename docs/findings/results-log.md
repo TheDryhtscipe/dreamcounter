@@ -4,7 +4,7 @@ title: Results log
 type: reference
 scope: internal
 created_at: '2026-10-27T17:11:14.071510Z'
-updated_at: '2026-11-04T22:31:28.049800Z'
+updated_at: '2026-11-15T21:40:54.849113Z'
 ---
 
 Dated entries for every experiment run, including failed and null results. Each
@@ -318,3 +318,104 @@ The next-closest class to each median series: msort `n` (0.112 on 16..512, 0.151
 - **Result:** tables that only their own entries reach are released, and peak memory no longer grows with the iteration count. Step counts do not change. The new build was faster on the bead case. Under this load, that difference does not measure the walk's own cost.
 - **Cost bound:** the test `reachability_walks_cost_at_most_a_constant_times_the_steps` checks that walk work stays within a constant times the steps taken. A walk that would visit more parts than the steps since the last finished walk gives up. The next walk then waits twice as long.
 - **Limits:** while the reachable memory is larger than the steps since the last finished walk, walks give up. Unreachable tables then stay until a walk finishes. Some frames count as roots even where they may not be the only path to a table: `unfold`'s `g`, `tabulate`'s `f`, and memo stores. This can keep a table longer; it never releases a reachable one.
+
+
+
+
+---
+
+## 2026-11-12: Seed-centred per-seed noise on the reference programs
+
+- **Question:** does the check on each seed alone in `reference_growth.rs` give different verdicts when its per-seed noise takes out each seed's level, as estimator C does (D15)? Until bead dreamcounter-eb1ace, that file had its own uncentred copy of `single_seed_noise`. The family tests have used the centred helper since PR 40.
+- **Command:** `cargo test --release -p dc-tasks --test reference_growth -- --include-ignored --nocapture --test-threads=1` (lines tagged `RESULT`).
+- **Builds:** base `c354a9d` (main). New `04364f5` on branch `eb1ace-centre-seed-noise` (PR 50). The later commit on the branch changes only doc comments.
+- **Config:** harness defaults (5 seeds, seeds 0..4). Every sweep comes from `measure`, so it is in seed order. Sweeps as in the entry of 2026-10-28.
+
+| program | sweep | per-seed noise, base | per-seed noise, new | noise margin, base | noise margin, new | per seed, both builds |
+|---|---|---|---|---|---|---|
+| sum_ref | 16..1024 | 9.9e-16 | 0.0 | 0.0000 | 0.0000 | 5 of 5 named n |
+| msort | 16..512 | 0.007258 | 0.007410 | 0.0218 | 0.0222 | 5 of 5 named n log n |
+| msort | 16..1024 | 0.007258 | 0.007401 | 0.0218 | 0.0222 | 5 of 5 named n log n |
+| isort | 16..512 | 0.159984 | 0.156343 | 0.4800 | 0.4690 | 5 of 5 TooNoisy |
+| isort | 16..1024 | 0.159984 | 0.156877 | 0.4800 | 0.4706 | 5 of 5 TooNoisy |
+| zero_subsets | 4..14 | 0.0 | 0.0 | 0.0000 | 0.0000 | 5 of 5 named 2ⁿ |
+
+- **Result:** no verdict on a seed alone changes. The per-seed noise moves by about 2 % or less, because the seeds of these reference programs barely differ in level. Merge sort's noise rises slightly: the centred variance is multiplied by `N / (N − 1)` over `N` sizes.
+- **Check:** the test `per_seed_noise_is_centred_on_a_sweep_in_seed_order` fails on the base build (0.1687 against C's 0.0175). An independent review made it fail on the new build in two ways: with centring turned off, and with the `N / (N − 1)` factor removed (0.0162 against 0.0175).
+
+
+
+
+---
+
+## 2026-11-13: Expansion throughput with foldhash for the Expander's maps
+
+- **Question:** how much slower is library expansion when the `Expander`'s three maps use foldhash with a seed for each map instead of FxHash? The maps are the task memo, the renaming index and the memo of `restrict`. Bead dreamcounter-994cf2 made this change for the reason given in dreamcounter-e3548c: a program's shape chooses which combinations of ids and depths become keys, and FxHash is affine in each field.
+- **Builds:** base `11728c6` on branch `fix-994cf2-expander-hash`, which adds only the new tests to `bdcd963` (main), so its maps still use FxHash. New `df20da9` on the same branch, with `foldhash::fast::RandomState` (foldhash 0.2). Both builds are `release` with default `RUSTFLAGS`, each in its own target directory. The runs were made at `9905e29` and `2961fc4`, which differ from these commits only in their author address. The later commit on the branch changes only comments.
+- **Probe:** a scratch example program `expand_probe` in `dc-core`, not committed. An xorshift generator with seed `0x9E3779B97F4A7C15` builds 24 libraries of arity 1 to 3. Their bodies have about 12 nodes and may use earlier libraries. The generator then builds random programs of lambdas, `if`s and saturated library uses, with variables, small integers and `true` as leaves. One `Expander` expands every program in turn into a clone of the arena. The probe reports CPU nanoseconds per program, read from `/proc/thread-self/schedstat`, as the best of 5 passes.
+  - **Large programs:** 5,000 programs of about 200 generated nodes (`expand_probe 200 5000`).
+  - **Small programs:** 30,000 programs of about 30 generated nodes (`expand_probe 30 30000`), so per-program costs weigh more.
+- **Method:** 8 rounds at both sizes. Each round runs the base build and then the new one. The table gives the median of the 8 runs.
+- **Machine:** AMD Ryzen 7 2700, 16 threads. The load average was 8.9 to 10.5 throughout, from other agents.
+
+| programs | base ns/program | new ns/program | change |
+|---|---|---|---|
+| large | 46,598 | 47,295 | +1.5 % |
+| small | 12,281 | 11,703 | −4.7 % |
+
+- **Raw runs, rounds 1 to 8, ns/program.** Large base: 51,282, 56,184, 44,799, 47,799, 43,943, 45,398, 41,667, 48,550. Large new: 51,998, 48,390, 50,191, 51,914, 43,997, 44,905, 39,721, 46,200. Small base: 11,974, 12,469, 12,330, 12,666, 11,994, 12,232, 10,800, 12,916. Small new: 12,071, 13,432, 11,334, 11,000, 12,499, 11,065, 11,288, 12,667.
+- **Result:** no change in expansion time is measurable at this load. The two builds differ by less than the spread of either build between rounds, which is about ±10 %. The new build was faster in 3 of the 8 large rounds and 5 of the 8 small rounds.
+- **Collision check:** three tests each hash 4,096 keys whose FxHash values agree in their low 50 bits before FxHash's final rotation. The tests are `the_renaming_index_spreads_keys_chosen_to_collide`, `the_restrict_memo_spreads_keys_chosen_to_collide` and `the_task_memo_spreads_keys_chosen_to_collide`. With FxHash, all 4,096 keys fall in 1 bucket and 1 tag in each map. With foldhash, each test needs more than 2,000 of 4,096 buckets and more than 100 of 128 tags, and passes. Expansion time on such keys was not measured, because no program is known that produces them.
+
+
+
+---
+
+## 2026-11-15: Evaluator profile, and throughput when a primitive with all its arguments builds no partial application
+
+- **Question:** where does the evaluator spend its time on one thread? How much faster is it when a primitive that the term applies to all its arguments runs without a function value for each argument? Bead dreamcounter-a0627f.
+- **Machine:** AMD Ryzen 7 2700, 16 threads. `perf` was not available (`perf_event_paranoid` is 4), and `valgrind` is not installed.
+
+### Profile
+
+- **Build:** `d96299c` (main at the time of the local checkout), `release` with `debug = 1`, default `RUSTFLAGS`.
+- **Probe:** a scratch Cargo package outside the repository, not committed, with a path dependency on `dc-bench`. It compiles one benchmark program and runs it at its full `n` on one thread for 12 s.
+- **Method:** `gdb` ran the probe as its child, with `handle SIGINT stop print nopass`. A shell loop sent `SIGINT` to the probe every 10 ms. A Python loop in `gdb` recorded the function names of the stack at each stop. Each sample is put in the first group it matches: a `Vec` growing anywhere in the stack; then a value drop anywhere in the stack; then an allocator function in the innermost six frames; then `memcpy` as the innermost frame.
+- **Load average:** 2.79 after the first set of runs and 2.92 after the second. A first set of runs recorded no samples, because `noprint` implies `nostop`.
+
+| program | samples | interpreter | dropping values, with their frees | other allocator calls | `Vec` growth |
+|---|---|---|---|---|---|
+| sum | 927 | 37.2 % | 32.9 % | 17.4 % | 12.5 % |
+| msort | 946 | 36.3 % | 35.7 % | 19.0 % | 9.0 % |
+| fib_memo | 931 | 39.7 % | 23.2 % | 24.3 % | 12.8 % |
+| max_subarray | 962 | 46.2 % | 25.6 % | 19.9 % | 8.1 % |
+
+- **`Vec` growth from `Machine::apply`:** 11.2 %, 6.6 %, 8.8 %, and 6.9 % of the samples of `sum`, `msort`, `fib_memo`, and `max_subarray`. That is the `Fun::Partial` arm, which copied the argument vector and pushed onto it for each argument.
+- **Throughput with and without sampling:** `sum` 4.79 and 5.25 Msteps/s; `msort` 2.68 and 2.88; `fib_memo` 2.89 and 3.22; `max_subarray` 3.17 and 3.53. These are wall-clock rates.
+- **Result:** 54 to 63 % of the samples are in allocation, freeing, and dropping values. The `max_subarray` row has 0.3 % of its samples in `memcpy`, not shown.
+
+### Throughput before and after
+
+- **Builds:** base `9071b02` (main). New `1369d6a` on branch `a0627f-saturated-prims`. Both `release` with `debug = 1` and default `RUSTFLAGS`, each in its own target directory.
+- **Probe:** a second scratch package, not committed. For each `dc-bench` program at its full `n`, on one thread, it warms up for 0.2 s and then runs ten times the warm-up's count of evaluations. It checks every step count against the first run's. It reports steps per second of the thread's CPU time, read from `/proc/thread-self/schedstat`.
+- **Method:** 6 rounds, each running the base build and then the new one. The table gives the median of the 6 runs.
+- **Load average:** 2.89 at the start and 2.87 at the end.
+
+| program | steps/eval, both builds | base Msteps/CPU-s | new Msteps/CPU-s | new / base |
+|---|---|---|---|---|
+| sum | 40,001 | 5.378 | 9.974 | 1.85 |
+| max_subarray | 150,003 | 3.752 | 5.998 | 1.60 |
+| msort | 290,817 | 3.040 | 5.627 | 1.85 |
+| fib_naive | 142,292 | 3.816 | 7.557 | 1.98 |
+| fib_memo | 661 | 3.293 | 5.986 | 1.82 |
+| bsearch | 248 | 2.745 | 5.572 | 2.03 |
+
+- **Raw runs, rounds 1 to 6, Msteps/CPU-s.**
+  - `sum` base: 5.550, 5.334, 5.359, 5.570, 5.398, 4.926. New: 10.105, 9.937, 9.861, 10.010, 10.166, 9.881.
+  - `max_subarray` base: 3.787, 3.676, 3.762, 3.741, 3.795, 3.621. New: 5.806, 6.065, 6.086, 5.986, 6.010, 5.917.
+  - `msort` base: 3.014, 3.102, 3.081, 3.067, 3.005, 2.978. New: 5.623, 5.718, 5.777, 5.631, 5.551, 5.527.
+  - `fib_naive` base: 3.827, 3.838, 3.918, 3.805, 3.725, 3.741. New: 7.547, 7.495, 7.584, 7.597, 7.329, 7.566.
+  - `fib_memo` base: 3.367, 3.301, 3.259, 3.320, 3.285, 3.254. New: 5.828, 5.955, 6.083, 6.056, 6.016, 5.801.
+  - `bsearch` base: 2.793, 2.816, 2.728, 2.718, 2.762, 2.595. New: 5.621, 5.495, 5.645, 5.478, 5.581, 5.563.
+- **Result:** the new build is 1.6 to 2.0 times as fast on one thread, and it was faster in all 6 rounds for every program. The step counts are the same on both builds.
+- **Not measured:** throughput on 16 threads, the task corpus, and a profile of the new build.

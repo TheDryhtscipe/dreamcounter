@@ -5,7 +5,7 @@ title: 'D11: Proposals come from Claude sessions pulling work over MCP; API call
 type: decision
 scope: internal
 created_at: '2026-10-27T21:23:29.915628Z'
-updated_at: '2026-10-27T21:23:29.915628Z'
+updated_at: '2026-11-15T19:38:34.116144Z'
 ---
 
 - **Date:** 2026-10-27. **Status:** accepted. The project lead chose the pull-based proposer to keep API spending low (Q5). The protocol details below are Claude's design and open to change.
@@ -23,5 +23,9 @@ updated_at: '2026-10-27T21:23:29.915628Z'
   3. **Sample independence.** Samples written in one context are correlated, unlike independent API samples at a fixed temperature. Where frontier diversity matters, each sample comes from a separate proposer agent; otherwise the run records that samples share a context.
   4. **Accounting.** Model version and temperature cannot be fixed. The server records the model identity where the session reports it, and counts proposals and approximate tokens. The compute-matched baseline (D8) is matched on proposals and tokens, not on money.
   5. **The project lead starts runs.** Launching proposer sessions is a side-effectful process under the user's rules, so a run starts only on the project lead's instruction.
+- **Additions (2026-11-12, accepted by the project lead):**
+  - **Second backend (Q5, bead dreamcounter-2170f2).** The optional backend's first use is a local open-weights model of about 7B parameters, quantised, as the weaker-model ablation. There is no paid API arm for now. That choice is revisited after P5 results show whether the limits on sampling control matter.
+  - **Where the model runs.** This machine may not have the resources for the model. A Windows machine that a friend owns probably does. So the backend calls a model served over HTTP at a configured endpoint, and dc stays on this Linux machine. dc does not need to build on Windows. Each run records the served model's name, quantisation, and sampling settings. Each run needs the project lead's go (requirement 5).
+  - **Feedback arm (Q9, bead dreamcounter-d8f7a4).** Every P4 arm is blind (requirement 2). A feedback arm comes later, as a separate, labelled ablation, after the blind arm has first results. In it, the proposer may call an evaluation tool (value, steps, and example results) before it submits. Its compute-matched LLM-only baseline gets the same tool and the same call budget. Evaluation calls are a third budget, beside proposals and tokens (bead dreamcounter-07fa2f).
 - **Costs of the choice:** less control over sampling than an API gives; usage limits set throughput; a contamination check is needed before results can be trusted.
-- **See:** D8 (compute-matched baseline), Q5 (budget), Q7 (held-out family), language spec §11.
+- **See:** D8 (compute-matched baseline), Q5 (budget), Q7 (held-out family), language spec §11, D21 (doc-amd: how proposer sessions are started and locked down, and the contamination check).

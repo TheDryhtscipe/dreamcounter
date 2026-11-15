@@ -5,7 +5,7 @@ title: 'D14: The held-out family is chosen by the project lead from four candida
 type: decision
 scope: internal
 created_at: '2026-10-29T18:39:53.431269Z'
-updated_at: '2026-11-04T10:39:21.739228Z'
+updated_at: '2026-11-12T12:07:55.054911Z'
 ---
 
 Status: accepted 2026-10-29 (answers Q7, dreamcounter-ee11eb). Work: P3.9 (dreamcounter-4eda41).
@@ -91,14 +91,26 @@ The four candidates were built on 2026-10-29 (beads dreamcounter-4c48e2, ca97cb,
 - **H3 full palette** takes no bound `k`. Its signature is `List Int -> Int`, and an empty list gives 0.
 - **H4 references.** Each variant has three references: the naive `2ⁿ` reference, checked on its own short sweep `6..16`; an `n²` reference, which makes the fuel plan; and the good `n` reference.
 - **Inputs built for natural solutions.** In each candidate, every input mixes all of its kinds, so a natural correct solution costs about the same on every seed of a size and estimator C can name its class. Each candidate's module documentation lists what its sweep holds.
+- **Choices that hold for a seed.** Since 2026-11-12 (dreamcounter-40ca4e), H1, H3 and H4 take each input's whole-input choices from the seed alone, as the development families do. Estimator C takes out each seed's level on a sweep in seed order, so such a choice adds no noise. The choices are:
+  - H1: the order of the four blocks.
+  - H3: the alphabet (its size by the seed mod 7), the late value, its copies (by the seed mod 3), and the kinds of the middle's blocks.
+  - H4: whether `N` is left so, broken, or set to the modulus edge, by the seed mod 3.
+
+  H2 still draws its choices per input. Per-seed choices there cut the sweep inputs that catch one wrong deepest-point program from 4 to 1. Its natural solutions are named `n log n` either way.
 - **Untimed checks.** A variant can also have checks (`HeldoutVariant::checks`). A check is an input that a program must answer as the oracle does, within the default fuel cap, but that is not timed. The evaluation counts a variant solved only if the program passes its checks as well as the sweep. It treats a variant whose good reference fails a check as broken. Only H3 has checks. They hold the regimes that make natural solutions too noisy for C when the sweep holds them: bounds of 0, bounds that few or most elements exceed, long answer windows, and full palette windows away from the end of the list. Each H3 variant has 204 checks, of sizes up to 512, the sweep's largest. A larger check could time out, under the default fuel cap, a correct program that the sweep's fuel plan allows. Stopping at 512 makes such a timeout unlikely but does not rule it out, because a check's cost depends on its input. For example, an `n²` program that stops early costs about 8 times as much on a check as on the sweep.
 - **H3 few kinds' bound.** The sweep's bound `k` is always 2, so a natural solution's cost per element is the same on every seed. The checks use bounds from 0 to 10.
-- **Natural solutions and C.** C names `n` for most natural linear solutions written in the tests, but not all of them. In H3, the tests require 13 natural solutions to be named `n`. One more natural few-kinds solution, which rescans the last positions each time the window breaks the bound, is measured but refused as too noisy, because its cost depends on the size of the list's alphabet. Estimator C refusing natural correct solutions is a project-wide issue, dreamcounter-0ea5b7. It affects the evaluation's `good_class` count for every candidate.
+- **Natural solutions and C.** C names the good class for most natural solutions written in the tests, but not all of them. The tests require it for 5 natural solutions in H1, 3 in H2 (`n log n`), 13 in H3, and 3 in H4. One more natural few-kinds solution in H3, which rescans the last positions each time the window breaks the bound, is measured but refused as too noisy. Within each seed its cost grows slower than `n`, because the middle's blocks are `n / 16` long and the window breaks the bound less often per element at larger sizes. Taking out each seed's level cannot fix that. Estimator C refusing natural correct solutions affects the evaluation's `good_class` count for every candidate (dreamcounter-0ea5b7).
 
 ## Limits
 
 - The agents that build the candidates see all four. Everyone knows the held-out family is one of them. The protocol hides which one, not the set.
-- The rule in step 3 is an instruction, not an enforced control. A hook that denies agent reads of `CHOICE` needs a change outside this repository, so it is filed as its own bead.
+- Since 2026-11-12 (dreamcounter-54585a), a Claude Code hook enforces the rule in step 3 on this machine. The hook is `~/.claude/hooks/guard-heldout-choice.py`, and its tests are in `~/.claude/hooks/tests/guard-heldout-choice.test.sh`. It denies these calls:
+  - file tool calls on `CHOICE`;
+  - Grep calls that would search it;
+  - shell commands that name it, match it with a glob, read the held-out crate's root recursively, list that root into another command, or delete or move it.
+
+  The evaluation command does not name `CHOICE`, so the hook lets it run. Glob calls are allowed, because they return names only.
+- The hook guards against accidental reads. It is not a sandbox. It does not stop a command that builds the path at run time, for example from a variable or a script file. It does not stop a recursive reader that follows a symlink into the held-out crate. The hook's docstring lists its other limits.
 
 ## Rejected alternatives
 
