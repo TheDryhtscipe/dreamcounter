@@ -206,6 +206,19 @@ enum Frame {
     AppFun { f: Value },
     /// A function value is done: apply it to this argument.
     ApplyTo(Value),
+    /// One argument of a primitive that the term applies to all its arguments
+    /// is done. `terms` are the argument terms in order, and `next` is the
+    /// number of arguments done once this value arrives. `done` holds the
+    /// earlier values, with `unit` in the places not yet filled. `env` is the
+    /// environment of the arguments still to evaluate, or the empty one when
+    /// there are none. See [`Machine::whole_prim_call`].
+    PrimArgs {
+        prim: Prim,
+        terms: [TermId; MAX_PRIM_ARITY],
+        done: [Value; MAX_PRIM_ARITY - 1],
+        next: usize,
+        env: Env,
+    },
     /// The bound value of a `let` is done: evaluate the body.
     LetBody { body: TermId, env: Env },
     /// The condition is done.
@@ -269,6 +282,8 @@ struct Machine<'a> {
     next_walk_at: u64,
     /// The work of every reachability walk so far. Only tests read it.
     walk_work: u64,
+    /// The partial applications of primitives built so far. Only tests read it.
+    partials_built: u64,
 }
 
 /// When [`Machine::adopt_table`] looks for memo tables the program cannot reach.
@@ -290,6 +305,11 @@ const PRUNING: Pruning = Pruning {
     eager: false,
 };
 
+/// The largest arity of a primitive that [`Machine::whole_prim_call`] handles.
+/// No primitive has a larger one; one that did would still run, by partial
+/// application.
+const MAX_PRIM_ARITY: usize = 3;
+
 /// The work a reachability walk may always do, whatever the steps since the last.
 const MEMO_WALK_MIN: u64 = 1024;
 
@@ -306,6 +326,7 @@ impl<'a> Machine<'a> {
             last_walk_at: 0,
             next_walk_at: 0,
             walk_work: 0,
+            partials_built: 0,
         }
     }
 
@@ -356,6 +377,21 @@ impl<'a> Machine<'a> {
             }
             Term::Lam(body) => Control::Return(Value::Fun(Rc::new(Fun::Closure { body, env }))),
             Term::App(f, a) => {
+                if let Some((prim, terms)) = self.whole_prim_call(f, a) {
+                    let rest = if prim.arity() == 1 {
+                        Env::empty()
+                    } else {
+                        env.clone()
+                    };
+                    self.stack.push(Frame::PrimArgs {
+                        prim,
+                        terms,
+                        done: [Value::Unit, Value::Unit],
+                        next: 1,
+                        env: rest,
+                    });
+                    return Ok(Control::Eval(terms[0], env));
+                }
                 self.stack.push(Frame::AppArg {
                     arg: a,
                     env: env.clone(),
@@ -385,10 +421,13 @@ impl<'a> Machine<'a> {
                     self.charge(cost::PRIM)?;
                     Control::Return(Value::Tree(Tree::leaf()))
                 }
-                _ => Control::Return(Value::Fun(Rc::new(Fun::Partial {
-                    prim: p,
-                    args: Vec::new(),
-                }))),
+                _ => {
+                    self.partials_built += 1;
+                    Control::Return(Value::Fun(Rc::new(Fun::Partial {
+                        prim: p,
+                        args: Vec::new(),
+                    })))
+                }
             },
             Term::Lib(l) => return Err(stuck(Stuck::UnexpandedLib(l))),
             Term::If(c, then_, else_) => {
@@ -416,6 +455,42 @@ impl<'a> Machine<'a> {
         })
     }
 
+    /// The primitive and the argument terms, in order, if the application of
+    /// `f` to `a` is a primitive applied to exactly as many arguments as its
+    /// arity. The unused places of the array repeat `a`.
+    ///
+    /// Such a call is evaluated without a function value for the primitive or
+    /// for each partial application. What the program can observe is the same
+    /// as applying the primitive to one argument at a time: the arguments are
+    /// evaluated in order, partial application charges nothing, and the
+    /// primitive runs, and is charged, when the last argument is done.
+    ///
+    /// The search looks at no more than `MAX_PRIM_ARITY + 1` terms, so it adds
+    /// constant work to an application however long its chain of arguments.
+    fn whole_prim_call(&self, f: TermId, a: TermId) -> Option<(Prim, [TermId; MAX_PRIM_ARITY])> {
+        // The arguments found so far, last first.
+        let mut found = [a; MAX_PRIM_ARITY];
+        let mut n = 1;
+        let mut head = f;
+        loop {
+            match self.arena.get(head) {
+                Term::Prim(p) if p.arity() == n => {
+                    let mut terms = [a; MAX_PRIM_ARITY];
+                    for (i, term) in terms.iter_mut().take(n).enumerate() {
+                        *term = found[n - 1 - i];
+                    }
+                    return Some((p, terms));
+                }
+                Term::App(g, b) if n < MAX_PRIM_ARITY => {
+                    found[n] = b;
+                    n += 1;
+                    head = g;
+                }
+                _ => return None,
+            }
+        }
+    }
+
     fn decide(&mut self, v: &Value) -> Result<bool, Halt> {
         match v {
             Value::Bool(b) => {
@@ -434,6 +509,37 @@ impl<'a> Machine<'a> {
             }
             Frame::AppFun { f } => self.apply(&f, v),
             Frame::ApplyTo(x) => self.apply(&v, x),
+            Frame::PrimArgs {
+                prim,
+                terms,
+                mut done,
+                next,
+                env,
+            } => {
+                let arity = prim.arity();
+                if next == arity {
+                    let [a, b] = done;
+                    return match arity {
+                        1 => self.prim(prim, &[v]),
+                        2 => self.prim(prim, &[a, v]),
+                        _ => self.prim(prim, &[a, b, v]),
+                    };
+                }
+                done[next - 1] = v;
+                let rest = if next + 1 == arity {
+                    Env::empty()
+                } else {
+                    env.clone()
+                };
+                self.stack.push(Frame::PrimArgs {
+                    prim,
+                    terms,
+                    done,
+                    next: next + 1,
+                    env: rest,
+                });
+                Ok(Control::Eval(terms[next], env))
+            }
             Frame::LetBody { body, env } => Ok(Control::Eval(body, env.push(v))),
             Frame::If { then_, else_, env } => {
                 let b = self.decide(&v)?;
@@ -501,6 +607,7 @@ impl<'a> Machine<'a> {
                 args.push(x);
                 if args.len() < prim.arity() {
                     self.charge(cost::PARTIAL)?;
+                    self.partials_built += 1;
                     Ok(Control::Return(Value::Fun(Rc::new(Fun::Partial {
                         prim: *prim,
                         args,
@@ -939,6 +1046,10 @@ fn frame_parts<'f>(
         Frame::AppFun { f } | Frame::ApplyTo(f) | Frame::Loop { f, .. } => {
             gather(parts, reach, value(f))
         }
+        Frame::PrimArgs { done, env, .. } => {
+            gather(parts, reach, once(Part::Env(env)))?;
+            gather(parts, reach, done.iter().map(Part::Value))
+        }
         Frame::Foldl { f, rest } => {
             gather(parts, reach, [Part::Value(f), Part::List(rest)].into_iter())
         }
@@ -1002,6 +1113,65 @@ mod tests {
         let mut m = Machine::new(arena, fuel);
         let o = m.run(Control::Eval(t, Env::empty()));
         (o, m.memo_tables.len())
+    }
+
+    /// Runs the closed term `src` with no fuel limit and returns the outcome as
+    /// text and the number of partial applications of primitives it built.
+    fn run_counting_partials(src: &str) -> (String, u64) {
+        let mut arena = Arena::new();
+        let t = sexpr::parse(&mut arena, src).expect("parse");
+        let mut m = Machine::new(&arena, UNLIMITED);
+        let o = m.run(Control::Eval(t, Env::empty()));
+        (format!("{o:?}"), m.partials_built)
+    }
+
+    #[test]
+    fn a_primitive_written_with_all_its_arguments_builds_no_partial_application() {
+        // One, two and three arguments; arguments that are themselves calls; a
+        // call under a lambda; a combinator that calls its argument; and calls
+        // that fail in an argument, in the primitive, and on an argument of the
+        // wrong kind.
+        for (src, outcome) in [
+            ("(not true)", "Value(false, 1)"),
+            ("(add 1 2)", "Value(3, 1)"),
+            ("(add (mul 2 3) (sub 10 4))", "Value(12, 3)"),
+            ("(fst (pair 1 true))", "Value(1, 2)"),
+            ("((lam (add $0 (mul $0 2))) 5)", "Value(15, 3)"),
+            ("(loop 3 0 (lam (lam (add $1 $0))))", "Value(3, 12)"),
+            ("(add (div 1 0) (div 2 0))", "Error(DivisionByZero, 1)"),
+            ("(add 1 (div 2 0))", "Error(DivisionByZero, 1)"),
+            ("(div 1 0)", "Error(DivisionByZero, 1)"),
+            ("(add 1 true)", "Error(Stuck(BadArgument(Add)), 0)"),
+        ] {
+            let (got, partials) = run_counting_partials(src);
+            assert_eq!(got, outcome, "{src}");
+            assert_eq!(partials, 0, "{src}");
+        }
+    }
+
+    #[test]
+    fn no_primitive_has_more_arguments_than_a_whole_call_handles() {
+        assert!(Prim::ALL.iter().all(|p| p.arity() <= MAX_PRIM_ARITY));
+        assert!(Prim::ALL.iter().any(|p| p.arity() == MAX_PRIM_ARITY));
+    }
+
+    #[test]
+    fn a_primitive_used_with_fewer_arguments_is_still_a_partial_application() {
+        // `add` alone and `add 1` are each one partial application. The counts
+        // show the counter sees them, so a count of 0 above means none was built.
+        for (src, outcome, partials) in [
+            ("(let (add 1) ($0 2))", "Value(3, 1)", 2),
+            ("((lam ($0 1 2)) add)", "Value(3, 2)", 2),
+            ("(foldl add 0 (cons 1 (cons 2 nil)))", "Value(3, 7)", 3),
+            // More arguments than the arity: the inner call is whole, and its
+            // result is applied to the rest.
+            ("(fst (pair (lam $0) 1) 7)", "Value(7, 3)", 0),
+            ("(fst (pair add 1) 3 4)", "Value(7, 3)", 2),
+        ] {
+            let (got, built) = run_counting_partials(src);
+            assert_eq!(got, outcome, "{src}");
+            assert_eq!(built, partials, "{src}");
+        }
     }
 
     #[test]
