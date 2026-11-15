@@ -343,11 +343,19 @@ pub fn stitch_config(cfg: &CompressConfig, library_len: usize) -> MultistepCompr
 ///
 /// # Errors
 ///
-/// [`CompressError::Names`] if a prelude name is not a legal Stitch token or
-/// clashes with another name. The shipped prelude has no such name.
+/// [`CompressError::Names`] if a prelude name is not a legal Stitch token,
+/// starts with [`ABSTRACTION_PREFIX`] (so it could clash with an abstraction
+/// Stitch names later in the run), or clashes with another prelude name. The
+/// shipped prelude has no such name.
 pub fn library_names(len: u32, prelude: Option<&Prelude>) -> Result<LibNames, CompressError> {
     let mut names = LibNames::sequential(ABSTRACTION_PREFIX, len).map_err(CompressError::Names)?;
     for e in prelude.map_or(&[][..], Prelude::entries) {
+        if e.name().starts_with(ABSTRACTION_PREFIX) {
+            return Err(CompressError::Names(NameError::Illegal {
+                name: e.name().to_owned(),
+                reason: "a prelude name may not start with the abstraction prefix",
+            }));
+        }
         names
             .insert(e.lib(), e.name())
             .map_err(CompressError::Names)?;

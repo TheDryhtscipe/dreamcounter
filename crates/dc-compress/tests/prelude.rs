@@ -11,6 +11,7 @@ use dc_compress::{
 };
 use dc_core::{expand, sexpr, Arena, LibDef, LibId, Prim, Term, TermId};
 use dc_stitch::to_expr;
+use dc_stitch::{EncodeError, NameError};
 use dc_surface::prelude::{Prelude, PreludeMode, PRELUDE_LIB_BASE};
 
 const WORKER: &str = env!("CARGO_BIN_EXE_dc-stitch-worker");
@@ -124,7 +125,10 @@ fn without_the_prelude_a_prelude_reference_is_refused() {
     assert!(
         matches!(
             e,
-            CompressError::Names(_) | CompressError::Encode { .. } | CompressError::Expand { .. }
+            CompressError::Encode {
+                error: EncodeError::UnnamedLib(LibId(l)),
+                ..
+            } if l >= PRELUDE_LIB_BASE
         ),
         "{e:?}"
     );
@@ -219,4 +223,56 @@ fn expand_prelude_with_none_returns_the_term() {
     let e = expand_prelude(Some(&prelude), &mut a, t);
     assert_ne!(e, t);
     assert!(scan(&a, e).1, "map was not expanded to its foldr body");
+}
+
+#[test]
+fn a_prelude_name_that_looks_like_an_abstraction_is_refused() {
+    // Stitch names new abstractions fn_0, fn_1, ...: a prelude function under
+    // such a name would clash with one of them later in the run.
+    for src in ["let fn_0 x = x + 1", "let fn_7 x = x", "let fn_x x = x"] {
+        let prelude = Prelude::from_source("p", src).unwrap();
+        let e = library_names(0, Some(&prelude)).unwrap_err();
+        assert!(
+            matches!(e, CompressError::Names(NameError::Illegal { .. })),
+            "{src}: {e:?}"
+        );
+        let mut a = Arena::new();
+        let t = compile(&prelude, &mut a, "fun x -> x");
+        let step = StitchStep {
+            name: "fn_0".to_owned(),
+            arity: 0,
+            body: "1".to_owned(),
+            rewritten: vec!["(lam $0)".to_owned()],
+        };
+        let e = accept_steps_with(&mut a, Some(&prelude), &[], &[t], &[step], 2).unwrap_err();
+        assert!(matches!(e, CompressError::Names(_)), "{src}: {e:?}");
+    }
+}
+
+#[test]
+fn a_rewritten_program_keeps_a_prelude_reference_outside_the_abstraction() {
+    // The abstraction is the list [1; 2]; `map` and `filter` stay in the
+    // rewritten programs, so the check must expand them there too.
+    let prelude = Prelude::load().unwrap();
+    let mut a = Arena::new();
+    let srcs = ["map (fun x -> x) [1; 2]", "filter (fun x -> true) [1; 2]"];
+    let programs: Vec<TermId> = srcs.iter().map(|s| compile(&prelude, &mut a, s)).collect();
+    let step = StitchStep {
+        name: "fn_0".to_owned(),
+        arity: 0,
+        body: "(cons int_1 (cons int_2 nil))".to_owned(),
+        rewritten: vec![
+            "(map (lam $0) fn_0)".to_owned(),
+            "(filter (lam true) fn_0)".to_owned(),
+        ],
+    };
+    let c = accept_steps_with(&mut a, Some(&prelude), &[], &programs, &[step], 2).expect("accepts");
+    assert_eq!(c.rejected, None);
+    assert_eq!(c.new_libs.len(), 1);
+    for (&p, &r) in programs.iter().zip(&c.rewritten) {
+        assert!(scan(&a, r).0, "the rewriting lost its prelude reference");
+        let want = full(&prelude, &mut a, &[], p);
+        let got = full(&prelude, &mut a, &c.new_libs, r);
+        assert_eq!(got, want);
+    }
 }

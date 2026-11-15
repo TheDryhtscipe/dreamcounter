@@ -305,9 +305,11 @@ impl Prelude {
         }
     }
 
-    /// A fingerprint of what each prelude reference means: every definition's
-    /// position, name and closed term, in source order. Comments and layout do
-    /// not change it; reordering, renaming, adding or changing a definition does.
+    /// A fingerprint of the prelude's definitions: every definition's position,
+    /// name and closed term, in source order. Comments and layout do not change
+    /// it; reordering, renaming, adding or changing a definition does. It does
+    /// not cover what the primitives do (a primitive is hashed by its name) or
+    /// [`PRELUDE_LIB_BASE`].
     ///
     /// A prelude reference is positional (`LibId(PRELUDE_LIB_BASE + i)`), so a
     /// stored program that uses one is only meaningful against the prelude it

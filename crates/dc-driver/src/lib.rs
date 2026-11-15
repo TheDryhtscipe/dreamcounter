@@ -403,8 +403,8 @@ pub enum DriverError {
     Interrupted(CompressError),
     /// The library has more entries than a library id can number.
     LibraryTooLarge,
-    /// A prelude function's name cannot be a Stitch token, or clashes with
-    /// another name. The shipped prelude has no such name.
+    /// A prelude function's name cannot be given to Stitch, as
+    /// [`dc_compress::library_names`] says. The shipped prelude has no such name.
     PreludeName(String),
 }
 
@@ -463,10 +463,8 @@ fn expr_cost(e: &Expr) -> u64 {
 /// the bridge gives them to Stitch ([`dc_compress::library_names`]).
 fn names(len: usize, prelude: Option<&Prelude>) -> Result<LibNames, DriverError> {
     let len = u32::try_from(len).map_err(|_| DriverError::LibraryTooLarge)?;
-    library_names(len, prelude).map_err(|err| match err {
-        CompressError::Names(e) => DriverError::PreludeName(e.to_string()),
-        _ => DriverError::LibraryTooLarge,
-    })
+    // The learned names cannot fail, so an error is about a prelude name.
+    library_names(len, prelude).map_err(|err| DriverError::PreludeName(err.to_string()))
 }
 
 /// `id` as text. Every program in the pool and every abstraction kept is

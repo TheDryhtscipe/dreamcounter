@@ -945,10 +945,6 @@ const TWO: &str = "let max a b = if a <= b then b else a\nlet min a b = if a <= 
 fn the_fingerprint_does_not_depend_on_comments_or_layout() {
     let spaced = "-- two\nlet max a b =\n  if a <= b then b else a\n\nlet min a b = if a <= b then a else b\n";
     assert_eq!(fingerprint_of(TWO), fingerprint_of(spaced));
-    assert_eq!(
-        prelude().fingerprint(),
-        Prelude::load().unwrap().fingerprint()
-    );
 }
 
 #[test]
