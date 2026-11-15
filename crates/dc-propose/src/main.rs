@@ -71,6 +71,9 @@ fn arguments() -> Result<Config, String> {
         }
     }
     let size = |n: u64| usize::try_from(n).map_err(|e| e.to_string());
+    if parallel == 0 || sessions == Some(0) {
+        return Err("--sessions and --parallel must be at least 1".to_owned());
+    }
     Ok(Config {
         state_dir: state_dir.ok_or("--state-dir is needed")?,
         run: run.ok_or("--run is needed")?,

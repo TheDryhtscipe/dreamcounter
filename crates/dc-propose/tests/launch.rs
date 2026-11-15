@@ -16,11 +16,10 @@ const SUBMIT: &str = "mcp__dc__dc_submit";
 /// The fake `claude`. Each call records its arguments (NUL-separated), its
 /// working directory and what that directory holds, then plays the first
 /// file left in `queue/` (in name order), or `default` when the queue is
-/// empty. In a played file, `@CWD@` becomes the working directory and
-/// `@SCRATCH@` a scratch directory that it makes as Claude Code does (under
-/// `fake/cc/`, named after the working directory); a line `@SLEEP n` sleeps,
-/// a line `@TOUCH name` makes a file, and a line `@BG` starts a background
-/// `sleep 300` that holds no pipe of the call and records its pid in `bg.<pid>`.
+/// empty. In a played file, `@CWD@` becomes the working directory; a line
+/// `@SLEEP n` sleeps, a line `@TOUCH name` makes a file, a line `@CLOSE`
+/// closes standard output, and a line `@BG` starts a background `sleep 300`
+/// that holds no pipe of the call and records its pid in `bg.<pid>`.
 const FAKE: &str = r#"#!/usr/bin/env bash
 set -u
 d="$FAKE_DIR"
@@ -30,8 +29,6 @@ printf '%s\0' "$@" > "$d/argv.$id"
 printf '%s' "$cwd" > "$d/cwd.$id"
 ls -A > "$d/ls.$id"
 env > "$d/env.$id"
-scratch="$d/cc/${cwd//\//-}/u1/scratchpad"
-mkdir -p "$scratch"
 mkdir "$d/running.$id"
 ls -d "$d"/running.* | wc -l > "$d/conc.$id"
 out="$d/default"
@@ -43,7 +40,8 @@ while IFS= read -r line; do
     @SLEEP*) sleep "${line#@SLEEP }" ;;
     @TOUCH*) touch "${line#@TOUCH }" ;;
     @BG) sleep 300 </dev/null >/dev/null 2>&1 & echo $! > "$d/bg.$id" ;;
-    *) line="${line//@CWD@/$cwd}"; printf '%s\n' "${line//@SCRATCH@/$scratch}" ;;
+    @CLOSE) exec 1>&- ;;
+    *) printf '%s\n' "${line//@CWD@/$cwd}" ;;
   esac
 done < "$out"
 rmdir "$d/running.$id"
@@ -182,7 +180,6 @@ fn init(tools: &[&str], servers: Value, model: &str, cwd: &str) -> String {
         "mcp_servers": servers, "model": model,
         "plugins": [{"name": "cc-plugin-privacy", "path": "builtin",
                      "source": "cc-plugin-privacy@builtin"}],
-        "scratchpad_path": "@SCRATCH@",
     })
     .to_string()
 }
@@ -392,6 +389,7 @@ fn every_session_gets_its_own_worker_id_and_directory() {
         .iter()
         .map(|c| f.read(&format!("fake/cwd.{c}")))
         .collect();
+    briefs.sort();
     briefs.dedup();
     cwds.sort();
     cwds.dedup();
@@ -704,18 +702,6 @@ fn an_interrupt_ends_every_session_and_writes_the_summary() {
 }
 
 #[test]
-fn the_scratch_directory_claude_makes_for_a_session_is_removed() {
-    let f = Fixture::new();
-    let out = f.run(&["--sessions", "1"]);
-    assert!(out.status.success(), "{out:?}");
-    let call = &f.calls()[0];
-    let cwd = f.read(&format!("fake/cwd.{call}"));
-    let made = f.path("fake/cc").join(cwd.replace('/', "-"));
-    assert!(f.path("fake/cc").is_dir());
-    assert!(!made.exists(), "{made:?} is left");
-}
-
-#[test]
 fn a_session_gets_only_the_allowed_environment() {
     let f = Fixture::new();
     let out = f.run(&["--sessions", "1"]);
@@ -765,4 +751,108 @@ fn a_session_directory_inside_a_git_repository_is_refused() {
     assert_eq!(outcomes(&summary), ["lockdown"]);
     let detail = summary["sessions"][0]["detail"].as_str().unwrap();
     assert!(detail.contains("repo"), "{detail}");
+}
+
+#[test]
+fn an_interrupt_ends_a_session_that_closed_its_output() {
+    let f = Fixture::new();
+    f.set_default(&[
+        good_init(),
+        "@BG".to_owned(),
+        "@CLOSE".to_owned(),
+        "@SLEEP 60".to_owned(),
+    ]);
+    let mut child = f
+        .command(&["--sessions", "1", "--session-timeout", "120"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while f.background().is_empty() {
+        assert!(started.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Let the launcher see the output close.
+    std::thread::sleep(Duration::from_millis(500));
+    let interrupted = Instant::now();
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(interrupted.elapsed() < Duration::from_secs(10));
+    assert!(!status.success());
+    assert_eq!(outcomes(&f.summary()), ["interrupted"]);
+    f.assert_no_background_left();
+}
+
+#[test]
+fn the_batch_a_session_leased_is_recorded_whatever_its_outcome() {
+    let f = Fixture::new();
+    let mut lines = submitted(4);
+    lines[4] = tool_result("t2", "the token does not match the batch", true);
+    lines[5] = result("FAILED");
+    f.set_default(&lines);
+    let out = f.run(&["--sessions", "1"]);
+    assert!(!out.status.success(), "{out:?}");
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["failed"]);
+    assert_eq!(summary["sessions"][0]["leased_batch"], 4);
+}
+
+#[test]
+fn a_session_directory_inside_the_state_directory_is_refused() {
+    let f = Fixture::new();
+    fs::create_dir(f.path("state/tmp")).unwrap();
+    let out = f
+        .command(&["--sessions", "1"])
+        .env("TMPDIR", f.path("state/tmp"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(f.calls().is_empty());
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["lockdown"]);
+    let detail = summary["sessions"][0]["detail"].as_str().unwrap();
+    assert!(detail.contains("state"), "{detail}");
+}
+
+#[test]
+fn the_launcher_may_run_in_the_directory_that_holds_the_sessions() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.path("work/tmp")).unwrap();
+    let out = f
+        .command(&["--sessions", "1"])
+        .current_dir(f.path("work"))
+        .env("TMPDIR", f.path("work/tmp"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(outcomes(&f.summary()), ["submitted"]);
+}
+
+#[test]
+fn a_first_request_without_usage_is_stopped() {
+    let mut lines = submitted(0);
+    lines[1] = json!({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": NEXT, "input": {"worker": "w"}}
+    ]}})
+    .to_string();
+    let f = Fixture::new();
+    lines.insert(2, "@SLEEP 30".to_owned());
+    f.set_default(&lines);
+    let out = f.run(&["--sessions", "2", "--parallel", "1"]);
+    assert!(!out.status.success(), "{out:?}");
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["lockdown"]);
+    let detail = summary["sessions"][0]["detail"].as_str().unwrap();
+    assert!(detail.contains("no usage"), "{detail}");
+}
+
+#[test]
+fn zero_parallel_sessions_is_a_usage_error() {
+    let f = Fixture::new();
+    let out = f.run(&["--sessions", "1", "--parallel", "0"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
 }

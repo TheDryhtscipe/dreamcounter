@@ -1,7 +1,8 @@
 //! Starts proposer sessions for a dc-mcp run (D11, D21).
 //!
 //! Each session is a headless Claude Code process (`claude -p`) that runs in
-//! a new, empty directory of its own, outside any git repository. It has no
+//! a new, empty directory of its own, outside any git repository, the state
+//! directory and the log directory. It has no
 //! built-in tools, loads no user, project or local settings (so no rules,
 //! hooks or installed plugins; Claude Code's built-in plugins still load),
 //! gets only an allowlisted environment, and has one MCP server: the run's
@@ -15,8 +16,9 @@
 //! first event must be the session's `init` report, and it must show the
 //! lockdown: exactly the two tools, exactly the one server, connected, only
 //! built-in plugins, the session's own directory, and the model asked for.
-//! The first request must also be small: its input tokens are capped, so
-//! that context added without a tool (rules, memory) is caught too. A session
+//! The first request's input tokens are capped too. The cap leaves room for
+//! the brief, so it catches large additions without a tool (the user's
+//! rules, say), not small ones; `--restricted` is what keeps them out. A session
 //! that shows anything else is killed, and no further session starts. A
 //! session that leaves anything in its directory fails the same way. Every
 //! transcript, command line and MCP configuration is kept in the log
@@ -26,6 +28,10 @@
 //! operator's tools. It starts sessions until it has started the number
 //! asked for, or until a session finds no batch to take. Worker ids are
 //! unique, so "no batch" means every open slot is leased or being checked.
+//!
+//! A session's processes are one process group, killed with it. A process
+//! that leaves the group (`setsid`) outlives the kill. If the launcher itself
+//! is killed with SIGKILL, its sessions run on.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -162,6 +168,9 @@ pub struct Session {
     pub result: Map<String, Value>,
     /// How many times it called `dc_next_batch` and `dc_submit`.
     pub calls: (u64, u64),
+    /// The batch `dc_next_batch` gave it, if it gave one. Its slots stay
+    /// leased until the lease ends, whatever the session did.
+    pub leased: Option<u64>,
     /// How long it ran, in milliseconds, as the launcher saw it.
     pub elapsed_ms: u64,
 }
@@ -175,6 +184,7 @@ impl Session {
             model: None,
             result: Map::new(),
             calls: (0, 0),
+            leased: None,
             elapsed_ms: 0,
         }
     }
@@ -187,6 +197,7 @@ impl Session {
         s.insert("model".into(), json!(self.model));
         s.insert("next_batch_calls".into(), json!(self.calls.0));
         s.insert("submit_calls".into(), json!(self.calls.1));
+        s.insert("leased_batch".into(), json!(self.leased));
         s.insert("elapsed_ms".into(), json!(self.elapsed_ms));
         match &self.outcome {
             Outcome::Submitted { batch, received } => {
@@ -368,13 +379,14 @@ fn result_text(content: &Value) -> String {
     }
 }
 
-/// How a session ended, from its events, and how many times it called
-/// `dc_next_batch` and `dc_submit`. A received submission wins over
+/// How a session ended, from its events; how many times it called
+/// `dc_next_batch` and `dc_submit`; and the last batch it was given. A received submission wins over
 /// anything else; then a reply with no batch; otherwise the session failed,
 /// and the last tool error or its last words say how.
-pub fn classify(events: &[Value]) -> (Outcome, (u64, u64)) {
+pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Option<u64>) {
     let mut names: Vec<(String, String)> = Vec::new();
     let mut calls = (0, 0);
+    let mut leased = None;
     let mut submitted = None;
     let mut no_batch = None;
     let mut error = None;
@@ -409,6 +421,10 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64)) {
                         {
                             submitted = Some(Outcome::Submitted { batch, received });
                         }
+                    } else if let Some(b) = reply["batch"]["batch"].as_u64() {
+                        if name == NEXT_BATCH {
+                            leased = Some(b);
+                        }
                     } else if name == NEXT_BATCH && reply.get("batch").is_some_and(Value::is_null) {
                         let wait = &reply["wait"];
                         let reason = wait["reason"].as_str().unwrap_or("no reason given");
@@ -431,7 +447,7 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64)) {
             .or(last_words.map(|t| format!("the session ended with: {t}")))
             .unwrap_or_else(|| "the session ended without submitting".to_owned()),
     });
-    (outcome, calls)
+    (outcome, calls, leased)
 }
 
 /// The fields of the last `result` event that the summary keeps.
@@ -478,28 +494,50 @@ impl Group {
         let _ = self.child.wait();
     }
 
-    /// Waits until `deadline` for the session to exit and then for the rest
-    /// of the group, at most [`GRACE`] more; then kills what is left.
-    /// Returns whether the session exited by itself.
-    fn end(&mut self, deadline: Instant) -> bool {
-        let exited = loop {
+    /// Waits until `deadline`, or until `interrupted` is set, for the
+    /// session to exit, and then for the rest of the group, at most
+    /// [`GRACE`] more; then kills what is left.
+    fn end(&mut self, deadline: Instant, interrupted: &AtomicBool) -> Ending {
+        let ending = loop {
             if let Ok(Some(_)) = self.child.try_wait() {
-                break true;
+                break Ending::Exited;
+            }
+            if interrupted.load(Ordering::SeqCst) {
+                break Ending::Interrupted;
             }
             if Instant::now() >= deadline {
-                break false;
+                break Ending::Deadline;
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        if exited {
+        if ending == Ending::Exited {
             let until = Instant::now() + GRACE;
-            while test_kill_process_group(self.id).is_ok() && Instant::now() < until {
+            loop {
+                // The session is reaped: once its group is empty, its id may
+                // be reused, so it is not signalled again.
+                if test_kill_process_group(self.id).is_err() {
+                    return ending;
+                }
+                if Instant::now() >= until || interrupted.load(Ordering::SeqCst) {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
         self.kill();
-        exited
+        ending
     }
+}
+
+/// How [`Group::end`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ending {
+    /// The session exited by itself.
+    Exited,
+    /// The deadline came first.
+    Deadline,
+    /// The launcher was interrupted first.
+    Interrupted,
 }
 
 /// The launcher, set up for one launch.
@@ -535,13 +573,8 @@ impl Launcher {
             .log_dir
             .canonicalize()
             .map_err(|e| io_error("cannot open the log directory", &config.log_dir, &e))?;
-        let mut forbidden = vec![state_dir.clone(), log_dir];
-        // The root would forbid everything, so it is left out.
-        if let Ok(here) = std::env::current_dir().and_then(|d| d.canonicalize()) {
-            if here.parent().is_some() {
-                forbidden.push(here);
-            }
-        }
+        // The repository is any git repository (see `misplaced`).
+        let forbidden = vec![state_dir.clone(), log_dir];
         let mut bytes = [0u8; 4];
         getrandom::fill(&mut bytes)
             .map_err(|e| LaunchError(format!("cannot make a launch id: {e}")))?;
@@ -730,7 +763,6 @@ impl Launcher {
         let mut model = None;
         let mut init_seen = false;
         let mut asked = false;
-        let mut scratch: Option<PathBuf> = None;
         let mut finished = false;
         let mut stopped: Option<Outcome> = None;
         loop {
@@ -762,7 +794,6 @@ impl Launcher {
                             stopped = Some(Outcome::Lockdown { detail });
                             break;
                         }
-                        scratch = self.scratch_dir(&event, &cwd);
                     } else if kind == "assistant" && !asked {
                         asked = true;
                         let detail = match input_tokens(&event) {
@@ -808,17 +839,15 @@ impl Launcher {
             } else {
                 deadline
             };
-            if !group.end(until) && !finished {
-                stopped = Some(Outcome::Timeout);
+            match group.end(until, &self.interrupted) {
+                Ending::Interrupted => stopped = Some(Outcome::Interrupted),
+                Ending::Deadline if !finished => stopped = Some(Outcome::Timeout),
+                Ending::Deadline | Ending::Exited => {}
             }
         }
 
-        // The session's processes have ended, so its scratch can go.
-        if let Some(d) = scratch {
-            let _ = fs::remove_dir_all(d);
-        }
         let left = entries(&cwd).map_err(|e| io_error("cannot list", &cwd, &e))?;
-        let (classified, calls) = classify(&events);
+        let (classified, calls, leased) = classify(&events);
         let timed_out = stopped == Some(Outcome::Timeout);
         let outcome = match stopped {
             Some(o @ Outcome::Lockdown { .. }) => o,
@@ -842,20 +871,8 @@ impl Launcher {
             model,
             result: result_fields(&events),
             calls,
+            leased,
             elapsed_ms: 0,
         })
-    }
-
-    /// The scratch directory Claude Code makes for a session in `cwd`: the
-    /// ancestor of the init event's `scratchpad_path` named after `cwd`, with
-    /// `/` as `-`, if it is outside `cwd` and every forbidden directory.
-    fn scratch_dir(&self, init: &Value, cwd: &Path) -> Option<PathBuf> {
-        let scratch = init["scratchpad_path"].as_str()?;
-        let name = cwd.to_string_lossy().replace('/', "-");
-        let dir = Path::new(scratch)
-            .ancestors()
-            .find(|a| a.file_name().is_some_and(|n| n.to_string_lossy() == name))?;
-        let clear = !cwd.starts_with(dir) && !self.forbidden.iter().any(|f| f.starts_with(dir));
-        clear.then(|| dir.to_owned())
     }
 }
