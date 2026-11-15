@@ -476,6 +476,10 @@ pub struct Store {
     /// The steps of the next append that fail, for tests of the error paths.
     #[cfg(test)]
     faults: Mutex<Vec<usize>>,
+    /// How many times an operation has found a run's lock held and waited,
+    /// so a test can act once a call is waiting.
+    #[cfg(test)]
+    waits: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
@@ -494,6 +498,8 @@ impl Store {
             cache: Mutex::new(HashMap::new()),
             #[cfg(test)]
             faults: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            waits: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1046,7 +1052,10 @@ impl Store {
             match dir.try_lock() {
                 Ok(()) => return Ok(()),
                 Err(TryLockError::Error(e)) => return Err(io_at(dir_path)(e)),
-                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::WouldBlock) => {
+                    #[cfg(test)]
+                    self.waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(StoreError::Busy(run.clone()));
