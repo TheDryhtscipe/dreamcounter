@@ -483,9 +483,9 @@ mod tests {
     #[test]
     fn interning_ints_chosen_to_collide_takes_as_long_as_ordinary_ints() {
         // Both sets have 16,000 ints, so their tables and arenas are the same
-        // size and a busy machine slows both alike. Ints that all share a
-        // bucket make each insert compare against every int before it: about
-        // 1,500 times as long as ordinary ints for 16,000 of them.
+        // size and fit the same caches. Ints that all share a bucket make each
+        // insert compare against every int before it: over 1,000 times as long
+        // as ordinary ints for 16,000 of them.
         let colliding = fx_colliding_ints(16_000);
         let ordinary: Vec<i64> = (0..16_000).collect();
         let intern_all = |xs: &[i64]| {
@@ -495,8 +495,10 @@ mod tests {
             }
             assert_eq!(a.len(), xs.len());
         };
-        // The runs alternate, so a spell of load falls on both, and the fastest
-        // of each is kept.
+        // The runs alternate and the fastest of each is kept. A run takes about
+        // a millisecond, so a busy machine can still make one side up to 20
+        // times slower than the other. The bound is well above that and well
+        // below the ratio for colliding ints.
         let (mut t_colliding, mut t_ordinary) =
             (std::time::Duration::MAX, std::time::Duration::MAX);
         for _ in 0..7 {
@@ -505,7 +507,7 @@ mod tests {
         }
         let ratio = t_colliding.as_secs_f64() / t_ordinary.as_secs_f64().max(1e-6);
         assert!(
-            ratio < 8.0,
+            ratio < 100.0,
             "{t_colliding:?} for colliding ints, {t_ordinary:?} for ordinary ints"
         );
     }
