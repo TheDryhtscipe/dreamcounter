@@ -16,7 +16,7 @@
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{fence, AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, TryLockError};
 use std::time::Duration;
 
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -560,9 +560,56 @@ struct Checker {
     running: Mutex<()>,
     /// Set when there may be new work.
     dirty: AtomicBool,
+    /// Taken by [`Checker::signal`] and [`Checker::back_off`] around
+    /// `woken`, so a signal cannot fall between a waiter's look at `dirty`
+    /// and its wait.
+    wake: Mutex<()>,
+    /// Notified when work is signalled, to end a wait after an error.
+    woken: Condvar,
+    /// How many checks have failed, for tests.
+    #[cfg(test)]
+    failures: std::sync::atomic::AtomicUsize,
 }
 
 impl Checker {
+    /// Signals that there may be new work, and wakes a thread that waits
+    /// after an error to try again.
+    fn signal(&self) {
+        self.dirty.store(true, Ordering::SeqCst);
+        // Taking the lock waits for a waiter that has seen `dirty` clear to
+        // start its wait, so the notification reaches it.
+        drop(self.wake.lock().unwrap_or_else(PoisonError::into_inner));
+        self.woken.notify_all();
+    }
+
+    /// Signals work only if no thread is running checks, or waiting after
+    /// an error to try again, and says whether it did. It sets `dirty` while
+    /// it holds `running`, so a thread that takes `running` later clears
+    /// `dirty` before it checks, and a wait after that check is not ended
+    /// by this signal.
+    fn signal_if_idle(&self) -> bool {
+        let running = match self.running.try_lock() {
+            Ok(running) => running,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        self.dirty.store(true, Ordering::SeqCst);
+        drop(running);
+        true
+    }
+
+    /// Waits `wait`, or less if work is signalled meanwhile, also before
+    /// this call. Returns whether a signal ended the wait. It holds no lock
+    /// of the run while it waits.
+    fn back_off(&self, wait: Duration) -> bool {
+        let guard = self.wake.lock().unwrap_or_else(PoisonError::into_inner);
+        let (_guard, waited) = self
+            .woken
+            .wait_timeout_while(guard, wait, |()| !self.dirty.load(Ordering::SeqCst))
+            .unwrap_or_else(PoisonError::into_inner);
+        !waited.timed_out()
+    }
+
     /// Runs `check` until no new work has been signalled, unless another
     /// thread is running it already. `idle` runs when this thread has found
     /// no new work but still holds `running`; tests use it to signal work in
@@ -618,8 +665,34 @@ impl ProposerServer {
     /// after a submission, and once when the server starts, so a submission
     /// left unchecked by a server that stopped is checked. Must be called
     /// within a Tokio runtime.
+    ///
+    /// After an error the checks wait, 5 s at first and twice as long after
+    /// each wait that ran out, up to 300 s, and then try again. A call here
+    /// ends such a wait at once. It does not shorten the next wait: while the
+    /// cause lasts, each call costs one more try. Submissions are few, so
+    /// these tries are too; see [`ProposerServer::check_if_idle`] for calls
+    /// that come as often as proposers poll.
     pub fn check_in_background(&self) {
-        self.checker.dirty.store(true, Ordering::SeqCst);
+        self.checker.signal();
+        self.drain_in_background();
+    }
+
+    /// Checks the run's pending submissions on a thread of its own, unless
+    /// this server's checks are running or waiting after an error to try
+    /// again. Call it when a proposer is told to wait, so a check whose
+    /// claimant stopped is taken up. It does not end a wait after an error,
+    /// so proposers that poll do not make a lasting error cost a try each
+    /// time. If the checks are just finishing, it does nothing; the
+    /// proposer's next poll starts them. Must be called within a Tokio
+    /// runtime.
+    pub fn check_if_idle(&self) {
+        if self.checker.signal_if_idle() {
+            self.drain_in_background();
+        }
+    }
+
+    /// Runs the checker's drain on a thread of its own.
+    fn drain_in_background(&self) {
         let store = Arc::clone(&self.store);
         let run = self.run.clone();
         let checker = Arc::clone(&self.checker);
@@ -634,15 +707,20 @@ impl ProposerServer {
                 }) {
                     Ok(_) => retry = CHECK_RETRY_FIRST,
                     Err(e) => {
+                        #[cfg(test)]
+                        checker.failures.fetch_add(1, Ordering::SeqCst);
                         // Standard error may be closed.
                         let _ = writeln!(
                             std::io::stderr(),
                             "dc-mcp: the submissions of run {run} could not be checked: {e}; \
-                             trying again in {} s",
+                             trying again in {} s, or when a submission comes in",
                             retry.as_secs()
                         );
-                        std::thread::sleep(retry);
-                        retry = (retry * 2).min(CHECK_RETRY_MAX);
+                        // The thread holds `running`, so no other check
+                        // starts, but a new submission ends the wait.
+                        if !checker.back_off(retry) {
+                            retry = (retry * 2).min(CHECK_RETRY_MAX);
+                        }
                         checker.dirty.store(true, Ordering::SeqCst);
                     }
                 },
@@ -740,7 +818,7 @@ impl ProposerServer {
         // (see `check_pending`); a check here takes it up. A claim that is
         // held is skipped, so this does not wait for other servers' checks.
         if reply.as_ref().is_ok_and(|r| r.0.wait.is_some()) {
-            self.check_in_background();
+            self.check_if_idle();
         }
         reply
     }
@@ -892,5 +970,212 @@ mod tests {
         let mut checks = 0;
         checker.drain(|| checks += 1, || {});
         assert_eq!(checks, 0);
+    }
+
+    #[test]
+    fn a_wait_after_an_error_ends_on_a_signal_and_not_otherwise() {
+        let checker = Arc::new(Checker::default());
+        let started = std::time::Instant::now();
+        assert!(!checker.back_off(Duration::from_millis(50)));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+
+        // A signal that came before the wait ends it at once. If it did not,
+        // the wait runs out and the test fails.
+        checker.signal();
+        assert!(checker.back_off(Duration::from_secs(20)));
+
+        // A signal during the wait ends it.
+        checker.dirty.store(false, Ordering::SeqCst);
+        let signaller = Arc::clone(&checker);
+        let signalled = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            signaller.signal();
+        });
+        assert!(checker.back_off(Duration::from_secs(20)));
+        signalled.join().unwrap();
+    }
+
+    /// A proposer server of a run with one submission waiting to be checked.
+    struct Fixture {
+        dir: tempfile::TempDir,
+        server: ProposerServer,
+        /// Another store on the run, which waits as long as a server does
+        /// for the run's lock, for the test's own reads.
+        reader: Store,
+        /// Taken out and shut down first when the fixture is dropped, so a
+        /// background check that waits does not hold up the test, and the
+        /// directory is not removed under it.
+        runtime: Option<tokio::runtime::Runtime>,
+    }
+
+    /// How long the server's store in a [`Fixture`] waits for the run's
+    /// lock: long enough to win it from the test's reads, short enough
+    /// to fail soon when the test holds it.
+    const FIXTURE_LOCK_WAIT: Duration = Duration::from_secs(1);
+
+    impl Fixture {
+        fn new() -> Fixture {
+            let dir = tempfile::TempDir::new().unwrap();
+            let store = Store::open_with_lock_wait(dir.path(), FIXTURE_LOCK_WAIT).unwrap();
+            let run = RunId::new("r").unwrap();
+            store
+                .create_run(
+                    &run,
+                    RunConfig {
+                        arm: Arm::Blind,
+                        seed: 3,
+                        proposals_per_task: 1,
+                        programs_per_batch: 1,
+                        lease_ms: 1_000_000,
+                    },
+                    vec!["collapse/merge".into()],
+                )
+                .unwrap();
+            let verifiers = VerifierCache::default();
+            let sent = next_batch(&store, &run, "a", 0, &verifiers)
+                .unwrap()
+                .batch
+                .unwrap();
+            submit(
+                &store,
+                &run,
+                0,
+                "a",
+                &sent.token,
+                vec!["let solve = (".into()],
+                None,
+                1,
+            )
+            .unwrap();
+            let server = ProposerServer::new(store, run, Arc::new(crate::proposer::SystemClock));
+            let reader = Store::open(dir.path()).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            Fixture {
+                dir,
+                server,
+                reader,
+                runtime: Some(runtime),
+            }
+        }
+
+        /// Lets the test start background checks until the guard drops.
+        fn enter(&self) -> tokio::runtime::EnterGuard<'_> {
+            self.runtime.as_ref().unwrap().enter()
+        }
+
+        fn pending_checks(&self) -> usize {
+            self.reader
+                .read(&self.server.run, |state| state.pending_checks().len())
+                .unwrap()
+        }
+
+        /// Holds the run's lock, as another process does, until dropped.
+        fn hold_the_run(&self) -> std::fs::File {
+            let lock = std::fs::File::open(self.dir.path().join("r")).unwrap();
+            lock.lock().unwrap();
+            lock
+        }
+
+        fn failures(&self) -> usize {
+            self.server.checker.failures.load(Ordering::SeqCst)
+        }
+
+        /// Waits until a background check has failed.
+        fn wait_for_a_failure(&self) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while self.failures() == 0 {
+                assert!(std::time::Instant::now() < deadline, "no check failed");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// Waits until the run has no pending check, at most `limit`, and
+        /// says whether it got there.
+        fn checked_within(&self, limit: Duration) -> bool {
+            let deadline = std::time::Instant::now() + limit;
+            loop {
+                if self.pending_checks() == 0 {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Some(runtime) = self.runtime.take() {
+                runtime.shutdown_background();
+            }
+        }
+    }
+
+    #[test]
+    fn a_check_that_failed_is_tried_again_with_no_new_submission() {
+        let f = Fixture::new();
+        let _entered = f.enter();
+        let lock = f.hold_the_run();
+        f.server.check_in_background();
+        f.wait_for_a_failure();
+        drop(lock);
+        // No new signal: the retry alone gets the check done, after the
+        // first wait.
+        assert!(
+            f.checked_within(CHECK_RETRY_FIRST * 4),
+            "the failed check was not tried again"
+        );
+    }
+
+    #[test]
+    fn a_new_submission_cuts_short_the_wait_after_a_failed_check() {
+        let f = Fixture::new();
+        let _entered = f.enter();
+        let lock = f.hold_the_run();
+        f.server.check_in_background();
+        f.wait_for_a_failure();
+        drop(lock);
+        // A submission comes in while the checker waits to try again.
+        let signalled = std::time::Instant::now();
+        f.server.check_in_background();
+        assert!(
+            f.checked_within(CHECK_RETRY_FIRST / 2),
+            "the check waited {:?} after the signal",
+            signalled.elapsed()
+        );
+    }
+
+    #[test]
+    fn proposers_that_wait_do_not_cut_short_the_wait_after_a_failed_check() {
+        let f = Fixture::new();
+        let _entered = f.enter();
+        // The cause lasts the whole test.
+        let _lock = f.hold_the_run();
+        f.server.check_in_background();
+        // Proposers poll `dc_next_batch` and are told to wait.
+        let polled = std::time::Instant::now();
+        while polled.elapsed() < CHECK_RETRY_FIRST + Duration::from_secs(2) {
+            f.server.check_if_idle();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // A try takes FIXTURE_LOCK_WAIT to fail. The first wait is 5 s, so
+        // a third try cannot start before 1 + 5 + 1 + 10 s.
+        let tries = f.failures();
+        assert!((1..=2).contains(&tries), "{tries} tries");
+    }
+
+    #[test]
+    fn a_proposer_that_waits_starts_a_check_if_none_runs() {
+        let f = Fixture::new();
+        let _entered = f.enter();
+        f.server.check_if_idle();
+        assert!(
+            f.checked_within(Duration::from_secs(30)),
+            "the pending submission was not checked"
+        );
     }
 }
