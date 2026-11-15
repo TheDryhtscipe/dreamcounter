@@ -53,6 +53,10 @@ const PLACEHOLDERS: &[(&str, &str, IsType)] = &[
 /// column are noticed.
 const EXPRESSION_FORMS: usize = 13;
 
+/// How many operators the `Expressions:` block lists. If the guide changes,
+/// change this to match; it is here so that a dropped operator is noticed.
+const GUIDE_OPERATORS: usize = 14;
+
 /// A check of one code span that is not an expression.
 type SpanCheck = fn(&Probe);
 
@@ -273,7 +277,13 @@ fn guide_operators() -> Vec<(&'static str, Option<&'static str>)> {
             out.push((op, remark));
         }
     }
-    assert!(out.len() >= 10, "too few operators: {out:?}");
+    assert_eq!(
+        out.len(),
+        GUIDE_OPERATORS,
+        "the Expressions block lists {} operators, not {GUIDE_OPERATORS}: if the guide \
+         changed, change GUIDE_OPERATORS: {out:?}",
+        out.len()
+    );
     out
 }
 
@@ -542,7 +552,7 @@ fn every_primitive_can_be_used_by_its_name() {
         .iter()
         // Left out: `mod` is a reserved word, so the primitive `mod` cannot
         // be used by its name, only as `( mod )`. The claim is false for it
-        // today; the prompt text is left as it is here.
+        // (dreamcounter-68e7e8); the assert below pins the exception.
         .filter(|prim| prim.name() != "mod")
         .filter_map(|prim| {
             let e = p.infer_closed(prim.name()).err()?;
@@ -550,4 +560,23 @@ fn every_primitive_can_be_used_by_its_name() {
         })
         .collect();
     assert!(failing.is_empty(), "cannot be used by name: {failing:?}");
+    assert!(
+        p.infer_closed("mod").is_err(),
+        "bare `mod` now compiles: dreamcounter-68e7e8 is fixed, so drop the \
+         `mod` exception in this test"
+    );
+}
+
+#[test]
+fn no_placeholder_name_is_in_scope() {
+    // A placeholder that names a primitive or prelude function is not a hole,
+    // so its type would go unchecked.
+    let p = Probe::new();
+    for (name, _, _) in PLACEHOLDERS {
+        assert!(
+            !p.in_scope(name),
+            "the placeholder `{name}` is a primitive or prelude name, so it is \
+             never a hole: rename it in the guide and PLACEHOLDERS"
+        );
+    }
 }
