@@ -998,8 +998,10 @@ impl Store {
 
     /// Calls `each` on the run's events, oldest first, until it returns
     /// [`ControlFlow::Break`]. The events include the payloads handed out and
-    /// the submissions received, with their text. It reads the whole journal
-    /// each time, one record at a time, and holds only the record it is on.
+    /// the submissions received, with their text; a
+    /// [`PromptTable`](crate::prompt::PromptTable) reads each payload back
+    /// from them. It reads the whole journal each time, one record at a time,
+    /// and holds only the record it is on.
     ///
     /// `each` is called while the run is locked, so it must not use this run
     /// through any store: that call would wait and then fail with

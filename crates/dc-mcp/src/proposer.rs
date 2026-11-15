@@ -3,7 +3,10 @@
 //!
 //! [`next_batch`] picks the task with the most open slots (see
 //! [`RunState::next_task`]), builds its payload, and commits a
-//! [`BatchIssued`] event that holds the payload as it is sent. A worker that
+//! [`BatchIssued`] event from which the payload reads back as it was sent.
+//! The pieces of the prompt that many batches share are stored once in the
+//! run, by [`PromptStored`] events in the same commit, and the event names
+//! them (dreamcounter-20c6e5). A worker that
 //! holds a batch whose lease has not ended gets no other until it submits.
 //! One that lost the payload waits for the lease to end: the payload is not
 //! sent again, because another session using the same id would get the
@@ -40,9 +43,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use crate::prompt::{payload, Payload};
+use crate::prompt::{payload_in_pieces, Payload, Piece};
 use crate::state::{
-    BatchIssued, Check, Checked, Event, LibraryEntry, RunId, RunState, Standing, Submitted,
+    BatchIssued, Check, Checked, Event, IssuedPayload, LibraryEntry, PayloadParts, PromptPart,
+    PromptStored, RunId, RunState, Standing, Submitted,
 };
 use crate::store::{Change, CheckClaim, RefusalKind, Store, StoreError};
 use crate::verify::{task, Verifier, VerifierCache};
@@ -258,10 +262,10 @@ fn issue(
     };
     let batch = state.batch_count();
     let token = new_token()?;
-    let sent = payload(state, &verifier, &*family, batch, &token, wanted);
-    let text = serde_json::to_string(&sent)
-        .map_err(|e| Refused::State(format!("the payload does not serialise: {e}")))?;
-    let event = Event::BatchIssued(BatchIssued {
+    let (sent, pieces) = payload_in_pieces(state, &verifier, &*family, batch, &token, wanted);
+    let mut events = Vec::new();
+    let prompt = prompt_parts(state, pieces, &mut events);
+    events.push(Event::BatchIssued(BatchIssued {
         batch,
         iteration: state.iteration(),
         task: name.to_owned(),
@@ -270,13 +274,56 @@ fn issue(
         token,
         issued_ms: now_ms,
         deadline_ms: now_ms.saturating_add(state.config().lease_ms),
-        payload: text,
-    });
+        payload: IssuedPayload::Parts(PayloadParts {
+            lease_seconds: sent.lease_seconds,
+            prompt,
+        }),
+    }));
     let reply = NextBatch {
         batch: Some(sent),
         wait: None,
     };
-    Ok((Attempt::Done(reply), vec![event]))
+    Ok((Attempt::Done(reply), events))
+}
+
+/// The parts of a prompt made of `pieces`. A shared piece names the stored
+/// prompt with its text; one the run has not stored yet gets a
+/// [`PromptStored`] event, added to `events`. The other pieces are written
+/// out, those next to each other as one part.
+fn prompt_parts(state: &RunState, pieces: Vec<Piece>, events: &mut Vec<Event>) -> Vec<PromptPart> {
+    let mut parts: Vec<PromptPart> = Vec::new();
+    let mut next_id = state.prompt_count();
+    for piece in pieces {
+        if !piece.shared {
+            match parts.last_mut() {
+                Some(PromptPart::Text(text)) => text.push_str(&piece.text),
+                _ => parts.push(PromptPart::Text(piece.text)),
+            }
+            continue;
+        }
+        // A piece stored by this batch's own events is found among them, by
+        // its text. One the run stored before is found by the digest of its
+        // text alone: the state does not hold the text, so a match is not
+        // compared byte for byte (D18 item 17).
+        let stored_here = events.iter().find_map(|e| match e {
+            Event::PromptStored(s) if s.text == piece.text => Some(s.id),
+            _ => None,
+        });
+        let id = match state.stored_prompt(&piece.text).or(stored_here) {
+            Some(id) => id,
+            None => {
+                let id = next_id;
+                next_id += 1;
+                events.push(Event::PromptStored(PromptStored {
+                    id,
+                    text: piece.text,
+                }));
+                id
+            }
+        };
+        parts.push(PromptPart::Stored(id));
+    }
+    parts
 }
 
 /// What `dc_submit` returns. In the blind arm it says only what came in.
@@ -592,6 +639,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::prompt::PromptTable;
     use crate::state::{Arm, RunConfig};
     use tempfile::TempDir;
 
@@ -728,7 +776,207 @@ mod tests {
         let b = &kept[0];
         assert_eq!((b.task.as_str(), b.worker.as_str()), (MERGE, "agent-1"));
         assert_eq!((b.issued_ms, b.deadline_ms), (5000, 6000));
-        assert_eq!(crate::prompt::read_payload(b).unwrap(), payload);
+        assert_eq!(
+            payloads(&store, &run),
+            [serde_json::to_string(&payload).unwrap()]
+        );
+    }
+
+    /// The JSON text of each payload the run handed out, read back from its
+    /// events, in the order of the batches.
+    fn payloads(store: &Store, run: &RunId) -> Vec<String> {
+        let mut table = PromptTable::default();
+        let mut texts = Vec::new();
+        for event in events(store, run) {
+            table.see(&event);
+            if let Event::BatchIssued(b) = &event {
+                texts.push(table.payload_text(b).unwrap());
+            }
+        }
+        texts
+    }
+
+    /// Payloads for several tasks, before and after a frontier changes what
+    /// they show, read back from the journal as they were sent. Each shared
+    /// piece is stored once.
+    #[test]
+    fn every_payload_reads_back_as_it_was_sent_and_each_prompt_is_stored_once() {
+        let (dir, store, run) = setup(2, 1);
+        let mut sent = Vec::new();
+        for round in 0..6u64 {
+            if round == 3 {
+                store
+                    .append(
+                        &run,
+                        vec![Event::FrontierSet {
+                            task: CANCEL.into(),
+                            members: vec![crate::state::FrontierMember {
+                                program: "(lam $0)".into(),
+                            }],
+                        }],
+                    )
+                    .unwrap();
+            }
+            let p = next_batch(&store, &run, "w", 10 * round)
+                .unwrap()
+                .batch
+                .unwrap();
+            sub(&store, &run, p.batch, "w", vec![], None, 10 * round + 1).unwrap();
+            sent.push(serde_json::to_string(&p).unwrap());
+        }
+        // A new store reads the run from its journal.
+        let fresh = Store::open(dir.path()).unwrap();
+        assert_eq!(payloads(&fresh, &run), sent);
+        let stored: Vec<String> = events(&fresh, &run)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::PromptStored(s) => Some(s.text),
+                _ => None,
+            })
+            .collect();
+        let distinct: std::collections::BTreeSet<&String> = stored.iter().collect();
+        assert_eq!(distinct.len(), stored.len());
+        // The state counts the bytes of the payloads as they were sent.
+        let state = fresh.state(&run).unwrap();
+        let bytes: usize = sent.iter().map(String::len).sum();
+        assert_eq!(state.iteration_counts(0).payload_bytes, bytes as u64);
+    }
+
+    /// A journal written before prompts were stored once holds each payload
+    /// whole. It still reads, its payloads read back byte for byte, and new
+    /// batches go on in the new form in the same journal.
+    #[test]
+    fn a_journal_with_whole_payloads_reads_back_and_goes_on() {
+        let config = RunConfig {
+            arm: Arm::Blind,
+            seed: 3,
+            proposals_per_task: 1,
+            programs_per_batch: 1,
+            lease_ms: 1000,
+            max_unchecked_per_batch: 3,
+        };
+        let tasks = vec![MERGE.to_owned(), CANCEL.to_owned()];
+        let created = Event::Created {
+            config: config.clone(),
+            tasks: tasks.clone(),
+        };
+        let state = RunState::create(config, tasks).unwrap();
+        let family = task(MERGE).unwrap();
+        let verifier = Verifier::new(&[]).unwrap();
+        let old = crate::prompt::payload(&state, &verifier, &*family, 0, "t0", 1);
+        let old_text = serde_json::to_string(&old).unwrap();
+        // The event as the server wrote it before: the payload as a string.
+        let old_event = format!(
+            "[{{\"batch_issued\":{{\"batch\":0,\"iteration\":0,\"task\":\"{MERGE}\",\
+             \"wanted\":1,\"worker\":\"w\",\"token\":\"t0\",\"issued_ms\":0,\
+             \"deadline_ms\":1000,\"payload\":{}}}}}]",
+            serde_json::to_string(&old_text).unwrap()
+        );
+        let mut journal = crate::journal::header(9);
+        for (seq, json) in [serde_json::to_string(&[created]).unwrap(), old_event]
+            .into_iter()
+            .enumerate()
+        {
+            let crc = crate::journal::crc32(format!("{seq} {json}").as_bytes());
+            journal.push_str(&format!("{seq} {crc:08x} {json}\n"));
+        }
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("old")).unwrap();
+        std::fs::write(dir.path().join("old").join("journal"), journal).unwrap();
+        let run = RunId::new("old").unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let b = &issued(&store, &run)[0];
+        assert_eq!(b.payload, IssuedPayload::Whole(old_text.clone()));
+        assert_eq!(payloads(&store, &run), std::slice::from_ref(&old_text));
+        let state = store.state(&run).unwrap();
+        assert_eq!(
+            state.iteration_counts(0).payload_bytes,
+            old_text.len() as u64
+        );
+
+        // The next batch is in the new form, in the same journal.
+        let new = next_batch(&store, &run, "v", 0).unwrap().batch.unwrap();
+        let fresh = Store::open(dir.path()).unwrap();
+        let both = issued(&fresh, &run);
+        assert!(matches!(both[1].payload, IssuedPayload::Parts(_)));
+        assert_eq!(
+            payloads(&fresh, &run),
+            [old_text, serde_json::to_string(&new).unwrap()]
+        );
+    }
+
+    /// A shared text that comes twice in one prompt is stored once, by the
+    /// first piece, and both pieces name it; a text the run already stored is
+    /// named and not stored again. The events apply to the run.
+    #[test]
+    fn a_shared_text_twice_in_one_prompt_is_stored_once() {
+        let (_dir, store, run) = setup(1, 1);
+        store
+            .append(
+                &run,
+                vec![Event::PromptStored(PromptStored {
+                    id: 0,
+                    text: "old".into(),
+                })],
+            )
+            .unwrap();
+        let state = store.state(&run).unwrap();
+        let piece = |text: &str, shared| Piece {
+            text: text.into(),
+            shared,
+        };
+        let pieces = vec![
+            piece("same", true),
+            piece("own", false),
+            piece("same", true),
+            piece("old", true),
+        ];
+        let mut events = Vec::new();
+        let parts = prompt_parts(&state, pieces, &mut events);
+        assert_eq!(
+            events,
+            [Event::PromptStored(PromptStored {
+                id: 1,
+                text: "same".into(),
+            })]
+        );
+        assert_eq!(
+            parts,
+            [
+                PromptPart::Stored(1),
+                PromptPart::Text("own".into()),
+                PromptPart::Stored(1),
+                PromptPart::Stored(0),
+            ]
+        );
+        store.append(&run, events).unwrap();
+    }
+
+    /// A proposer that asks for a batch and submits nothing, again and
+    /// again, gets a new batch each time (dreamcounter-20c6e5). Each round
+    /// must not store the whole prompt again: the rounds after the first
+    /// grow the journal by a small part of one payload each.
+    #[test]
+    fn rounds_of_empty_submissions_do_not_store_the_prompt_again() {
+        const ROUNDS: u64 = 50;
+        let (dir, store, run) = setup(1, 1);
+        let first = next_batch(&store, &run, "w", 0).unwrap().batch.unwrap();
+        sub(&store, &run, first.batch, "w", vec![], None, 1).unwrap();
+        let full = serde_json::to_string(&first).unwrap().len() as u64;
+        let after_first = journal_len(&dir, &run);
+        for round in 1..=ROUNDS {
+            let sent = next_batch(&store, &run, "w", 10 * round)
+                .unwrap()
+                .batch
+                .unwrap();
+            sub(&store, &run, sent.batch, "w", vec![], None, 10 * round + 1).unwrap();
+        }
+        let per_round = (journal_len(&dir, &run) - after_first) / ROUNDS;
+        assert!(
+            per_round * 8 < full,
+            "each round adds {per_round} bytes; a payload is {full}"
+        );
     }
 
     #[test]

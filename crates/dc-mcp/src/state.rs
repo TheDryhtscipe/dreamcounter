@@ -179,8 +179,81 @@ pub struct BatchIssued {
     pub issued_ms: u64,
     /// When the lease ends, in milliseconds since the Unix epoch.
     pub deadline_ms: u64,
-    /// The payload handed to the proposer, exactly as it was sent.
-    pub payload: String,
+    /// The payload handed to the proposer. `crate::prompt::PromptTable`
+    /// gives it back exactly as it was sent.
+    pub payload: IssuedPayload,
+}
+
+/// How a [`BatchIssued`] event holds its payload (dreamcounter-20c6e5).
+///
+/// In the journal the first form is a JSON string and the second a JSON
+/// object, so each reads back as the form it was written in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IssuedPayload {
+    /// The payload as it was sent: the JSON text of a
+    /// [`Payload`](crate::prompt::Payload), whole. Runs written before
+    /// prompts were stored once hold this form. It still reads, and means
+    /// what it meant; the server no longer writes it.
+    Whole(String),
+    /// The payload with its prompt in parts. The batch number, token and
+    /// programs wanted are the event's own fields.
+    Parts(PayloadParts),
+}
+
+/// A payload whose prompt is made of parts, some of them stored once in the
+/// run by [`Event::PromptStored`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayloadParts {
+    /// The lease the payload gave, in seconds.
+    pub lease_seconds: u64,
+    /// The prompt: its parts joined in order, with nothing between them.
+    pub prompt: Vec<PromptPart>,
+}
+
+/// A part of a prompt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum PromptPart {
+    /// Text that is written out in the event.
+    Text(String),
+    /// The text of the stored prompt with this id.
+    Stored(u64),
+}
+
+/// A piece of prompt text, stored once in the run so that the payloads that
+/// use it can name it (dreamcounter-20c6e5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptStored {
+    /// The prompt's id. Prompts are numbered 0, 1, ... over the whole run.
+    pub id: u64,
+    /// The text. No other stored prompt of the run has the same text.
+    pub text: String,
+}
+
+/// What the state keeps of the run's stored prompts: a digest of each text
+/// and the length of the text as a JSON string, but not the text itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StoredPrompts {
+    /// The id of each stored prompt, by the SHA-256 digest of its text.
+    ids: BTreeMap<[u8; 32], u64>,
+    /// The length in bytes of each stored prompt's text when it is written
+    /// inside a JSON string, by id.
+    json_lens: Vec<u64>,
+}
+
+/// The SHA-256 digest of `text`.
+fn digest(text: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes()).into()
+}
+
+/// The length in bytes of `text` when it is written inside a JSON string,
+/// without the quotes.
+fn json_len(text: &str) -> u64 {
+    serde_json::to_string(text).map_or(0, |s| s.len().saturating_sub(2)) as u64
 }
 
 /// How a submission stands to its batch.
@@ -298,6 +371,8 @@ pub enum Event {
     },
     /// A record joins the log.
     Logged(LogRecord),
+    /// A piece of prompt text is stored, for payloads to name.
+    PromptStored(PromptStored),
     /// A batch is handed to a proposer.
     BatchIssued(BatchIssued),
     /// A proposer submits programs for a batch.
@@ -474,6 +549,17 @@ pub enum Rejected {
     BadBatch,
     /// The run has issued no batch of this number.
     UnknownBatch(u64),
+    /// A `PromptStored` event does not have the next prompt number.
+    WrongPromptNumber {
+        /// The next prompt number.
+        next: u64,
+        /// The number the event gives.
+        given: u64,
+    },
+    /// A `PromptStored` event's text is already stored, under this id.
+    DuplicatePrompt(u64),
+    /// A `BatchIssued` event names a prompt the run has not stored.
+    UnknownPrompt(u64),
     /// A `Submitted` event's standing, or a `Checked` event's checks, do not
     /// fit the batch.
     BadSubmission(u64),
@@ -529,6 +615,14 @@ impl fmt::Display for Rejected {
                 "a batch must ask for at least one program and end after it starts"
             ),
             Rejected::UnknownBatch(b) => write!(f, "the run has no batch {b}"),
+            Rejected::WrongPromptNumber { next, given } => write!(
+                f,
+                "the event stores prompt {given}, but the next prompt is {next}"
+            ),
+            Rejected::DuplicatePrompt(id) => {
+                write!(f, "the prompt's text is already stored as prompt {id}")
+            }
+            Rejected::UnknownPrompt(id) => write!(f, "the run has stored no prompt {id}"),
             Rejected::BadSubmission(b) => write!(
                 f,
                 "the submission's standing or checks do not fit batch {b}"
@@ -633,7 +727,10 @@ pub struct Verified {
 /// Everything the server knows about a run, except the text of its log,
 /// payloads and submissions.
 ///
-/// That text is in the journal. The state keeps counts.
+/// That text is in the journal. The state keeps counts. Of each stored
+/// prompt ([`Event::PromptStored`]) it keeps a SHA-256 digest of the text and
+/// its length, so that a new payload can name a prompt that is already
+/// stored (see [`RunState::stored_prompt`]).
 ///
 /// # Indexes
 ///
@@ -665,6 +762,7 @@ pub struct RunState {
     iteration: u64,
     log_counts: BTreeMap<LogKind, u64>,
     batches: Batches,
+    prompts: StoredPrompts,
     live: BTreeSet<u64>,
     awaiting: BTreeSet<u64>,
     task_counts: ByIteration<BTreeMap<String, TaskCounts>>,
@@ -728,6 +826,7 @@ impl RunState {
             iteration: 0,
             log_counts: BTreeMap::new(),
             batches: Batches::default(),
+            prompts: StoredPrompts::default(),
             live: BTreeSet::new(),
             awaiting: BTreeSet::new(),
             task_counts: ByIteration::default(),
@@ -781,6 +880,7 @@ impl RunState {
                 }
                 *self.log_counts.entry(record.kind).or_insert(0) += 1;
             }
+            Event::PromptStored(stored) => self.store_prompt(stored)?,
             Event::BatchIssued(issued) => self.issue(issued)?,
             Event::Submitted(submitted) => self.submit(submitted)?,
             Event::Checked(checked) => self.check(checked)?,
@@ -835,6 +935,7 @@ impl RunState {
         if issued.wanted == 0 || issued.deadline_ms <= issued.issued_ms || issued.token.is_empty() {
             return Err(Rejected::BadBatch);
         }
+        let payload_bytes = self.payload_len(issued)?;
         self.batches.push(Batch {
             iteration: issued.iteration,
             task: issued.task.clone(),
@@ -852,10 +953,68 @@ impl RunState {
             c.batches += 1
         });
         let counts = self.iteration_counts.entry(issued.iteration);
-        counts.payload_bytes = counts
-            .payload_bytes
-            .saturating_add(issued.payload.len() as u64);
+        counts.payload_bytes = counts.payload_bytes.saturating_add(payload_bytes);
         Ok(())
+    }
+
+    fn store_prompt(&mut self, stored: &PromptStored) -> Result<(), Rejected> {
+        let next = self.prompts.json_lens.len() as u64;
+        if stored.id != next {
+            return Err(Rejected::WrongPromptNumber {
+                next,
+                given: stored.id,
+            });
+        }
+        let key = digest(&stored.text);
+        if let Some(&id) = self.prompts.ids.get(&key) {
+            return Err(Rejected::DuplicatePrompt(id));
+        }
+        self.prompts.ids.insert(key, stored.id);
+        self.prompts.json_lens.push(json_len(&stored.text));
+        Ok(())
+    }
+
+    /// The length in bytes of the JSON text of `issued`'s payload, or why
+    /// the event is rejected: it names a prompt the run has not stored.
+    fn payload_len(&self, issued: &BatchIssued) -> Result<u64, Rejected> {
+        let parts = match &issued.payload {
+            IssuedPayload::Whole(text) => return Ok(text.len() as u64),
+            IssuedPayload::Parts(parts) => parts,
+        };
+        // The payload with an empty prompt, and then the prompt's parts as
+        // they are written inside its JSON string: JSON escapes each
+        // character on its own, so the parts' lengths add up.
+        let frame = crate::prompt::Payload {
+            batch: issued.batch,
+            token: issued.token.clone(),
+            programs_wanted: issued.wanted,
+            lease_seconds: parts.lease_seconds,
+            prompt: String::new(),
+        };
+        let mut len = serde_json::to_string(&frame).map_or(0, |s| s.len() as u64);
+        for part in &parts.prompt {
+            let part_len = match part {
+                PromptPart::Text(text) => json_len(text),
+                PromptPart::Stored(id) => usize::try_from(*id)
+                    .ok()
+                    .and_then(|i| self.prompts.json_lens.get(i))
+                    .copied()
+                    .ok_or(Rejected::UnknownPrompt(*id))?,
+            };
+            len = len.saturating_add(part_len);
+        }
+        Ok(len)
+    }
+
+    /// The id of the stored prompt whose text is `text`, if the run has
+    /// stored one.
+    pub fn stored_prompt(&self, text: &str) -> Option<u64> {
+        self.prompts.ids.get(&digest(text)).copied()
+    }
+
+    /// How many prompts the run has stored: the next prompt's id.
+    pub fn prompt_count(&self) -> u64 {
+        self.prompts.json_lens.len() as u64
     }
 
     /// The standing a submission for `batch` from `worker`, giving `token`,
@@ -1387,7 +1546,7 @@ mod tests {
             token: format!("t{batch}"),
             issued_ms,
             deadline_ms: issued_ms + 1000,
-            payload: "pay".into(),
+            payload: IssuedPayload::Whole("pay".into()),
         })
     }
 
@@ -1693,6 +1852,118 @@ mod tests {
         assert_eq!(s, new_state());
     }
 
+    fn stored(id: u64, text: &str) -> Event {
+        Event::PromptStored(PromptStored {
+            id,
+            text: text.into(),
+        })
+    }
+
+    /// `issued`, with its prompt in parts.
+    fn issued_in_parts(batch: u64, prompt: Vec<PromptPart>) -> Event {
+        let mut event = issued(batch, "a", 1, 0);
+        if let Event::BatchIssued(b) = &mut event {
+            b.payload = IssuedPayload::Parts(PayloadParts {
+                lease_seconds: 1,
+                prompt,
+            });
+        }
+        event
+    }
+
+    #[test]
+    fn a_prompt_is_stored_once_with_the_next_number() {
+        let mut s = new_state();
+        s.apply(&stored(0, "guide")).unwrap();
+        let before = s.clone();
+        assert_eq!(
+            s.apply(&stored(2, "task")),
+            Err(Rejected::WrongPromptNumber { next: 1, given: 2 })
+        );
+        assert_eq!(
+            s.apply(&stored(1, "guide")),
+            Err(Rejected::DuplicatePrompt(0))
+        );
+        assert_eq!(s, before);
+        assert_eq!(s.stored_prompt("guide"), Some(0));
+        assert_eq!(s.stored_prompt("task"), None);
+        s.apply(&stored(1, "task")).unwrap();
+        assert_eq!((s.stored_prompt("task"), s.prompt_count()), (Some(1), 2));
+    }
+
+    #[test]
+    fn a_batch_that_names_a_prompt_not_stored_is_rejected_and_changes_nothing() {
+        let mut s = new_state();
+        s.apply(&stored(0, "guide")).unwrap();
+        let before = s.clone();
+        // The unknown prompt comes after a known one and some text, so a
+        // check made part by part as the state changed would leave a trace.
+        let bad = issued_in_parts(
+            0,
+            vec![
+                PromptPart::Text("x".into()),
+                PromptPart::Stored(0),
+                PromptPart::Stored(1),
+            ],
+        );
+        assert_eq!(s.apply(&bad), Err(Rejected::UnknownPrompt(1)));
+        assert_eq!(s, before);
+        assert_eq!(s.batch_count(), 0);
+        assert_eq!(s.iteration_counts(0), IterationCounts::default());
+        // A prompt stored in the same commit, before the batch, is known.
+        s.apply(&stored(1, "task \"one\"\n")).unwrap();
+        s.apply(&bad).unwrap();
+        assert_eq!(s.batch_count(), 1);
+    }
+
+    /// A payload in parts counts the bytes of its JSON text as it was sent,
+    /// with the parts escaped as they are inside the JSON string.
+    #[test]
+    fn a_payload_in_parts_counts_the_bytes_of_its_json_text() {
+        let mut s = new_state();
+        s.apply(&stored(0, "a \"quoted\"\nline\t\u{1}é")).unwrap();
+        let event = issued_in_parts(
+            0,
+            vec![
+                PromptPart::Text("\\head\n".into()),
+                PromptPart::Stored(0),
+                PromptPart::Text("tail".into()),
+            ],
+        );
+        s.apply(&event).unwrap();
+        let Event::BatchIssued(b) = &event else {
+            unreachable!()
+        };
+        let sent = crate::prompt::Payload {
+            batch: 0,
+            token: b.token.clone(),
+            programs_wanted: 1,
+            lease_seconds: 1,
+            prompt: "\\head\na \"quoted\"\nline\t\u{1}étail".into(),
+        };
+        let text = serde_json::to_string(&sent).unwrap();
+        assert_eq!(s.iteration_counts(0).payload_bytes, text.len() as u64);
+    }
+
+    /// An event in the old form holds the payload as a JSON string, and
+    /// one in the new form as an object; each reads back as written.
+    #[test]
+    fn each_form_of_payload_reads_back_as_it_was_written() {
+        let whole = issued(0, "a", 1, 0);
+        let json = serde_json::to_string(&whole).unwrap();
+        assert!(json.contains("\"payload\":\"pay\""), "{json}");
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), whole);
+        let parts = issued_in_parts(0, vec![PromptPart::Stored(3), PromptPart::Text("t".into())]);
+        let json = serde_json::to_string(&parts).unwrap();
+        assert!(
+            json.contains(
+                "\"payload\":{\"lease_seconds\":1,\"prompt\":[{\"stored\":3},{\"text\":\"t\"}]}"
+            ),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), parts);
+    }
+
     #[test]
     fn the_quota_is_in_when_every_task_has_its_programs_checked() {
         let mut s = RunState::create(
@@ -1737,7 +2008,7 @@ mod tests {
                 token: format!("t{batch}"),
                 issued_ms: 0,
                 deadline_ms,
-                payload: String::new(),
+                payload: IssuedPayload::Whole(String::new()),
             }))
             .unwrap();
         };

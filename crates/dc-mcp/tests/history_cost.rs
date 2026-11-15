@@ -17,8 +17,8 @@ use std::time::Instant;
 
 use dc_mcp::proposer::next_batch;
 use dc_mcp::state::{
-    Arm, BatchIssued, Check, Checked, Event, LogKind, LogRecord, RunConfig, RunId, Standing,
-    Submitted,
+    Arm, BatchIssued, Check, Checked, Event, IssuedPayload, LogKind, LogRecord, RunConfig, RunId,
+    Standing, Submitted,
 };
 use dc_mcp::store::Store;
 use dc_mcp::verify::VerifierCache;
@@ -43,7 +43,7 @@ fn issued(batch: u64, iteration: u64, task: &str, deadline_ms: u64) -> Event {
         token: format!("t{batch}"),
         issued_ms: 0,
         deadline_ms,
-        payload: "payload".to_owned(),
+        payload: IssuedPayload::Whole("payload".to_owned()),
     })
 }
 

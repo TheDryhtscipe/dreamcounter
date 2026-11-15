@@ -18,7 +18,7 @@ use dc_tasks::task::TaskFamily;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
-use crate::state::{BatchIssued, RunState};
+use crate::state::{BatchIssued, Event, IssuedPayload, PromptPart, RunState};
 use crate::verify::{library_name, Verifier, ENTRY};
 
 /// The most programs of other tasks a payload shows.
@@ -239,6 +239,18 @@ fn solved(state: &RunState, verifier: &Verifier, this: &str, batch: u64) -> Stri
     out
 }
 
+/// A piece of a prompt as it is built. A shared piece is the same for many
+/// batches (the guide, the types, the library, a task), so the run stores it
+/// once and payloads name it; the others are written out in each batch's
+/// event (dreamcounter-20c6e5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Piece {
+    /// The text.
+    pub text: String,
+    /// Whether the piece is stored once in the run.
+    pub shared: bool,
+}
+
 /// The payload of `batch`, a batch for `family` that asks for `wanted`
 /// programs, under the state's library.
 pub fn payload(
@@ -249,33 +261,159 @@ pub fn payload(
     token: &str,
     wanted: u32,
 ) -> Payload {
+    payload_in_pieces(state, verifier, family, batch, token, wanted).0
+}
+
+/// [`payload`], with the pieces its prompt is made of, in order: the prompt
+/// is their texts joined with nothing between them.
+pub fn payload_in_pieces(
+    state: &RunState,
+    verifier: &Verifier,
+    family: &dyn TaskFamily,
+    batch: u64,
+    token: &str,
+    wanted: u32,
+) -> (Payload, Vec<Piece>) {
     let sections = [
-        instructions(wanted, batch, token),
-        GUIDE.to_owned(),
-        primitives(),
-        prelude(verifier),
-        library(state, verifier),
-        solved(state, verifier, family.name(), batch),
-        task(family),
+        (instructions(wanted, batch, token), false),
+        (GUIDE.to_owned(), true),
+        (primitives(), true),
+        (prelude(verifier), true),
+        (library(state, verifier), true),
+        (solved(state, verifier, family.name(), batch), false),
+        (task(family), true),
     ];
-    let prompt = sections
-        .iter()
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
-    Payload {
+    let mut pieces = Vec::new();
+    for (i, (text, shared)) in sections.into_iter().enumerate() {
+        if text.is_empty() {
+            continue;
+        }
+        if !pieces.is_empty() {
+            pieces.push(Piece {
+                text: "\n".to_owned(),
+                shared: false,
+            });
+        }
+        if i == 0 {
+            pieces.extend(split_instructions(text, batch, token));
+        } else {
+            pieces.push(Piece { text, shared });
+        }
+    }
+    let payload = Payload {
         batch,
         token: token.to_owned(),
         programs_wanted: wanted,
         lease_seconds: state.config().lease_ms / 1000,
-        prompt,
+        prompt: pieces.iter().map(|p| p.text.as_str()).collect(),
+    };
+    (payload, pieces)
+}
+
+/// The instructions in pieces: the batch number and token, which change
+/// with each batch, and the text around them, which is shared.
+fn split_instructions(text: String, batch: u64, token: &str) -> Vec<Piece> {
+    let own = format!("batch {batch}, token {token},");
+    let Some(at) = text.find(&own) else {
+        return vec![Piece {
+            text,
+            shared: false,
+        }];
+    };
+    let (before, rest) = text.split_at(at);
+    let after = &rest[own.len()..];
+    [(before, true), (own.as_str(), false), (after, true)]
+        .into_iter()
+        .filter(|(t, _)| !t.is_empty())
+        .map(|(t, shared)| Piece {
+            text: t.to_owned(),
+            shared,
+        })
+        .collect()
+}
+
+/// Why a payload does not read back from its event.
+#[derive(Debug)]
+pub enum PayloadError {
+    /// The event names a prompt that the events seen so far did not store.
+    UnknownPrompt(u64),
+    /// The payload's JSON text does not read or write.
+    Json(serde_json::Error),
+}
+
+impl std::fmt::Display for PayloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PayloadError::UnknownPrompt(id) => write!(f, "no prompt {id} is stored"),
+            PayloadError::Json(e) => write!(f, "the payload's JSON: {e}"),
+        }
     }
 }
 
-/// The payload a [`BatchIssued`] event holds, read back.
-pub fn read_payload(issued: &BatchIssued) -> Result<Payload, serde_json::Error> {
-    serde_json::from_str(&issued.payload)
+impl std::error::Error for PayloadError {}
+
+/// The prompts a run has stored, read from its events, so that the payload
+/// of each [`BatchIssued`] event reads back as it was sent.
+///
+/// Give it the run's events in order with [`PromptTable::see`]; a payload
+/// reads back once the events before it have been seen. It keeps one copy
+/// of each stored prompt's text, however many payloads name it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PromptTable {
+    texts: Vec<String>,
+}
+
+impl PromptTable {
+    /// Takes note of `event` if it stores a prompt. A prompt whose id is not
+    /// the next one is left out, so payloads that name it do not read back.
+    /// The run's state refuses such an event, so a run the store reads has
+    /// none.
+    pub fn see(&mut self, event: &Event) {
+        if let Event::PromptStored(stored) = event {
+            if stored.id == self.texts.len() as u64 {
+                self.texts.push(stored.text.clone());
+            }
+        }
+    }
+
+    /// The payload of `issued`, read back.
+    pub fn read_payload(&self, issued: &BatchIssued) -> Result<Payload, PayloadError> {
+        let parts = match &issued.payload {
+            IssuedPayload::Whole(text) => {
+                return serde_json::from_str(text).map_err(PayloadError::Json)
+            }
+            IssuedPayload::Parts(parts) => parts,
+        };
+        let mut prompt = String::new();
+        for part in &parts.prompt {
+            match part {
+                PromptPart::Text(text) => prompt.push_str(text),
+                PromptPart::Stored(id) => prompt.push_str(
+                    usize::try_from(*id)
+                        .ok()
+                        .and_then(|i| self.texts.get(i))
+                        .ok_or(PayloadError::UnknownPrompt(*id))?,
+                ),
+            }
+        }
+        Ok(Payload {
+            batch: issued.batch,
+            token: issued.token.clone(),
+            programs_wanted: issued.wanted,
+            lease_seconds: parts.lease_seconds,
+            prompt,
+        })
+    }
+
+    /// The JSON text of the payload of `issued`, exactly as it was sent.
+    pub fn payload_text(&self, issued: &BatchIssued) -> Result<String, PayloadError> {
+        match &issued.payload {
+            IssuedPayload::Whole(text) => Ok(text.clone()),
+            IssuedPayload::Parts(_) => {
+                serde_json::to_string(&self.read_payload(issued)?).map_err(PayloadError::Json)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -406,12 +544,13 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_reads_back_from_its_event() {
+    fn a_whole_payload_reads_back_from_its_event() {
         let s = state(&["collapse/merge"]);
         let v = Verifier::new(&[]).unwrap();
         let family = crate::verify::task("collapse/merge").unwrap();
         let p = payload(&s, &v, &*family, 0, "tok", 1);
         assert!(p.prompt.contains("batch 0, token tok,"), "{}", p.prompt);
+        let text = serde_json::to_string(&p).unwrap();
         let issued = BatchIssued {
             batch: 0,
             iteration: 0,
@@ -421,9 +560,71 @@ mod tests {
             token: "tok".into(),
             issued_ms: 0,
             deadline_ms: 1,
-            payload: serde_json::to_string(&p).unwrap(),
+            payload: IssuedPayload::Whole(text.clone()),
         };
-        assert_eq!(read_payload(&issued).unwrap(), p);
+        let table = PromptTable::default();
+        assert_eq!(table.read_payload(&issued).unwrap(), p);
+        assert_eq!(table.payload_text(&issued).unwrap(), text);
+    }
+
+    /// The prompt as `payload` built it before it was made of pieces: the
+    /// sections that are not empty, joined by line breaks.
+    fn prompt_as_before(
+        state: &RunState,
+        verifier: &Verifier,
+        family: &dyn TaskFamily,
+        batch: u64,
+        token: &str,
+        wanted: u32,
+    ) -> String {
+        [
+            instructions(wanted, batch, token),
+            GUIDE.to_owned(),
+            primitives(),
+            prelude(verifier),
+            library(state, verifier),
+            solved(state, verifier, family.name(), batch),
+            task(family),
+        ]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
+    /// Proposers see no change: the pieces make the prompt that was built
+    /// before, and only the batch's own text and the solved programs, which
+    /// change with the batch, are not shared.
+    #[test]
+    fn the_pieces_make_the_prompt_as_it_was_built_before() {
+        let names = ["collapse/merge", "collapse/cancel"];
+        let mut s = state(&names);
+        s.apply(&Event::FrontierSet {
+            task: names[1].into(),
+            members: vec![FrontierMember {
+                program: "(lam $0)".into(),
+            }],
+        })
+        .unwrap();
+        let v = Verifier::new(&[]).unwrap();
+        let family = crate::verify::task(names[0]).unwrap();
+        for (batch, wanted) in [(0, 1), (7, 3)] {
+            let (p, pieces) = payload_in_pieces(&s, &v, &*family, batch, "tok", wanted);
+            assert_eq!(
+                p.prompt,
+                prompt_as_before(&s, &v, &*family, batch, "tok", wanted)
+            );
+            let own: String = pieces
+                .iter()
+                .filter(|p| !p.shared)
+                .map(|p| p.text.as_str())
+                .collect();
+            let solved = solved(&s, &v, family.name(), batch);
+            assert!(!solved.is_empty());
+            assert!(own.contains(&format!("batch {batch}, token tok,")));
+            assert!(own.contains(&solved));
+            assert!(own.len() < solved.len() + 64, "{own}");
+        }
     }
 }
 
