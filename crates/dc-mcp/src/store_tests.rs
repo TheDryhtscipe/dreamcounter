@@ -994,15 +994,29 @@ fn the_longest_lock_wait_does_not_overflow() {
 fn a_lock_on_a_removed_directory_does_not_license_a_write_to_its_successor() {
     let dir = TempDir::new().unwrap();
     let run = id("r1");
-    let store = Store::open_with_lock_wait(dir.path(), std::time::Duration::from_secs(2)).unwrap();
+    // The wait is far longer than the steps below take, even on a busy
+    // machine, so the call is still waiting when the old lock is released.
+    let store = Store::open_with_lock_wait(dir.path(), std::time::Duration::from_secs(60)).unwrap();
     store.create_run(&run, config(), tasks()).unwrap();
     let old_lock = fs::File::open(dir.path().join("r1")).unwrap();
     old_lock.lock().unwrap();
 
     std::thread::scope(|scope| {
-        // This waits for the lock on the directory that is about to go.
         let waiting = scope.spawn(|| store.append(&run, vec![note(0, "late")]));
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // The directory goes only once the call has found it locked, so the
+        // call holds the directory that is about to go.
+        let start = std::time::Instant::now();
+        while store.waits.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            if waiting.is_finished() {
+                let result = waiting.join().unwrap();
+                panic!("the call returned without waiting for the lock: {result:?}");
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(60),
+                "the call never waited for the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         fs::remove_dir_all(dir.path().join("r1")).unwrap();
         Store::open(dir.path())
             .unwrap()
