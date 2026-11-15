@@ -32,6 +32,8 @@ rustix = { version = "1.1", default-features = false, features = ["std", "proces
 tokio = { version = "1", default-features = false }
 # Batch tokens for proposers (dc-mcp).
 getrandom = "0.3"
+# Digests of stored prompts (dc-mcp). rmcp already brings this version in.
+sha2 = "0.11"
 # Pinned to one commit: the Stitch bridge (dc-compress) is tested against it.
 stitch_core = { git = "https://github.com/mlb2251/stitch", rev = "350804b7b35807c78bd21c313785ae5152ae2985" }
 

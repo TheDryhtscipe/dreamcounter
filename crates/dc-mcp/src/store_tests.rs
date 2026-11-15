@@ -1238,7 +1238,7 @@ fn random_event(rng: &mut Rng, state: &RunState, now_ms: u64) -> Event {
                 token: format!("t{batch}"),
                 issued_ms: now_ms,
                 deadline_ms: now_ms + state.config().lease_ms,
-                payload: "p".into(),
+                payload: crate::state::IssuedPayload::Whole("p".into()),
             })
         }
         3..=4 => {
@@ -1513,7 +1513,7 @@ fn a_journal_from_before_the_cap_replays_with_the_default_cap() {
             token: "t".into(),
             issued_ms: 0,
             deadline_ms: 10,
-            payload: "p".into(),
+            payload: crate::state::IssuedPayload::Whole("p".into()),
         })],
         vec![submitted(Standing::OnTime)],
     ];

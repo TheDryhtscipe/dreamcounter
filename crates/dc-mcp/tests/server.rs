@@ -10,6 +10,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 mod common;
 
 use common::{assert_checks, deepest_programs};
+use dc_mcp::prompt::PromptTable;
 use dc_mcp::state::{Check, Event, FrontierMember, LibraryEntry, LogKind, LogRecord, RunId};
 use dc_mcp::store::Store;
 use serde_json::{json, Value};
@@ -741,10 +742,12 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
     let run = RunId::new("r1").unwrap();
     let mut payloads = Vec::new();
     let mut programs = Vec::new();
+    let mut prompts = PromptTable::default();
     store
         .for_each_event(&run, |e| {
+            prompts.see(&e);
             match e {
-                Event::BatchIssued(b) => payloads.push(b.payload),
+                Event::BatchIssued(b) => payloads.push(prompts.payload_text(&b).unwrap()),
                 Event::Submitted(s) => programs.push((s.programs, s.model)),
                 _ => {}
             }
