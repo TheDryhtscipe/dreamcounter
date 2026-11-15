@@ -53,7 +53,7 @@ fn batch(i: u64) -> Vec<Event> {
                 program: format!("(program {i})"),
             }],
         });
-        events.push(Event::IterationFinished { iteration });
+        events.push(Event::IterationFinished { iteration, used: 0 });
     }
     events
 }

@@ -300,6 +300,10 @@ pub enum Event {
     IterationFinished {
         /// The iteration that ends.
         iteration: u64,
+        /// How many of the verified programs, from the first, the iteration
+        /// step took. Programs checked after the step read them stay
+        /// verified for the next iteration's step.
+        used: u64,
     },
 }
 
@@ -375,6 +379,14 @@ pub enum Rejected {
     },
     /// The iteration cannot end while a submission of it waits to be checked.
     ChecksPending(u64),
+    /// An `IterationFinished` event says the step took more programs than
+    /// are verified.
+    UnknownVerified {
+        /// How many the event says the step took.
+        used: u64,
+        /// How many are verified.
+        verified: u64,
+    },
 }
 
 impl fmt::Display for Rejected {
@@ -424,6 +436,10 @@ impl fmt::Display for Rejected {
             Rejected::ChecksPending(b) => write!(
                 f,
                 "the iteration cannot end: batch {b}'s submission waits to be checked"
+            ),
+            Rejected::UnknownVerified { used, verified } => write!(
+                f,
+                "the iteration step took {used} verified programs, but there are {verified}"
             ),
         }
     }
@@ -591,16 +607,27 @@ impl RunState {
                 }
                 self.library.extend(entries.iter().cloned());
             }
-            Event::IterationFinished { iteration } => {
+            Event::IterationFinished { iteration, used } => {
                 self.check_iteration(*iteration)?;
                 if let Some(b) = self.pending_checks().first() {
                     return Err(Rejected::ChecksPending(*b));
                 }
+                let verified = self.verified.len() as u64;
+                let taken = usize::try_from(*used)
+                    .ok()
+                    .filter(|&n| n <= self.verified.len())
+                    .ok_or(Rejected::UnknownVerified {
+                        used: *used,
+                        verified,
+                    })?;
                 self.iteration = self
                     .iteration
                     .checked_add(1)
                     .ok_or(Rejected::IterationOverflow)?;
-                self.verified.clear();
+                // The iteration step reads the verified programs and commits
+                // this event later, without the run's lock in between; a
+                // program checked in that time waits for the next step.
+                self.verified.drain(..taken);
             }
         }
         Ok(())
@@ -836,8 +863,10 @@ impl RunState {
             .unwrap_or_default()
     }
 
-    /// The programs of the current iteration that passed their examples, in
-    /// the order they came in.
+    /// The programs that passed their examples and that no iteration step has
+    /// taken yet, in the order they were checked. They are of the current
+    /// iteration, and of earlier ones if they were checked after the step
+    /// that ended it read them.
     pub fn verified(&self) -> &[Verified] {
         &self.verified
     }
@@ -994,7 +1023,11 @@ mod tests {
         assert_eq!(s.log_count(LogKind::Note), 1);
         assert_eq!(s.log_count(LogKind::Compression), 0);
 
-        s.apply(&Event::IterationFinished { iteration: 0 }).unwrap();
+        s.apply(&Event::IterationFinished {
+            iteration: 0,
+            used: 0,
+        })
+        .unwrap();
         assert_eq!(s.iteration(), 1);
     }
 
@@ -1029,7 +1062,10 @@ mod tests {
                 Rejected::NoEntries,
             ),
             (
-                Event::IterationFinished { iteration: 1 },
+                Event::IterationFinished {
+                    iteration: 1,
+                    used: 0,
+                },
                 Rejected::WrongIteration {
                     current: 0,
                     given: 1,
@@ -1057,7 +1093,8 @@ mod tests {
         s.iteration = u64::MAX;
         assert_eq!(
             s.apply(&Event::IterationFinished {
-                iteration: u64::MAX
+                iteration: u64::MAX,
+                used: 0,
             }),
             Err(Rejected::IterationOverflow)
         );
@@ -1070,7 +1107,10 @@ mod tests {
             config: config(),
             tasks: vec!["a".into(), "b".into()],
         };
-        let finished = Event::IterationFinished { iteration: 0 };
+        let finished = Event::IterationFinished {
+            iteration: 0,
+            used: 0,
+        };
         assert_eq!(RunState::replay([]), Err(Rejected::NotCreated));
         assert_eq!(RunState::replay([&finished]), Err(Rejected::NotCreated));
         assert_eq!(RunState::replay([&created]), Ok(new_state()));
@@ -1249,7 +1289,10 @@ mod tests {
 
         // The iteration cannot end while checks are pending.
         assert_eq!(
-            s.clone().apply(&Event::IterationFinished { iteration: 0 }),
+            s.clone().apply(&Event::IterationFinished {
+                iteration: 0,
+                used: 0
+            }),
             Err(Rejected::ChecksPending(0))
         );
 
@@ -1296,9 +1339,35 @@ mod tests {
             }]
         );
 
+        // The iteration step cannot take more programs than are verified.
+        assert_eq!(
+            s.clone().apply(&Event::IterationFinished {
+                iteration: 0,
+                used: 2,
+            }),
+            Err(Rejected::UnknownVerified {
+                used: 2,
+                verified: 1
+            })
+        );
+        // A program checked after the step read the verified programs is
+        // kept for the next step.
+        let mut later = s.clone();
+        later
+            .apply(&Event::IterationFinished {
+                iteration: 0,
+                used: 0,
+            })
+            .unwrap();
+        assert_eq!(later.verified(), s.verified());
+
         // The iteration ends: a submission for its batch 2 is late, kept, not
-        // counted, and the verified programs start again.
-        s.apply(&Event::IterationFinished { iteration: 0 }).unwrap();
+        // counted, and the verified programs the step took are gone.
+        s.apply(&Event::IterationFinished {
+            iteration: 0,
+            used: 1,
+        })
+        .unwrap();
         assert!(s.verified().is_empty());
         assert_eq!(s.standing(2, "w", "t2", 10), Some(Standing::Late));
         s.apply(&sub(2, "w", 1, 10, Standing::Late, 1)).unwrap();

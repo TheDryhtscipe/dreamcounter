@@ -236,7 +236,10 @@ fn a_run_survives_a_kill_in_the_middle_of_an_iteration() {
                         term: "(lam 0)".into(),
                     }],
                 },
-                Event::IterationFinished { iteration: 0 },
+                Event::IterationFinished {
+                    iteration: 0,
+                    used: 0,
+                },
             ]
         })
         .unwrap();
@@ -290,7 +293,13 @@ fn a_server_killed_while_it_writes_keeps_every_note_it_acknowledged() {
     // Take the run into its second iteration, so the kill is inside one.
     Store::open(dir.path())
         .unwrap()
-        .append(&run, vec![Event::IterationFinished { iteration: 0 }])
+        .append(
+            &run,
+            vec![Event::IterationFinished {
+                iteration: 0,
+                used: 0,
+            }],
+        )
         .unwrap();
 
     // Ask for many notes at once, and kill the server when some are

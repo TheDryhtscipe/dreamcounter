@@ -30,7 +30,13 @@ fn three() -> (Vec<u8>, Vec<usize>) {
     for (seq, events) in [
         vec![created()],
         vec![note("line\nbreak \u{1F980} \"quoted\"")],
-        vec![note("x"), Event::IterationFinished { iteration: 0 }],
+        vec![
+            note("x"),
+            Event::IterationFinished {
+                iteration: 0,
+                used: 0,
+            },
+        ],
     ]
     .into_iter()
     .enumerate()
@@ -65,7 +71,13 @@ fn scan_reads_back_what_encode_wrote() {
     assert_eq!(scan.records[0], vec![created()]);
     assert_eq!(
         scan.records[2],
-        vec![note("x"), Event::IterationFinished { iteration: 0 }]
+        vec![
+            note("x"),
+            Event::IterationFinished {
+                iteration: 0,
+                used: 0
+            }
+        ]
     );
 
     // A scan can start at any record boundary, given that record's number.

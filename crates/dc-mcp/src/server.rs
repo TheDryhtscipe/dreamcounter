@@ -14,8 +14,9 @@
 //! lock does not hold up other calls or the protocol.
 
 use std::io::Write;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{fence, AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -556,9 +557,13 @@ impl Checker {
             // With the fence after `drop` below, either this thread sees the
             // lock free or the holder sees `dirty` set.
             fence(Ordering::SeqCst);
-            let Ok(running) = self.running.try_lock() else {
+            let running = match self.running.try_lock() {
+                Ok(running) => running,
+                // The lock guards no data, so a check that panicked while it
+                // held the lock left nothing half done.
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
                 // The thread that holds it looks at `dirty` after it lets go.
-                return;
+                Err(TryLockError::WouldBlock) => return,
             };
             if self.dirty.swap(false, Ordering::SeqCst) {
                 check();
@@ -605,7 +610,11 @@ impl ProposerServer {
         tokio::task::spawn_blocking(move || {
             let mut retry = CHECK_RETRY_FIRST;
             checker.drain(
-                || match check_pending(&store, &run) {
+                || match catch_check(|| {
+                    check_pending(&store, &run)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }) {
                     Ok(_) => retry = CHECK_RETRY_FIRST,
                     Err(e) => {
                         // Standard error may be closed.
@@ -636,19 +645,53 @@ impl ProposerServer {
         let clock = Arc::clone(&self.clock);
         let done = tokio::task::spawn_blocking(move || work(&store, &run, clock.now_ms()))
             .await
-            .map_err(|e| format!("the tool call did not finish: {e}"))?;
-        match done {
-            Ok(value) => Ok(Json(value)),
-            // The details are for the operator, not the proposer.
-            Err(Refused::State(why)) => {
+            .map_err(|e| {
                 let _ = writeln!(
                     std::io::stderr(),
-                    "dc-mcp: run {} cannot take work: {why}",
+                    "dc-mcp: run {}: a tool call did not finish: {e}",
                     self.run
                 );
-                Err("the run cannot take work now; tell the operator".to_owned())
-            }
-            Err(e) => Err(e.to_string()),
+                "the server could not do this; tell the operator".to_owned()
+            })?;
+        done.map(Json)
+            .map_err(|refused| proposer_reply(&self.run, refused))
+    }
+}
+
+/// Runs `check`, and makes a panic in it an error, so the background checks
+/// log it and try again rather than stop.
+fn catch_check(check: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    catch_unwind(AssertUnwindSafe(check)).unwrap_or_else(|panic| {
+        let what = panic
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "no message".to_owned());
+        Err(format!("the check panicked: {what}"))
+    })
+}
+
+/// What a proposer of `run` is told when its call is refused. Only a refused
+/// request, which is the proposer's to fix, is told in full; anything else
+/// goes to standard error for the operator, as it may show the state
+/// directory or the run's state.
+fn proposer_reply(run: &RunId, refused: Refused) -> String {
+    match refused {
+        // The details are for the operator, not the proposer.
+        Refused::State(why) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "dc-mcp: run {run} cannot take work: {why}"
+            );
+            "the run cannot take work now; tell the operator".to_owned()
+        }
+        Refused::Request(why) => why,
+        Refused::Store(StoreError::Busy(_)) => {
+            "the run is busy; ask again in a few seconds".to_owned()
+        }
+        Refused::Store(e) => {
+            let _ = writeln!(std::io::stderr(), "dc-mcp: run {run}: {e}");
+            "the server could not do this; tell the operator".to_owned()
         }
     }
 }
@@ -740,6 +783,62 @@ mod tests {
             || {},
         );
         assert_eq!(checks, 3);
+    }
+
+    #[test]
+    fn a_checker_whose_lock_was_poisoned_still_checks() {
+        let checker = Arc::new(Checker::default());
+        let poisoner = Arc::clone(&checker);
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner.running.lock().unwrap();
+            panic!("a check panicked");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(checker.running.is_poisoned());
+        checker.dirty.store(true, Ordering::SeqCst);
+        let mut checks = 0;
+        checker.drain(|| checks += 1, || {});
+        assert_eq!(checks, 1);
+        assert!(!checker.dirty.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_panicking_check_is_an_error_with_its_message() {
+        let got = catch_check(|| panic!("the verifier broke"));
+        let Err(why) = got else {
+            panic!("a panic was taken for success: {got:?}");
+        };
+        assert!(why.contains("the verifier broke"), "{why}");
+        assert_eq!(catch_check(|| Ok(())), Ok(()));
+        assert_eq!(catch_check(|| Err("no".to_owned())), Err("no".to_owned()));
+    }
+
+    #[test]
+    fn a_proposer_is_not_told_what_the_store_says() {
+        let run = RunId::new("r1").unwrap();
+        let secret = "/home/operator/state-dir/r1/journal";
+        let refusals = [
+            Refused::Store(StoreError::Io {
+                path: secret.into(),
+                error: std::io::Error::other("disk full"),
+            }),
+            Refused::Store(StoreError::Rejected(crate::state::Rejected::UnknownTask(
+                secret.to_owned(),
+            ))),
+            Refused::State(secret.to_owned()),
+        ];
+        for refused in refusals {
+            let told = proposer_reply(&run, refused);
+            assert!(!told.contains(secret), "{told}");
+            assert!(!told.contains("disk full"), "{told}");
+            assert!(told.contains("operator"), "{told}");
+        }
+        let busy = proposer_reply(&run, Refused::Store(StoreError::Busy(run.clone())));
+        assert!(busy.contains("again"), "{busy}");
+        // A refused request is the proposer's to fix, so it is told why.
+        let why = "batch 9 was not issued in this run";
+        assert_eq!(proposer_reply(&run, Refused::Request(why.to_owned())), why);
     }
 
     #[test]

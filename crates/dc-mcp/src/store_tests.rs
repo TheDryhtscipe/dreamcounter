@@ -61,7 +61,10 @@ fn mid_iteration(store: &Store, run: &RunId) {
                         term: "(lam (lam 1))".into(),
                     }],
                 },
-                Event::IterationFinished { iteration: 0 },
+                Event::IterationFinished {
+                    iteration: 0,
+                    used: 0,
+                },
             ]
         })
         .unwrap();
@@ -219,7 +222,10 @@ fn commit_shows_the_closure_the_current_state() {
     mid_iteration(&store, &run);
     let seen: Result<u64, StoreError> = store.commit(&run, |state| {
         let iteration = state.iteration();
-        Ok((iteration, vec![Event::IterationFinished { iteration }]))
+        Ok((
+            iteration,
+            vec![Event::IterationFinished { iteration, used: 0 }],
+        ))
     });
     assert_eq!(seen.unwrap(), 1);
     assert_eq!(store.state(&run).unwrap().iteration(), 2);
@@ -449,7 +455,10 @@ fn two_stores_on_one_run_see_each_other_s_commits() {
         let seen: Result<u64, StoreError> = store.commit(&run, |state| {
             let events = vec![
                 note(i, &format!("n{i}")),
-                Event::IterationFinished { iteration: i },
+                Event::IterationFinished {
+                    iteration: i,
+                    used: 0,
+                },
             ];
             Ok((state.iteration(), events))
         });
@@ -915,7 +924,13 @@ fn a_set_aside_tail_is_reported_first_in_the_commit_that_replaces_it() {
         |_| {
             Ok((
                 (),
-                vec![Event::IterationFinished { iteration: 1 }, note(2, "after")],
+                vec![
+                    Event::IterationFinished {
+                        iteration: 1,
+                        used: 0,
+                    },
+                    note(2, "after"),
+                ],
             ))
         },
         |(), state| state.log_count(LogKind::Recovery),

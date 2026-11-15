@@ -161,10 +161,12 @@ fn library(state: &RunState, verifier: &Verifier) -> String {
     out
 }
 
-/// A value as the payload shows it, in brackets if it has a space.
+/// A value as the payload shows it as an argument: in brackets if it has a
+/// space or starts with a minus sign, so it reads as one argument.
 fn shown(v: &dc_eval::Value) -> String {
     let s = v.display_within(SHOWN_VALUES).to_string();
-    if s.contains(' ') && !(s.starts_with('(') || s.starts_with('[')) {
+    let bare = !(s.starts_with('(') || s.starts_with('['));
+    if bare && (s.contains(' ') || s.starts_with('-')) {
         format!("({s})")
     } else {
         s
@@ -279,6 +281,14 @@ pub fn read_payload(issued: &BatchIssued) -> Result<Payload, serde_json::Error> 
 mod tests {
     use super::*;
     use crate::state::{Arm, Event, FrontierMember, LibraryEntry, RunConfig};
+
+    #[test]
+    fn an_argument_is_bracketed_when_it_would_not_read_as_one() {
+        use dc_eval::Value;
+        assert_eq!(shown(&Value::Int(-3)), "(-3)");
+        assert_eq!(shown(&Value::Int(3)), "3");
+        assert_eq!(shown(&Value::Bool(true)), "true");
+    }
 
     fn state(tasks: &[&str]) -> RunState {
         RunState::create(

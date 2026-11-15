@@ -597,7 +597,13 @@ mod tests {
         check_pending(&store, &run).unwrap();
         // After the iteration ends, batch 1's submission is late.
         store
-            .append(&run, vec![Event::IterationFinished { iteration: 0 }])
+            .append(
+                &run,
+                vec![Event::IterationFinished {
+                    iteration: 0,
+                    used: 0,
+                }],
+            )
             .unwrap();
         sub(&store, &run, 1, "b", vec!["late".into()], None, 12).unwrap();
 
