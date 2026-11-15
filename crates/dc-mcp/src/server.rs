@@ -150,7 +150,7 @@ impl RunStatus {
                 note: state.log_count(LogKind::Note),
                 recovery: state.log_count(LogKind::Recovery),
             },
-            batches_issued: state.batches().len(),
+            batches_issued: usize::try_from(state.batch_count()).unwrap_or(usize::MAX),
             current: IterationStats::of(state, state.iteration()),
         }
     }

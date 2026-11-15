@@ -1169,3 +1169,256 @@ fn an_entry_that_is_not_a_plain_file_does_not_stop_a_tail_being_set_aside() {
         assert!(fs::symlink_metadata(&taken).is_ok(), "{kind}");
     }
 }
+
+/// SplitMix64: a small generator, so a random test gives the same steps on
+/// every run.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// A number below `n`, which is positive.
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    /// True `percent` times in a hundred.
+    fn chance(&mut self, percent: u64) -> bool {
+        self.below(100) < percent
+    }
+}
+
+/// A random event for `state` at `now_ms`. Most apply; some do not: a wrong
+/// batch number, standing, worker, token or library size, a check with
+/// nothing to check, or an iteration end with checks pending.
+fn random_event(rng: &mut Rng, state: &RunState, now_ms: u64) -> Event {
+    use crate::state::{BatchIssued, Check, Checked, Standing, Submitted};
+    let count = state.batch_count();
+    let worker = |batch: u64| format!("w{}", batch % 3);
+    match rng.below(10) {
+        0..=2 => {
+            let batch = if rng.chance(10) { count + 1 } else { count };
+            let tasks = state.tasks();
+            Event::BatchIssued(BatchIssued {
+                batch,
+                iteration: state.iteration(),
+                task: tasks[rng.below(tasks.len() as u64) as usize].clone(),
+                wanted: 1,
+                worker: worker(batch),
+                token: format!("t{batch}"),
+                issued_ms: now_ms,
+                deadline_ms: now_ms + state.config().lease_ms,
+                payload: "p".into(),
+            })
+        }
+        3..=4 => {
+            // Mostly a batch with a live lease, so that many submissions are
+            // checked; otherwise any batch, or one not issued.
+            let live: Vec<u64> = state.leased(now_ms).map(|(i, _)| i).collect();
+            let batch = if !live.is_empty() && rng.chance(70) {
+                live[rng.below(live.len() as u64) as usize]
+            } else {
+                rng.below(count + 1)
+            };
+            let who = if rng.chance(80) {
+                worker(batch)
+            } else {
+                "x".into()
+            };
+            let token = if rng.chance(80) {
+                format!("t{batch}")
+            } else {
+                "bad".into()
+            };
+            let right = state
+                .standing(batch, &who, &token, now_ms)
+                .unwrap_or(Standing::OnTime);
+            let standing = if rng.chance(10) {
+                Standing::Repeat
+            } else {
+                right
+            };
+            Event::Submitted(Submitted {
+                batch,
+                worker: who,
+                token,
+                iteration: state.iteration(),
+                received_ms: now_ms,
+                model: None,
+                programs: vec!["(lam 0)".into(); rng.below(3) as usize],
+                standing,
+            })
+        }
+        5..=6 => {
+            let pending = state
+                .first_pending_check()
+                .and_then(|b| Some((b, state.batch(b)?)));
+            let (batch, checks) = match pending {
+                Some((b, batch)) => {
+                    let n = batch.awaiting_check.as_ref().map_or(0, Vec::len);
+                    let mut checks: Vec<Check> = (0..n)
+                        .map(|i| {
+                            if i >= batch.wanted as usize {
+                                Check::Extra
+                            } else if rng.chance(50) {
+                                Check::Passed {
+                                    program: "(lam 0)".into(),
+                                }
+                            } else {
+                                Check::Compile { error: "e".into() }
+                            }
+                        })
+                        .collect();
+                    // Sometimes the checks do not fit the submission: one
+                    // too many, one too few, or `Extra` where a program the
+                    // batch asked for should be.
+                    if rng.chance(15) {
+                        match rng.below(3) {
+                            0 => checks.push(Check::Extra),
+                            1 => {
+                                checks.pop();
+                            }
+                            _ => {
+                                if let Some(c) = checks.first_mut() {
+                                    *c = Check::Extra;
+                                }
+                            }
+                        }
+                    }
+                    (b, checks)
+                }
+                None => (rng.below(count + 1), Vec::new()),
+            };
+            let library_len = state.library().len() as u64 + u64::from(rng.chance(10));
+            Event::Checked(Checked {
+                batch,
+                library_len,
+                checks,
+            })
+        }
+        7 => Event::IterationFinished {
+            iteration: state.iteration(),
+            used: rng.below(state.verified().len() as u64 + 2),
+        },
+        8 => Event::LibraryExtended {
+            entries: vec![LibraryEntry {
+                arity: 1,
+                term: "(lam 0)".into(),
+            }],
+        },
+        _ => note(state.iteration(), "n"),
+    }
+}
+
+/// How the commits of [`two_stores_agree_with_the_journal`] ended.
+#[derive(Debug, Default)]
+struct Outcomes {
+    written: u32,
+    rejected_first: u32,
+    rejected_later: u32,
+    not_written: u32,
+    unknown: u32,
+    /// The run's iteration at the end.
+    iterations: u64,
+    /// The batches issued, and the programs checked, over the run.
+    batches: u64,
+    checked: u64,
+}
+
+/// Two stores on one run, standing in for two server processes, make
+/// `steps` random commits in turn. Some commits are rejected at their first
+/// event, some at a second one, and some have their write fail, with a
+/// known or an unknown outcome. After each step, each store's state must be
+/// the state a new store reads from the journal.
+fn two_stores_agree_with_the_journal(seed: u64, steps: u32) -> Outcomes {
+    let dir = TempDir::new().unwrap();
+    let a = Store::open(dir.path()).unwrap();
+    let b = Store::open(dir.path()).unwrap();
+    let run = id("r1");
+    a.create_run(&run, config(), tasks()).unwrap();
+    let mut rng = Rng(seed);
+    let mut now_ms = 0;
+    let mut outcomes = Outcomes::default();
+    for step in 0..steps {
+        now_ms += rng.below(20_000);
+        let store = if rng.chance(50) { &a } else { &b };
+        // The steps of an append are truncate, write, sync, and the truncate
+        // that takes a failed record out. Failing the sync and that truncate
+        // leaves the outcome unknown.
+        let fail = if rng.chance(15) {
+            match rng.below(4) {
+                0 => vec![0],
+                1 => vec![1],
+                2 => vec![2],
+                _ => vec![2, 3],
+            }
+        } else {
+            Vec::new()
+        };
+        *store.faults.lock().unwrap() = fail;
+        let bad_second = rng.chance(20);
+        let mut first_applies = false;
+        let result: Result<(), StoreError> = store.commit(&run, |state| {
+            let first = random_event(&mut rng, state, now_ms);
+            first_applies = state.clone().apply(&first).is_ok();
+            let mut events = vec![first];
+            if bad_second {
+                events.push(note(u64::MAX, "never applies"));
+            }
+            Ok(((), events))
+        });
+        // A commit rejected before its append leaves the faults unused.
+        store.faults.lock().unwrap().clear();
+        match result {
+            Ok(()) => outcomes.written += 1,
+            Err(StoreError::Rejected(_)) if first_applies => outcomes.rejected_later += 1,
+            Err(StoreError::Rejected(_)) => outcomes.rejected_first += 1,
+            Err(StoreError::Io { .. }) => outcomes.not_written += 1,
+            Err(StoreError::OutcomeUnknown { .. }) => outcomes.unknown += 1,
+            Err(other) => panic!("step {step}: {other:?}"),
+        }
+        let fresh = Store::open(dir.path()).unwrap().state(&run).unwrap();
+        assert_eq!(a.state(&run).unwrap(), fresh, "store a, step {step}");
+        assert_eq!(b.state(&run).unwrap(), fresh, "store b, step {step}");
+    }
+    let end = a.state(&run).unwrap();
+    outcomes.iterations = end.iteration();
+    outcomes.batches = end.batch_count();
+    outcomes.checked = (0..=end.iteration())
+        .flat_map(|i| end.tasks().iter().map(move |t| (i, t)))
+        .map(|(i, t)| end.task_counts(i, t).programs)
+        .sum();
+    outcomes
+}
+
+#[test]
+fn two_stores_keep_the_journal_s_state_through_rejections_and_failed_writes() {
+    let o = two_stores_agree_with_the_journal(0x3c6f_ca00, 300);
+    // Each kind of ending happened, so each was checked.
+    for (kind, n) in [
+        ("written", o.written),
+        ("rejected at the first event", o.rejected_first),
+        ("rejected at a later event", o.rejected_later),
+        ("write failed", o.not_written),
+        ("outcome unknown", o.unknown),
+    ] {
+        assert!(n > 0, "no commit was {kind}: {o:?}");
+    }
+    // And the run went somewhere: iterations ended, and batches were issued
+    // and checked.
+    assert!(o.iterations > 1 && o.batches > 10 && o.checked > 5, "{o:?}");
+}
+
+#[test]
+#[ignore = "a longer run of the same test"]
+fn two_stores_keep_the_journal_s_state_over_a_long_run() {
+    for seed in 1..=5 {
+        two_stores_agree_with_the_journal(seed, 2000);
+    }
+}
