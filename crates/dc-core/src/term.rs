@@ -473,21 +473,21 @@ mod tests {
         );
     }
 
-    /// The fastest of five runs of `f`.
-    fn fastest(f: impl Fn()) -> std::time::Duration {
-        (0..5)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                f();
-                start.elapsed()
-            })
-            .min()
-            .expect("five runs")
+    /// How long `f` takes.
+    fn time(f: impl Fn()) -> std::time::Duration {
+        let start = std::time::Instant::now();
+        f();
+        start.elapsed()
     }
 
     #[test]
-    fn interning_ints_chosen_to_collide_takes_linear_time() {
-        let xs = fx_colliding_ints(16_000);
+    fn interning_ints_chosen_to_collide_takes_as_long_as_ordinary_ints() {
+        // Both sets have 16,000 ints, so their tables and arenas are the same
+        // size and a busy machine slows both alike. Ints that all share a
+        // bucket make each insert compare against every int before it: about
+        // 1,500 times as long as ordinary ints for 16,000 of them.
+        let colliding = fx_colliding_ints(16_000);
+        let ordinary: Vec<i64> = (0..16_000).collect();
         let intern_all = |xs: &[i64]| {
             let mut a = Arena::new();
             for &x in xs {
@@ -495,14 +495,18 @@ mod tests {
             }
             assert_eq!(a.len(), xs.len());
         };
-        let t_small = fastest(|| intern_all(&xs[..2_000]));
-        let t_large = fastest(|| intern_all(&xs));
-        // Eight times the ints: about 8 times the time if inserts are constant
-        // time, 64 times if each is linear.
-        let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
+        // The runs alternate, so a spell of load falls on both, and the fastest
+        // of each is kept.
+        let (mut t_colliding, mut t_ordinary) =
+            (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..7 {
+            t_ordinary = t_ordinary.min(time(|| intern_all(&ordinary)));
+            t_colliding = t_colliding.min(time(|| intern_all(&colliding)));
+        }
+        let ratio = t_colliding.as_secs_f64() / t_ordinary.as_secs_f64().max(1e-6);
         assert!(
-            ratio < 24.0,
-            "{t_small:?} for 2,000 ints, {t_large:?} for 16,000"
+            ratio < 8.0,
+            "{t_colliding:?} for colliding ints, {t_ordinary:?} for ordinary ints"
         );
     }
 
