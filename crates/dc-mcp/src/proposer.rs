@@ -192,7 +192,7 @@ pub fn next_batch(
         let family =
             task(name).ok_or_else(|| Refused::State(format!("there is no task {name:?}")))?;
         let verifier = Verifier::new(state.library()).map_err(|e| Refused::State(e.to_string()))?;
-        let batch = state.batches().len() as u64;
+        let batch = state.batch_count();
         let token = new_token()?;
         let sent = payload(state, &verifier, &*family, batch, &token, wanted);
         let text = serde_json::to_string(&sent)
@@ -307,8 +307,8 @@ struct Pending {
 }
 
 fn first_pending(state: &RunState) -> Option<Pending> {
-    let batch = *state.pending_checks().first()?;
-    let b = &state.batches()[batch as usize];
+    let batch = state.first_pending_check()?;
+    let b = state.batch(batch)?;
     Some(Pending {
         batch,
         task: b.task.clone(),

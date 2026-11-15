@@ -318,20 +318,66 @@ fn same_secret(secret: &str, given: &str) -> bool {
             == 0
 }
 
-#[cfg(test)]
-thread_local! {
-    /// How many batches this thread's calls have read while they searched
-    /// for live or pending ones. The tests use it to check that a search
-    /// does not read the batches of finished iterations.
-    static BATCHES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+mod batches {
+    //! Every batch of a run, behind methods that count each batch they hand
+    //! out. The vector is private to this module, so no code in
+    //! [`RunState`](super::RunState) can read a batch without being counted.
+    //! The tests use the count to check that the calls a proposer or the
+    //! operator make all the time do not read the batches of finished
+    //! iterations.
+
+    use super::Batch;
+
+    #[cfg(test)]
+    thread_local! {
+        /// How many batches this thread has read through [`Batches`].
+        pub(super) static READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Notes that `n` batches were read.
+    fn count(n: usize) {
+        #[cfg(test)]
+        READ.with(|read| read.set(read.get() + n as u64));
+        #[cfg(not(test))]
+        let _ = n;
+    }
+
+    /// Every batch of a run: batch `i` is entry `i`.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub(super) struct Batches(Vec<Batch>);
+
+    impl Batches {
+        /// How many batches there are. It reads none.
+        pub(super) fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        /// Adds the next batch. It reads none.
+        pub(super) fn push(&mut self, batch: Batch) {
+            self.0.push(batch);
+        }
+
+        /// Batch `number`, if there is one. It reads one.
+        pub(super) fn get(&self, number: u64) -> Option<&Batch> {
+            count(1);
+            self.0.get(usize::try_from(number).ok()?)
+        }
+
+        /// Batch `number`, to change, if there is one. It reads one.
+        pub(super) fn get_mut(&mut self, number: u64) -> Option<&mut Batch> {
+            count(1);
+            self.0.get_mut(usize::try_from(number).ok()?)
+        }
+
+        /// Every batch, as a slice. It counts as reading all of them.
+        pub(super) fn as_slice(&self) -> &[Batch] {
+            count(self.0.len());
+            &self.0
+        }
+    }
 }
 
-/// `batch`, counted as read by a search (see `BATCHES_READ`).
-fn counted(batch: &Batch) -> &Batch {
-    #[cfg(test)]
-    BATCHES_READ.with(|n| n.set(n.get() + 1));
-    batch
-}
+use batches::Batches;
 
 /// The most programs a batch may ask for. A submission may hold this many
 /// programs, so every program a batch asks for fits in one submission.
@@ -563,7 +609,7 @@ pub struct RunState {
     frontiers: BTreeMap<String, Vec<FrontierMember>>,
     iteration: u64,
     log_counts: BTreeMap<LogKind, u64>,
-    batches: Vec<Batch>,
+    batches: Batches,
     live: BTreeSet<u64>,
     awaiting: BTreeSet<u64>,
     task_counts: BTreeMap<u64, BTreeMap<String, TaskCounts>>,
@@ -622,7 +668,7 @@ impl RunState {
             frontiers,
             iteration: 0,
             log_counts: BTreeMap::new(),
-            batches: Vec::new(),
+            batches: Batches::default(),
             live: BTreeSet::new(),
             awaiting: BTreeSet::new(),
             task_counts: BTreeMap::new(),
@@ -742,7 +788,7 @@ impl RunState {
         token: &str,
         received_ms: u64,
     ) -> Option<Standing> {
-        let b = self.batches.get(usize::try_from(batch).ok()?)?;
+        let b = self.batches.get(batch)?;
         Some(if b.worker != worker || !same_secret(&b.token, token) {
             Standing::Foreign
         } else if b.submitted {
@@ -764,7 +810,10 @@ impl RunState {
         if standing != s.standing {
             return Err(Rejected::BadSubmission(s.batch));
         }
-        let batch = &mut self.batches[s.batch as usize];
+        // `standing` found the batch, so this finds it too.
+        let Some(batch) = self.batches.get_mut(s.batch) else {
+            return Err(Rejected::UnknownBatch(s.batch));
+        };
         if standing != Standing::Foreign {
             batch.submitted = true;
             self.live.remove(&s.batch);
@@ -791,12 +840,12 @@ impl RunState {
     }
 
     fn check(&mut self, c: &Checked) -> Result<(), Rejected> {
-        let index = usize::try_from(c.batch)
-            .ok()
-            .filter(|&i| i < self.batches.len())
-            .ok_or(Rejected::UnknownBatch(c.batch))?;
         let library = self.library.len() as u64;
-        let batch = &self.batches[index];
+        // Every check below comes before the first change to the batch.
+        let batch = self
+            .batches
+            .get_mut(c.batch)
+            .ok_or(Rejected::UnknownBatch(c.batch))?;
         let Some(programs) = &batch.awaiting_check else {
             return Err(Rejected::NotAwaitingCheck(c.batch));
         };
@@ -816,7 +865,6 @@ impl RunState {
         if !fits {
             return Err(Rejected::BadSubmission(c.batch));
         }
-        let batch = &mut self.batches[index];
         batch.awaiting_check = None;
         self.awaiting.remove(&c.batch);
         change_task_counts(&mut self.task_counts, batch.iteration, &batch.task, |tc| {
@@ -850,6 +898,11 @@ impl RunState {
     /// The batches whose submission waits to be checked, in order.
     pub fn pending_checks(&self) -> Vec<u64> {
         self.awaiting.iter().copied().collect()
+    }
+
+    /// The first batch whose submission waits to be checked, if any.
+    pub fn first_pending_check(&self) -> Option<u64> {
+        self.awaiting.first().copied()
     }
 
     /// Whether `batch`'s submission waits to be checked.
@@ -906,9 +959,22 @@ impl RunState {
         self.log_counts.get(&kind).copied().unwrap_or(0)
     }
 
-    /// Every batch issued, in order: batch `i` is entry `i`.
+    /// Every batch issued, in order: batch `i` is entry `i`. It is as long
+    /// as the run, so a search through it costs more the longer the run:
+    /// use [`RunState::batch`], [`RunState::leased`] or
+    /// [`RunState::first_pending_check`] in a call made all the time.
     pub fn batches(&self) -> &[Batch] {
-        &self.batches
+        self.batches.as_slice()
+    }
+
+    /// Batch `number`, if the run has issued it.
+    pub fn batch(&self, number: u64) -> Option<&Batch> {
+        self.batches.get(number)
+    }
+
+    /// How many batches the run has issued: the next batch's number.
+    pub fn batch_count(&self) -> u64 {
+        self.batches.len() as u64
     }
 
     /// What came in for `task` in `iteration`.
@@ -958,7 +1024,7 @@ impl RunState {
     pub fn leased(&self, now_ms: u64) -> impl Iterator<Item = (u64, &Batch)> + '_ {
         self.live
             .iter()
-            .map(|&i| (i, counted(&self.batches[i as usize])))
+            .filter_map(|&i| Some((i, self.batches.get(i)?)))
             .filter(move |(_, b)| now_ms <= b.deadline_ms)
     }
 
@@ -966,7 +1032,7 @@ impl RunState {
     /// iteration and every one of them has been checked.
     pub fn quota_in(&self) -> bool {
         let quota = u64::from(self.config.proposals_per_task);
-        self.pending_checks().is_empty()
+        self.awaiting.is_empty()
             && self
                 .tasks
                 .iter()
@@ -1583,36 +1649,58 @@ mod tests {
         s
     }
 
-    /// What the searches of [`hot_calls`] found: the pending checks, whether
-    /// the quota is in, the next task, the open slots of both tasks, and the
-    /// leased batches.
-    type Found<'a> = (Vec<u64>, bool, Option<(&'a str, u32)>, u64, Vec<u64>);
+    /// What the calls of [`hot_calls`] found.
+    #[derive(Debug, PartialEq)]
+    struct Found<'a> {
+        pending: Vec<u64>,
+        first_pending: Option<u64>,
+        awaits: bool,
+        quota_in: bool,
+        next_task: Option<(&'a str, u32)>,
+        open_slots: u64,
+        leased: Vec<u64>,
+        standing: Option<Standing>,
+        wanted: Option<u32>,
+        finish: Result<(), Rejected>,
+    }
 
-    /// Calls each search a proposer or the operator makes all the time, and
-    /// returns what they found and how many batches they read.
-    fn hot_calls(s: &RunState) -> (Found<'_>, u64) {
+    /// Makes each call a proposer or the operator makes all the time on `s`,
+    /// whose first batch of the current iteration is `first`, and returns
+    /// what they found and how many batches they read.
+    fn hot_calls(s: &RunState, first: u64) -> (Found<'_>, u64) {
         let now = 500;
-        BATCHES_READ.with(|n| n.set(0));
-        let found = (
-            s.pending_checks(),
-            s.quota_in(),
-            s.next_task(now),
-            s.open_slots("a", now) + s.open_slots("b", now),
-            s.leased(now).map(|(i, _)| i).collect(),
-        );
-        (found, BATCHES_READ.with(std::cell::Cell::get))
+        let mut copy = s.clone();
+        let finish = Event::IterationFinished {
+            iteration: s.iteration(),
+            used: 0,
+        };
+        batches::READ.with(|n| n.set(0));
+        let found = Found {
+            pending: s.pending_checks(),
+            first_pending: s.first_pending_check(),
+            awaits: s.awaits_check(first),
+            quota_in: s.quota_in(),
+            next_task: s.next_task(now),
+            open_slots: s.open_slots("a", now) + s.open_slots("b", now),
+            leased: s.leased(now).map(|(i, _)| i).collect(),
+            standing: s.standing(first + 2, "w", &format!("t{}", first + 2), now),
+            wanted: s.batch(first).map(|b| b.wanted),
+            finish: copy.apply(&finish),
+        };
+        (found, batches::READ.with(std::cell::Cell::get))
     }
 
     /// The indexes hold what a search of every batch finds.
     fn assert_indexes_hold(s: &RunState) {
-        let live: BTreeSet<u64> = (0..s.batches.len() as u64)
+        let all = s.batches();
+        let live: BTreeSet<u64> = (0..all.len() as u64)
             .filter(|&i| {
-                let b = &s.batches[i as usize];
+                let b = &all[i as usize];
                 b.iteration == s.iteration && !b.submitted
             })
             .collect();
-        let awaiting: BTreeSet<u64> = (0..s.batches.len() as u64)
-            .filter(|&i| s.batches[i as usize].awaiting_check.is_some())
+        let awaiting: BTreeSet<u64> = (0..all.len() as u64)
+            .filter(|&i| all[i as usize].awaiting_check.is_some())
             .collect();
         assert_eq!(s.live, live);
         assert_eq!(s.awaiting, awaiting);
@@ -1623,17 +1711,29 @@ mod tests {
         let (few, many) = (long_run(10), long_run(1000));
         assert_indexes_hold(&few);
         assert_indexes_hold(&many);
-        let (short, short_read) = hot_calls(&few);
-        let (long, long_read) = hot_calls(&many);
-        // The searches find the same batches, by number, after 10 and after
+        let (short, short_read) = hot_calls(&few, 40);
+        let (long, long_read) = hot_calls(&many, 4000);
+        // The calls find the same batches, by number, after 10 and after
         // 1000 finished iterations.
-        assert_eq!(short, (vec![40], false, None, 0, vec![41, 42, 43]));
-        assert_eq!(long, (vec![4000], false, None, 0, vec![4001, 4002, 4003]));
+        let expect = |first: u64| Found {
+            pending: vec![first],
+            first_pending: Some(first),
+            awaits: true,
+            quota_in: false,
+            next_task: None,
+            open_slots: 0,
+            leased: vec![first + 1, first + 2, first + 3],
+            standing: Some(Standing::OnTime),
+            wanted: Some(2),
+            finish: Err(Rejected::ChecksPending(first)),
+        };
+        assert_eq!(short, expect(40));
+        assert_eq!(long, expect(4000));
         // And they read no more batches after 1000 than after 10. Five of the
-        // calls search the leases (next_task searches once for each task),
-        // and each reads at most the current iteration's four batches.
+        // calls search the three live leases (next_task searches once for
+        // each task), and two read one batch by its number.
         assert_eq!(long_read, short_read);
-        assert!(short_read <= 5 * 4, "{short_read}");
+        assert!(short_read <= 5 * 3 + 2, "{short_read}");
     }
 
     #[test]
