@@ -318,23 +318,27 @@ fn same_secret(secret: &str, given: &str) -> bool {
             == 0
 }
 
-mod batches {
-    //! Every batch of a run, behind methods that count each batch they hand
-    //! out. The vector is private to this module, so no code in
-    //! [`RunState`](super::RunState) can read a batch without being counted.
-    //! The tests use the count to check that the calls a proposer or the
-    //! operator make all the time do not read the batches of finished
-    //! iterations.
+mod history {
+    //! The parts of a run's state that grow with every iteration: its
+    //! batches, and its counts for each iteration. Each is behind methods
+    //! that count each entry they hand out. The containers are private to
+    //! this module, so no code in [`RunState`](super::RunState) can read an
+    //! entry without it being counted. The tests use the count to check
+    //! that the calls a proposer or the operator make all the time do not
+    //! read the history of finished iterations.
+
+    use std::collections::BTreeMap;
 
     use super::Batch;
 
     #[cfg(test)]
     thread_local! {
-        /// How many batches this thread has read through [`Batches`].
+        /// How many entries this thread has read through [`Batches`] and
+        /// [`ByIteration`].
         pub(super) static READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
-    /// Notes that `n` batches were read.
+    /// Notes that `n` entries were read.
     fn count(n: usize) {
         #[cfg(test)]
         READ.with(|read| read.set(read.get() + n as u64));
@@ -375,9 +379,35 @@ mod batches {
             &self.0
         }
     }
+
+    /// A value for each iteration that has one.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub(super) struct ByIteration<V>(BTreeMap<u64, V>);
+
+    impl<V: Default> ByIteration<V> {
+        /// The value of `iteration`, if it has one. It reads one.
+        pub(super) fn get(&self, iteration: u64) -> Option<&V> {
+            count(1);
+            self.0.get(&iteration)
+        }
+
+        /// The value of `iteration`, to change, made if it has none. It
+        /// reads one.
+        pub(super) fn entry(&mut self, iteration: u64) -> &mut V {
+            count(1);
+            self.0.entry(iteration).or_default()
+        }
+
+        /// Every iteration's value, in order. It reads each one it hands
+        /// out.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(super) fn iter(&self) -> impl Iterator<Item = (u64, &V)> + '_ {
+            self.0.iter().inspect(|_| count(1)).map(|(&i, v)| (i, v))
+        }
+    }
 }
 
-use batches::Batches;
+use history::{Batches, ByIteration};
 
 /// The most programs a batch may ask for. A submission may hold this many
 /// programs, so every program a batch asks for fits in one submission.
@@ -612,20 +642,20 @@ pub struct RunState {
     batches: Batches,
     live: BTreeSet<u64>,
     awaiting: BTreeSet<u64>,
-    task_counts: BTreeMap<u64, BTreeMap<String, TaskCounts>>,
-    iteration_counts: BTreeMap<u64, IterationCounts>,
+    task_counts: ByIteration<BTreeMap<String, TaskCounts>>,
+    iteration_counts: ByIteration<IterationCounts>,
     verified: Vec<Verified>,
 }
 
 /// Changes the counts of `task` in `iteration` by `change`. The task's name
 /// is copied only the first time it has counts in the iteration.
 fn change_task_counts(
-    counts: &mut BTreeMap<u64, BTreeMap<String, TaskCounts>>,
+    counts: &mut ByIteration<BTreeMap<String, TaskCounts>>,
     iteration: u64,
     task: &str,
     change: impl FnOnce(&mut TaskCounts),
 ) {
-    let by_task = counts.entry(iteration).or_default();
+    let by_task = counts.entry(iteration);
     match by_task.get_mut(task) {
         Some(c) => change(c),
         None => {
@@ -671,8 +701,8 @@ impl RunState {
             batches: Batches::default(),
             live: BTreeSet::new(),
             awaiting: BTreeSet::new(),
-            task_counts: BTreeMap::new(),
-            iteration_counts: BTreeMap::new(),
+            task_counts: ByIteration::default(),
+            iteration_counts: ByIteration::default(),
             verified: Vec::new(),
         })
     }
@@ -693,7 +723,26 @@ impl RunState {
     /// Changes the state by `event`. On an error the state is unchanged:
     /// every check comes before the first change. `Store::commit` relies on
     /// this to apply events without a copy of the state.
+    ///
+    /// In tests, every rejection checks this: the state is copied before the
+    /// event and compared with the copy after it.
     pub fn apply(&mut self, event: &Event) -> Result<(), Rejected> {
+        #[cfg(test)]
+        let before = self.clone();
+        let result = self.apply_checked(event);
+        #[cfg(test)]
+        if result.is_err() {
+            assert!(
+                *self == before,
+                "a rejected event changed the state: {event:?}, {result:?}"
+            );
+        }
+        result
+    }
+
+    /// Changes the state by `event`, with every check before the first
+    /// change. See [`RunState::apply`].
+    fn apply_checked(&mut self, event: &Event) -> Result<(), Rejected> {
         match event {
             Event::Created { .. } => return Err(Rejected::CreatedTwice),
             Event::Logged(record) => {
@@ -771,7 +820,7 @@ impl RunState {
         change_task_counts(&mut self.task_counts, issued.iteration, &issued.task, |c| {
             c.batches += 1
         });
-        let counts = self.iteration_counts.entry(issued.iteration).or_default();
+        let counts = self.iteration_counts.entry(issued.iteration);
         counts.payload_bytes = counts
             .payload_bytes
             .saturating_add(issued.payload.len() as u64);
@@ -826,7 +875,7 @@ impl RunState {
                 c.received += received;
             });
         }
-        let counts = self.iteration_counts.entry(s.iteration).or_default();
+        let counts = self.iteration_counts.entry(s.iteration);
         counts.submissions += 1;
         let bytes: u64 = s.programs.iter().map(|p| p.len() as u64).sum();
         counts.submission_bytes = counts.submission_bytes.saturating_add(bytes);
@@ -980,7 +1029,7 @@ impl RunState {
     /// What came in for `task` in `iteration`.
     pub fn task_counts(&self, iteration: u64, task: &str) -> TaskCounts {
         self.task_counts
-            .get(&iteration)
+            .get(iteration)
             .and_then(|by_task| by_task.get(task))
             .copied()
             .unwrap_or_default()
@@ -989,7 +1038,7 @@ impl RunState {
     /// What came in during `iteration`.
     pub fn iteration_counts(&self, iteration: u64) -> IterationCounts {
         self.iteration_counts
-            .get(&iteration)
+            .get(iteration)
             .copied()
             .unwrap_or_default()
     }
@@ -1406,24 +1455,27 @@ mod tests {
             ],
             vec![Check::Compile { error: "c".into() }],
         ] {
-            assert_eq!(
-                s.clone().apply(&checked(0, bad)),
-                Err(Rejected::BadSubmission(0))
-            );
+            let mut t = s.clone();
+            assert_eq!(t.apply(&checked(0, bad)), Err(Rejected::BadSubmission(0)));
+            assert_eq!(t, s);
         }
         let stale = Event::Checked(Checked {
             batch: 0,
             library_len: 1,
             checks: vec![],
         });
+        let mut t = s.clone();
         assert!(matches!(
-            s.clone().apply(&stale),
+            t.apply(&stale),
             Err(Rejected::StaleLibrary { batch: 0, .. })
         ));
+        assert_eq!(t, s);
+        let mut t = s.clone();
         assert_eq!(
-            s.clone().apply(&checked(2, vec![])),
+            t.apply(&checked(2, vec![])),
             Err(Rejected::NotAwaitingCheck(2))
         );
+        assert_eq!(t, s);
 
         // The iteration cannot end while checks are pending.
         assert_eq!(
@@ -1602,10 +1654,15 @@ mod tests {
     /// submitted and checked, and one never submitted. The current iteration
     /// has four batches: one submitted and waiting to be checked, one
     /// submitted by another worker (so still leased), and two leased.
+    ///
+    /// It applies its events with `apply_checked`, without the copy that
+    /// `apply` makes in tests: every event applies, and the copy of a
+    /// growing state at each of its thousands of events would make the
+    /// test take seconds.
     fn long_run(past: u64) -> RunState {
         let mut s = new_state();
         let issue = |s: &mut RunState, batch: u64, task: &str, deadline_ms: u64| {
-            s.apply(&Event::BatchIssued(BatchIssued {
+            s.apply_checked(&Event::BatchIssued(BatchIssued {
                 batch,
                 iteration: s.iteration(),
                 task: task.into(),
@@ -1624,15 +1681,15 @@ mod tests {
                 issue(&mut s, first + k as u64, task, 1000);
             }
             for batch in first..first + 3 {
-                s.apply(&sub(batch, "w", i, 10, Standing::OnTime, 2))
+                s.apply_checked(&sub(batch, "w", i, 10, Standing::OnTime, 2))
                     .unwrap();
-                s.apply(&checked(
+                s.apply_checked(&checked(
                     batch,
                     vec![Check::Compile { error: "e".into() }; 2],
                 ))
                 .unwrap();
             }
-            s.apply(&Event::IterationFinished {
+            s.apply_checked(&Event::IterationFinished {
                 iteration: i,
                 used: 0,
             })
@@ -1642,9 +1699,9 @@ mod tests {
         for (k, task) in ["a", "a", "b", "b"].into_iter().enumerate() {
             issue(&mut s, first + k as u64, task, 1_000_000);
         }
-        s.apply(&sub(first, "w", past, 10, Standing::OnTime, 2))
+        s.apply_checked(&sub(first, "w", past, 10, Standing::OnTime, 2))
             .unwrap();
-        s.apply(&sub(first + 1, "intruder", past, 10, Standing::Foreign, 2))
+        s.apply_checked(&sub(first + 1, "intruder", past, 10, Standing::Foreign, 2))
             .unwrap();
         s
     }
@@ -1656,6 +1713,9 @@ mod tests {
         first_pending: Option<u64>,
         awaits: bool,
         quota_in: bool,
+        /// `quota_in` once the pending check is done, so that it reads the
+        /// task counts.
+        quota_in_once_checked: bool,
         next_task: Option<(&'a str, u32)>,
         open_slots: u64,
         leased: Vec<u64>,
@@ -1674,12 +1734,21 @@ mod tests {
             iteration: s.iteration(),
             used: 0,
         };
-        batches::READ.with(|n| n.set(0));
+        let mut checked_copy = s.clone();
+        checked_copy
+            .apply(&Event::Checked(Checked {
+                batch: first,
+                library_len: s.library().len() as u64,
+                checks: vec![Check::Compile { error: "e".into() }; 2],
+            }))
+            .unwrap();
+        history::READ.with(|n| n.set(0));
         let found = Found {
             pending: s.pending_checks(),
             first_pending: s.first_pending_check(),
             awaits: s.awaits_check(first),
             quota_in: s.quota_in(),
+            quota_in_once_checked: checked_copy.quota_in(),
             next_task: s.next_task(now),
             open_slots: s.open_slots("a", now) + s.open_slots("b", now),
             leased: s.leased(now).map(|(i, _)| i).collect(),
@@ -1687,7 +1756,7 @@ mod tests {
             wanted: s.batch(first).map(|b| b.wanted),
             finish: copy.apply(&finish),
         };
-        (found, batches::READ.with(std::cell::Cell::get))
+        (found, history::READ.with(std::cell::Cell::get))
     }
 
     /// The indexes hold what a search of every batch finds.
@@ -1704,6 +1773,14 @@ mod tests {
             .collect();
         assert_eq!(s.live, live);
         assert_eq!(s.awaiting, awaiting);
+        // And the task counts count every batch once.
+        let counted: u64 = s
+            .task_counts
+            .iter()
+            .flat_map(|(_, by_task)| by_task.values())
+            .map(|c| c.batches)
+            .sum();
+        assert_eq!(counted, s.batch_count());
     }
 
     #[test]
@@ -1720,6 +1797,7 @@ mod tests {
             first_pending: Some(first),
             awaits: true,
             quota_in: false,
+            quota_in_once_checked: false,
             next_task: None,
             open_slots: 0,
             leased: vec![first + 1, first + 2, first + 3],
@@ -1729,11 +1807,13 @@ mod tests {
         };
         assert_eq!(short, expect(40));
         assert_eq!(long, expect(4000));
-        // And they read no more batches after 1000 than after 10. Five of the
-        // calls search the three live leases (next_task searches once for
-        // each task), and two read one batch by its number.
+        // And they read no more of the run's history after 1000 than after
+        // 10. Five of the calls search the three live leases (next_task
+        // searches once for each task), two read one batch by its number,
+        // and six read one task's counts in the current iteration (each
+        // open_slots, and quota_in once checked for each task).
         assert_eq!(long_read, short_read);
-        assert!(short_read <= 5 * 3 + 2, "{short_read}");
+        assert!(short_read <= 5 * 3 + 2 + 6, "{short_read}");
     }
 
     #[test]

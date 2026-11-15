@@ -1262,7 +1262,7 @@ fn random_event(rng: &mut Rng, state: &RunState, now_ms: u64) -> Event {
             let (batch, checks) = match pending {
                 Some((b, batch)) => {
                     let n = batch.awaiting_check.as_ref().map_or(0, Vec::len);
-                    let checks = (0..n)
+                    let mut checks: Vec<Check> = (0..n)
                         .map(|i| {
                             if i >= batch.wanted as usize {
                                 Check::Extra
@@ -1275,6 +1275,22 @@ fn random_event(rng: &mut Rng, state: &RunState, now_ms: u64) -> Event {
                             }
                         })
                         .collect();
+                    // Sometimes the checks do not fit the submission: one
+                    // too many, one too few, or `Extra` where a program the
+                    // batch asked for should be.
+                    if rng.chance(15) {
+                        match rng.below(3) {
+                            0 => checks.push(Check::Extra),
+                            1 => {
+                                checks.pop();
+                            }
+                            _ => {
+                                if let Some(c) = checks.first_mut() {
+                                    *c = Check::Extra;
+                                }
+                            }
+                        }
+                    }
                     (b, checks)
                 }
                 None => (rng.below(count + 1), Vec::new()),
