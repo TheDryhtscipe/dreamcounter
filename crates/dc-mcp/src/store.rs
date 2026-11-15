@@ -468,6 +468,43 @@ impl Store {
             self.put(run, cached);
             return Ok(result);
         }
+        if torn_len == 0 {
+            // The usual commit applies the events to the state in place, not
+            // to a copy, so it does not cost a copy of the whole run.
+            for (i, event) in events.iter().enumerate() {
+                if let Err(why) = cached.state.apply(event) {
+                    // A rejected event leaves the state as it was (see
+                    // `RunState::apply`). So after the first event the state
+                    // is unchanged and is kept; after a later one it holds
+                    // events that are not in the journal, and it is dropped:
+                    // the next operation reads the journal again.
+                    if i == 0 {
+                        self.put(run, cached);
+                    }
+                    return Err(StoreError::Rejected(why).into());
+                }
+            }
+            let record = journal::encode(cached.next_seq, &events);
+            match self.append_record(&mut locked.journal, cached.len, record.as_bytes()) {
+                Ok(()) => {}
+                // The state holds events that are not in the journal, so it
+                // is dropped, and the next operation reads the journal again.
+                Err(AppendError::NotWritten(error)) => {
+                    return Err(io_at(&locked.path)(error).into());
+                }
+                Err(AppendError::Unknown(error)) => {
+                    return Err(StoreError::OutcomeUnknown {
+                        path: locked.path,
+                        error,
+                    }
+                    .into());
+                }
+            }
+            return Ok(self.written(run, cached, &record, value, then));
+        }
+        // A commit over a torn tail is rare: it applies the events to a copy,
+        // so that a rejected event leaves no file set aside, and then again
+        // after the tail's report.
         let mut state = cached.state.clone();
         for event in &events {
             if let Err(why) = state.apply(event) {
@@ -522,12 +559,29 @@ impl Store {
             }
         }
         cached.state = state;
+        Ok(self.written(run, cached, &record, value, then))
+    }
+
+    /// Notes in `cached`, whose state already has the record's events, that
+    /// `record` is the journal's last record, keeps it, and returns what
+    /// `then` makes of `value` and the state.
+    fn written<T, U, G>(
+        &self,
+        run: &RunId,
+        mut cached: Cached,
+        record: &str,
+        value: T,
+        then: G,
+    ) -> U
+    where
+        G: FnOnce(T, &RunState) -> U,
+    {
         cached.last = (cached.len, journal::crc32(record.as_bytes()));
         cached.len += record.len() as u64;
         cached.next_seq += 1;
         let result = then(value, &cached.state);
         self.put(run, cached);
-        Ok(result)
+        result
     }
 
     /// Appends a record to the journal. See [`append`].

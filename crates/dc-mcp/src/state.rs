@@ -7,7 +7,7 @@
 //! Programs and library bodies are text here. The state does not parse them:
 //! the code that evaluates and compresses them does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -318,6 +318,21 @@ fn same_secret(secret: &str, given: &str) -> bool {
             == 0
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many batches this thread's calls have read while they searched
+    /// for live or pending ones. The tests use it to check that a search
+    /// does not read the batches of finished iterations.
+    static BATCHES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `batch`, counted as read by a search (see `BATCHES_READ`).
+fn counted(batch: &Batch) -> &Batch {
+    #[cfg(test)]
+    BATCHES_READ.with(|n| n.set(n.get() + 1));
+    batch
+}
+
 /// The most programs a batch may ask for. A submission may hold this many
 /// programs, so every program a batch asks for fits in one submission.
 pub const MAX_PROGRAMS_PER_BATCH: u32 = 32;
@@ -518,6 +533,28 @@ pub struct Verified {
 /// payloads and submissions.
 ///
 /// That text is in the journal. The state keeps counts.
+///
+/// # Indexes
+///
+/// `batches` holds every batch since the run began, so a search through it
+/// costs more the longer the run. The calls a proposer or the operator makes
+/// all the time search two indexes instead, which hold only batch numbers:
+///
+/// * `live`: the batches of the current iteration that no submission from
+///   their worker has come in for. A lease is live while its batch is in
+///   `live` and its deadline has not passed (see [`RunState::leased`]). A
+///   batch leaves when it is submitted, and the set empties when the
+///   iteration ends. A batch whose lease ended without a submission stays
+///   until then, so the set is at most the current iteration's batches.
+/// * `awaiting`: the batches whose submission waits to be checked (their
+///   [`Batch::awaiting_check`] is `Some`). An iteration cannot end while one
+///   waits, so these are of the current iteration too.
+///
+/// `task_counts` is keyed by iteration and then by task, so a lookup by a
+/// task's name borrows the name and does not copy it.
+///
+/// The indexes are derived: [`RunState::apply`] keeps them, so a replay of
+/// the journal builds them again, and nothing about them is written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunState {
     config: RunConfig,
@@ -527,9 +564,30 @@ pub struct RunState {
     iteration: u64,
     log_counts: BTreeMap<LogKind, u64>,
     batches: Vec<Batch>,
-    task_counts: BTreeMap<(u64, String), TaskCounts>,
+    live: BTreeSet<u64>,
+    awaiting: BTreeSet<u64>,
+    task_counts: BTreeMap<u64, BTreeMap<String, TaskCounts>>,
     iteration_counts: BTreeMap<u64, IterationCounts>,
     verified: Vec<Verified>,
+}
+
+/// Changes the counts of `task` in `iteration` by `change`. The task's name
+/// is copied only the first time it has counts in the iteration.
+fn change_task_counts(
+    counts: &mut BTreeMap<u64, BTreeMap<String, TaskCounts>>,
+    iteration: u64,
+    task: &str,
+    change: impl FnOnce(&mut TaskCounts),
+) {
+    let by_task = counts.entry(iteration).or_default();
+    match by_task.get_mut(task) {
+        Some(c) => change(c),
+        None => {
+            let mut c = TaskCounts::default();
+            change(&mut c);
+            by_task.insert(task.to_owned(), c);
+        }
+    }
 }
 
 impl RunState {
@@ -565,6 +623,8 @@ impl RunState {
             iteration: 0,
             log_counts: BTreeMap::new(),
             batches: Vec::new(),
+            live: BTreeSet::new(),
+            awaiting: BTreeSet::new(),
             task_counts: BTreeMap::new(),
             iteration_counts: BTreeMap::new(),
             verified: Vec::new(),
@@ -584,7 +644,9 @@ impl RunState {
         Ok(state)
     }
 
-    /// Changes the state by `event`. On an error the state is unchanged.
+    /// Changes the state by `event`. On an error the state is unchanged:
+    /// every check comes before the first change. `Store::commit` relies on
+    /// this to apply events without a copy of the state.
     pub fn apply(&mut self, event: &Event) -> Result<(), Rejected> {
         match event {
             Event::Created { .. } => return Err(Rejected::CreatedTwice),
@@ -610,7 +672,7 @@ impl RunState {
             }
             Event::IterationFinished { iteration, used } => {
                 self.check_iteration(*iteration)?;
-                if let Some(b) = self.pending_checks().first() {
+                if let Some(b) = self.awaiting.first() {
                     return Err(Rejected::ChecksPending(*b));
                 }
                 let verified = self.verified.len() as u64;
@@ -629,6 +691,8 @@ impl RunState {
                 // this event later, without the run's lock in between; a
                 // program checked in that time waits for the next step.
                 self.verified.drain(..taken);
+                // No batch of the ended iteration holds a live lease now.
+                self.live.clear();
             }
         }
         Ok(())
@@ -657,10 +721,10 @@ impl RunState {
             submitted: false,
             awaiting_check: None,
         });
-        self.task_counts
-            .entry((issued.iteration, issued.task.clone()))
-            .or_default()
-            .batches += 1;
+        self.live.insert(issued.batch);
+        change_task_counts(&mut self.task_counts, issued.iteration, &issued.task, |c| {
+            c.batches += 1
+        });
         let counts = self.iteration_counts.entry(issued.iteration).or_default();
         counts.payload_bytes = counts
             .payload_bytes
@@ -703,15 +767,15 @@ impl RunState {
         let batch = &mut self.batches[s.batch as usize];
         if standing != Standing::Foreign {
             batch.submitted = true;
+            self.live.remove(&s.batch);
         }
-        let (iteration, task, wanted) = (batch.iteration, batch.task.clone(), batch.wanted);
         if standing.evaluated() {
             batch.awaiting_check = Some(s.programs.clone());
-            let received = (s.programs.len() as u64).min(u64::from(wanted));
-            self.task_counts
-                .entry((iteration, task))
-                .or_default()
-                .received += received;
+            self.awaiting.insert(s.batch);
+            let received = (s.programs.len() as u64).min(u64::from(batch.wanted));
+            change_task_counts(&mut self.task_counts, batch.iteration, &batch.task, |c| {
+                c.received += received;
+            });
         }
         let counts = self.iteration_counts.entry(s.iteration).or_default();
         counts.submissions += 1;
@@ -752,31 +816,30 @@ impl RunState {
         if !fits {
             return Err(Rejected::BadSubmission(c.batch));
         }
-        let (iteration, task) = (batch.iteration, batch.task.clone());
-        self.batches[index].awaiting_check = None;
-        let tc = self
-            .task_counts
-            .entry((iteration, task.clone()))
-            .or_default();
-        for check in &c.checks {
-            let (compiled, typed, passed) = match check {
-                Check::Extra => continue,
-                Check::Compile { .. } => (false, false, false),
-                Check::Type { .. } => (true, false, false),
-                Check::Run { .. } => (true, true, false),
-                Check::Passed { .. } => (true, true, true),
-            };
-            tc.programs += 1;
-            tc.compiled += u64::from(compiled);
-            tc.typed += u64::from(typed);
-            tc.passed += u64::from(passed);
-        }
+        let batch = &mut self.batches[index];
+        batch.awaiting_check = None;
+        self.awaiting.remove(&c.batch);
+        change_task_counts(&mut self.task_counts, batch.iteration, &batch.task, |tc| {
+            for check in &c.checks {
+                let (compiled, typed, passed) = match check {
+                    Check::Extra => continue,
+                    Check::Compile { .. } => (false, false, false),
+                    Check::Type { .. } => (true, false, false),
+                    Check::Run { .. } => (true, true, false),
+                    Check::Passed { .. } => (true, true, true),
+                };
+                tc.programs += 1;
+                tc.compiled += u64::from(compiled);
+                tc.typed += u64::from(typed);
+                tc.passed += u64::from(passed);
+            }
+        });
         // An iteration cannot end with a check pending, so the batch is of
         // the current iteration.
         for check in &c.checks {
             if let Check::Passed { program } = check {
                 self.verified.push(Verified {
-                    task: task.clone(),
+                    task: batch.task.clone(),
                     program: program.clone(),
                 });
             }
@@ -786,12 +849,12 @@ impl RunState {
 
     /// The batches whose submission waits to be checked, in order.
     pub fn pending_checks(&self) -> Vec<u64> {
-        self.batches
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.awaiting_check.is_some())
-            .map(|(i, _)| i as u64)
-            .collect()
+        self.awaiting.iter().copied().collect()
+    }
+
+    /// Whether `batch`'s submission waits to be checked.
+    pub fn awaits_check(&self, batch: u64) -> bool {
+        self.awaiting.contains(&batch)
     }
 
     fn check_iteration(&self, given: u64) -> Result<(), Rejected> {
@@ -851,7 +914,8 @@ impl RunState {
     /// What came in for `task` in `iteration`.
     pub fn task_counts(&self, iteration: u64, task: &str) -> TaskCounts {
         self.task_counts
-            .get(&(iteration, task.to_owned()))
+            .get(&iteration)
+            .and_then(|by_task| by_task.get(task))
             .copied()
             .unwrap_or_default()
     }
@@ -878,17 +942,24 @@ impl RunState {
     pub fn open_slots(&self, task: &str, now_ms: u64) -> u64 {
         let received = self.task_counts(self.iteration, task).received;
         let leased: u64 = self
-            .batches
-            .iter()
-            .filter(|b| {
-                b.iteration == self.iteration
-                    && b.task == task
-                    && !b.submitted
-                    && now_ms <= b.deadline_ms
-            })
-            .map(|b| u64::from(b.wanted))
+            .leased(now_ms)
+            .filter(|(_, b)| b.task == task)
+            .map(|(_, b)| u64::from(b.wanted))
             .sum();
         u64::from(self.config.proposals_per_task).saturating_sub(received.saturating_add(leased))
+    }
+
+    /// The batches of the current iteration whose lease is live at `now_ms`:
+    /// not submitted, and with a deadline that has not passed. With each
+    /// batch comes its number. They are in order of their numbers.
+    ///
+    /// It reads only the current iteration's unsubmitted batches, not every
+    /// batch of the run: see the indexes in [`RunState`].
+    pub fn leased(&self, now_ms: u64) -> impl Iterator<Item = (u64, &Batch)> + '_ {
+        self.live
+            .iter()
+            .map(|&i| (i, counted(&self.batches[i as usize])))
+            .filter(move |(_, b)| now_ms <= b.deadline_ms)
     }
 
     /// Whether every task has received its programs for the current
@@ -1459,5 +1530,144 @@ mod tests {
         assert!(!s.quota_in());
         s.apply(&checked(1, vec![passed("p")])).unwrap();
         assert!(s.quota_in());
+    }
+
+    /// A run with `past` finished iterations, each with four batches: three
+    /// submitted and checked, and one never submitted. The current iteration
+    /// has four batches: one submitted and waiting to be checked, one
+    /// submitted by another worker (so still leased), and two leased.
+    fn long_run(past: u64) -> RunState {
+        let mut s = new_state();
+        let issue = |s: &mut RunState, batch: u64, task: &str, deadline_ms: u64| {
+            s.apply(&Event::BatchIssued(BatchIssued {
+                batch,
+                iteration: s.iteration(),
+                task: task.into(),
+                wanted: 2,
+                worker: "w".into(),
+                token: format!("t{batch}"),
+                issued_ms: 0,
+                deadline_ms,
+                payload: String::new(),
+            }))
+            .unwrap();
+        };
+        for i in 0..past {
+            let first = i * 4;
+            for (k, task) in ["a", "a", "b", "b"].into_iter().enumerate() {
+                issue(&mut s, first + k as u64, task, 1000);
+            }
+            for batch in first..first + 3 {
+                s.apply(&sub(batch, "w", i, 10, Standing::OnTime, 2))
+                    .unwrap();
+                s.apply(&checked(
+                    batch,
+                    vec![Check::Compile { error: "e".into() }; 2],
+                ))
+                .unwrap();
+            }
+            s.apply(&Event::IterationFinished {
+                iteration: i,
+                used: 0,
+            })
+            .unwrap();
+        }
+        let first = past * 4;
+        for (k, task) in ["a", "a", "b", "b"].into_iter().enumerate() {
+            issue(&mut s, first + k as u64, task, 1_000_000);
+        }
+        s.apply(&sub(first, "w", past, 10, Standing::OnTime, 2))
+            .unwrap();
+        s.apply(&sub(first + 1, "intruder", past, 10, Standing::Foreign, 2))
+            .unwrap();
+        s
+    }
+
+    /// What the searches of [`hot_calls`] found: the pending checks, whether
+    /// the quota is in, the next task, the open slots of both tasks, and the
+    /// leased batches.
+    type Found<'a> = (Vec<u64>, bool, Option<(&'a str, u32)>, u64, Vec<u64>);
+
+    /// Calls each search a proposer or the operator makes all the time, and
+    /// returns what they found and how many batches they read.
+    fn hot_calls(s: &RunState) -> (Found<'_>, u64) {
+        let now = 500;
+        BATCHES_READ.with(|n| n.set(0));
+        let found = (
+            s.pending_checks(),
+            s.quota_in(),
+            s.next_task(now),
+            s.open_slots("a", now) + s.open_slots("b", now),
+            s.leased(now).map(|(i, _)| i).collect(),
+        );
+        (found, BATCHES_READ.with(std::cell::Cell::get))
+    }
+
+    /// The indexes hold what a search of every batch finds.
+    fn assert_indexes_hold(s: &RunState) {
+        let live: BTreeSet<u64> = (0..s.batches.len() as u64)
+            .filter(|&i| {
+                let b = &s.batches[i as usize];
+                b.iteration == s.iteration && !b.submitted
+            })
+            .collect();
+        let awaiting: BTreeSet<u64> = (0..s.batches.len() as u64)
+            .filter(|&i| s.batches[i as usize].awaiting_check.is_some())
+            .collect();
+        assert_eq!(s.live, live);
+        assert_eq!(s.awaiting, awaiting);
+    }
+
+    #[test]
+    fn searches_read_only_the_batches_of_the_current_iteration() {
+        let (few, many) = (long_run(10), long_run(1000));
+        assert_indexes_hold(&few);
+        assert_indexes_hold(&many);
+        let (short, short_read) = hot_calls(&few);
+        let (long, long_read) = hot_calls(&many);
+        // The searches find the same batches, by number, after 10 and after
+        // 1000 finished iterations.
+        assert_eq!(short, (vec![40], false, None, 0, vec![41, 42, 43]));
+        assert_eq!(long, (vec![4000], false, None, 0, vec![4001, 4002, 4003]));
+        // And they read no more batches after 1000 than after 10. Five of the
+        // calls search the leases (next_task searches once for each task),
+        // and each reads at most the current iteration's four batches.
+        assert_eq!(long_read, short_read);
+        assert!(short_read <= 5 * 4, "{short_read}");
+    }
+
+    #[test]
+    fn the_indexes_follow_submissions_checks_and_the_end_of_an_iteration() {
+        let mut s = new_state();
+        for b in 0..4 {
+            s.apply(&issued(b, "a", 1, 0)).unwrap();
+        }
+        assert_indexes_hold(&s);
+        // Foreign leaves the batch live; on time and expired take it out
+        // and make it wait for a check; a repeat changes neither.
+        s.apply(&sub(0, "intruder", 0, 5, Standing::Foreign, 1))
+            .unwrap();
+        s.apply(&submitted(1, 5, Standing::OnTime, 1)).unwrap();
+        s.apply(&submitted(2, 5000, Standing::Expired, 1)).unwrap();
+        s.apply(&submitted(1, 6, Standing::Repeat, 1)).unwrap();
+        assert_indexes_hold(&s);
+        assert_eq!(s.leased(0).map(|(i, _)| i).collect::<Vec<_>>(), [0, 3]);
+        assert_eq!(s.pending_checks(), [1, 2]);
+        assert!(s.awaits_check(2) && !s.awaits_check(0));
+        s.apply(&checked(1, vec![passed("p")])).unwrap();
+        s.apply(&checked(2, vec![passed("q")])).unwrap();
+        assert_indexes_hold(&s);
+        s.apply(&Event::IterationFinished {
+            iteration: 0,
+            used: 2,
+        })
+        .unwrap();
+        // Batches 0 and 3 were never submitted; they are not live in the new
+        // iteration, and a late submission does not bring them back.
+        assert_indexes_hold(&s);
+        assert_eq!(s.leased(0).count(), 0);
+        s.apply(&sub(3, "w", 1, 10, Standing::Late, 1)).unwrap();
+        assert_indexes_hold(&s);
+        assert!(s.pending_checks().is_empty());
     }
 }
