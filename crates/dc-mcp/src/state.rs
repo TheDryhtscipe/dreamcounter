@@ -504,7 +504,8 @@ pub struct IterationCounts {
     pub foreign: u64,
 }
 
-/// A program of the current iteration that passed its task's examples.
+/// A program that passed its task's examples and that no iteration step has
+/// taken yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Verified {
     /// The task.

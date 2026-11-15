@@ -691,7 +691,13 @@ fn proposer_reply(run: &RunId, refused: Refused) -> String {
         }
         Refused::Store(e) => {
             let _ = writeln!(std::io::stderr(), "dc-mcp: run {run}: {e}");
-            "the server could not do this; tell the operator".to_owned()
+            if matches!(e, StoreError::OutcomeUnknown { .. }) {
+                "the server cannot tell whether this was recorded; do not send it again, \
+                 and tell the operator"
+                    .to_owned()
+            } else {
+                "the server could not do this; tell the operator".to_owned()
+            }
         }
     }
 }
@@ -737,9 +743,11 @@ impl ProposerServer {
                     now,
                 )
             })
-            .await?;
+            .await;
+        // A submission may be kept even when the reply is an error, if the
+        // store cannot tell whether its write went through.
         self.check_in_background();
-        Ok(receipt)
+        receipt
     }
 }
 
@@ -834,6 +842,17 @@ mod tests {
             assert!(!told.contains("disk full"), "{told}");
             assert!(told.contains("operator"), "{told}");
         }
+        // When the store cannot tell whether a submission was kept, sending
+        // it again would make it a repeat.
+        let unknown = proposer_reply(
+            &run,
+            Refused::Store(StoreError::OutcomeUnknown {
+                path: secret.into(),
+                error: std::io::Error::other("disk full"),
+            }),
+        );
+        assert!(!unknown.contains(secret), "{unknown}");
+        assert!(unknown.contains("not send it again"), "{unknown}");
         let busy = proposer_reply(&run, Refused::Store(StoreError::Busy(run.clone())));
         assert!(busy.contains("again"), "{busy}");
         // A refused request is the proposer's to fix, so it is told why.
