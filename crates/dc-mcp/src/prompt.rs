@@ -45,7 +45,8 @@ pub struct Payload {
 }
 
 /// The language guide. The types of primitives and prelude functions follow
-/// it in the prompt.
+/// it in the prompt. The tests in `prompt_guide_tests.rs` check its claims
+/// against the parser and type checker by reading them out of this text.
 const GUIDE: &str = "\
 ## The dc language
 
@@ -424,3 +425,7 @@ mod tests {
         assert_eq!(read_payload(&issued).unwrap(), p);
     }
 }
+
+#[cfg(test)]
+#[path = "prompt_guide_tests.rs"]
+mod guide_tests;
