@@ -76,12 +76,23 @@
 //! The operating system releases a claim when its holder's file is closed,
 //! also when the holder is killed, so a claim cannot outlive its process. A
 //! holder that is done removes the file before it releases the lock
-//! ([`CheckClaim::release`]). A claim is only taken on the file that is at
+//! ([`CheckClaim::release`]), if the file at the path is still the one it
+//! locked: after the run was removed and made again, the path can name a
+//! file another checker holds. A claim is only taken on the file that is at
 //! the path once the lock is held, so a checker that opened the removed file
 //! takes no claim on it. A file left by a holder that stopped is taken by the
 //! next checker of its batch, or removed by [`Store::remove_settled_claims`]
 //! once the batch is checked. The files hold nothing, and the journal does
 //! not depend on them.
+//!
+//! Claims need a local file system, as the run's lock does. On NFS, Linux
+//! emulates `flock` with POSIX locks, which belong to a process, so two
+//! checkers in one process would both get a claim.
+//!
+//! A claim does not tie a check to the run: a checker that reads a pending
+//! submission with [`Store::read_journal`] commits its checks with
+//! [`Store::commit_to`], which writes nothing if the run was removed and made
+//! again in the meantime.
 //!
 //! # A journal that is replaced
 //!
@@ -338,11 +349,21 @@ impl CheckClaim {
     /// batch needs no more checking. A file that cannot be removed is left
     /// for [`Store::remove_settled_claims`].
     pub fn release(self) {
-        // Removed while the lock is held: see `Store::try_claim_check`.
-        let _ = fs::remove_file(&self.path);
+        // Removed while the lock is held: see `Store::try_claim_check`. Only
+        // the file this claim locked is removed. If the run's directory was
+        // removed and made again, the path can name a file of the new run
+        // that another checker holds.
+        if still_at(&self.file, &self.path).ok() == Some(Some(true)) {
+            let _ = fs::remove_file(&self.path);
+        }
         drop(self.file);
     }
 }
+
+/// One journal of a run. A run that is removed and made again has a journal
+/// with another id. See [`Store::read_journal`] and [`Store::commit_to`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalId(u64);
 
 /// A directory of runs. See the module docs.
 #[derive(Debug)]
@@ -553,11 +574,21 @@ impl Store {
     where
         F: FnOnce(&RunState) -> T,
     {
+        self.read_journal(run, read).map(|(result, _)| result)
+    }
+
+    /// As [`Store::read`], and the journal that was read. Pass it to
+    /// [`Store::commit_to`] to write only to that journal.
+    pub fn read_journal<T, F>(&self, run: &RunId, read: F) -> Result<(T, JournalId), StoreError>
+    where
+        F: FnOnce(&RunState) -> T,
+    {
         let mut locked = self.lock_run(run)?;
         let (cached, _) = self.catch_up(run, &mut locked)?;
         let result = read(&cached.state);
+        let journal = JournalId(cached.id);
         self.put(run, cached);
-        Ok(result)
+        Ok((result, journal))
     }
 
     /// A copy of the run's state now.
@@ -591,9 +622,45 @@ impl Store {
         G: FnOnce(T, &RunState) -> U,
         E: From<StoreError>,
     {
+        self.commit_in(run, |state, _| change(state), then)
+    }
+
+    /// As [`Store::commit`], if the run's journal is still `journal`.
+    /// Otherwise the run was removed and made again since `journal` was read:
+    /// `change` is not called, nothing is written, and the result is `None`.
+    pub fn commit_to<T, E, F>(
+        &self,
+        run: &RunId,
+        journal: JournalId,
+        change: F,
+    ) -> Result<Option<T>, E>
+    where
+        F: FnOnce(&RunState) -> Result<(T, Vec<Event>), E>,
+        E: From<StoreError>,
+    {
+        self.commit_in(
+            run,
+            |state, now| {
+                if now == journal {
+                    change(state).map(|(value, events)| (Some(value), events))
+                } else {
+                    Ok((None, Vec::new()))
+                }
+            },
+            |value, _| value,
+        )
+    }
+
+    /// [`Store::commit_then`], with `change` told which journal it sees.
+    fn commit_in<T, U, E, F, G>(&self, run: &RunId, change: F, then: G) -> Result<U, E>
+    where
+        F: FnOnce(&RunState, JournalId) -> Result<(T, Vec<Event>), E>,
+        G: FnOnce(T, &RunState) -> U,
+        E: From<StoreError>,
+    {
         let mut locked = self.lock_run(run)?;
         let (mut cached, torn_len) = self.catch_up(run, &mut locked)?;
-        let (value, mut events) = match change(&cached.state) {
+        let (value, mut events) = match change(&cached.state, JournalId(cached.id)) {
             Ok(changed) => changed,
             Err(error) => {
                 self.put(run, cached);

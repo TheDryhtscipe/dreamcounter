@@ -937,7 +937,7 @@ fn the_operator_can_check_what_a_stopped_proposer_left() {
         .unwrap();
     assert_eq!(
         report,
-        json!({ "run": "r1", "checked": 1, "pending_checks": 0 })
+        json!({ "run": "r1", "checked": 1, "pending_checks": 0, "claimed_elsewhere": [] })
     );
     let stats = operator
         .call("dc_proposal_stats", json!({ "run": "r1" }))
@@ -1001,6 +1001,14 @@ fn a_proposer_that_waits_for_an_abandoned_check_gets_it_done() {
             .clone()
     };
     assert_eq!(pending(&mut operator), 1);
+    // The operator sees which batch another checker holds.
+    let report = operator
+        .call("dc_check_pending", json!({ "run": "r1" }))
+        .unwrap();
+    assert_eq!(
+        report,
+        json!({ "run": "r1", "checked": 0, "pending_checks": 1, "claimed_elsewhere": [0] })
+    );
 
     // The claimant stops without checking.
     drop(claim);

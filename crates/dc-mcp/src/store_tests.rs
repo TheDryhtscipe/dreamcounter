@@ -560,6 +560,29 @@ fn commit_returns_the_closure_s_value_or_its_error_and_writes_nothing_on_error()
 }
 
 #[test]
+fn a_commit_to_a_journal_writes_nothing_to_a_run_made_in_its_place() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = id("r1");
+    store.create_run(&run, config(), tasks()).unwrap();
+    let ((), read) = store.read_journal(&run, |_| ()).unwrap();
+    let to_same: Result<Option<&str>, StoreError> =
+        store.commit_to(&run, read, |_| Ok(("same", vec![note(0, "a")])));
+    assert_eq!(to_same.unwrap(), Some("same"));
+
+    fs::remove_dir_all(dir.path().join("r1")).unwrap();
+    store.create_run(&run, config(), tasks()).unwrap();
+    let bytes = fs::read(journal(dir.path(), "r1")).unwrap();
+    let to_old: Result<Option<&str>, StoreError> = store.commit_to(&run, read, |_| {
+        panic!("the change is not made for a journal that is gone")
+    });
+    assert_eq!(to_old.unwrap(), None);
+    assert_eq!(fs::read(journal(dir.path(), "r1")).unwrap(), bytes);
+    let ((), now) = store.read_journal(&run, |_| ()).unwrap();
+    assert_ne!(now, read);
+}
+
+#[test]
 fn a_run_locked_elsewhere_is_busy_and_other_runs_still_work() {
     let dir = TempDir::new().unwrap();
     let store =

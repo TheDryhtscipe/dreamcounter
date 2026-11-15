@@ -98,18 +98,17 @@ fn a_claim_held_by_a_killed_process_does_not_strand_its_submission() {
     // While the child holds the claim, the submission is left to it.
     let left = check_pending(&store, &run, &verifiers);
     let pending = store.state(&run).unwrap().pending_checks();
-    if left.as_ref().is_ok_and(|&n| n != 0) || pending != [0] {
-        child.kill().unwrap();
-        child.wait().unwrap();
-    }
-    assert_eq!(left.unwrap(), 0, "a claimed submission was checked");
-    assert_eq!(pending, [0]);
-
     child.kill().unwrap();
     child.wait().unwrap();
+    let left = left.unwrap();
+    assert_eq!(left.checked, 0, "a claimed submission was checked");
+    assert_eq!(left.claimed_elsewhere, [0]);
+    assert_eq!(pending, [0]);
+
     // The claim died with the child; its file is still there.
     assert_eq!(store.check_claims(&run).unwrap(), [0]);
-    assert_eq!(check_pending(&store, &run, &verifiers).unwrap(), 1);
+    let done = check_pending(&store, &run, &verifiers).unwrap();
+    assert_eq!((done.checked, done.claimed_elsewhere.len()), (1, 0));
     assert!(store.state(&run).unwrap().pending_checks().is_empty());
     assert!(
         store.check_claims(&run).unwrap().is_empty(),

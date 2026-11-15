@@ -267,6 +267,11 @@ pub struct CheckReport {
     /// another submission came in meanwhile, or another server is checking
     /// one.
     pub pending_checks: usize,
+    /// The batches this call left to another server, which held their
+    /// claims. A batch that stays here while no check finishes may be held
+    /// by a process that hangs: stop that process, and its claim goes with
+    /// it.
+    pub claimed_elsewhere: Vec<u64>,
 }
 
 /// The result of `dc_proposal_stats`.
@@ -465,7 +470,8 @@ impl DcServer {
                        and wait until they are done. A submission that another server is \
                        checking is left to it. Proposer servers do this in the background; use \
                        this when one stopped before it finished, or to see why checks fail. \
-                       Returns how many it checked and how many still wait."
+                       Returns how many it checked, how many still wait, and the batches \
+                       another server is checking."
     )]
     async fn check_pending(
         &self,
@@ -476,14 +482,15 @@ impl DcServer {
             // This server serves many runs, so it keeps no verifier between
             // calls; one call builds one for each library length it meets.
             let verifiers = VerifierCache::default();
-            let checked = check_pending(store, &run, &verifiers).map_err(|e| e.to_string())?;
+            let done = check_pending(store, &run, &verifiers).map_err(|e| e.to_string())?;
             let pending_checks = store
                 .read(&run, |state| state.pending_checks().len())
                 .map_err(|e| e.to_string())?;
             Ok(CheckReport {
                 run: run.as_str().to_owned(),
-                checked,
+                checked: done.checked,
                 pending_checks,
+                claimed_elsewhere: done.claimed_elsewhere,
             })
         })
         .await
