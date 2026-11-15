@@ -3,23 +3,27 @@
 //! ```text
 //! dc-propose --state-dir <dir> --run <run> --model <model id> --log-dir <dir>
 //!            --sessions <n> [--parallel <n>] [--session-timeout <seconds>]
+//!            [--max-context-tokens <n>] [--pass-env <name>]...
 //!            [--dc-mcp <path>] [--claude <path>]
 //! ```
 //!
+//! SIGINT, SIGTERM or SIGHUP kills the running sessions and writes the
+//! summary.
+//!
 //! Writes `summary.json` to the log directory and prints it. Exits 0 when
-//! every session submitted or found no batch, 1 when one failed, and 2 on a
-//! usage error. The project lead starts every run (D11 requirement 5).
+//! every session submitted or found no batch, 1 when one failed or the launch
+//! was interrupted, and 2 on a usage error. The project lead starts every run (D11 requirement 5).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use dc_propose::{Config, Launcher};
+use dc_propose::{Config, Launcher, DEFAULT_MAX_CONTEXT_TOKENS};
 
 const USAGE: &str = "usage: dc-propose --state-dir <dir> --run <run> --model <model id> \
     --log-dir <dir> --sessions <n> [--parallel <n>] [--session-timeout <seconds>] \
-    [--dc-mcp <path>] [--claude <path>]";
+    [--max-context-tokens <n>] [--pass-env <name>]... [--dc-mcp <path>] [--claude <path>]";
 
 /// The `dc-mcp` beside this executable, as cargo builds them.
 fn sibling_dc_mcp() -> PathBuf {
@@ -40,6 +44,8 @@ fn arguments() -> Result<Config, String> {
     let mut timeout = 1200;
     let mut dc_mcp = None;
     let mut claude = PathBuf::from("claude");
+    let mut max_context_tokens = DEFAULT_MAX_CONTEXT_TOKENS;
+    let mut pass_env = Vec::new();
     while let Some(flag) = args.next() {
         let value: OsString = args.next().ok_or(format!("{flag:?} needs a value"))?;
         let text = || {
@@ -59,6 +65,8 @@ fn arguments() -> Result<Config, String> {
             Some("--session-timeout") => timeout = number()?,
             Some("--dc-mcp") => dc_mcp = Some(PathBuf::from(&value)),
             Some("--claude") => claude = PathBuf::from(&value),
+            Some("--max-context-tokens") => max_context_tokens = number()?,
+            Some("--pass-env") => pass_env.push(text()?),
             _ => return Err(format!("unknown flag {flag:?}")),
         }
     }
@@ -73,6 +81,8 @@ fn arguments() -> Result<Config, String> {
         session_timeout: Duration::from_secs(timeout),
         dc_mcp: dc_mcp.unwrap_or_else(sibling_dc_mcp),
         claude,
+        max_context_tokens,
+        pass_env,
     })
 }
 
@@ -92,6 +102,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    for signal in [
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ] {
+        if let Err(e) = signal_hook::flag::register(signal, launcher.interrupt_flag()) {
+            eprintln!("dc-propose: cannot handle signal {signal}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     eprintln!("dc-propose: launch {}", launcher.id());
     let sessions = launcher.launch();
     let summary = launcher.summary(&sessions);
@@ -100,7 +120,10 @@ fn main() -> ExitCode {
         eprintln!("dc-propose: cannot write {}: {e}", summary_path.display());
     }
     println!("{text}");
-    if sessions.iter().any(|s| s.outcome.is_failure()) {
+    let interrupted = launcher
+        .interrupt_flag()
+        .load(std::sync::atomic::Ordering::SeqCst);
+    if interrupted || sessions.iter().any(|s| s.outcome.is_failure()) {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS

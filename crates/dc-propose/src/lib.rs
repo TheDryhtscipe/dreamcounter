@@ -1,25 +1,31 @@
 //! Starts proposer sessions for a dc-mcp run (D11, D21).
 //!
 //! Each session is a headless Claude Code process (`claude -p`) that runs in
-//! a new, empty directory of its own. It has no built-in tools, loads no user,
-//! project or local settings (so no rules, hooks or plugins), and has one MCP
-//! server: the run's proposer server, `dc-mcp --proposer`, whose two tools are
-//! the only ones it may call. Its brief tells it to take one batch, write the
-//! programs the batch's prompt asks for, and submit them, so each batch is
-//! written in a context of its own (D11 requirement 3).
+//! a new, empty directory of its own, outside any git repository. It has no
+//! built-in tools, loads no user, project or local settings (so no rules,
+//! hooks or installed plugins; Claude Code's built-in plugins still load),
+//! gets only an allowlisted environment, and has one MCP server: the run's
+//! proposer server, `dc-mcp --proposer`, whose two tools are the only ones it
+//! may call. Its brief, which replaces Claude Code's default system prompt,
+//! tells it to take one batch, write the programs the batch's prompt asks
+//! for, and submit them, so each batch is written in a context of its own
+//! (D11 requirement 3).
 //!
 //! The launcher reads each session's stream-json transcript as it comes. The
-//! session's `init` event must come before anything it does, and it must show
-//! the lockdown: exactly the two tools, exactly the one server, connected, the
-//! session's own directory, and the model asked for. A session that shows
-//! anything else is killed, and no further session starts. A session that
-//! leaves anything in its directory fails the same way. Every transcript,
-//! command line and MCP configuration is kept in the log directory, with a
-//! summary of every session.
+//! first event must be the session's `init` report, and it must show the
+//! lockdown: exactly the two tools, exactly the one server, connected, only
+//! built-in plugins, the session's own directory, and the model asked for.
+//! The first request must also be small: its input tokens are capped, so
+//! that context added without a tool (rules, memory) is caught too. A session
+//! that shows anything else is killed, and no further session starts. A
+//! session that leaves anything in its directory fails the same way. Every
+//! transcript, command line and MCP configuration is kept in the log
+//! directory, with a summary of every session.
 //!
 //! The launcher does not create runs or finish iterations: those are the
 //! operator's tools. It starts sessions until it has started the number
-//! asked for, or until a session finds no batch to take.
+//! asked for, or until a session finds no batch to take. Worker ids are
+//! unique, so "no batch" means every open slot is leased or being checked.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -30,10 +36,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rustix::process::{kill_process_group, Pid, Signal};
+use rustix::process::{kill_process_group, test_kill_process_group, Pid, Signal};
 use serde_json::{json, Map, Value};
 
 /// The name of the run's server in each session's MCP configuration.
@@ -44,6 +50,22 @@ pub const NEXT_BATCH: &str = "mcp__dc__dc_next_batch";
 pub const SUBMIT: &str = "mcp__dc__dc_submit";
 /// The prefix of each session's directory name.
 pub const DIR_PREFIX: &str = "dc-proposer-";
+/// The environment variables a session gets, if the launcher has them.
+/// Claude Code needs `HOME` for its sign-in; nothing else of the launcher's
+/// environment (a parent session's variables, say) reaches the session.
+pub const ENV_ALLOW: &[&str] = &[
+    "HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR",
+];
+/// The default cap on the input tokens of a session's first request. A
+/// locked-down session's first request is about 2,100 tokens; the user's
+/// rules alone would add about 5,000.
+pub const DEFAULT_MAX_CONTEXT_TOKENS: u64 = 4000;
+
+/// How long a session's processes get to end by themselves after its
+/// `result` event, or after it exits, before they are killed.
+const GRACE: Duration = Duration::from_secs(2);
+/// How often a waiting session checks for an interrupt.
+const TICK: Duration = Duration::from_millis(100);
 
 /// What the launcher is asked to do.
 #[derive(Clone, Debug)]
@@ -66,6 +88,10 @@ pub struct Config {
     pub parallel: usize,
     /// How long a session may run before it is killed.
     pub session_timeout: Duration,
+    /// The cap on the input tokens of a session's first request.
+    pub max_context_tokens: u64,
+    /// Environment variables a session gets beyond [`ENV_ALLOW`].
+    pub pass_env: Vec<String>,
 }
 
 /// How a session ended.
@@ -89,8 +115,10 @@ pub enum Outcome {
         /// What it showed.
         detail: String,
     },
-    /// It ran past its time and was killed.
+    /// It ran past its time without submitting and was killed.
     Timeout,
+    /// The launcher was interrupted and killed it.
+    Interrupted,
     /// It ended without submitting, or could not be started.
     Failed {
         /// Why.
@@ -106,6 +134,7 @@ impl Outcome {
             Outcome::NoBatch { .. } => "no_batch",
             Outcome::Lockdown { .. } => "lockdown",
             Outcome::Timeout => "timeout",
+            Outcome::Interrupted => "interrupted",
             Outcome::Failed { .. } => "failed",
         }
     }
@@ -123,6 +152,9 @@ pub struct Session {
     pub worker: String,
     /// How it ended.
     pub outcome: Outcome,
+    /// Whether it was killed for running past its time (after it submitted,
+    /// if the outcome is [`Outcome::Submitted`]).
+    pub timed_out: bool,
     /// The model it reported, if it reported one.
     pub model: Option<String>,
     /// The `usage`, `total_cost_usd`, `num_turns` and `duration_ms` of its
@@ -135,10 +167,11 @@ pub struct Session {
 }
 
 impl Session {
-    fn failed(worker: &str, outcome: Outcome) -> Self {
+    fn ended(worker: &str, outcome: Outcome) -> Self {
         Session {
             worker: worker.to_owned(),
             outcome,
+            timed_out: false,
             model: None,
             result: Map::new(),
             calls: (0, 0),
@@ -150,6 +183,7 @@ impl Session {
         let mut s = Map::new();
         s.insert("worker".into(), json!(self.worker));
         s.insert("outcome".into(), json!(self.outcome.name()));
+        s.insert("timed_out".into(), json!(self.timed_out));
         s.insert("model".into(), json!(self.model));
         s.insert("next_batch_calls".into(), json!(self.calls.0));
         s.insert("submit_calls".into(), json!(self.calls.1));
@@ -164,7 +198,7 @@ impl Session {
             | Outcome::Failed { detail } => {
                 s.insert("detail".into(), json!(detail));
             }
-            Outcome::Timeout => {}
+            Outcome::Timeout | Outcome::Interrupted => {}
         }
         for (k, v) in &self.result {
             s.insert(k.clone(), v.clone());
@@ -225,7 +259,8 @@ pub fn claude_args(model: &str, mcp_config: &Path, brief: &str) -> Vec<OsString>
         "Begin.",
         "--model",
         model,
-        // No user, project or local settings: no rules, hooks or plugins.
+        // No user, project or local settings: no rules, hooks or installed
+        // plugins.
         "--restricted",
         // No built-in tools.
         "--tools",
@@ -286,6 +321,16 @@ pub fn check_init(init: &Value, cwd: &Path, model: &str) -> Result<(), String> {
             "the session has the MCP servers {servers:?} (name, status)"
         ));
     }
+    let installed: Vec<&str> = init["plugins"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| p["source"].as_str().unwrap_or("?"))
+        .filter(|s| !s.ends_with("@builtin"))
+        .collect();
+    if !installed.is_empty() {
+        return Err(format!("the session has the plugins {installed:?}"));
+    }
     let reported = init["cwd"].as_str().unwrap_or("?");
     if !Path::new(reported).canonicalize().is_ok_and(|p| p == cwd) {
         return Err(format!("the session runs in {reported}"));
@@ -295,6 +340,19 @@ pub fn check_init(init: &Value, cwd: &Path, model: &str) -> Result<(), String> {
         return Err(format!("the session runs on the model {reported}"));
     }
     Ok(())
+}
+
+/// The input tokens of an assistant event's request, cached or not.
+fn input_tokens(event: &Value) -> Option<u64> {
+    let usage = event["message"].get("usage")?;
+    [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .iter()
+    .map(|k| usage[*k].as_u64().unwrap_or(0))
+    .try_fold(0u64, u64::checked_add)
 }
 
 /// The text of a `tool_result` block's content.
@@ -399,26 +457,48 @@ fn entries(dir: &Path) -> Result<Vec<String>, std::io::Error> {
     Ok(names)
 }
 
-/// Kills `child`'s process group, which holds the session and what it
-/// started (its MCP server), and reaps `child`.
-fn kill_group(child: &mut Child) {
-    let _ = kill_process_group(Pid::from_child(child), Signal::KILL);
-    let _ = child.kill();
-    let _ = child.wait();
+/// The git repository `dir` is inside, if any.
+fn repository(dir: &Path) -> Option<&Path> {
+    dir.ancestors().find(|a| a.join(".git").exists())
 }
 
-/// Waits for `child` to exit until `deadline`, then kills its group.
-/// Returns whether it exited by itself.
-fn reap(child: &mut Child, deadline: Instant) -> bool {
-    loop {
-        if let Ok(Some(_)) = child.try_wait() {
-            return true;
+/// A session's process group: the session, and what it started (its MCP
+/// server) unless that left the group.
+#[derive(Debug)]
+struct Group {
+    child: Child,
+    id: Pid,
+}
+
+impl Group {
+    /// Kills every process of the group, and reaps the session.
+    fn kill(&mut self) {
+        let _ = kill_process_group(self.id, Signal::KILL);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Waits until `deadline` for the session to exit and then for the rest
+    /// of the group, at most [`GRACE`] more; then kills what is left.
+    /// Returns whether the session exited by itself.
+    fn end(&mut self, deadline: Instant) -> bool {
+        let exited = loop {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if exited {
+            let until = Instant::now() + GRACE;
+            while test_kill_process_group(self.id).is_ok() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
-        if Instant::now() >= deadline {
-            kill_group(child);
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        self.kill();
+        exited
     }
 }
 
@@ -432,6 +512,8 @@ pub struct Launcher {
     forbidden: Vec<PathBuf>,
     /// The prefix of this launch's worker ids.
     launch: String,
+    /// Set when the launcher is told to stop.
+    interrupted: Arc<AtomicBool>,
 }
 
 impl Launcher {
@@ -454,8 +536,7 @@ impl Launcher {
             .canonicalize()
             .map_err(|e| io_error("cannot open the log directory", &config.log_dir, &e))?;
         let mut forbidden = vec![state_dir.clone(), log_dir];
-        // The launcher most likely runs in the repository. The root would
-        // forbid everything, so it is left out.
+        // The root would forbid everything, so it is left out.
         if let Ok(here) = std::env::current_dir().and_then(|d| d.canonicalize()) {
             if here.parent().is_some() {
                 forbidden.push(here);
@@ -473,6 +554,7 @@ impl Launcher {
             state_dir,
             forbidden,
             launch,
+            interrupted: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -481,9 +563,19 @@ impl Launcher {
         &self.launch
     }
 
+    /// The flag that stops the launch: once it is set, running sessions are
+    /// killed and no other starts. A signal handler may set it.
+    pub fn interrupt_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.interrupted)
+    }
+
+    fn is_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::SeqCst)
+    }
+
     /// Starts the sessions, at most `parallel` at once, and returns their
     /// records in the order they started. No session starts after one finds
-    /// no batch or fails the lockdown.
+    /// no batch or fails the lockdown, or after an interrupt.
     pub fn launch(&self) -> Vec<Session> {
         let next = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
@@ -492,7 +584,7 @@ impl Launcher {
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| loop {
-                    if stop.load(Ordering::SeqCst) {
+                    if stop.load(Ordering::SeqCst) || self.is_interrupted() {
                         return;
                     }
                     let n = next.fetch_add(1, Ordering::SeqCst);
@@ -532,6 +624,7 @@ impl Launcher {
             "run": self.config.run,
             "model": self.config.model,
             "state_dir": self.state_dir,
+            "interrupted": self.is_interrupted(),
             "sessions": sessions.iter().map(Session::to_json).collect::<Vec<_>>(),
         })
     }
@@ -542,9 +635,24 @@ impl Launcher {
         let started = Instant::now();
         let mut session = self
             .run_session(&worker, started)
-            .unwrap_or_else(|e| Session::failed(&worker, Outcome::Failed { detail: e.0 }));
+            .unwrap_or_else(|e| Session::ended(&worker, Outcome::Failed { detail: e.0 }));
         session.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         session
+    }
+
+    /// Why a session may not run in `cwd`, if it may not.
+    fn misplaced(&self, cwd: &Path) -> Option<String> {
+        let inside = self
+            .forbidden
+            .iter()
+            .find(|f| cwd.starts_with(f))
+            .map(PathBuf::as_path)
+            .or_else(|| repository(cwd))?;
+        Some(format!(
+            "the session's directory {} is inside {}; set TMPDIR elsewhere",
+            cwd.display(),
+            inside.display()
+        ))
     }
 
     fn run_session(&self, worker: &str, started: Instant) -> Result<Session, LaunchError> {
@@ -557,17 +665,8 @@ impl Launcher {
             .path()
             .canonicalize()
             .map_err(|e| io_error("cannot open", dir.path(), &e))?;
-        if let Some(f) = self.forbidden.iter().find(|f| cwd.starts_with(f)) {
-            return Ok(Session::failed(
-                worker,
-                Outcome::Lockdown {
-                    detail: format!(
-                        "the session's directory {} is inside {}; set TMPDIR elsewhere",
-                        cwd.display(),
-                        f.display()
-                    ),
-                },
-            ));
+        if let Some(detail) = self.misplaced(&cwd) {
+            return Ok(Session::ended(worker, Outcome::Lockdown { detail }));
         }
         let log = |suffix: &str| c.log_dir.join(format!("{worker}{suffix}"));
         let config_path = log(".mcp.json");
@@ -580,10 +679,17 @@ impl Launcher {
             .canonicalize()
             .map_err(|e| io_error("cannot open", &config_path, &e))?;
         let args = claude_args(&c.model, &config_path, &brief(worker, &c.model));
+        let env: Vec<(String, OsString)> = ENV_ALLOW
+            .iter()
+            .copied()
+            .chain(c.pass_env.iter().map(String::as_str))
+            .filter_map(|k| std::env::var_os(k).map(|v| (k.to_owned(), v)))
+            .collect();
         let command = json!({
             "program": c.claude,
             "args": args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>(),
             "cwd": cwd,
+            "env": env.iter().map(|(k, _)| k).collect::<Vec<_>>(),
         });
         fs::write(log(".cmd.json"), command.to_string())
             .map_err(|e| io_error("cannot write", &log(".cmd.json"), &e))?;
@@ -594,6 +700,8 @@ impl Launcher {
         let mut child = Command::new(&c.claude)
             .args(&args)
             .current_dir(&cwd)
+            .env_clear()
+            .envs(env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(stderr)
@@ -602,9 +710,10 @@ impl Launcher {
             .spawn()
             .map_err(|e| io_error("cannot start", &c.claude, &e))?;
         let stdout = child.stdout.take().expect("stdout is piped");
+        let id = Pid::from_child(&child);
+        let mut group = Group { child, id };
         let (send, lines) = mpsc::channel::<Result<String, String>>();
-        // Not joined: after a kill, a process that left the group could
-        // still hold the pipe open.
+        // Not joined: a process that left the group could hold the pipe open.
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let failed = line.is_err();
@@ -620,32 +729,60 @@ impl Launcher {
         let mut events: Vec<Value> = Vec::new();
         let mut model = None;
         let mut init_seen = false;
+        let mut asked = false;
+        let mut scratch: Option<PathBuf> = None;
+        let mut finished = false;
         let mut stopped: Option<Outcome> = None;
         loop {
-            match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            if self.is_interrupted() {
+                stopped = Some(Outcome::Interrupted);
+                break;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match lines.recv_timeout(left.min(TICK)) {
                 Ok(Ok(line)) => {
                     let _ = writeln!(transcript, "{line}");
                     let Ok(event) = serde_json::from_str::<Value>(&line) else {
                         continue;
                     };
-                    let is_init = event["type"] == "system" && event["subtype"] == "init";
-                    if is_init && !init_seen {
+                    let kind = event["type"].as_str().unwrap_or("?").to_owned();
+                    if !init_seen {
+                        if kind != "system" || event["subtype"] != "init" {
+                            stopped = Some(Outcome::Lockdown {
+                                detail: format!(
+                                    "the session sent a {kind} event ({}) before its init event",
+                                    event["subtype"]
+                                ),
+                            });
+                            break;
+                        }
                         init_seen = true;
                         model = event["model"].as_str().map(str::to_owned);
                         if let Err(detail) = check_init(&event, &cwd, &c.model) {
                             stopped = Some(Outcome::Lockdown { detail });
                             break;
                         }
-                    } else if !init_seen && event["type"] != "system" {
-                        stopped = Some(Outcome::Lockdown {
-                            detail: format!(
-                                "the session sent a {} event before its init event",
-                                event["type"]
-                            ),
-                        });
-                        break;
+                        scratch = self.scratch_dir(&event, &cwd);
+                    } else if kind == "assistant" && !asked {
+                        asked = true;
+                        let detail = match input_tokens(&event) {
+                            None => Some("the session's first request reports no usage".into()),
+                            Some(n) if n > c.max_context_tokens => Some(format!(
+                                "the session's first request has {n} input tokens, over {}",
+                                c.max_context_tokens
+                            )),
+                            Some(_) => None,
+                        };
+                        if let Some(detail) = detail {
+                            stopped = Some(Outcome::Lockdown { detail });
+                            break;
+                        }
                     }
                     events.push(event);
+                    if kind == "result" {
+                        finished = true;
+                        break;
+                    }
                 }
                 Ok(Err(e)) => {
                     stopped = Some(Outcome::Failed {
@@ -654,25 +791,42 @@ impl Launcher {
                     break;
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    stopped = Some(Outcome::Timeout);
-                    break;
+                    if Instant::now() >= deadline {
+                        stopped = Some(Outcome::Timeout);
+                        break;
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         if stopped.is_some() {
-            kill_group(&mut child);
-        } else if !reap(&mut child, deadline) {
-            stopped = Some(Outcome::Timeout);
+            group.kill();
+        } else {
+            // After its result, a session gets a short time to exit.
+            let until = if finished {
+                deadline.min(Instant::now() + GRACE)
+            } else {
+                deadline
+            };
+            if !group.end(until) && !finished {
+                stopped = Some(Outcome::Timeout);
+            }
         }
 
+        // The session's processes have ended, so its scratch can go.
+        if let Some(d) = scratch {
+            let _ = fs::remove_dir_all(d);
+        }
         let left = entries(&cwd).map_err(|e| io_error("cannot list", &cwd, &e))?;
         let (classified, calls) = classify(&events);
+        let timed_out = stopped == Some(Outcome::Timeout);
         let outcome = match stopped {
             Some(o @ Outcome::Lockdown { .. }) => o,
             _ if !left.is_empty() => Outcome::Lockdown {
                 detail: format!("the session left {left:?} in its directory"),
             },
+            // Programs the server took count, whatever came after.
+            _ if matches!(classified, Outcome::Submitted { .. }) => classified,
             Some(o) => o,
             None if !init_seen => Outcome::Lockdown {
                 detail: "the session never sent its init event".to_owned(),
@@ -684,10 +838,24 @@ impl Launcher {
         Ok(Session {
             worker: worker.to_owned(),
             outcome,
+            timed_out,
             model,
             result: result_fields(&events),
             calls,
             elapsed_ms: 0,
         })
+    }
+
+    /// The scratch directory Claude Code makes for a session in `cwd`: the
+    /// ancestor of the init event's `scratchpad_path` named after `cwd`, with
+    /// `/` as `-`, if it is outside `cwd` and every forbidden directory.
+    fn scratch_dir(&self, init: &Value, cwd: &Path) -> Option<PathBuf> {
+        let scratch = init["scratchpad_path"].as_str()?;
+        let name = cwd.to_string_lossy().replace('/', "-");
+        let dir = Path::new(scratch)
+            .ancestors()
+            .find(|a| a.file_name().is_some_and(|n| n.to_string_lossy() == name))?;
+        let clear = !cwd.starts_with(dir) && !self.forbidden.iter().any(|f| f.starts_with(dir));
+        clear.then(|| dir.to_owned())
     }
 }

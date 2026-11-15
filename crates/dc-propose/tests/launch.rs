@@ -16,8 +16,11 @@ const SUBMIT: &str = "mcp__dc__dc_submit";
 /// The fake `claude`. Each call records its arguments (NUL-separated), its
 /// working directory and what that directory holds, then plays the first
 /// file left in `queue/` (in name order), or `default` when the queue is
-/// empty. In a played file, `@CWD@` becomes the working directory, a line
-/// `@SLEEP n` sleeps, and a line `@TOUCH name` makes a file.
+/// empty. In a played file, `@CWD@` becomes the working directory and
+/// `@SCRATCH@` a scratch directory that it makes as Claude Code does (under
+/// `fake/cc/`, named after the working directory); a line `@SLEEP n` sleeps,
+/// a line `@TOUCH name` makes a file, and a line `@BG` starts a background
+/// `sleep 300` that holds no pipe of the call and records its pid in `bg.<pid>`.
 const FAKE: &str = r#"#!/usr/bin/env bash
 set -u
 d="$FAKE_DIR"
@@ -26,6 +29,9 @@ cwd="$(pwd -P)"
 printf '%s\0' "$@" > "$d/argv.$id"
 printf '%s' "$cwd" > "$d/cwd.$id"
 ls -A > "$d/ls.$id"
+env > "$d/env.$id"
+scratch="$d/cc/${cwd//\//-}/u1/scratchpad"
+mkdir -p "$scratch"
 mkdir "$d/running.$id"
 ls -d "$d"/running.* | wc -l > "$d/conc.$id"
 out="$d/default"
@@ -36,7 +42,8 @@ while IFS= read -r line; do
   case "$line" in
     @SLEEP*) sleep "${line#@SLEEP }" ;;
     @TOUCH*) touch "${line#@TOUCH }" ;;
-    *) printf '%s\n' "${line//@CWD@/$cwd}" ;;
+    @BG) sleep 300 </dev/null >/dev/null 2>&1 & echo $! > "$d/bg.$id" ;;
+    *) line="${line//@CWD@/$cwd}"; printf '%s\n' "${line//@SCRATCH@/$scratch}" ;;
   esac
 done < "$out"
 rmdir "$d/running.$id"
@@ -74,7 +81,13 @@ impl Fixture {
 
     /// Runs `dc-propose` with `extra` after the usual arguments.
     fn run(&self, extra: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_dc-propose"))
+        self.command(extra).output().unwrap()
+    }
+
+    /// The `dc-propose` command with `extra` after the usual arguments.
+    fn command(&self, extra: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dc-propose"));
+        command
             .args(["--state-dir"])
             .arg(self.path("state"))
             .args([
@@ -90,9 +103,36 @@ impl Fixture {
             .arg("--log-dir")
             .arg(self.path("logs"))
             .args(extra)
+            .args(["--pass-env", "FAKE_DIR"])
             .env("FAKE_DIR", self.path("fake"))
-            .output()
+            .env("DC_PROPOSE_TEST_SECRET", "s3cret");
+        command
+    }
+
+    /// The pids of the background processes the fake's calls started.
+    fn background(&self) -> Vec<u32> {
+        fs::read_dir(self.path("fake"))
             .unwrap()
+            .filter_map(|e| {
+                let name = e.unwrap().file_name().into_string().unwrap();
+                name.strip_prefix("bg.")?;
+                Some(self.read(&format!("fake/{name}")).trim().parse().unwrap())
+            })
+            .collect()
+    }
+
+    /// Panics if a background process of the fake is still alive, after
+    /// killing it.
+    fn assert_no_background_left(&self) {
+        let pids = self.background();
+        assert!(!pids.is_empty(), "the fake started no background process");
+        // A killed process's parent may take a moment to reap it.
+        std::thread::sleep(Duration::from_millis(300));
+        let alive: Vec<u32> = pids.into_iter().filter(|p| alive(*p)).collect();
+        for p in &alive {
+            let _ = Command::new("kill").args(["-9", &p.to_string()]).status();
+        }
+        assert!(alive.is_empty(), "left running: {alive:?}");
     }
 
     /// The pids of the fake's calls, in the order they started.
@@ -127,10 +167,22 @@ impl Fixture {
     }
 }
 
+/// Whether process `pid` is alive and not a zombie.
+fn alive(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+        s.rsplit(')')
+            .next()
+            .is_some_and(|r| !r.trim_start().starts_with('Z'))
+    })
+}
+
 fn init(tools: &[&str], servers: Value, model: &str, cwd: &str) -> String {
     json!({
         "type": "system", "subtype": "init", "cwd": cwd, "tools": tools,
         "mcp_servers": servers, "model": model,
+        "plugins": [{"name": "cc-plugin-privacy", "path": "builtin",
+                     "source": "cc-plugin-privacy@builtin"}],
+        "scratchpad_path": "@SCRATCH@",
     })
     .to_string()
 }
@@ -145,9 +197,16 @@ fn good_init() -> String {
 }
 
 fn tool_use(id: &str, name: &str, input: Value) -> String {
-    json!({"type": "assistant", "message": {"content": [
-        {"type": "tool_use", "id": id, "name": name, "input": input}
-    ]}})
+    asking(id, name, input, 2000)
+}
+
+/// A tool call from a request of `tokens` input tokens.
+fn asking(id: &str, name: &str, input: Value, tokens: u64) -> String {
+    json!({"type": "assistant", "message": {
+        "content": [{"type": "tool_use", "id": id, "name": name, "input": input}],
+        "usage": {"input_tokens": 2, "cache_creation_input_tokens": tokens - 1000,
+                  "cache_read_input_tokens": 998, "output_tokens": 30},
+    }})
     .to_string()
 }
 
@@ -497,7 +556,7 @@ fn a_session_that_leaves_files_fails_the_lockdown() {
 #[test]
 fn a_session_past_its_time_is_killed() {
     let f = Fixture::new();
-    let mut lines = vec![good_init(), "@SLEEP 30".to_owned()];
+    let mut lines = vec![good_init(), "@BG".to_owned(), "@SLEEP 30".to_owned()];
     lines.extend(submitted(0).into_iter().skip(1));
     f.set_default(&lines);
     let started = Instant::now();
@@ -505,6 +564,8 @@ fn a_session_past_its_time_is_killed() {
     assert!(started.elapsed() < Duration::from_secs(20));
     assert!(!out.status.success(), "{out:?}");
     assert_eq!(outcomes(&f.summary()), ["timeout"]);
+    // What the session started went with it.
+    f.assert_no_background_left();
 }
 
 #[test]
@@ -530,4 +591,178 @@ fn bad_arguments_are_a_usage_error() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("usage"));
+}
+
+#[test]
+fn a_system_event_before_the_init_event_is_stopped() {
+    // Hook output comes as system events; anything before init is refused.
+    refuses(
+        json!({"type": "system", "subtype": "hook_response", "output": "context"}).to_string(),
+        "before its init event",
+    );
+}
+
+#[test]
+fn a_session_with_a_user_plugin_is_stopped() {
+    let mut event: Value = serde_json::from_str(&good_init()).unwrap();
+    event["plugins"].as_array_mut().unwrap().push(
+        json!({"name": "notes", "path": "/home/u/.claude/plugins/notes",
+                     "source": "notes@market"}),
+    );
+    refuses(event.to_string(), "notes@market");
+}
+
+#[test]
+fn a_session_directory_inside_the_logs_is_refused() {
+    let f = Fixture::new();
+    fs::create_dir(f.path("logs/tmp")).unwrap();
+    let out = f
+        .command(&["--sessions", "2", "--parallel", "1"])
+        .env("TMPDIR", f.path("logs/tmp"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(f.calls().is_empty());
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["lockdown"]);
+    let detail = summary["sessions"][0]["detail"].as_str().unwrap();
+    assert!(detail.contains("TMPDIR"), "{detail}");
+}
+
+#[test]
+fn what_a_session_started_ends_when_it_ends() {
+    let f = Fixture::new();
+    let mut lines = submitted(0);
+    lines.insert(1, "@BG".to_owned());
+    f.set_default(&lines);
+    let out = f.run(&["--sessions", "1"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(outcomes(&f.summary()), ["submitted"]);
+    f.assert_no_background_left();
+}
+
+#[test]
+fn a_session_that_hangs_after_its_result_is_ended() {
+    let f = Fixture::new();
+    let mut lines = submitted(3);
+    lines.push("@SLEEP 30".to_owned());
+    f.set_default(&lines);
+    let started = Instant::now();
+    let out = f.run(&["--sessions", "1", "--session-timeout", "60"]);
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(out.status.success(), "{out:?}");
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["submitted"]);
+    assert_eq!(summary["sessions"][0]["batch"], 3);
+}
+
+#[test]
+fn a_session_killed_after_it_submitted_still_submitted() {
+    let f = Fixture::new();
+    let mut lines = submitted(2);
+    // No result event: the session hangs after the server took its programs.
+    lines[5] = "@SLEEP 30".to_owned();
+    f.set_default(&lines);
+    let out = f.run(&["--sessions", "1", "--session-timeout", "2"]);
+    assert!(out.status.success(), "{out:?}");
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["submitted"]);
+    assert_eq!(summary["sessions"][0]["batch"], 2);
+    assert_eq!(summary["sessions"][0]["timed_out"], true);
+}
+
+#[test]
+fn an_interrupt_ends_every_session_and_writes_the_summary() {
+    let f = Fixture::new();
+    f.set_default(&[good_init(), "@BG".to_owned(), "@SLEEP 60".to_owned()]);
+    let mut child = f
+        .command(&["--sessions", "4", "--parallel", "2"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // Wait until both sessions run.
+    let started = Instant::now();
+    while f.background().len() < 2 {
+        assert!(started.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let interrupted = Instant::now();
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(interrupted.elapsed() < Duration::from_secs(10));
+    assert!(!status.success());
+    assert_eq!(f.calls().len(), 2);
+    assert_eq!(outcomes(&f.summary()), ["interrupted", "interrupted"]);
+    f.assert_no_background_left();
+    for c in f.calls() {
+        assert!(!Path::new(&f.read(&format!("fake/cwd.{c}"))).exists());
+    }
+}
+
+#[test]
+fn the_scratch_directory_claude_makes_for_a_session_is_removed() {
+    let f = Fixture::new();
+    let out = f.run(&["--sessions", "1"]);
+    assert!(out.status.success(), "{out:?}");
+    let call = &f.calls()[0];
+    let cwd = f.read(&format!("fake/cwd.{call}"));
+    let made = f.path("fake/cc").join(cwd.replace('/', "-"));
+    assert!(f.path("fake/cc").is_dir());
+    assert!(!made.exists(), "{made:?} is left");
+}
+
+#[test]
+fn a_session_gets_only_the_allowed_environment() {
+    let f = Fixture::new();
+    let out = f.run(&["--sessions", "1"]);
+    assert!(out.status.success(), "{out:?}");
+    let env = f.read(&format!("fake/env.{}", f.calls()[0]));
+    assert!(env.lines().any(|l| l.starts_with("FAKE_DIR=")), "{env}");
+    assert!(env.lines().any(|l| l.starts_with("HOME=")), "{env}");
+    assert!(!env.contains("DC_PROPOSE_TEST_SECRET"), "{env}");
+}
+
+#[test]
+fn a_session_with_a_large_first_request_is_stopped() {
+    let f = Fixture::new();
+    let mut lines = submitted(0);
+    lines[1] = asking("t1", NEXT, json!({"worker": "w"}), 9000);
+    lines.insert(2, "@SLEEP 30".to_owned());
+    f.set_default(&lines);
+    let started = Instant::now();
+    let out = f.run(&["--sessions", "2", "--parallel", "1"]);
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(!out.status.success(), "{out:?}");
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["lockdown"]);
+    let detail = summary["sessions"][0]["detail"].as_str().unwrap();
+    assert!(detail.contains("9000 input tokens"), "{detail}");
+    // The cap is the launcher's flag.
+    let f = Fixture::new();
+    lines.retain(|l| !l.starts_with("@SLEEP"));
+    f.set_default(&lines);
+    let out = f.run(&["--sessions", "1", "--max-context-tokens", "10000"]);
+    assert!(out.status.success(), "{out:?}");
+}
+
+#[test]
+fn a_session_directory_inside_a_git_repository_is_refused() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.path("repo/.git")).unwrap();
+    fs::create_dir(f.path("repo/tmp")).unwrap();
+    let out = f
+        .command(&["--sessions", "1"])
+        .env("TMPDIR", f.path("repo/tmp"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(f.calls().is_empty());
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["lockdown"]);
+    let detail = summary["sessions"][0]["detail"].as_str().unwrap();
+    assert!(detail.contains("repo"), "{detail}");
 }
