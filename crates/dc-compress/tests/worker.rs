@@ -370,12 +370,14 @@ fn run_worker_via(
         .spawn()
         .expect("start the worker");
     let body = serde_json::to_vec(input).expect("serialise");
-    child
-        .stdin
-        .take()
-        .expect("piped")
-        .write_all(&body)
-        .expect("write the request");
+    // A worker may exit without reading its request, for example when it
+    // refuses its settings. The write then fails with a broken pipe, and the
+    // worker's exit status and error output are what the test judges.
+    match child.stdin.take().expect("piped").write_all(&body) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("write the request: {e}"),
+    }
     let out = child.wait_with_output().expect("wait");
     (
         out.status,
@@ -523,6 +525,17 @@ fn a_bad_limit_is_refused() {
     let (status, stderr) = run_worker_directly(&[(MEMORY_ENV, "lots".to_string())], &two_lists(1));
     assert_eq!(exit_code(&status), Some(2), "{stderr}");
     assert!(stderr.contains(MEMORY_ENV), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_worker_that_exits_before_reading_its_request_is_judged_by_its_status() {
+    // A worker that refuses its settings exits without reading the request.
+    // A request larger than the pipe buffer makes the write fail every time,
+    // as a small one does only when the worker is quick.
+    let (status, stderr) = run_worker_via("echo refused >&2; exit 2", &[], &two_lists(20_000));
+    assert_eq!(exit_code(&status), Some(2), "{stderr}");
+    assert!(stderr.contains("refused"), "{stderr}");
 }
 
 #[cfg(target_os = "linux")]
