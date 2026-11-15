@@ -7,9 +7,10 @@ The research bet is this: an objective that rewards an abstraction for reducing 
 ## Status
 
 - Phase 1 (literature and language specification) is done.
-- Phase 2 (the core language) is built: parser, type inference, evaluator with exact step counts, library expansion, prelude, property tests, and a throughput baseline. Robustness fixes are still open.
-- Phase 3 (task corpus) is in progress. Three task families are built: collapse games, sorted-order queries, and constrained subsequence counting. The held-out family and the corpus-wide test run are still to do.
-- Phases 4 to 6 have not started.
+- Phase 2 (the core language) is done: parser, type inference, evaluator with exact step counts, library expansion, prelude, property tests, and a throughput baseline.
+- Phase 3 (task corpus) is done. Three development families are built: collapse games, sorted-order queries, and constrained subsequence counting. A corpus run checked every reference program against every oracle. Four candidate held-out families are built outside this repository, and the project lead picks one without saying which (decision D14).
+- Phase 4 (the baseline loop) is in progress. The MCP server keeps each run on disk, hands out proposal batches, and checks the programs that come back. The Stitch compression step and one iteration of the loop are built as library code. The server does not yet run an iteration when its proposals are in.
+- Phases 5 and 6 have not started.
 
 ## Phases
 
@@ -31,6 +32,8 @@ The code is a Cargo workspace under `crates/`:
 | `dc-eval` | CEK evaluator with exact step counting and fuel |
 | `dc-stitch` | Serialisation of `dc` terms to and from the Stitch format |
 | `dc-compress` | Library learning: runs Stitch on `dc` programs and decodes the abstractions it finds |
+| `dc-driver` | One iteration of the loop: frontier update, Stitch compression, and library update |
+| `dc-mcp` | MCP server that keeps the state of each run on disk, hands out proposal batches, and checks submitted programs |
 | `dc-tasks` | Task format, seeded input generators, oracles, growth estimators, and the task families |
 | `dc-bench` | Evaluator throughput benchmark |
 
