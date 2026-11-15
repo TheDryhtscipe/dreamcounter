@@ -91,6 +91,25 @@ pub struct RunConfig {
     /// How long a proposer has to submit a batch, in milliseconds. After
     /// that the batch's programs can be handed out again. It is positive.
     pub lease_ms: u64,
+    /// The most submissions kept for one batch that are not checked, of
+    /// each of two kinds: foreign ones, and late or repeat ones from the
+    /// batch's worker. A submission past it is refused and counted, not
+    /// kept (see [`Store::commit_or_refuse`](crate::store::Store::commit_or_refuse)). It is positive. A run made before the
+    /// setting has [`DEFAULT_MAX_UNCHECKED_PER_BATCH`].
+    #[serde(default = "default_max_unchecked_per_batch")]
+    pub max_unchecked_per_batch: u32,
+}
+
+/// The most submissions kept for one batch that are not checked, of each
+/// kind, when a run does not say (see [`RunConfig::max_unchecked_per_batch`]).
+/// An honest proposer sends at most one late or repeat submission in the
+/// usual case, a retry after a lost reply; three leave room for a second
+/// retry and bound what one batch can add to the journal at six
+/// submissions.
+pub const DEFAULT_MAX_UNCHECKED_PER_BATCH: u32 = 3;
+
+fn default_max_unchecked_per_batch() -> u32 {
+    DEFAULT_MAX_UNCHECKED_PER_BATCH
 }
 
 /// One definition in the library.
@@ -181,11 +200,12 @@ pub enum Standing {
     /// for another library.
     Late,
     /// A later submission for the batch from its worker. It is kept but not
-    /// checked.
+    /// checked, up to the cap (see [`RunState::keeps`]).
     Repeat,
     /// A submission that gives the wrong token for the batch, or names a
     /// worker the batch was not issued to. It is kept but not checked, and
-    /// the batch stays open for the proposer it was sent to.
+    /// the batch stays open for the proposer it was sent to. Past the cap
+    /// (see [`RunState::keeps`]) it is counted, not kept.
     Foreign,
 }
 
@@ -420,7 +440,8 @@ pub enum Rejected {
     NoTasks,
     /// The task is named twice in the task set.
     DuplicateTask(String),
-    /// `proposals_per_task`, `programs_per_batch` or `lease_ms` is zero.
+    /// `proposals_per_task`, `programs_per_batch`, `lease_ms` or
+    /// `max_unchecked_per_batch` is zero.
     ZeroSetting(&'static str),
     /// `programs_per_batch` is over [`MAX_PROGRAMS_PER_BATCH`].
     TooManyPerBatch(u32),
@@ -557,6 +578,10 @@ pub struct Batch {
     pub submitted: bool,
     /// The programs of its submission, while they wait to be checked.
     pub awaiting_check: Option<Vec<String>>,
+    /// How many foreign submissions for it are kept.
+    pub foreign_kept: u32,
+    /// How many late or repeat submissions from its worker are kept.
+    pub unchecked_kept: u32,
 }
 
 /// What came in for one task in one iteration. Only evaluated submissions
@@ -680,6 +705,10 @@ impl RunState {
             ("proposals_per_task", u64::from(config.proposals_per_task)),
             ("programs_per_batch", u64::from(config.programs_per_batch)),
             ("lease_ms", config.lease_ms),
+            (
+                "max_unchecked_per_batch",
+                u64::from(config.max_unchecked_per_batch),
+            ),
         ] {
             if value == 0 {
                 return Err(Rejected::ZeroSetting(name));
@@ -815,6 +844,8 @@ impl RunState {
             deadline_ms: issued.deadline_ms,
             submitted: false,
             awaiting_check: None,
+            foreign_kept: 0,
+            unchecked_kept: 0,
         });
         self.live.insert(issued.batch);
         change_task_counts(&mut self.task_counts, issued.iteration, &issued.task, |c| {
@@ -851,6 +882,22 @@ impl RunState {
         })
     }
 
+    /// Whether a submission of `standing` for `batch` is kept: one that is
+    /// checked always is; one that is not is kept while the batch has fewer
+    /// than [`RunConfig::max_unchecked_per_batch`] of its kind (foreign, or
+    /// late and repeat). `false` if the run has no such batch.
+    pub fn keeps(&self, batch: u64, standing: Standing) -> bool {
+        let Some(b) = self.batches.get(batch) else {
+            return false;
+        };
+        let cap = self.config.max_unchecked_per_batch;
+        match standing {
+            Standing::OnTime | Standing::Expired => true,
+            Standing::Foreign => b.foreign_kept < cap,
+            Standing::Late | Standing::Repeat => b.unchecked_kept < cap,
+        }
+    }
+
     fn submit(&mut self, s: &Submitted) -> Result<(), Rejected> {
         self.check_iteration(s.iteration)?;
         let standing = self
@@ -866,6 +913,16 @@ impl RunState {
         if standing != Standing::Foreign {
             batch.submitted = true;
             self.live.remove(&s.batch);
+        }
+        // A journal from before the cap can hold more than it allows, so
+        // the cap is the server's to keep (see `RunState::keeps`), not a
+        // reason to reject the event.
+        match standing {
+            Standing::Foreign => batch.foreign_kept = batch.foreign_kept.saturating_add(1),
+            Standing::Late | Standing::Repeat => {
+                batch.unchecked_kept = batch.unchecked_kept.saturating_add(1);
+            }
+            Standing::OnTime | Standing::Expired => {}
         }
         if standing.evaluated() {
             batch.awaiting_check = Some(s.programs.clone());
@@ -1118,6 +1175,7 @@ mod tests {
             proposals_per_task: 4,
             programs_per_batch: 2,
             lease_ms: 1000,
+            max_unchecked_per_batch: 3,
         }
     }
 
@@ -1158,6 +1216,14 @@ mod tests {
         assert_eq!(
             RunState::create(zero, vec!["a".into()]),
             Err(Rejected::ZeroSetting("proposals_per_task"))
+        );
+        let zero = RunConfig {
+            max_unchecked_per_batch: 0,
+            ..config()
+        };
+        assert_eq!(
+            RunState::create(zero, vec!["a".into()]),
+            Err(Rejected::ZeroSetting("max_unchecked_per_batch"))
         );
         for (n, ok) in [
             (MAX_PROGRAMS_PER_BATCH, true),

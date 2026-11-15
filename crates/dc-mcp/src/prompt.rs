@@ -299,6 +299,7 @@ mod tests {
                 proposals_per_task: 2,
                 programs_per_batch: 1,
                 lease_ms: 90_000,
+                max_unchecked_per_batch: 3,
             },
             tasks.iter().map(|t| (*t).to_owned()).collect(),
         )

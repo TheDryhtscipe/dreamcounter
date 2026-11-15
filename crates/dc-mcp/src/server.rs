@@ -24,8 +24,10 @@ use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::proposer::{check_pending, next_batch, submit, Clock, NextBatch, Receipt, Refused};
-use crate::state::{Arm, Event, LogKind, LogRecord, RunConfig, RunId, RunState};
-use crate::store::{Store, StoreError};
+use crate::state::{
+    Arm, Event, LogKind, LogRecord, RunConfig, RunId, RunState, DEFAULT_MAX_UNCHECKED_PER_BATCH,
+};
+use crate::store::{Refusals, Store, StoreError};
 use crate::verify::VerifierCache;
 
 /// The arguments of `dc_create_run`.
@@ -48,6 +50,11 @@ pub struct CreateRun {
     /// How long a proposer has to submit a batch, in seconds, before its
     /// programs can be handed out again. At least 1. If absent, 1800.
     pub lease_seconds: Option<u64>,
+    /// The most submissions kept for one batch that are not checked, of
+    /// each kind: foreign ones, and late or repeat ones from the batch's
+    /// worker. Past it a submission is counted but not kept. At least 1. If
+    /// absent, 3.
+    pub max_unchecked_per_batch: Option<u32>,
 }
 
 /// The most programs one batch asks for when `dc_create_run` does not say.
@@ -127,7 +134,7 @@ pub struct RunStatus {
 }
 
 impl RunStatus {
-    fn of(run: &RunId, state: &RunState) -> RunStatus {
+    fn of(run: &RunId, state: &RunState, refusals: &Refusals) -> RunStatus {
         let config = state.config();
         RunStatus {
             run: run.as_str().to_owned(),
@@ -152,7 +159,7 @@ impl RunStatus {
                 recovery: state.log_count(LogKind::Recovery),
             },
             batches_issued: usize::try_from(state.batch_count()).unwrap_or(usize::MAX),
-            current: IterationStats::of(state, state.iteration()),
+            current: IterationStats::of(state, refusals, state.iteration()),
         }
     }
 }
@@ -202,6 +209,12 @@ pub struct IterationStats {
     /// Submissions from a worker that does not hold the batch: kept, not
     /// checked.
     pub foreign: u64,
+    /// Late or repeat submissions refused because their batch had as many
+    /// kept as the run keeps: counted, not kept.
+    pub refused_repeats: u64,
+    /// Foreign submissions refused because their batch had as many kept as
+    /// the run keeps: counted, not kept.
+    pub refused_foreign: u64,
     /// Bytes of payload handed out. About four bytes make a token.
     pub payload_bytes: u64,
     /// Bytes of program text received.
@@ -211,7 +224,7 @@ pub struct IterationStats {
 }
 
 impl IterationStats {
-    fn of(state: &RunState, iteration: u64) -> IterationStats {
+    fn of(state: &RunState, refusals: &Refusals, iteration: u64) -> IterationStats {
         let tasks: Vec<TaskStats> = state
             .tasks()
             .iter()
@@ -249,6 +262,8 @@ impl IterationStats {
             late: counts.late,
             repeats: counts.repeats,
             foreign: counts.foreign,
+            refused_repeats: refusals.iteration(iteration).repeats,
+            refused_foreign: refusals.iteration(iteration).foreign,
             payload_bytes: counts.payload_bytes,
             submission_bytes: counts.submission_bytes,
             tasks,
@@ -377,12 +392,15 @@ impl DcServer {
                 .lease_seconds
                 .unwrap_or(DEFAULT_LEASE_SECONDS)
                 .saturating_mul(1000),
+            max_unchecked_per_batch: arg
+                .max_unchecked_per_batch
+                .unwrap_or(DEFAULT_MAX_UNCHECKED_PER_BATCH),
         };
         self.blocking(move |store| {
             let state = store
                 .create_run(&run, config, tasks)
                 .map_err(|e| e.to_string())?;
-            Ok(RunStatus::of(&run, &state))
+            Ok(RunStatus::of(&run, &state, &Refusals::default()))
         })
         .await
     }
@@ -401,7 +419,7 @@ impl DcServer {
         let run = run_id(&arg.run)?;
         self.blocking(move |store| {
             store
-                .read(&run, |state| RunStatus::of(&run, state))
+                .read_with_refusals(&run, |state, refusals| RunStatus::of(&run, state, refusals))
                 .map_err(|e| e.to_string())
         })
         .await
@@ -419,7 +437,7 @@ impl DcServer {
     ) -> Result<Json<RunStatus>, String> {
         let run = run_id(&arg.run)?;
         self.blocking(move |store| {
-            let noted: Result<RunStatus, StoreError> = store.commit_then(
+            let noted: Result<RunStatus, StoreError> = store.commit_then_with_refusals(
                 &run,
                 |state| {
                     let note = Event::Logged(LogRecord {
@@ -430,7 +448,7 @@ impl DcServer {
                     });
                     Ok(((), vec![note]))
                 },
-                |(), state| RunStatus::of(&run, state),
+                |(), state, refusals| RunStatus::of(&run, state, &refusals.read()),
             );
             noted.map_err(|e| e.to_string())
         })
@@ -452,10 +470,10 @@ impl DcServer {
         let run = run_id(&arg.run)?;
         self.blocking(move |store| {
             store
-                .read(&run, |state| ProposalStats {
+                .read_with_refusals(&run, |state, refusals| ProposalStats {
                     run: run.as_str().to_owned(),
                     iterations: (0..=state.iteration())
-                        .map(|i| IterationStats::of(state, i))
+                        .map(|i| IterationStats::of(state, refusals, i))
                         .collect(),
                 })
                 .map_err(|e| e.to_string())
@@ -1027,6 +1045,7 @@ mod tests {
                         proposals_per_task: 1,
                         programs_per_batch: 1,
                         lease_ms: 1_000_000,
+                        max_unchecked_per_batch: 3,
                     },
                     vec!["collapse/merge".into()],
                 )
