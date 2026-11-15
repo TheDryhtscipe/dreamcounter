@@ -189,13 +189,13 @@ impl Refusals {
 #[derive(Debug)]
 pub struct RefusalsFile {
     dir: PathBuf,
-    id: u64,
+    journal: JournalId,
 }
 
 impl RefusalsFile {
     /// The refusals the file holds now.
     pub fn read(&self) -> Result<Refusals, StoreError> {
-        read_refusals(&self.dir, self.id)
+        read_refusals(&self.dir, self.journal)
     }
 }
 
@@ -798,7 +798,7 @@ impl Store {
     {
         let mut locked = self.lock_run(run)?;
         let (cached, _) = self.catch_up(run, &mut locked)?;
-        let refusals = read_refusals(&locked.dir_path, cached.id);
+        let refusals = read_refusals(&locked.dir_path, JournalId(cached.id));
         let result = refusals.map(|refusals| read(&cached.state, &refusals));
         self.put(run, cached);
         result
@@ -816,13 +816,13 @@ impl Store {
         let (mut cached, torn_len) = self.catch_up(run, &mut locked)?;
         let file = RefusalsFile {
             dir: locked.dir_path.clone(),
-            id: cached.id,
+            journal: JournalId(cached.id),
         };
         let then = |value: T, state: &RunState| then(value, state, &file);
         let (value, mut events) = match change(&cached.state, JournalId(cached.id)) {
             Ok((value, Change::Events(events))) => (value, events),
             Ok((value, Change::Refuse { iteration, kind })) => {
-                let counted = count_refusal(&locked, cached.id, iteration, kind);
+                let counted = count_refusal(&locked, JournalId(cached.id), iteration, kind);
                 let result = counted.map(|()| then(value, &cached.state));
                 self.put(run, cached);
                 return result.map_err(E::from);
@@ -1389,16 +1389,16 @@ fn set_aside(locked: &Locked, at: u64, torn: &[u8], iteration: u64) -> Result<Ev
     unreachable!("the loop ends by returning")
 }
 
-/// The journal id `id` as the `refused` file writes it.
-fn journal_id(id: u64) -> String {
-    format!("{id:016x}")
+/// The id of `journal` as the `refused` file writes it.
+fn journal_id(journal: JournalId) -> String {
+    format!("{:016x}", journal.0)
 }
 
 /// The refusals in the `refused` file of the run in `dir_path`, whose
-/// journal has id `id`. None if there is no file or it is for another
+/// journal is `journal`. None if there is no file or it is for another
 /// journal. None too if it does not read, which is reported on standard
 /// error; the next refusal writes over it. Only a failed read is an error.
-fn read_refusals(dir_path: &Path, id: u64) -> Result<Refusals, StoreError> {
+fn read_refusals(dir_path: &Path, journal: JournalId) -> Result<Refusals, StoreError> {
     let path = dir_path.join(REFUSED);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -1425,7 +1425,7 @@ fn read_refusals(dir_path: &Path, id: u64) -> Result<Refusals, StoreError> {
         Ok(owner) => owner,
         Err(e) => return unreadable(e),
     };
-    if owner.journal != journal_id(id) {
+    if owner.journal != journal_id(journal) {
         return Ok(Refusals::default());
     }
     match serde_json::from_slice(&bytes) {
@@ -1435,17 +1435,17 @@ fn read_refusals(dir_path: &Path, id: u64) -> Result<Refusals, StoreError> {
 }
 
 /// Adds one refusal of a submission of `kind` in `iteration` to the
-/// `refused` file of the locked run, whose journal has id `id`. The new
+/// `refused` file of the locked run, whose journal is `journal`. The new
 /// count is on disk when it returns `Ok`; on an error the file holds the
 /// old count or the new one.
 fn count_refusal(
     locked: &Locked,
-    id: u64,
+    journal: JournalId,
     iteration: u64,
     kind: RefusalKind,
 ) -> Result<(), StoreError> {
-    let mut refusals = read_refusals(&locked.dir_path, id)?;
-    refusals.journal = journal_id(id);
+    let mut refusals = read_refusals(&locked.dir_path, journal)?;
+    refusals.journal = journal_id(journal);
     let counts = refusals.iterations.entry(iteration).or_default();
     match kind {
         RefusalKind::Foreign => counts.foreign = counts.foreign.saturating_add(1),
