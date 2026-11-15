@@ -7,7 +7,10 @@ use std::io::{BufRead, BufReader, Lines, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use dc_mcp::state::{Event, FrontierMember, LibraryEntry, LogKind, LogRecord, RunId};
+mod common;
+
+use common::{assert_checks, deepest_programs};
+use dc_mcp::state::{Check, Event, FrontierMember, LibraryEntry, LogKind, LogRecord, RunId};
 use dc_mcp::store::Store;
 use serde_json::{json, Value};
 
@@ -743,6 +746,153 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
             (vec![], None),
         ]
     );
+}
+
+/// The checks of the run's checked submissions, in the order they were
+/// checked.
+fn checks(dir: &Path, run: &str) -> Vec<Vec<Check>> {
+    let mut checks = Vec::new();
+    Store::open(dir)
+        .unwrap()
+        .for_each_event(&RunId::new(run).unwrap(), |e| {
+            if let Event::Checked(c) = e {
+                checks.push(c.checks);
+            }
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+    checks
+}
+
+/// Waits until the run has no submission waiting to be checked.
+fn wait_for_checks(operator: &mut Client, proposer: &mut Client, run: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        // A stack overflow in a check aborts the proposer's server.
+        assert!(
+            proposer.child.try_wait().unwrap().is_none(),
+            "the proposer's server stopped"
+        );
+        let stats = operator
+            .call("dc_proposal_stats", json!({ "run": run }))
+            .unwrap();
+        if stats["iterations"][0]["pending_checks"] == 0 {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "{stats}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn the_deepest_programs_a_proposer_can_send_do_not_crash_the_server() {
+    let programs = deepest_programs();
+    let texts: Vec<String> = programs.iter().map(|p| p.text.clone()).collect();
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut operator = Client::start(dir.path());
+    // One task, so every batch is its.
+    operator
+        .call(
+            "dc_create_run",
+            json!({
+                "run": "r1", "seed": 5, "proposals_per_task": 64,
+                "programs_per_batch": 32, "tasks": ["collapse/merge"]
+            }),
+        )
+        .unwrap();
+
+    // Sent to a live server, which checks them in the background.
+    let mut proposer = Client::start_proposer(dir.path(), "r1");
+    let first = proposer
+        .call("dc_next_batch", json!({ "worker": "agent-1" }))
+        .unwrap();
+    proposer
+        .call(
+            "dc_submit",
+            json!({
+                "worker": "agent-1", "batch": first["batch"]["batch"],
+                "token": first["batch"]["token"], "programs": texts
+            }),
+        )
+        .unwrap();
+    wait_for_checks(&mut operator, &mut proposer, "r1");
+    let done = checks(dir.path(), "r1");
+    assert_eq!(done.len(), 1);
+    assert_checks(&programs, &done[0]);
+    proposer.kill();
+
+    // Left unchecked by a server that stopped, and checked when the next one
+    // starts.
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("r1").unwrap();
+    let held = dc_mcp::proposer::next_batch(&store, &run, "agent-2", 0)
+        .unwrap()
+        .batch
+        .unwrap();
+    dc_mcp::proposer::submit(
+        &store,
+        &run,
+        held.batch,
+        "agent-2",
+        &held.token,
+        texts,
+        None,
+        1,
+    )
+    .unwrap();
+    let mut proposer = Client::start_proposer(dir.path(), "r1");
+    wait_for_checks(&mut operator, &mut proposer, "r1");
+    let done = checks(dir.path(), "r1");
+    assert_eq!(done.len(), 2);
+    assert_checks(&programs, &done[1]);
+    proposer.kill();
+
+    // The program that passed, in the frontier of a task, is too deep to show
+    // in another task's prompt, and is left out.
+    let deep = done[0]
+        .iter()
+        .find_map(|c| match c {
+            Check::Passed { program } => Some(program.clone()),
+            _ => None,
+        })
+        .unwrap();
+    operator
+        .call(
+            "dc_create_run",
+            json!({
+                "run": "r2", "seed": 5, "proposals_per_task": 1,
+                "tasks": ["collapse/merge", "collapse/cancel"]
+            }),
+        )
+        .unwrap();
+    let r2 = RunId::new("r2").unwrap();
+    let frontiers = |program: &str| -> Vec<Event> {
+        ["collapse/merge", "collapse/cancel"]
+            .map(|task| Event::FrontierSet {
+                task: task.to_owned(),
+                members: vec![FrontierMember {
+                    program: program.to_owned(),
+                }],
+            })
+            .to_vec()
+    };
+    const SOLVED: &str = "Programs that solve other tasks";
+    store.append(&r2, frontiers(&deep)).unwrap();
+    let mut proposer = Client::start_proposer(dir.path(), "r2");
+    let batch = proposer
+        .call("dc_next_batch", json!({ "worker": "agent-1" }))
+        .unwrap();
+    let prompt = batch["batch"]["prompt"].as_str().unwrap();
+    assert!(!prompt.contains(SOLVED), "{prompt}");
+    // A program that can be shown is shown.
+    store.append(&r2, frontiers("(lam $0)")).unwrap();
+    let batch = proposer
+        .call("dc_next_batch", json!({ "worker": "agent-2" }))
+        .unwrap();
+    let prompt = batch["batch"]["prompt"].as_str().unwrap();
+    assert!(prompt.contains(SOLVED), "{prompt}");
+    proposer.kill();
+    operator.kill();
 }
 
 #[test]

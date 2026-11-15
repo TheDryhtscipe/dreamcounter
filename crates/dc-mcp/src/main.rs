@@ -18,6 +18,16 @@ use rmcp::ServiceExt;
 
 const USAGE: &str = "usage: dc-mcp --state-dir <dir> [--proposer <run>]";
 
+/// The stack of the runtime's threads, where tool calls and the checks of
+/// submitted programs run. A stack overflow aborts the server, and a proposer's
+/// server checks what is left unchecked again when it starts, so a program
+/// that overflowed the checker would stop the server each time. So the stack
+/// is set here, not left to Tokio's default. Checking the deepest program a
+/// proposer can submit needs less than 128 KiB in the tests' build
+/// (`tests/deep.rs` checks them on 256 KiB); 8 MiB, what dc-surface gives
+/// deep parsing, leaves a wide margin for builds with larger frames.
+const THREAD_STACK_BYTES: usize = 8 << 20;
+
 /// The state directory, and the run if the server is a proposer's.
 fn arguments() -> Option<(PathBuf, Option<String>)> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -70,6 +80,7 @@ fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn st
     );
     // One thread for the protocol. Tool calls run on the blocking pool.
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .thread_stack_size(THREAD_STACK_BYTES)
         .enable_all()
         .build()?;
     let checks_in_background = proposer.is_some();
