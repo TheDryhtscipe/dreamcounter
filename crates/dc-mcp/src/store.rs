@@ -560,8 +560,21 @@ impl Store {
     }
 
     /// Calls `each` on the run's log records, oldest first, until it returns
-    /// [`ControlFlow::Break`]. It reads the whole journal each time, one
-    /// record at a time, and holds only the record it is on.
+    /// [`ControlFlow::Break`]. See [`Store::for_each_event`].
+    pub fn for_each_log<F>(&self, run: &RunId, mut each: F) -> Result<(), StoreError>
+    where
+        F: FnMut(LogRecord) -> ControlFlow<()>,
+    {
+        self.for_each_event(run, |event| match event {
+            Event::Logged(log) => each(log),
+            _ => ControlFlow::Continue(()),
+        })
+    }
+
+    /// Calls `each` on the run's events, oldest first, until it returns
+    /// [`ControlFlow::Break`]. The events include the payloads handed out and
+    /// the submissions received, with their text. It reads the whole journal
+    /// each time, one record at a time, and holds only the record it is on.
     ///
     /// `each` is called while the run is locked, so it must not use this run
     /// through any store: that call would wait and then fail with
@@ -569,17 +582,15 @@ impl Store {
     ///
     /// If the journal is damaged after some records, `each` sees those
     /// records and then the call returns [`StoreError::Corrupt`].
-    pub fn for_each_log<F>(&self, run: &RunId, mut each: F) -> Result<(), StoreError>
+    pub fn for_each_event<F>(&self, run: &RunId, mut each: F) -> Result<(), StoreError>
     where
-        F: FnMut(LogRecord) -> ControlFlow<()>,
+        F: FnMut(Event) -> ControlFlow<()>,
     {
         let mut locked = self.lock_run(run)?;
         let scanned = scan_journal(&mut locked, run, None, |record| {
             for event in record.events {
-                if let Event::Logged(log) = event {
-                    if each(log).is_break() {
-                        return Err(Halt::Break);
-                    }
+                if each(event).is_break() {
+                    return Err(Halt::Break);
                 }
             }
             Ok(())
