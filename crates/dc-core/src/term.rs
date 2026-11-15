@@ -508,7 +508,7 @@ mod tests {
         let ratio = t_colliding.as_secs_f64() / t_ordinary.as_secs_f64().max(1e-6);
         assert!(
             ratio < 100.0,
-            "{t_colliding:?} for colliding ints, {t_ordinary:?} for ordinary ints"
+            "{t_colliding:?} for colliding ints, {t_ordinary:?} for ordinary ints: ratio {ratio:.1}, bound 100"
         );
     }
 
