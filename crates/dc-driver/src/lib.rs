@@ -40,6 +40,21 @@
 //!    abstractions after the last one an accepted rewriting uses are cut too.
 //!    Each frontier is sorted again by cost under the new library.
 //!
+//! # The prelude
+//!
+//! Programs that proposers write are compiled with the prelude, so they use its
+//! functions as `Term::Lib(LibId(PRELUDE_LIB_BASE + i))` (`dc_surface::prelude`).
+//! [`IterationInput::prelude`] says which prelude they were compiled against:
+//! `None` is the prelude-off ablation, and a prelude reference is then an unknown
+//! library. With a prelude, every check above types a reference with the
+//! function's scheme over the learned schemes, and expands the prelude's
+//! references first and the learned abstractions second. Stitch is given each
+//! prelude function as an opaque token with its own name, never its body, and an
+//! abstraction or a rewritten program may use it. Frontier members, library
+//! entries and new abstractions keep the references, so they are not replaced by
+//! definitions in the run's state. [`stitch_cost`] charges a reference as one
+//! library use (100), the same as Stitch does.
+//!
 //! # Determinism
 //!
 //! Programs are handled in a fixed order, ties keep the earlier program, and
@@ -62,14 +77,17 @@ use std::sync::atomic::AtomicBool;
 
 use dc_compress::worker::{Worker, WorkerError};
 use dc_compress::{
-    compress, compress_isolated, CompressConfig, CompressError, Compression, FrontierProgram,
-    ABSTRACTION_PREFIX,
+    compress_isolated_with, compress_with, expand_prelude, library_names, CompressConfig,
+    CompressError, Compression, FrontierProgram, IsolatedRun,
 };
 use dc_core::sexpr::MAX_PRINT_NODES;
 use dc_core::term::children;
 use dc_core::types::{check, infer};
-use dc_core::{sexpr, Arena, ExpandError, Expander, LibDef, LibId, Scheme, Term, TermId};
+use dc_core::{
+    sexpr, Arena, ExpandError, Expander, LibDef, LibId, Scheme, Term, TermId, TypeError,
+};
 use dc_stitch::{to_expr, EncodeError, Expr, LibNames};
+use dc_surface::prelude::Prelude;
 use serde::{Deserialize, Serialize};
 
 /// One library definition, as text.
@@ -123,22 +141,29 @@ pub struct IterationInput<'a> {
     pub frontiers: &'a BTreeMap<String, Vec<String>>,
     /// The verified programs of this iteration, in the order they came in.
     pub candidates: &'a [Candidate],
+    /// The prelude that programs were compiled against, or `None` when they
+    /// were compiled without it (`PreludeMode::Off`). A program, a frontier
+    /// member or a library entry may use its functions as
+    /// `Term::Lib(LibId(PRELUDE_LIB_BASE + i))`; with `None`, such a reference
+    /// is an unknown library.
+    pub prelude: Option<&'a Prelude>,
 }
 
 /// Runs Stitch on the selected programs.
 pub trait Stitch {
-    /// Compresses `programs`, which may use `libs`, as [`dc_compress::compress`]
-    /// does.
+    /// Compresses `programs`, which may use `libs` and the functions of
+    /// `prelude`, as [`dc_compress::compress_with`] does.
     fn run(
         &mut self,
         arena: &mut Arena,
+        prelude: Option<&Prelude>,
         libs: &[LibDef],
         programs: &[FrontierProgram],
         cfg: &CompressConfig,
     ) -> Result<Compression, CompressError>;
 }
 
-/// Runs Stitch in this process, with no limits ([`dc_compress::compress`]).
+/// Runs Stitch in this process, with no limits ([`dc_compress::compress_with`]).
 /// For tests and tools. A Stitch panic carries on in the caller.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InProcess;
@@ -147,16 +172,17 @@ impl Stitch for InProcess {
     fn run(
         &mut self,
         arena: &mut Arena,
+        prelude: Option<&Prelude>,
         libs: &[LibDef],
         programs: &[FrontierProgram],
         cfg: &CompressConfig,
     ) -> Result<Compression, CompressError> {
-        compress(arena, libs, programs, cfg)
+        compress_with(arena, prelude, libs, programs, cfg)
     }
 }
 
 /// Runs Stitch in a worker process with the worker's limits
-/// ([`dc_compress::compress_isolated`]). Setting `cancel` stops the run.
+/// ([`dc_compress::compress_isolated_with`]). Setting `cancel` stops the run.
 #[derive(Clone, Copy, Debug)]
 pub struct Isolated<'a> {
     /// How to start the worker, and its limits.
@@ -169,11 +195,16 @@ impl Stitch for Isolated<'_> {
     fn run(
         &mut self,
         arena: &mut Arena,
+        prelude: Option<&Prelude>,
         libs: &[LibDef],
         programs: &[FrontierProgram],
         cfg: &CompressConfig,
     ) -> Result<Compression, CompressError> {
-        compress_isolated(arena, libs, programs, cfg, self.worker, self.cancel)
+        let run = IsolatedRun {
+            worker: self.worker,
+            cancel: self.cancel,
+        };
+        compress_isolated_with(arena, prelude, libs, programs, cfg, run)
     }
 }
 
@@ -372,6 +403,9 @@ pub enum DriverError {
     Interrupted(CompressError),
     /// The library has more entries than a library id can number.
     LibraryTooLarge,
+    /// A prelude function's name cannot be given to Stitch, as
+    /// [`dc_compress::library_names`] says. The shipped prelude has no such name.
+    PreludeName(String),
 }
 
 impl fmt::Display for DriverError {
@@ -388,6 +422,7 @@ impl fmt::Display for DriverError {
             } => write!(f, "member {index} of task {task:?}: {reason}"),
             DriverError::TooLarge => f.write_str("a term is too large to print"),
             DriverError::LibraryTooLarge => f.write_str("the library has too many entries"),
+            DriverError::PreludeName(e) => write!(f, "a prelude function cannot be named: {e}"),
             DriverError::Interrupted(e) => write!(f, "the Stitch run was interrupted: {e}"),
         }
     }
@@ -424,10 +459,13 @@ fn expr_cost(e: &Expr) -> u64 {
     total
 }
 
-/// The names of a library of `len` entries, as the bridge names them.
-fn names(len: usize) -> Result<LibNames, DriverError> {
+/// The names of a library of `len` entries and of the prelude's functions, as
+/// the bridge gives them to Stitch ([`dc_compress::library_names`]).
+fn names(len: usize, prelude: Option<&Prelude>) -> Result<LibNames, DriverError> {
     let len = u32::try_from(len).map_err(|_| DriverError::LibraryTooLarge)?;
-    LibNames::sequential(ABSTRACTION_PREFIX, len).map_err(|_| DriverError::LibraryTooLarge)
+    // The learned names fail only for a library that reaches PRELUDE_LIB_BASE
+    // entries, so an error is about a prelude name.
+    library_names(len, prelude).map_err(|err| DriverError::PreludeName(err.to_string()))
 }
 
 /// `id` as text. Every program in the pool and every abstraction kept is
@@ -436,9 +474,10 @@ fn print(arena: &Arena, id: TermId) -> Result<String, DriverError> {
     sexpr::print(arena, id).map_err(|_| DriverError::TooLarge)
 }
 
-/// The largest library id `id` uses, found with a work list over the shared
-/// term graph.
-fn max_lib(arena: &Arena, id: TermId) -> Option<usize> {
+/// The largest learned library id `id` uses, found with a work list over the
+/// shared term graph. The prelude's references are not learned ids and are
+/// skipped.
+fn max_lib(arena: &Arena, prelude: Option<&Prelude>, id: TermId) -> Option<usize> {
     let mut seen = HashSet::new();
     let mut stack = vec![id];
     let mut max = None;
@@ -447,8 +486,11 @@ fn max_lib(arena: &Arena, id: TermId) -> Option<usize> {
             continue;
         }
         let term = arena.get(t);
-        if let Term::Lib(LibId(l)) = term {
-            let l = l as usize;
+        if let Term::Lib(l) = term {
+            if prelude.is_some_and(|p| p.name(l).is_some()) {
+                continue;
+            }
+            let l = l.0 as usize;
             max = Some(max.map_or(l, |m: usize| m.max(l)));
         }
         stack.extend(children(&term));
@@ -457,21 +499,30 @@ fn max_lib(arena: &Arena, id: TermId) -> Option<usize> {
 }
 
 /// The checked library: its definitions, an expander, and their schemes.
-struct Library {
+struct Library<'a> {
+    /// The prelude the programs may use.
+    prelude: Option<&'a Prelude>,
+    /// The definitions as given, which may use the prelude.
     defs: Vec<LibDef>,
+    /// Expands the learned abstractions, over terms with the prelude already
+    /// expanded.
     expander: Expander,
     schemes: Vec<Scheme>,
 }
 
-impl Library {
-    fn load(arena: &mut Arena, entries: &[LibraryEntry]) -> Result<Library, DriverError> {
+impl<'a> Library<'a> {
+    fn load(
+        arena: &mut Arena,
+        prelude: Option<&'a Prelude>,
+        entries: &[LibraryEntry],
+    ) -> Result<Library<'a>, DriverError> {
         let mut defs = Vec::with_capacity(entries.len());
         for (index, e) in entries.iter().enumerate() {
             let bad = |reason: String| DriverError::Library { index, reason };
             let term = sexpr::parse(arena, &e.term).map_err(|err| bad(err.to_string()))?;
             // The expander names the entry that uses a library, except when the
             // library does not exist. So check that here, for each entry.
-            if let Some(l) = max_lib(arena, term).filter(|&l| l >= index) {
+            if let Some(l) = max_lib(arena, prelude, term).filter(|&l| l >= index) {
                 return Err(bad(format!(
                     "it uses lib_{l}, which is not an earlier entry"
                 )));
@@ -481,7 +532,14 @@ impl Library {
                 term,
             });
         }
-        let expander = Expander::new(arena, &defs).map_err(|err| DriverError::Library {
+        let expandable: Vec<LibDef> = defs
+            .iter()
+            .map(|d| LibDef {
+                arity: d.arity,
+                term: expand_prelude(prelude, arena, d.term),
+            })
+            .collect();
+        let expander = Expander::new(arena, &expandable).map_err(|err| DriverError::Library {
             index: match err {
                 ExpandError::UnknownLib(LibId(l))
                 | ExpandError::ForwardReference { lib: LibId(l), .. }
@@ -492,13 +550,16 @@ impl Library {
         })?;
         let mut schemes: Vec<Scheme> = Vec::with_capacity(defs.len());
         for (index, def) in defs.iter().enumerate() {
-            let s = infer(arena, def.term, &schemes).map_err(|err| DriverError::Library {
-                index,
-                reason: err.to_string(),
+            let s = infer_in(arena, prelude, def.term, &schemes).map_err(|err| {
+                DriverError::Library {
+                    index,
+                    reason: err.to_string(),
+                }
             })?;
             schemes.push(s);
         }
         Ok(Library {
+            prelude,
             defs,
             expander,
             schemes,
@@ -524,12 +585,41 @@ impl Library {
         if !arena.is_closed(program) {
             return Err("the program is not closed".to_owned());
         }
+        let bare = expand_prelude(self.prelude, arena, program);
         let expanded = self
             .expander
-            .expand(arena, program)
+            .expand(arena, bare)
             .map_err(|e| e.to_string())?;
-        check(arena, program, &self.schemes, signature).map_err(|e| e.to_string())?;
+        check_in(arena, self.prelude, program, &self.schemes, signature)
+            .map_err(|e| e.to_string())?;
         Ok((program, expanded))
+    }
+}
+
+/// [`infer`] with the prelude's schemes added to `schemes`.
+fn infer_in(
+    arena: &Arena,
+    prelude: Option<&Prelude>,
+    term: TermId,
+    schemes: &[Scheme],
+) -> Result<Scheme, TypeError> {
+    match prelude {
+        Some(p) => infer(arena, term, &p.with_libs(schemes)),
+        None => infer(arena, term, schemes),
+    }
+}
+
+/// [`check`] with the prelude's schemes added to `schemes`.
+fn check_in(
+    arena: &Arena,
+    prelude: Option<&Prelude>,
+    term: TermId,
+    schemes: &[Scheme],
+    signature: &Scheme,
+) -> Result<(), TypeError> {
+    match prelude {
+        Some(p) => check(arena, term, &p.with_libs(schemes), signature),
+        None => check(arena, term, schemes, signature),
     }
 }
 
@@ -560,7 +650,7 @@ impl Pooled {
 /// the fate of every program.
 fn select(
     arena: &mut Arena,
-    library: &mut Library,
+    library: &mut Library<'_>,
     names: &LibNames,
     input: IterationInput<'_>,
     frontier_size: usize,
@@ -722,7 +812,7 @@ fn is_interruption(e: &CompressError) -> bool {
 /// run at a time. Adds the programs left out to `left_out`.
 fn run_stitch(
     arena: &mut Arena,
-    libs: &[LibDef],
+    library: &Library<'_>,
     tasks: &[TaskSpec],
     kept: &[Vec<Pooled>],
     cfg: &CompressConfig,
@@ -758,7 +848,7 @@ fn run_stitch(
                 program: kept[t][p].program,
             })
             .collect();
-        match stitch.run(arena, libs, &programs, cfg) {
+        match stitch.run(arena, library.prelude, &library.defs, &programs, cfg) {
             Ok(c) if c.rewritten.len() == slots.len() => {
                 return Ok(StitchRun::Ran {
                     slots,
@@ -792,7 +882,7 @@ fn run_stitch(
 /// and returns the new library entries and the report.
 fn update_library(
     arena: &mut Arena,
-    library: &Library,
+    library: &Library<'_>,
     tasks: &[TaskSpec],
     kept: &mut [Vec<Pooled>],
     slots: &[(usize, usize)],
@@ -813,7 +903,7 @@ fn update_library(
             });
             break;
         }
-        match infer(arena, def.term, &schemes) {
+        match infer_in(arena, library.prelude, def.term, &schemes) {
             Ok(s) => schemes.push(s),
             Err(e) => {
                 untyped = Some(Untyped {
@@ -829,11 +919,15 @@ fn update_library(
     // The bridge checks that each rewriting keeps the expansion. It is checked
     // again here, against the typed abstractions, so that a runner that skips
     // the check cannot change a program.
+    let prelude = library.prelude;
     let typed_libs: Vec<LibDef> = library
         .defs
         .iter()
         .chain(&c.new_libs[..typed])
-        .copied()
+        .map(|d| LibDef {
+            arity: d.arity,
+            term: expand_prelude(prelude, arena, d.term),
+        })
         .collect();
     let mut expander = match Expander::new(arena, &typed_libs) {
         Ok(x) => x,
@@ -847,7 +941,7 @@ fn update_library(
     let mut used: Option<usize> = None;
     for (&(t, p), &rewritten) in slots.iter().zip(&c.rewritten) {
         let task = &tasks[t];
-        let uses = max_lib(arena, rewritten);
+        let uses = max_lib(arena, prelude, rewritten);
         let text = sexpr::print(arena, rewritten);
         let refused = if text.is_err() {
             Some(format!(
@@ -855,10 +949,11 @@ fn update_library(
             ))
         } else if uses.is_some_and(|l| l >= schemes.len()) {
             Some("it uses a new abstraction that does not type, or one after it".to_owned())
-        } else if let Err(e) = check(arena, rewritten, &schemes, &task.signature) {
+        } else if let Err(e) = check_in(arena, prelude, rewritten, &schemes, &task.signature) {
             Some(e.to_string())
         } else {
-            match expander.expand(arena, rewritten) {
+            let bare = expand_prelude(prelude, arena, rewritten);
+            match expander.expand(arena, bare) {
                 Err(e) => Some(format!("it does not expand: {e}")),
                 Ok(e) if e != kept[t][p].expanded => {
                     Some("it does not expand to its original".to_owned())
@@ -918,9 +1013,9 @@ pub fn run_iteration(
         return Err(DriverError::NoFrontier);
     }
     let mut arena = Arena::new();
-    let mut library = Library::load(&mut arena, input.library)?;
+    let mut library = Library::load(&mut arena, input.prelude, input.library)?;
     let old_len = library.defs.len();
-    let old_names = names(old_len)?;
+    let old_names = names(old_len, input.prelude)?;
     let (mut kept, programs) = select(
         &mut arena,
         &mut library,
@@ -932,7 +1027,7 @@ pub fn run_iteration(
     let mut left_out = Vec::new();
     let run = run_stitch(
         &mut arena,
-        &library.defs,
+        &library,
         input.tasks,
         &kept,
         &cfg.compress,
@@ -954,7 +1049,7 @@ pub fn run_iteration(
     };
 
     // Sort each frontier again under the new library.
-    let new_names = names(old_len + new_library.len())?;
+    let new_names = names(old_len + new_library.len(), input.prelude)?;
     let mut frontiers = BTreeMap::new();
     for (task, pool) in input.tasks.iter().zip(&mut kept) {
         for p in pool.iter_mut() {

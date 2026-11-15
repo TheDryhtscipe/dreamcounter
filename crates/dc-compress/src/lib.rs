@@ -65,6 +65,7 @@ use dc_stitch::{
     decode, decode_abstraction, expr, to_expr, DecodeError, EncodeError, Expr, LibNames, NameError,
     LET_LAMBDA_TAG,
 };
+use dc_surface::prelude::Prelude;
 use serde::{Deserialize, Serialize};
 use stitch_core::{multistep_compression, MultistepCompressionConfig};
 use worker::{StitchRequest, Worker, WorkerError};
@@ -333,9 +334,43 @@ pub fn stitch_config(cfg: &CompressConfig, library_len: usize) -> MultistepCompr
     s
 }
 
-/// The names of a library of `len` entries.
-fn library_names(len: u32) -> Result<LibNames, CompressError> {
-    LibNames::sequential(ABSTRACTION_PREFIX, len).map_err(CompressError::Names)
+/// The names the bridge gives a library of `len` entries (`fn_0`, `fn_1`, ...).
+/// With a `prelude`, each of its functions is named as the prelude names it,
+/// so Stitch sees it as an opaque token.
+///
+/// Anything that prices or prints programs the way Stitch sees them uses this
+/// table, so that it agrees with the text given to Stitch.
+///
+/// # Errors
+///
+/// [`CompressError::Names`] if a prelude name is not a legal Stitch token,
+/// starts with [`ABSTRACTION_PREFIX`] (so it could clash with an abstraction
+/// Stitch names later in the run), or clashes with another prelude name. The
+/// shipped prelude has no such name.
+pub fn library_names(len: u32, prelude: Option<&Prelude>) -> Result<LibNames, CompressError> {
+    let mut names = LibNames::sequential(ABSTRACTION_PREFIX, len).map_err(CompressError::Names)?;
+    for e in prelude.map_or(&[][..], Prelude::entries) {
+        if e.name().starts_with(ABSTRACTION_PREFIX) {
+            return Err(CompressError::Names(NameError::Illegal {
+                name: e.name().to_owned(),
+                reason: "a prelude name may not start with the abstraction prefix",
+            }));
+        }
+        names
+            .insert(e.lib(), e.name())
+            .map_err(CompressError::Names)?;
+    }
+    Ok(names)
+}
+
+/// `term` with the prelude's functions replaced by their definitions. This is
+/// the first step of expansion: the learned-abstraction expander never sees a
+/// prelude id (`dc_surface::prelude`). With no prelude, `term` is returned.
+pub fn expand_prelude(prelude: Option<&Prelude>, arena: &mut Arena, term: TermId) -> TermId {
+    match prelude {
+        Some(p) => p.expand(arena, term),
+        None => term,
+    }
 }
 
 /// The number of levels of `e`: 1 for a leaf, and one more than its deepest
@@ -415,7 +450,24 @@ pub fn compress(
     programs: &[FrontierProgram],
     cfg: &CompressConfig,
 ) -> Result<Compression, CompressError> {
-    compress_via(arena, libs, programs, cfg, |text, tasks| {
+    compress_with(arena, None, libs, programs, cfg)
+}
+
+/// [`compress`], where the programs and the library's terms may also use the
+/// functions of `prelude`.
+///
+/// Stitch is given each prelude function as a token with the function's name,
+/// so it cannot see the definition. The new abstractions and the rewritten
+/// programs keep the prelude references. A rewriting is checked as
+/// [`accept_steps_with`] says.
+pub fn compress_with(
+    arena: &mut Arena,
+    prelude: Option<&Prelude>,
+    libs: &[LibDef],
+    programs: &[FrontierProgram],
+    cfg: &CompressConfig,
+) -> Result<Compression, CompressError> {
+    compress_via(arena, prelude, libs, programs, cfg, |text, tasks| {
         run_stitch(&text, tasks, cfg, libs.len())
     })
 }
@@ -437,7 +489,36 @@ pub fn compress_isolated(
     worker: &Worker,
     cancel: &AtomicBool,
 ) -> Result<Compression, CompressError> {
-    compress_via(arena, libs, programs, cfg, |text, tasks| {
+    compress_isolated_with(
+        arena,
+        None,
+        libs,
+        programs,
+        cfg,
+        IsolatedRun { worker, cancel },
+    )
+}
+
+/// The worker of an isolated run, and the flag that stops it.
+#[derive(Clone, Copy, Debug)]
+pub struct IsolatedRun<'a> {
+    /// How to start the worker, and its limits.
+    pub worker: &'a Worker,
+    /// Set from another thread to stop the run.
+    pub cancel: &'a AtomicBool,
+}
+
+/// [`compress_isolated`], with a `prelude` as in [`compress_with`].
+pub fn compress_isolated_with(
+    arena: &mut Arena,
+    prelude: Option<&Prelude>,
+    libs: &[LibDef],
+    programs: &[FrontierProgram],
+    cfg: &CompressConfig,
+    run: IsolatedRun<'_>,
+) -> Result<Compression, CompressError> {
+    let IsolatedRun { worker, cancel } = run;
+    compress_via(arena, prelude, libs, programs, cfg, |text, tasks| {
         let request = StitchRequest {
             programs: text,
             tasks,
@@ -453,13 +534,14 @@ pub fn compress_isolated(
 /// task labels.
 fn compress_via(
     arena: &mut Arena,
+    prelude: Option<&Prelude>,
     libs: &[LibDef],
     programs: &[FrontierProgram],
     cfg: &CompressConfig,
     stitch: impl FnOnce(Vec<String>, Vec<String>) -> Result<Vec<StitchStep>, CompressError>,
 ) -> Result<Compression, CompressError> {
     let len = u32::try_from(libs.len()).map_err(|_| CompressError::LibraryTooLarge)?;
-    let names = library_names(len)?;
+    let names = library_names(len, prelude)?;
     let mut text = Vec::with_capacity(programs.len());
     for (index, p) in programs.iter().enumerate() {
         if !arena.is_closed(p.program) {
@@ -474,14 +556,14 @@ fn compress_via(
     }
     let ids: Vec<TermId> = programs.iter().map(|p| p.program).collect();
     // Check the library and the programs before Stitch runs, which can take long.
-    let inputs = check_inputs(arena, libs, &ids)?;
+    let inputs = check_inputs(arena, prelude, libs, &ids)?;
     let steps = if programs.is_empty() {
         Vec::new()
     } else {
         let tasks: Vec<String> = programs.iter().map(|p| p.task.clone()).collect();
         stitch(text, tasks)?
     };
-    accept(arena, inputs, names, &ids, &steps, cfg.max_arity)
+    accept(arena, prelude, inputs, names, &ids, &steps, cfg.max_arity)
 }
 
 /// Decodes Stitch's `steps` for `programs` over the library `libs`. Keeps the
@@ -507,10 +589,25 @@ pub fn accept_steps(
     steps: &[StitchStep],
     max_arity: u32,
 ) -> Result<Compression, CompressError> {
+    accept_steps_with(arena, None, libs, programs, steps, max_arity)
+}
+
+/// [`accept_steps`], where the programs, the library and the steps may use the
+/// functions of `prelude`. Each term is expanded as the `dc_surface::prelude`
+/// docs say: the prelude's references first, then the learned abstractions. The
+/// terms of the result keep the prelude references.
+pub fn accept_steps_with(
+    arena: &mut Arena,
+    prelude: Option<&Prelude>,
+    libs: &[LibDef],
+    programs: &[TermId],
+    steps: &[StitchStep],
+    max_arity: u32,
+) -> Result<Compression, CompressError> {
     let len = u32::try_from(libs.len()).map_err(|_| CompressError::LibraryTooLarge)?;
-    let names = library_names(len)?;
-    let inputs = check_inputs(arena, libs, programs)?;
-    accept(arena, inputs, names, programs, steps, max_arity)
+    let names = library_names(len, prelude)?;
+    let inputs = check_inputs(arena, prelude, libs, programs)?;
+    accept(arena, prelude, inputs, names, programs, steps, max_arity)
 }
 
 /// The library and the input programs of a run, copied into a scratch arena and
@@ -519,7 +616,7 @@ struct Inputs {
     /// The arena the steps are checked in, so that the terms of a dropped step
     /// and of the steps before the last do not stay in the caller's arena.
     scratch: Arena,
-    /// The library, in `scratch`.
+    /// The library, in `scratch`, with the prelude's references expanded.
     libs: Vec<LibDef>,
     /// What each input program expands to under the library, in `scratch`.
     want: Vec<TermId>,
@@ -529,6 +626,7 @@ struct Inputs {
 /// library and each program expand.
 fn check_inputs(
     arena: &Arena,
+    prelude: Option<&Prelude>,
     libs: &[LibDef],
     programs: &[TermId],
 ) -> Result<Inputs, CompressError> {
@@ -536,15 +634,19 @@ fn check_inputs(
     let mut copied = HashMap::new();
     let libs: Vec<LibDef> = libs
         .iter()
-        .map(|def| LibDef {
-            arity: def.arity,
-            term: copy_term(arena, &mut scratch, def.term, &mut copied),
+        .map(|def| {
+            let term = copy_term(arena, &mut scratch, def.term, &mut copied);
+            LibDef {
+                arity: def.arity,
+                term: expand_prelude(prelude, &mut scratch, term),
+            }
         })
         .collect();
     let mut expander = Expander::new(&mut scratch, &libs).map_err(CompressError::Library)?;
     let mut want = Vec::with_capacity(programs.len());
     for (index, p) in programs.iter().enumerate() {
         let p = copy_term(arena, &mut scratch, *p, &mut copied);
+        let p = expand_prelude(prelude, &mut scratch, p);
         let expanded = expander
             .expand(&mut scratch, p)
             .map_err(|error| CompressError::Expand { index, error })?;
@@ -560,6 +662,7 @@ fn check_inputs(
 /// [`accept_steps`], given the checked inputs and the names of the library.
 fn accept(
     arena: &mut Arena,
+    prelude: Option<&Prelude>,
     inputs: Inputs,
     mut names: LibNames,
     programs: &[TermId],
@@ -581,10 +684,10 @@ fn accept(
             .map(LibId);
         match check_step(
             &mut scratch,
+            StepRules { prelude, max_arity },
             next,
             step,
             &mut names,
-            max_arity,
             &mut all,
             &want,
         ) {
@@ -673,6 +776,14 @@ fn copy_term(
     copied[&id]
 }
 
+/// What a step may use: the prelude its terms may refer to, and the largest
+/// arity its abstraction may have.
+#[derive(Clone, Copy, Debug)]
+struct StepRules<'a> {
+    prelude: Option<&'a Prelude>,
+    max_arity: u32,
+}
+
 /// Checks one step in the scratch arena. Its abstraction should get the id `id`.
 /// `libs` is the library with the abstractions kept so far, and `want` holds
 /// what each input program expands to.
@@ -681,13 +792,14 @@ fn copy_term(
 /// `names`. If not, both are left as they were.
 fn check_step(
     scratch: &mut Arena,
+    rules: StepRules<'_>,
     id: Option<LibId>,
     step: &StitchStep,
     names: &mut LibNames,
-    max_arity: u32,
     libs: &mut Vec<LibDef>,
     want: &[TermId],
 ) -> Result<(), RejectReason> {
+    let StepRules { prelude, max_arity } = rules;
     let Some(id) = id else {
         return Err(RejectReason::UnexpectedName { expected: None });
     };
@@ -713,8 +825,9 @@ fn check_step(
     names
         .insert(id, name)
         .expect("the bridge's names are legal, and the id and name are fresh");
+    let term = expand_prelude(prelude, scratch, term);
     libs.push(LibDef { arity, term });
-    let checked = check_programs(scratch, step, names, libs, want);
+    let checked = check_programs(scratch, prelude, step, names, libs, want);
     if checked.is_err() {
         names.remove(id);
         libs.pop();
@@ -726,6 +839,7 @@ fn check_step(
 /// `libs` to the term in `want`.
 fn check_programs(
     scratch: &mut Arena,
+    prelude: Option<&Prelude>,
     step: &StitchStep,
     names: &LibNames,
     libs: &[LibDef],
@@ -735,7 +849,7 @@ fn check_programs(
     for (index, p) in step.rewritten.iter().enumerate() {
         let decoded =
             decode(scratch, p, names).map_err(|error| RejectReason::Program { index, error })?;
-        programs.push(decoded);
+        programs.push(expand_prelude(prelude, scratch, decoded));
     }
     let mut expander = Expander::new(scratch, libs).map_err(RejectReason::Library)?;
     for (index, (p, want)) in programs.iter().zip(want).enumerate() {
@@ -927,10 +1041,13 @@ mod tests {
         assert_eq!(
             check_step(
                 &mut a,
+                StepRules {
+                    prelude: None,
+                    max_arity: 2
+                },
                 None,
                 &s,
                 &mut LibNames::new(),
-                2,
                 &mut Vec::new(),
                 &[]
             ),

@@ -304,6 +304,102 @@ impl Prelude {
             libs,
         }
     }
+
+    /// A fingerprint of the prelude's definitions: every definition's position,
+    /// name and closed term, in source order. Comments and layout do not change
+    /// it; reordering, renaming, adding or changing a definition does. It does
+    /// not cover what the primitives do (a primitive is hashed by its name) or
+    /// [`PRELUDE_LIB_BASE`].
+    ///
+    /// A prelude reference is positional (`LibId(PRELUDE_LIB_BASE + i)`), so a
+    /// stored program that uses one is only meaningful against the prelude it
+    /// was compiled with. Store the fingerprint with such programs and compare
+    /// it before using them: two definitions of the same type, such as `max`
+    /// and `min`, can swap ids without a type error.
+    ///
+    /// The hash is 64-bit FNV-1a over the term structure, so it is the same in
+    /// every process and on every platform. It guards against mistakes, not
+    /// against a crafted prelude.
+    pub fn fingerprint(&self) -> u64 {
+        let mut h = Fnv::new();
+        h.u64(self.entries.len() as u64);
+        let mut memo = HashMap::new();
+        for e in &self.entries {
+            h.bytes(e.name.as_bytes());
+            h.u64(term_hash(&self.arena, e.term, &mut memo));
+        }
+        h.finish()
+    }
+}
+
+/// 64-bit FNV-1a.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Fnv {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn byte(&mut self, b: u8) {
+        self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    fn u64(&mut self, x: u64) {
+        x.to_le_bytes().into_iter().for_each(|b| self.byte(b));
+    }
+
+    /// `b`, prefixed by its length so that two strings cannot run together.
+    fn bytes(&mut self, b: &[u8]) {
+        self.u64(b.len() as u64);
+        b.iter().for_each(|&b| self.byte(b));
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// The structural hash of `term`: a node's tag and contents, and its children's
+/// hashes. `memo` holds the hash of each node done, so a shared subterm is hashed
+/// once. Iterative, so a deep term cannot overflow the stack.
+fn term_hash(arena: &Arena, term: TermId, memo: &mut HashMap<TermId, u64>) -> u64 {
+    let mut stack = vec![(term, false)];
+    while let Some((id, children_done)) = stack.pop() {
+        if memo.contains_key(&id) {
+            continue;
+        }
+        let node = arena.get(id);
+        if !children_done {
+            stack.push((id, true));
+            stack.extend(term::children(&node).into_iter().map(|c| (c, false)));
+            continue;
+        }
+        let mut h = Fnv::new();
+        let (tag, payload): (u8, u64) = match node {
+            Term::Var(i) => (0, u64::from(i)),
+            Term::Lam(_) => (1, 0),
+            Term::App(..) => (2, 0),
+            Term::Let(..) => (3, 0),
+            Term::Int(i) => (4, u64::from_le_bytes(i.to_le_bytes())),
+            Term::Bool(b) => (5, u64::from(b)),
+            Term::Unit => (6, 0),
+            Term::Prim(p) => {
+                h.bytes(p.name().as_bytes());
+                (7, 0)
+            }
+            Term::Lib(LibId(l)) => (8, u64::from(l)),
+            Term::If(..) => (9, 0),
+            Term::And(..) => (10, 0),
+            Term::Or(..) => (11, 0),
+        };
+        h.byte(tag);
+        h.u64(payload);
+        for c in term::children(&node) {
+            h.u64(memo[&c]);
+        }
+        memo.insert(id, h.finish());
+    }
+    memo[&term]
 }
 
 const NO_LIBS: [Scheme; 0] = [];

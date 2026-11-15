@@ -11,15 +11,13 @@ publish = false
 [dependencies]
 dc-core.workspace = true
 dc-stitch.workspace = true
+dc-surface.workspace = true
 stitch_core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
-
-[dev-dependencies]
-dc-surface.workspace = true
 
 [lints]
 workspace = true
