@@ -692,6 +692,18 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
         }),
     );
     assert!(wrong.unwrap_err().contains("token"));
+    // Batch 0 keeps three foreign submissions; the next is counted, not kept.
+    for kept in [true, true, false] {
+        let again = proposer.call(
+            "dc_submit",
+            json!({
+                "worker": "agent-1", "batch": 0, "token": "not-the-token",
+                "programs": ["let solve xs = xs"]
+            }),
+        );
+        let why = again.unwrap_err();
+        assert_eq!(why.contains("counted but not kept"), !kept, "{why}");
+    }
 
     // The operator sees what came in, once the server has checked it.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -709,8 +721,10 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
     assert_eq!(it["tasks"][0]["received"], 1);
     assert_eq!(it["quota_in"], true);
     assert_eq!(it["tasks_solved"], 1);
-    assert_eq!(it["submissions"], 3);
-    assert_eq!(it["foreign"], 1);
+    assert_eq!(it["submissions"], 5);
+    assert_eq!(it["foreign"], 3);
+    assert_eq!(it["refused_foreign"], 1);
+    assert_eq!(it["refused_repeats"], 0);
     assert_eq!(it["tasks"][0]["passed"], 1);
     assert_eq!(it["tasks"][1]["compiled"], 0);
     let status = operator
@@ -718,6 +732,7 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
         .unwrap();
     assert_eq!(status["batches_issued"], 2);
     assert_eq!(status["current"]["quota_in"], true);
+    assert_eq!(status["current"]["refused_foreign"], 1);
 
     // Payloads and submissions are in the journal as they were sent.
     proposer.kill();
@@ -744,8 +759,12 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
             (vec![solves_merge()], Some("test-model".to_owned())),
             (vec!["let solve = (".to_owned()], None),
             (vec![], None),
+            // The refused fourth foreign submission is not here.
+            (vec!["let solve xs = xs".to_owned()], None),
+            (vec!["let solve xs = xs".to_owned()], None),
         ]
     );
+    assert_eq!(store.refusals(&run).unwrap().iteration(0).foreign, 1);
 }
 
 /// The checks of the run's checked submissions, in the order they were

@@ -51,6 +51,7 @@ fn a_claim_held_by_a_killed_process_does_not_strand_its_submission() {
                 proposals_per_task: 1,
                 programs_per_batch: 1,
                 lease_ms: 60_000,
+                max_unchecked_per_batch: 3,
             },
             vec!["collapse/merge".into()],
         )

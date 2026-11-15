@@ -44,7 +44,7 @@ use crate::prompt::{payload, Payload};
 use crate::state::{
     BatchIssued, Check, Checked, Event, LibraryEntry, RunId, RunState, Standing, Submitted,
 };
-use crate::store::{CheckClaim, Store, StoreError};
+use crate::store::{Change, CheckClaim, RefusalKind, Store, StoreError};
 use crate::verify::{task, Verifier, VerifierCache};
 
 /// The longest worker id or model name, in bytes.
@@ -305,6 +305,13 @@ fn new_token() -> Result<String, Refused> {
 /// A submission with the wrong token or worker id is committed as
 /// [`Standing::Foreign`] and the reply is an error that says so. It says
 /// nothing about the programs.
+///
+/// A submission that is not checked (foreign, late or repeat) is kept only
+/// while its batch has fewer than the run's
+/// [`max_unchecked_per_batch`](crate::state::RunConfig::max_unchecked_per_batch)
+/// of its kind (see [`RunState::keeps`]). Past that it is counted in the
+/// run's refusals, not kept, and the reply is an error that says so. So a
+/// proposer that keeps submitting for a batch does not grow the journal.
 #[allow(clippy::too_many_arguments)]
 pub fn submit(
     store: &Store,
@@ -335,10 +342,22 @@ pub fn submit(
         batch,
         received: programs.len(),
     };
-    let standing = store.commit(run, |state| -> Result<_, Refused> {
+    let (standing, kept) = store.commit_or_refuse(run, |state| -> Result<_, Refused> {
         let standing = state
             .standing(batch, worker, token, now_ms)
             .ok_or_else(|| Refused::Request(format!("batch {batch} was not issued in this run")))?;
+        if !state.keeps(batch, standing) {
+            let kind = if standing == Standing::Foreign {
+                RefusalKind::Foreign
+            } else {
+                RefusalKind::Repeat
+            };
+            let refuse = Change::Refuse {
+                iteration: state.iteration(),
+                kind,
+            };
+            return Ok(((standing, false), refuse));
+        }
         let event = Event::Submitted(Submitted {
             batch,
             worker: worker.to_owned(),
@@ -349,15 +368,23 @@ pub fn submit(
             programs,
             standing,
         });
-        Ok((standing, vec![event]))
+        Ok(((standing, true), Change::Events(vec![event])))
     })?;
-    if standing == Standing::Foreign {
-        return Err(Refused::Request(format!(
+    match (standing, kept) {
+        (Standing::Foreign, true) => Err(Refused::Request(format!(
             "batch {batch} was not sent to worker {worker:?} with that token; the submission \
              is kept but will not be checked"
-        )));
+        ))),
+        (Standing::Foreign, false) => Err(Refused::Request(format!(
+            "batch {batch} was not sent to worker {worker:?} with that token; the run keeps no \
+             more such submissions for this batch, so this one is counted but not kept"
+        ))),
+        (_, false) => Err(Refused::Request(format!(
+            "batch {batch} already has its submission, and the run keeps no more for it, so \
+             this one is counted but not kept. Ask dc_next_batch for new work"
+        ))),
+        (_, true) => Ok(receipt),
     }
-    Ok(receipt)
 }
 
 /// The library a pending submission is checked with.
@@ -605,6 +632,7 @@ mod tests {
                     proposals_per_task: quota,
                     programs_per_batch: per_batch,
                     lease_ms: 1000,
+                    max_unchecked_per_batch: 3,
                 },
                 vec![MERGE.into(), CANCEL.into()],
             )
@@ -1096,6 +1124,7 @@ mod tests {
             proposals_per_task: 1,
             programs_per_batch: 1,
             lease_ms: 1000,
+            max_unchecked_per_batch: 3,
         }
     }
 
@@ -1299,6 +1328,89 @@ mod tests {
         assert_eq!(library.len(), 1);
         assert!(verifiers.get(&library).is_some());
         assert!(verifiers.get(&[]).is_none());
+    }
+
+    /// The length of the run's journal in bytes.
+    fn journal_len(dir: &TempDir, run: &RunId) -> u64 {
+        std::fs::metadata(dir.path().join(run.as_str()).join("journal"))
+            .unwrap()
+            .len()
+    }
+
+    /// Whether each length is more than the one before.
+    fn grows(lens: &[u64]) -> bool {
+        lens.windows(2).all(|w| w[0] < w[1])
+    }
+
+    /// Whether every length is the same.
+    fn flat(lens: &[u64]) -> bool {
+        lens.windows(2).all(|w| w[0] == w[1])
+    }
+
+    #[test]
+    fn a_looping_proposer_cannot_grow_the_journal_past_the_cap() {
+        let (dir, store, run) = setup(2, 1);
+        next_batch(&store, &run, "a", 0).unwrap();
+        sub(&store, &run, 0, "a", vec![solves_merge()], None, 1).unwrap();
+        let big = vec!["x".repeat(MAX_PROGRAM_LEN); 4];
+        let cap: usize = 3;
+        // Repeats from the batch's worker: the first `cap` are kept, and
+        // after them the journal does not grow.
+        let mut lens = vec![journal_len(&dir, &run)];
+        let mut replies = Vec::new();
+        for i in 0..10 {
+            replies.push(sub(&store, &run, 0, "a", big.clone(), None, 2 + i));
+            lens.push(journal_len(&dir, &run));
+        }
+        assert!(grows(&lens[..=cap]), "{lens:?}");
+        assert!(flat(&lens[cap..]), "{lens:?}");
+        for (i, got) in replies.iter().enumerate() {
+            assert_eq!(got.is_ok(), i < cap, "repeat {i}: {got:?}");
+        }
+        // Foreign submissions for the same batch have a cap of their own.
+        let mut lens = vec![journal_len(&dir, &run)];
+        let mut foreign = Ok(Receipt {
+            batch: 0,
+            received: 0,
+        });
+        for i in 0..10 {
+            foreign = submit(&store, &run, 0, "b", "bad", big.clone(), None, 20 + i);
+            assert!(matches!(foreign, Err(Refused::Request(_))), "{foreign:?}");
+            lens.push(journal_len(&dir, &run));
+        }
+        assert!(grows(&lens[..=cap]), "{lens:?}");
+        assert!(flat(&lens[cap..]), "{lens:?}");
+        assert_eq!(submissions(&store, &run).len(), 1 + 2 * cap);
+        let state = store.state(&run).unwrap();
+        let ic = state.iteration_counts(0);
+        assert_eq!((ic.repeats, ic.foreign), (cap as u64, cap as u64));
+        // The refused ones are counted, and the proposer is told so.
+        let refused = 10 - cap as u64;
+        let counts = store.refusals(&run).unwrap().iteration(0);
+        assert_eq!((counts.repeats, counts.foreign), (refused, refused));
+        let Err(Refused::Request(why)) = &replies[cap] else {
+            panic!("{:?}", replies[cap]);
+        };
+        assert!(why.contains("counted but not kept"), "{why}");
+        let Err(Refused::Request(why)) = &foreign else {
+            panic!("{foreign:?}");
+        };
+        assert!(why.contains("counted but not kept"), "{why}");
+        // The count is on disk: a server started afresh reads the same run
+        // and the same count.
+        let len = journal_len(&dir, &run);
+        let restarted = Store::open(dir.path()).unwrap();
+        assert_eq!(restarted.state(&run).unwrap(), state);
+        assert_eq!(restarted.refusals(&run).unwrap().iteration(0), counts);
+        assert_eq!(restarted.refusals(&run).unwrap().total(), counts);
+        assert_eq!(journal_len(&dir, &run), len);
+        // The cap is for each batch: another batch's submission is kept and
+        // checked as before.
+        next_batch(&store, &run, "a", 40).unwrap();
+        let got = sub(&store, &run, 1, "a", vec![solves_merge()], None, 41);
+        assert_eq!(got.unwrap().received, 1);
+        let last = submissions(&store, &run).pop().unwrap();
+        assert_eq!((last.batch, last.standing), (1, Standing::OnTime));
     }
 
     #[test]

@@ -14,6 +14,7 @@ fn config() -> RunConfig {
         proposals_per_task: 3,
         programs_per_batch: 1,
         lease_ms: 60_000,
+        max_unchecked_per_batch: 3,
     }
 }
 
@@ -1347,6 +1348,8 @@ struct Outcomes {
     rejected_later: u32,
     not_written: u32,
     unknown: u32,
+    /// Submissions refused under the cap and counted.
+    refused: u32,
     /// The run's iteration at the end.
     iterations: u64,
     /// The batches issued, and the programs checked, over the run.
@@ -1357,14 +1360,23 @@ struct Outcomes {
 /// Two stores on one run, standing in for two server processes, make
 /// `steps` random commits in turn. Some commits are rejected at their first
 /// event, some at a second one, and some have their write fail, with a
-/// known or an unknown outcome. After each step, each store's state must be
-/// the state a new store reads from the journal.
+/// known or an unknown outcome. A submission past the cap on unchecked
+/// submissions is refused and counted, as the proposer server does. After
+/// each step, each store's state and refusals must be those a new store
+/// reads from the run's files, and the refusals those counted here.
 fn two_stores_agree_with_the_journal(seed: u64, steps: u32) -> Outcomes {
+    use crate::state::Standing;
     let dir = TempDir::new().unwrap();
     let a = Store::open(dir.path()).unwrap();
     let b = Store::open(dir.path()).unwrap();
     let run = id("r1");
-    a.create_run(&run, config(), tasks()).unwrap();
+    // A cap of 1, so that refusals are common.
+    let capped = RunConfig {
+        max_unchecked_per_batch: 1,
+        ..config()
+    };
+    a.create_run(&run, capped, tasks()).unwrap();
+    let mut counted: BTreeMap<u64, RefusedCounts> = BTreeMap::new();
     let mut rng = Rng(seed);
     let mut now_ms = 0;
     let mut outcomes = Outcomes::default();
@@ -1387,28 +1399,61 @@ fn two_stores_agree_with_the_journal(seed: u64, steps: u32) -> Outcomes {
         *store.faults.lock().unwrap() = fail;
         let bad_second = rng.chance(20);
         let mut first_applies = false;
-        let result: Result<(), StoreError> = store.commit(&run, |state| {
+        let mut refusal = None;
+        let result: Result<(), StoreError> = store.commit_or_refuse(&run, |state| {
             let first = random_event(&mut rng, state, now_ms);
+            if let Event::Submitted(s) = &first {
+                let right = state.standing(s.batch, &s.worker, &s.token, now_ms);
+                if right == Some(s.standing) && !state.keeps(s.batch, s.standing) {
+                    let kind = if s.standing == Standing::Foreign {
+                        RefusalKind::Foreign
+                    } else {
+                        RefusalKind::Repeat
+                    };
+                    refusal = Some((state.iteration(), kind));
+                    let iteration = state.iteration();
+                    return Ok(((), Change::Refuse { iteration, kind }));
+                }
+            }
             first_applies = state.clone().apply(&first).is_ok();
             let mut events = vec![first];
             if bad_second {
                 events.push(note(u64::MAX, "never applies"));
             }
-            Ok(((), events))
+            Ok(((), Change::Events(events)))
         });
         // A commit rejected before its append leaves the faults unused.
         store.faults.lock().unwrap().clear();
-        match result {
-            Ok(()) => outcomes.written += 1,
-            Err(StoreError::Rejected(_)) if first_applies => outcomes.rejected_later += 1,
-            Err(StoreError::Rejected(_)) => outcomes.rejected_first += 1,
-            Err(StoreError::Io { .. }) => outcomes.not_written += 1,
-            Err(StoreError::OutcomeUnknown { .. }) => outcomes.unknown += 1,
-            Err(other) => panic!("step {step}: {other:?}"),
+        match (result, refusal) {
+            (Ok(()), Some((iteration, kind))) => {
+                outcomes.refused += 1;
+                let c = counted.entry(iteration).or_default();
+                match kind {
+                    RefusalKind::Foreign => c.foreign += 1,
+                    RefusalKind::Repeat => c.repeats += 1,
+                }
+            }
+            (result, Some(_)) => panic!("step {step}: a refusal failed: {result:?}"),
+            (result, None) => match result {
+                Ok(()) => outcomes.written += 1,
+                Err(StoreError::Rejected(_)) if first_applies => outcomes.rejected_later += 1,
+                Err(StoreError::Rejected(_)) => outcomes.rejected_first += 1,
+                Err(StoreError::Io { .. }) => outcomes.not_written += 1,
+                Err(StoreError::OutcomeUnknown { .. }) => outcomes.unknown += 1,
+                Err(other) => panic!("step {step}: {other:?}"),
+            },
         }
-        let fresh = Store::open(dir.path()).unwrap().state(&run).unwrap();
+        let new = Store::open(dir.path()).unwrap();
+        let fresh = new.state(&run).unwrap();
         assert_eq!(a.state(&run).unwrap(), fresh, "store a, step {step}");
         assert_eq!(b.state(&run).unwrap(), fresh, "store b, step {step}");
+        let refusals = new.refusals(&run).unwrap();
+        assert_eq!(a.refusals(&run).unwrap(), refusals, "store a, step {step}");
+        assert_eq!(b.refusals(&run).unwrap(), refusals, "store b, step {step}");
+        for i in 0..=fresh.iteration() {
+            let want = counted.get(&i).copied().unwrap_or_default();
+            assert_eq!(refusals.iteration(i), want, "iteration {i}, step {step}");
+        }
     }
     let end = a.state(&run).unwrap();
     outcomes.iterations = end.iteration();
@@ -1430,12 +1475,79 @@ fn two_stores_keep_the_journal_s_state_through_rejections_and_failed_writes() {
         ("rejected at a later event", o.rejected_later),
         ("write failed", o.not_written),
         ("outcome unknown", o.unknown),
+        ("refused and counted", o.refused),
     ] {
         assert!(n > 0, "no commit was {kind}: {o:?}");
     }
     // And the run went somewhere: iterations ended, and batches were issued
     // and checked.
     assert!(o.iterations > 1 && o.batches > 10 && o.checked > 5, "{o:?}");
+}
+
+#[test]
+fn a_journal_from_before_the_cap_replays_with_the_default_cap() {
+    use crate::state::{BatchIssued, Standing, Submitted, DEFAULT_MAX_UNCHECKED_PER_BATCH};
+    let submitted = |standing| {
+        Event::Submitted(Submitted {
+            batch: 0,
+            worker: "w".into(),
+            token: "t".into(),
+            iteration: 0,
+            received_ms: 5,
+            model: None,
+            programs: vec!["p".into()],
+            standing,
+        })
+    };
+    let mut records = vec![
+        vec![Event::Created {
+            config: config(),
+            tasks: tasks(),
+        }],
+        vec![Event::BatchIssued(BatchIssued {
+            batch: 0,
+            iteration: 0,
+            task: "sum".into(),
+            wanted: 1,
+            worker: "w".into(),
+            token: "t".into(),
+            issued_ms: 0,
+            deadline_ms: 10,
+            payload: "p".into(),
+        })],
+        vec![submitted(Standing::OnTime)],
+    ];
+    // More repeats than the default cap keeps: a journal from before the cap
+    // can hold them.
+    let over = DEFAULT_MAX_UNCHECKED_PER_BATCH as usize + 2;
+    records.extend((0..over).map(|_| vec![submitted(Standing::Repeat)]));
+    // The records as a journal made before the setting wrote them: the run's
+    // settings without it.
+    let field = format!(",\"max_unchecked_per_batch\":{DEFAULT_MAX_UNCHECKED_PER_BATCH}");
+    let mut text = journal::header(7);
+    for (seq, record) in records.iter().enumerate() {
+        let full = serde_json::to_string(record).unwrap();
+        assert_eq!(full.contains(&field), seq == 0);
+        let json = full.replacen(&field, "", 1);
+        let body = format!("{seq} {json}");
+        let crc = journal::crc32(body.as_bytes());
+        text.push_str(&format!("{seq} {crc:08x} {json}\n"));
+    }
+    let dir = TempDir::new().unwrap();
+    let run = id("old");
+    fs::create_dir(dir.path().join("old")).unwrap();
+    fs::write(dir.path().join("old").join("journal"), &text).unwrap();
+
+    let state = Store::open(dir.path()).unwrap().state(&run).unwrap();
+    let all: Vec<Event> = records.into_iter().flatten().collect();
+    assert_eq!(state, RunState::replay(&all).unwrap());
+    assert_eq!(
+        state.config().max_unchecked_per_batch,
+        DEFAULT_MAX_UNCHECKED_PER_BATCH
+    );
+    assert_eq!(state.iteration_counts(0).repeats, over as u64);
+    assert!(!state.keeps(0, Standing::Repeat));
+    assert!(state.keeps(0, Standing::Foreign));
 }
 
 #[test]

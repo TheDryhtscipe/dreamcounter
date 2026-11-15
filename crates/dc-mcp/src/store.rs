@@ -16,6 +16,19 @@
 //! error. If that fails too, it returns [`StoreError::OutcomeUnknown`]: the
 //! commit may or may not be in the run.
 //!
+//! # Refused submissions
+//!
+//! A submission past the run's cap on unchecked submissions for its batch
+//! (see [`crate::state::RunConfig::max_unchecked_per_batch`]) is not kept in
+//! the journal: [`Store::commit_or_refuse`] counts it instead, in the file
+//! `refused` beside the journal. The file holds a count for each iteration
+//! and kind, and the journal's id, so it does not grow with the refusals.
+//! It is written whole to `refused.new`, synced, and renamed over
+//! `refused`, under the run's lock, so a crash leaves the old count or the
+//! new one. A count is on disk before the refusal is answered. A `refused`
+//! file with another journal's id counts as none. The journal does not
+//! depend on the file.
+//!
 //! # More than one server
 //!
 //! Several stores, in one process or in several, can use the same run. Each
@@ -103,7 +116,7 @@
 //! its last record has changed, the operation fails with
 //! [`StoreError::Corrupt`], and the next one reads the journal from the start.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::hash::{BuildHasher, Hasher, RandomState};
@@ -113,6 +126,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::journal::{self, Corrupt, HeaderError, Record, ScanError};
 pub use crate::state::{Event, LogRecord, RunConfig, RunId, RunState};
@@ -124,6 +139,88 @@ const JOURNAL_NEW: &str = "journal.new";
 const CHECKS: &str = "checks";
 /// How many times a claim is tried when its file is removed meanwhile.
 const CLAIM_TRIES: usize = 8;
+const REFUSED: &str = "refused";
+const REFUSED_NEW: &str = "refused.new";
+
+/// How many submissions were refused in one iteration because their batch
+/// had as many unchecked submissions of their kind as the run keeps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefusedCounts {
+    /// Late or repeat submissions from the batch's worker. A late one is
+    /// the first from its worker, and a batch keeps at least one of this
+    /// kind, so a late one is never refused.
+    pub repeats: u64,
+    /// Foreign submissions.
+    pub foreign: u64,
+}
+
+/// The submissions of a run that were refused and counted rather than kept
+/// (see the module docs), as its `refused` file holds them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Refusals {
+    /// The id of the journal the counts are for, in hex.
+    journal: String,
+    /// The counts of each iteration that has any.
+    iterations: BTreeMap<u64, RefusedCounts>,
+}
+
+impl Refusals {
+    /// The counts of `iteration`.
+    pub fn iteration(&self, iteration: u64) -> RefusedCounts {
+        self.iterations.get(&iteration).copied().unwrap_or_default()
+    }
+
+    /// The counts of every iteration, added up.
+    pub fn total(&self) -> RefusedCounts {
+        self.iterations
+            .values()
+            .fold(RefusedCounts::default(), |a, c| RefusedCounts {
+                repeats: a.repeats.saturating_add(c.repeats),
+                foreign: a.foreign.saturating_add(c.foreign),
+            })
+    }
+}
+
+/// A run's `refused` file, for [`Store::commit_then_with_refusals`] to read
+/// while the run is locked.
+#[derive(Debug)]
+pub struct RefusalsFile {
+    dir: PathBuf,
+    id: u64,
+}
+
+impl RefusalsFile {
+    /// The refusals the file holds now.
+    pub fn read(&self) -> Result<Refusals, StoreError> {
+        read_refusals(&self.dir, self.id)
+    }
+}
+
+/// What a [`Store::commit_or_refuse`] does to a run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// Commit these events, as [`Store::commit`] does.
+    Events(Vec<Event>),
+    /// Count a submission of this kind as refused in this iteration,
+    /// and write nothing to the journal.
+    Refuse {
+        /// The run's iteration when it came in.
+        iteration: u64,
+        /// Its kind.
+        kind: RefusalKind,
+    },
+}
+
+/// The kind of a refused submission, for its count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// A late or repeat submission from the batch's worker.
+    Repeat,
+    /// A foreign submission.
+    Foreign,
+}
 
 /// How much of a journal a scan reads from the file at a time.
 const READ_BUFFER: usize = 1 << 16;
@@ -622,7 +719,11 @@ impl Store {
         G: FnOnce(T, &RunState) -> U,
         E: From<StoreError>,
     {
-        self.commit_in(run, |state, _| change(state), then)
+        self.change_then(
+            run,
+            |state, _| change(state).map(|(value, events)| (value, Change::Events(events))),
+            |value, state, _| then(value, state),
+        )
     }
 
     /// As [`Store::commit`], if the run's journal is still `journal`.
@@ -638,30 +739,93 @@ impl Store {
         F: FnOnce(&RunState) -> Result<(T, Vec<Event>), E>,
         E: From<StoreError>,
     {
-        self.commit_in(
+        self.change_then(
             run,
             |state, now| {
                 if now == journal {
-                    change(state).map(|(value, events)| (Some(value), events))
+                    change(state).map(|(value, events)| (Some(value), Change::Events(events)))
                 } else {
-                    Ok((None, Vec::new()))
+                    Ok((None, Change::Events(Vec::new())))
                 }
             },
-            |value, _| value,
+            |value, _, _| value,
         )
     }
 
-    /// [`Store::commit_then`], with `change` told which journal it sees.
-    fn commit_in<T, U, E, F, G>(&self, run: &RunId, change: F, then: G) -> Result<U, E>
+    /// As [`Store::commit_then`], where `then` can also read the run's
+    /// refusals (see [`Store::commit_or_refuse`]) while the run is locked.
+    pub fn commit_then_with_refusals<T, U, E, F, G>(
+        &self,
+        run: &RunId,
+        change: F,
+        then: G,
+    ) -> Result<U, E>
     where
-        F: FnOnce(&RunState, JournalId) -> Result<(T, Vec<Event>), E>,
-        G: FnOnce(T, &RunState) -> U,
+        F: FnOnce(&RunState) -> Result<(T, Vec<Event>), E>,
+        G: FnOnce(T, &RunState, &RefusalsFile) -> U,
+        E: From<StoreError>,
+    {
+        self.change_then(
+            run,
+            |state, _| change(state).map(|(value, events)| (value, Change::Events(events))),
+            then,
+        )
+    }
+
+    /// As [`Store::commit`], where `change` can also count a submission as
+    /// refused rather than commit events. A refusal is in the run's
+    /// `refused` file, not the journal, so a proposer that keeps sending
+    /// does not grow the journal (see the module docs). `Ok` means the
+    /// count is on disk.
+    pub fn commit_or_refuse<T, E, F>(&self, run: &RunId, change: F) -> Result<T, E>
+    where
+        F: FnOnce(&RunState) -> Result<(T, Change), E>,
+        E: From<StoreError>,
+    {
+        self.change_then(run, |state, _| change(state), |value, _, _| value)
+    }
+
+    /// The refusals counted for the run (see [`Store::commit_or_refuse`]).
+    pub fn refusals(&self, run: &RunId) -> Result<Refusals, StoreError> {
+        self.read_with_refusals(run, |_, refusals| refusals.clone())
+    }
+
+    /// What `read` makes of the run's state and its refusals now.
+    pub fn read_with_refusals<T, F>(&self, run: &RunId, read: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&RunState, &Refusals) -> T,
+    {
+        let mut locked = self.lock_run(run)?;
+        let (cached, _) = self.catch_up(run, &mut locked)?;
+        let refusals = read_refusals(&locked.dir_path, cached.id);
+        let result = refusals.map(|refusals| read(&cached.state, &refusals));
+        self.put(run, cached);
+        result
+    }
+
+    /// [`Store::commit_then`], [`Store::commit_to`] and
+    /// [`Store::commit_or_refuse`], with `change` told which journal it sees.
+    fn change_then<T, U, E, F, G>(&self, run: &RunId, change: F, then: G) -> Result<U, E>
+    where
+        F: FnOnce(&RunState, JournalId) -> Result<(T, Change), E>,
+        G: FnOnce(T, &RunState, &RefusalsFile) -> U,
         E: From<StoreError>,
     {
         let mut locked = self.lock_run(run)?;
         let (mut cached, torn_len) = self.catch_up(run, &mut locked)?;
+        let file = RefusalsFile {
+            dir: locked.dir_path.clone(),
+            id: cached.id,
+        };
+        let then = |value: T, state: &RunState| then(value, state, &file);
         let (value, mut events) = match change(&cached.state, JournalId(cached.id)) {
-            Ok(changed) => changed,
+            Ok((value, Change::Events(events))) => (value, events),
+            Ok((value, Change::Refuse { iteration, kind })) => {
+                let counted = count_refusal(&locked, cached.id, iteration, kind);
+                let result = counted.map(|()| then(value, &cached.state));
+                self.put(run, cached);
+                return result.map_err(E::from);
+            }
             Err(error) => {
                 self.put(run, cached);
                 return Err(error);
@@ -1222,6 +1386,60 @@ fn set_aside(locked: &Locked, at: u64, torn: &[u8], iteration: u64) -> Result<Ev
         }));
     }
     unreachable!("the loop ends by returning")
+}
+
+/// The journal id `id` as the `refused` file writes it.
+fn journal_id(id: u64) -> String {
+    format!("{id:016x}")
+}
+
+/// The refusals in the `refused` file of the run in `dir_path`, whose
+/// journal has id `id`. None if there is no file or it is for another
+/// journal.
+fn read_refusals(dir_path: &Path, id: u64) -> Result<Refusals, StoreError> {
+    let path = dir_path.join(REFUSED);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Refusals::default()),
+        Err(e) => return Err(io_at(&path)(e)),
+    };
+    let refusals: Refusals = serde_json::from_slice(&bytes).map_err(|e| StoreError::Io {
+        path: path.clone(),
+        error: io::Error::new(io::ErrorKind::InvalidData, e),
+    })?;
+    if refusals.journal != journal_id(id) {
+        return Ok(Refusals::default());
+    }
+    Ok(refusals)
+}
+
+/// Adds one refusal of a submission of `kind` in `iteration` to the
+/// `refused` file of the locked run, whose journal has id `id`. The new
+/// count is on disk when it returns `Ok`; on an error the file holds the
+/// old count or the new one.
+fn count_refusal(
+    locked: &Locked,
+    id: u64,
+    iteration: u64,
+    kind: RefusalKind,
+) -> Result<(), StoreError> {
+    let mut refusals = read_refusals(&locked.dir_path, id)?;
+    refusals.journal = journal_id(id);
+    let counts = refusals.iterations.entry(iteration).or_default();
+    match kind {
+        RefusalKind::Foreign => counts.foreign = counts.foreign.saturating_add(1),
+        RefusalKind::Repeat => counts.repeats = counts.repeats.saturating_add(1),
+    }
+    // Serialising these types cannot fail: every map key is a number.
+    let mut text = serde_json::to_vec(&refusals).expect("refusals serialise to JSON");
+    text.push(b'\n');
+    let new_path = locked.dir_path.join(REFUSED_NEW);
+    File::create(&new_path)
+        .and_then(|mut file| file.write_all(&text).and_then(|()| file.sync_all()))
+        .map_err(io_at(&new_path))?;
+    let path = locked.dir_path.join(REFUSED);
+    fs::rename(&new_path, &path).map_err(io_at(&path))?;
+    locked.dir.sync_all().map_err(io_at(&locked.dir_path))
 }
 
 /// Waits until the entries of directory `dir` are on disk.

@@ -106,6 +106,7 @@ fn build(past: u64) -> (TempDir, Store, RunId) {
                 proposals_per_task: 4,
                 programs_per_batch: 2,
                 lease_ms: 1000,
+                max_unchecked_per_batch: 3,
             },
             vec![MERGE.to_owned(), CANCEL.to_owned()],
         )
