@@ -453,7 +453,7 @@ fn setting_the_cancel_flag_stops_a_step_in_a_worker_and_nothing_is_written() {
         matches!(stopped, FinishError::Interrupted(_)),
         "{stopped:?}"
     );
-    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(started.elapsed() < STUCK_WALL);
     assert_eq!(journal(&dir), before);
 }
 
@@ -491,7 +491,7 @@ fn a_worker_stopped_at_the_runs_time_limit_ends_the_iteration_without_abstractio
     // The run's limit, not the worker's default of ten minutes, stops it.
     let started = std::time::Instant::now();
     let done = finish_iteration_in_worker(&store, &run, &sleeper(), &cancel).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(started.elapsed() < STUCK_WALL);
     let CompressionReport::Failed { error, .. } = &done.report.compression else {
         panic!("{:?}", done.report.compression);
     };
@@ -505,16 +505,11 @@ fn a_worker_stopped_at_the_runs_time_limit_ends_the_iteration_without_abstractio
 
 #[test]
 fn a_server_that_shuts_down_stops_its_step() {
-    use crate::server::{DcServer, RunArg};
+    use crate::server::RunArg;
 
-    let (dir, store, run) = setup(1);
-    fill(&store, &run, 0);
+    let (dir, store, run, server, runtime) = stuck_server();
     let before = journal(&dir);
-    let server = DcServer::new(Store::open(dir.path()).unwrap(), sleeper());
     let stopper = server.clone();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
     let stop = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
         stopper.shut_down();
@@ -530,13 +525,16 @@ fn a_server_that_shuts_down_stops_its_step() {
     let why = reply.unwrap_err();
     assert!(why.contains("interrupted"), "{why}");
     assert!(started.elapsed() >= Duration::from_millis(300));
-    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(started.elapsed() < STUCK_WALL);
     assert_eq!(journal(&dir), before);
     assert_eq!(store.read(&run, RunState::iteration).unwrap(), 0);
 }
 
-/// A server whose worker never answers, on a run that is ready to end, and
-/// a runtime with a clock.
+/// The time limit of the Stitch runs of `stuck_server`'s run.
+const STUCK_WALL: Duration = Duration::from_secs(20);
+
+/// A server whose worker does not answer within the run's limit of
+/// `STUCK_WALL`, on a run that is ready to end, and a runtime with a clock.
 fn stuck_server() -> (
     TempDir,
     Store,
@@ -544,7 +542,15 @@ fn stuck_server() -> (
     crate::server::DcServer,
     tokio::runtime::Runtime,
 ) {
-    let (dir, store, run) = setup(1);
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("r").unwrap();
+    // A step that is not stopped ends at this limit, without the error the
+    // tests look for, so a test fails then and does not wait long.
+    let mut config = config(1, shipped_prelude());
+    config.stitch.wall_ms = STUCK_WALL.as_millis() as u64;
+    let tasks = TASKS.iter().map(|t| (*t).to_owned()).collect();
+    store.create_run(&run, config, tasks).unwrap();
     fill(&store, &run, 0);
     let server = crate::server::DcServer::new(Store::open(dir.path()).unwrap(), sleeper());
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -561,7 +567,6 @@ fn a_call_the_client_cancels_stops_its_step_and_writes_nothing() {
     let (dir, store, run, server, runtime) = stuck_server();
     let before = journal(&dir);
     let started = std::time::Instant::now();
-    // The worker would run for the run's 600 seconds.
     let reply = runtime.block_on(server.finish_iteration_for_test(
         RunArg {
             run: "r".to_owned(),
@@ -571,7 +576,7 @@ fn a_call_the_client_cancels_stops_its_step_and_writes_nothing() {
     let why = reply.unwrap_err();
     assert!(why.contains("interrupted"), "{why}");
     assert!(started.elapsed() >= Duration::from_millis(300));
-    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(started.elapsed() < STUCK_WALL);
     assert_eq!(journal(&dir), before);
     assert_eq!(store.read(&run, RunState::iteration).unwrap(), 0);
 }
@@ -599,7 +604,7 @@ fn a_call_whose_future_is_dropped_stops_its_step_and_writes_nothing() {
     // Dropping the runtime waits for the step's thread, which ends once its
     // worker is stopped.
     drop(runtime);
-    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(started.elapsed() < STUCK_WALL);
     assert_eq!(journal(&dir), before);
     assert_eq!(store.read(&run, RunState::iteration).unwrap(), 0);
 }
@@ -689,8 +694,8 @@ fn a_cancelled_notification_stops_the_step_of_its_call() {
             "params": { "name": "dc_finish_iteration", "arguments": { "run": "r" } }
         }))
         .await;
-        // The call runs: its worker would go on for the run's 600 seconds.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        // The call runs, and would go on for the run's time limit.
+        let deadline = tokio::time::Instant::now() + STUCK_WALL / 2;
         while server.finish_calls_running() != 1 {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -712,6 +717,27 @@ fn a_cancelled_notification_stops_the_step_of_its_call() {
         serving.abort();
     });
     drop(runtime);
+    assert_eq!(journal(&dir), before);
+    assert_eq!(store.read(&run, RunState::iteration).unwrap(), 0);
+}
+
+#[test]
+fn a_call_that_starts_after_the_server_shut_down_is_stopped() {
+    use crate::server::RunArg;
+
+    let (dir, store, run, server, runtime) = stuck_server();
+    let before = journal(&dir);
+    server.shut_down();
+    let started = std::time::Instant::now();
+    let reply = runtime.block_on(server.finish_iteration_for_test(
+        RunArg {
+            run: "r".to_owned(),
+        },
+        std::future::pending(),
+    ));
+    let why = reply.unwrap_err();
+    assert!(why.contains("interrupted"), "{why}");
+    assert!(started.elapsed() < STUCK_WALL);
     assert_eq!(journal(&dir), before);
     assert_eq!(store.read(&run, RunState::iteration).unwrap(), 0);
 }

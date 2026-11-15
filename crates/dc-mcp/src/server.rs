@@ -460,10 +460,12 @@ impl DcServer {
         }
     }
 
-    /// Stops the Stitch run of every `dc_finish_iteration` call of this
-    /// server and its clones, running or still to come: each fails as
-    /// interrupted and writes nothing. Call it when the client is gone, so
-    /// that a call does not go on for as long as its Stitch run may take.
+    /// Stops every `dc_finish_iteration` call of this server and its
+    /// clones, running or still to come: its Stitch run stops, and the call
+    /// fails as interrupted and writes nothing, unless it had already read
+    /// its cancel flag for the commit (`crate::iterate`). Call it when the
+    /// client is gone, so that a call does not go on for as long as its
+    /// Stitch run may take.
     pub fn shut_down(&self) {
         self.stops.stop_all();
     }
@@ -512,7 +514,9 @@ impl DcServer {
     }
 
     /// `dc_finish_iteration`. When `cancelled` is done, or this future is
-    /// dropped, the call's Stitch run stops and the call writes nothing.
+    /// dropped, the call's cancel flag is set: its Stitch run stops, and
+    /// the call writes nothing unless its commit had already read the flag
+    /// (`crate::iterate`).
     async fn finish(
         &self,
         arg: RunArg,
@@ -756,9 +760,9 @@ impl DcServer {
                        Stitch for at most the run's stitch.wall_seconds, then checks what \
                        proposers submitted meanwhile, up to 8 times. If Stitch is stopped at a \
                        limit the iteration still ends, with the library unchanged. If you \
-                       cancel the call while Stitch runs, Stitch stops and the run is not \
-                       changed; a cancel that comes later may not stop the change, so read \
-                       dc_run_status. Returns what the step did and the run's status; the full \
+                       cancel the call before its change is written, Stitch stops and the run \
+                       is not changed. A cancelled call gets no reply, and a cancel may come \
+                       too late, so read dc_run_status afterwards. Returns what the step did and the run's status; the full \
                        report is in the run's log."
     )]
     async fn finish_iteration(

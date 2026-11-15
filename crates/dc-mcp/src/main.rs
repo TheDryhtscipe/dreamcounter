@@ -105,8 +105,10 @@ fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn st
                     Ok(service) => service.waiting().await.map(|_| ()).map_err(Into::into),
                     Err(e) => Err(e.into()),
                 };
-                // The client is gone. A Stitch run would go on for as long
-                // as its limit allows; stop it, and its call writes nothing.
+                // The client is gone, and rmcp has waited some seconds for
+                // the calls that were running. A Stitch run would go on for
+                // as long as its limit allows; stop it. Its call then writes
+                // nothing. A call that ended during rmcp's wait has written.
                 server.shut_down();
                 return served;
             }

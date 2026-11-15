@@ -45,8 +45,9 @@
 //! record says why (D19, item 6).
 //!
 //! The cancel flag of [`finish_iteration_in_worker`] is read while Stitch
-//! runs and once more before the first commit. A flag set after that does
-//! not stop the commit.
+//! runs, and under the run's lock at each attempt to commit. A flag set
+//! after the attempt that commits has read it does not stop the commit. It
+//! is not read while the step measures programs before Stitch.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -334,8 +335,8 @@ pub fn finish_iteration(
 /// `start` says, under the time and memory limits of the run's settings
 /// ([`StitchSettings`]). Setting `cancel` from another thread stops the
 /// worker within about 50 milliseconds; the result is then
-/// [`FinishError::Interrupted`]. If `cancel` is set when the step is done
-/// and nothing is committed yet, the result is the same.
+/// [`FinishError::Interrupted`]. The result is the same if `cancel` is set
+/// when an attempt to commit reads it, under the run's lock.
 pub fn finish_iteration_in_worker(
     store: &Store,
     run: &RunId,
@@ -391,13 +392,6 @@ fn finish(store: &Store, run: &RunId, runner: Runner<'_>) -> Result<Finished, Fi
         DriverError::Interrupted(why) => FinishError::Interrupted(why.to_string()),
         other => FinishError::State(other),
     })?;
-    // A step with no programs for Stitch starts no worker, and a cancel may
-    // come after the worker is done.
-    if cancelled.is_some_and(|c| c.load(Ordering::SeqCst)) {
-        return Err(FinishError::Interrupted(
-            "the call was cancelled".to_owned(),
-        ));
-    }
 
     let used = snap.candidates.len() as u64;
     let mut events = Vec::with_capacity(snap.tasks.len() + 3);
@@ -444,6 +438,14 @@ fn finish(store: &Store, run: &RunId, runner: Runner<'_>) -> Result<Finished, Fi
         // is where the step read it. The frontiers and the library change
         // only when an iteration ends, so they are as the step read them.
         let wrote = store.commit_to(run, journal, |state| -> Result<_, FinishError> {
+            // Read under the run's lock, at each attempt: a step with no
+            // programs for Stitch starts no worker, and a cancel may come
+            // after the worker is done or while the call waits for the lock.
+            if cancelled.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                return Err(FinishError::Interrupted(
+                    "the call was cancelled".to_owned(),
+                ));
+            }
             if state.iteration() != snap.iteration || state.library().len() != snap.library.len() {
                 return Err(beaten());
             }
