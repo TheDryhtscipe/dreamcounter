@@ -5,7 +5,7 @@ title: 'D16: Going back keeps open-scope memo entries whose nodes were not chang
 type: decision
 scope: internal
 created_at: '2026-11-04T23:04:37.930456Z'
-updated_at: '2026-11-05T14:05:41.509548Z'
+updated_at: '2026-11-13T02:51:19.074208Z'
 ---
 
 - **Date:** 2026-11-04, reworked 2026-11-05. **Status:** accepted; merged 2026-11-05 in PR 48 as `d96299c`. It refines D13 (doc-mnj). Bead `dreamcounter-772e12`.
@@ -38,6 +38,12 @@ Once a kept key survives `back_to`, no checkpoint is open, and it has the same s
 - `going_back_keeps_memo_entries_it_does_not_change` (tests.rs): on `partition_chain(a, 80, true)`, a test-only counter (`repeat_tries`) counts keys the second walk infers afresh after it has already done so. The test requires fewer repeats than rollbacks. Without the change it fails with 3,474 repeats and 80 rollbacks.
 - `going_back_drops_memo_entries_whose_scope_lost_a_key_constraint` (tests.rs): a shared subterm uses `x` as a `memorec` key inside a try that then fails. It fails if `differs` does not compare the `Key` flag.
 - `keeping_memo_entries_costs_nothing_until_a_use_fails` (tests.rs): many shared subterms `s_i = (add i g)` have a helper over a large type in scope, but take their type from the memo entry of `g`, and no use fails before the error at the tail. The second walk must cost at most 1.1 times the first. Recording each key's nodes as it was kept, as the first version of this decision did, cost 1.76 times the first walk at `m` = 100 and 2.56 times at `m` = 4,000 with a cap on the recording, and 13.6 times and out of budget without one.
+- Four tests added for bead `dreamcounter-7b9905` (tests.rs, PR 52) each fail when one part of the check is removed, where no earlier test did:
+  - `going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_through_a_link` fails if `first_change` does not follow a link. A helper's `Canon` names its free variable's node as it was at the `let`, so that node can be a link when a use is tried.
+  - `going_back_drops_memo_entries_whose_scope_reaches_a_changed_node_in_a_first_child` and `..._in_a_second_child` fail if `first_change` skips that child of a constructor.
+  - `going_back_drops_memo_entries_whose_node_changed_before_and_after_they_were_kept` fails if `back_to` maps a node to its last change on the trail instead of its first. The second change is a link made by `apply_scope` after the key was kept.
+- These tests make ranks differ at each union they rely on. They still catch their mutant when union by rank breaks ties the other way. Their judge is the `debug_assert` in `run`, so they are ignored without debug assertions.
+- A mutation run over the `types::` tests (each mutant alone) found these gaps. With the tests added, every mutant is caught except four: counting a change from one link to another (stricter, so it costs only reuse), the two safety rules under "Costs and limits", and skipping the walk of the kept type in `keep_logged` (bead `dreamcounter-414f99`).
 - The existing judges: the errors equal the tree walk's, there are at most as many rollbacks as shared subterms, and `locate_cost` holds.
 
 ## Measured
