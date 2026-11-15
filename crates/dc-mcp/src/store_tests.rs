@@ -1613,3 +1613,44 @@ fn a_refused_file_of_another_journal_counts_as_none_whatever_its_fields() {
     let again = Store::open(dir.path()).unwrap();
     assert_eq!(again.refusals(&run).unwrap().iteration(0), counts);
 }
+
+#[test]
+fn a_well_formed_refused_file_of_another_journal_counts_as_none() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = id("r1");
+    store.create_run(&run, config(), tasks()).unwrap();
+    // A file another journal's run left, in this version's form.
+    let path = dir.path().join("r1").join("refused");
+    let other = r#"{"journal":"0000000000000001","iterations":{"0":{"repeats":5,"foreign":2}}}"#;
+    fs::write(&path, other).unwrap();
+
+    assert_eq!(store.refusals(&run).unwrap(), Refusals::default());
+    refuse_one(&store, &run).unwrap();
+    let counts = store.refusals(&run).unwrap().iteration(0);
+    assert_eq!((counts.repeats, counts.foreign), (1, 0));
+    assert!(!fs::read_to_string(&path)
+        .unwrap()
+        .contains("0000000000000001"));
+}
+
+#[test]
+fn a_refused_file_that_cannot_be_read_counts_as_none() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = id("r1");
+    store.create_run(&run, config(), tasks()).unwrap();
+    // Reading a directory fails with an I/O error, not a parse error.
+    fs::create_dir(dir.path().join("r1").join("refused")).unwrap();
+
+    let got = store.read_with_refusals(&run, |state, refusals| {
+        (state.iteration(), refusals.iteration(0))
+    });
+    assert_eq!(got.unwrap(), (0, RefusedCounts::default()));
+    let noted = store.commit_then_with_refusals(
+        &run,
+        |state| Ok::<_, StoreError>(((), vec![note(state.iteration(), "n")])),
+        |(), _, refusals| refusals.read(),
+    );
+    assert_eq!(noted.unwrap(), Refusals::default());
+}

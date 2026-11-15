@@ -437,25 +437,20 @@ impl DcServer {
     ) -> Result<Json<RunStatus>, String> {
         let run = run_id(&arg.run)?;
         self.blocking(move |store| {
-            let noted: Result<Result<RunStatus, String>, StoreError> = store
-                .commit_then_with_refusals(
-                    &run,
-                    |state| {
-                        let note = Event::Logged(LogRecord {
-                            kind: LogKind::Note,
-                            iteration: state.iteration(),
-                            task: None,
-                            text: arg.text,
-                        });
-                        Ok(((), vec![note]))
-                    },
-                    |(), state, refusals| match refusals.read() {
-                        Ok(refusals) => Ok(RunStatus::of(&run, state, &refusals)),
-                        // The note is on disk; only the status failed.
-                        Err(e) => Err(format!("the remark is written, but the status failed: {e}")),
-                    },
-                );
-            noted.map_err(|e| e.to_string())?
+            let noted: Result<RunStatus, StoreError> = store.commit_then_with_refusals(
+                &run,
+                |state| {
+                    let note = Event::Logged(LogRecord {
+                        kind: LogKind::Note,
+                        iteration: state.iteration(),
+                        task: None,
+                        text: arg.text,
+                    });
+                    Ok(((), vec![note]))
+                },
+                |(), state, refusals| RunStatus::of(&run, state, &refusals.read()),
+            );
+            noted.map_err(|e| e.to_string())
         })
         .await
     }

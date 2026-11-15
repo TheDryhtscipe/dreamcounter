@@ -94,7 +94,7 @@ pub struct RunConfig {
     /// The most submissions kept for one batch that are not checked, of
     /// each of two kinds: foreign ones, and late or repeat ones from the
     /// batch's worker. A submission past it is refused and counted, not
-    /// kept (see `Store::refuse`). It is positive. A run made before the
+    /// kept (see [`Store::commit_or_refuse`](crate::store::Store::commit_or_refuse)). It is positive. A run made before the
     /// setting has [`DEFAULT_MAX_UNCHECKED_PER_BATCH`].
     #[serde(default = "default_max_unchecked_per_batch")]
     pub max_unchecked_per_batch: u32,

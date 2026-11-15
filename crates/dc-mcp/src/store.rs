@@ -27,7 +27,8 @@
 //! `refused`, under the run's lock, so a crash leaves the old count or the
 //! new one. A count is on disk before the refusal is answered. A `refused`
 //! file with another journal's id, or one that does not read, counts as none
-//! (the second is reported on standard error), and the next refusal writes
+//! (the second is reported on standard error, and covers a file that cannot
+//! be read at all), and the next refusal writes
 //! over it. The journal does not depend on the file.
 //!
 //! # More than one server
@@ -193,8 +194,9 @@ pub struct RefusalsFile {
 }
 
 impl RefusalsFile {
-    /// The refusals the file holds now.
-    pub fn read(&self) -> Result<Refusals, StoreError> {
+    /// The refusals the file holds now: none if it cannot be read (see
+    /// the module docs).
+    pub fn read(&self) -> Refusals {
         read_refusals(&self.dir, self.journal)
     }
 }
@@ -799,9 +801,9 @@ impl Store {
         let mut locked = self.lock_run(run)?;
         let (cached, _) = self.catch_up(run, &mut locked)?;
         let refusals = read_refusals(&locked.dir_path, JournalId(cached.id));
-        let result = refusals.map(|refusals| read(&cached.state, &refusals));
+        let result = read(&cached.state, &refusals);
         self.put(run, cached);
-        result
+        Ok(result)
     }
 
     /// [`Store::commit_then`], [`Store::commit_to`] and
@@ -1396,22 +1398,12 @@ fn journal_id(journal: JournalId) -> String {
 
 /// The refusals in the `refused` file of the run in `dir_path`, whose
 /// journal is `journal`. None if there is no file or it is for another
-/// journal. None too if it does not read, which is reported on standard
-/// error; the next refusal writes over it. Only a failed read is an error.
-fn read_refusals(dir_path: &Path, journal: JournalId) -> Result<Refusals, StoreError> {
+/// journal. None too if it cannot be read or does not parse, which is
+/// reported on standard error; the next refusal writes over it. So a damaged
+/// file never stops a run.
+fn read_refusals(dir_path: &Path, journal: JournalId) -> Refusals {
     let path = dir_path.join(REFUSED);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Refusals::default()),
-        Err(e) => return Err(io_at(&path)(e)),
-    };
-    // The journal's id first, with any other fields, so that a file of
-    // another journal counts as none whatever else it holds.
-    #[derive(Deserialize)]
-    struct Owner {
-        journal: String,
-    }
-    let unreadable = |e: serde_json::Error| {
+    let unreadable = |e: &dyn fmt::Display| {
         // Standard error may be closed; the counts start again from none,
         // and the next refusal writes over the file.
         let _ = writeln!(
@@ -1419,18 +1411,29 @@ fn read_refusals(dir_path: &Path, journal: JournalId) -> Result<Refusals, StoreE
             "dc-mcp: {}: the refusal counts do not read ({e}); they count as none",
             path.display()
         );
-        Ok(Refusals::default())
+        Refusals::default()
     };
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Refusals::default(),
+        Err(e) => return unreadable(&e),
+    };
+    // The journal's id first, with any other fields, so that a file of
+    // another journal counts as none whatever else it holds.
+    #[derive(Deserialize)]
+    struct Owner {
+        journal: String,
+    }
     let owner: Owner = match serde_json::from_slice(&bytes) {
         Ok(owner) => owner,
-        Err(e) => return unreadable(e),
+        Err(e) => return unreadable(&e),
     };
     if owner.journal != journal_id(journal) {
-        return Ok(Refusals::default());
+        return Refusals::default();
     }
     match serde_json::from_slice(&bytes) {
-        Ok(refusals) => Ok(refusals),
-        Err(e) => unreadable(e),
+        Ok(refusals) => refusals,
+        Err(e) => unreadable(&e),
     }
 }
 
@@ -1444,7 +1447,7 @@ fn count_refusal(
     iteration: u64,
     kind: RefusalKind,
 ) -> Result<(), StoreError> {
-    let mut refusals = read_refusals(&locked.dir_path, journal)?;
+    let mut refusals = read_refusals(&locked.dir_path, journal);
     refusals.journal = journal_id(journal);
     let counts = refusals.iterations.entry(iteration).or_default();
     match kind {
