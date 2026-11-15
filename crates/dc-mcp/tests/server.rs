@@ -825,7 +825,7 @@ fn the_deepest_programs_a_proposer_can_send_do_not_crash_the_server() {
     // starts.
     let store = Store::open(dir.path()).unwrap();
     let run = RunId::new("r1").unwrap();
-    let held = dc_mcp::proposer::next_batch(&store, &run, "agent-2", 0)
+    let held = dc_mcp::proposer::next_batch(&store, &run, "agent-2", 0, &Default::default())
         .unwrap()
         .batch
         .unwrap();
@@ -911,7 +911,7 @@ fn the_operator_can_check_what_a_stopped_proposer_left() {
     // A proposer server took a submission and stopped before checking it.
     let store = Store::open(dir.path()).unwrap();
     let run = RunId::new("r1").unwrap();
-    let sent = dc_mcp::proposer::next_batch(&store, &run, "a", 0)
+    let sent = dc_mcp::proposer::next_batch(&store, &run, "a", 0, &Default::default())
         .unwrap()
         .batch
         .unwrap();

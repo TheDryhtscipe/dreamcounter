@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::proposer::{check_pending, next_batch, submit, Clock, NextBatch, Receipt, Refused};
 use crate::state::{Arm, Event, LogKind, LogRecord, RunConfig, RunId, RunState};
 use crate::store::{Store, StoreError};
+use crate::verify::VerifierCache;
 
 /// The arguments of `dc_create_run`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -470,7 +471,10 @@ impl DcServer {
     ) -> Result<Json<CheckReport>, String> {
         let run = run_id(&arg.run)?;
         self.blocking(move |store| {
-            let checked = check_pending(store, &run).map_err(|e| e.to_string())?;
+            // This server serves many runs, so it keeps no verifier between
+            // calls; one call builds one for each library length it meets.
+            let verifiers = VerifierCache::default();
+            let checked = check_pending(store, &run, &verifiers).map_err(|e| e.to_string())?;
             let pending_checks = store
                 .read(&run, |state| state.pending_checks().len())
                 .map_err(|e| e.to_string())?;
@@ -536,6 +540,8 @@ pub struct ProposerServer {
     run: RunId,
     clock: Arc<dyn Clock>,
     checker: Arc<Checker>,
+    /// The verifier of the run's latest library, for batches and checks.
+    verifiers: Arc<VerifierCache>,
 }
 
 /// Runs the checks of pending submissions, one at a time in each process.
@@ -595,6 +601,7 @@ impl ProposerServer {
             run,
             clock,
             checker: Arc::default(),
+            verifiers: Arc::default(),
         }
     }
 
@@ -607,11 +614,12 @@ impl ProposerServer {
         let store = Arc::clone(&self.store);
         let run = self.run.clone();
         let checker = Arc::clone(&self.checker);
+        let verifiers = Arc::clone(&self.verifiers);
         tokio::task::spawn_blocking(move || {
             let mut retry = CHECK_RETRY_FIRST;
             checker.drain(
                 || match catch_check(|| {
-                    check_pending(&store, &run)
+                    check_pending(&store, &run, &verifiers)
                         .map(|_| ())
                         .map_err(|e| e.to_string())
                 }) {
@@ -715,7 +723,8 @@ impl ProposerServer {
         &self,
         Parameters(arg): Parameters<NextBatchArgs>,
     ) -> Result<Json<NextBatch>, String> {
-        self.blocking(move |store, run, now| next_batch(store, run, &arg.worker, now))
+        let verifiers = Arc::clone(&self.verifiers);
+        self.blocking(move |store, run, now| next_batch(store, run, &arg.worker, now, &verifiers))
             .await
     }
 

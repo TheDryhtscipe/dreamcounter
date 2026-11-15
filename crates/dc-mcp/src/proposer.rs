@@ -34,6 +34,7 @@
 //! was not sent, whatever worker id it gives.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmcp::schemars;
@@ -44,7 +45,7 @@ use crate::state::{
     BatchIssued, Check, Checked, Event, LibraryEntry, RunId, RunState, Standing, Submitted,
 };
 use crate::store::{Store, StoreError};
-use crate::verify::{task, Verifier};
+use crate::verify::{task, Verifier, VerifierCache};
 
 /// The longest worker id or model name, in bytes.
 pub const MAX_NAME_LEN: usize = 200;
@@ -153,67 +154,129 @@ fn wait(state: &RunState, now_ms: u64) -> Wait {
     }
 }
 
+/// What one attempt of [`next_batch`] under the run's lock came to.
+enum Attempt {
+    /// The reply. The events committed with it are the commit's.
+    Done(NextBatch),
+    /// A batch is due, but the cache has no verifier for the run's library,
+    /// which is this copy. It is built without the lock and the attempt made
+    /// again.
+    Build(Vec<LibraryEntry>),
+}
+
 /// Hands `worker` the next batch of `run` at `now_ms`, or says why there is
-/// none.
+/// none. The payload is built with the verifier `verifiers` keeps for the
+/// run's library.
+///
+/// When `verifiers` has no verifier for the run's library, the verifier is
+/// built without the run's lock and the request made again under it. If the
+/// library grew in the meantime, the second attempt builds the verifier
+/// under the lock rather than try again.
 pub fn next_batch(
     store: &Store,
     run: &RunId,
     worker: &str,
     now_ms: u64,
+    verifiers: &VerifierCache,
+) -> Result<NextBatch, Refused> {
+    next_batch_with(store, run, worker, now_ms, verifiers, || {})
+}
+
+/// [`next_batch`], which runs `built` after it builds a verifier without the
+/// lock. Tests use it to change the run in that window.
+fn next_batch_with(
+    store: &Store,
+    run: &RunId,
+    worker: &str,
+    now_ms: u64,
+    verifiers: &VerifierCache,
+    mut built: impl FnMut(),
 ) -> Result<NextBatch, Refused> {
     check_name("worker id", worker)?;
-    store.commit(run, |state| {
-        // One live batch at a time for each worker id, so that a proposer
-        // that keeps asking under one id cannot hold every slot. Ids are what
-        // the caller says, so one that uses many ids still can.
-        let held = state.leased(now_ms).find(|(_, b)| b.worker == worker);
-        if let Some((held, b)) = held {
-            let left = (b.deadline_ms - now_ms).div_ceil(1000).max(1);
-            let reply = NextBatch {
-                batch: None,
-                wait: Some(Wait {
-                    reason: format!(
-                        "you hold batch {held}; submit it with dc_submit, with its token, \
-                         before you ask for another. If you no longer have it, it is released \
-                         when its lease ends, in {left} seconds"
-                    ),
-                    retry_after_seconds: left,
-                }),
-            };
-            return Ok((reply, Vec::new()));
+    let mut built_outside = false;
+    loop {
+        let attempt = store.commit(run, |state| {
+            issue(state, worker, now_ms, verifiers, built_outside)
+        })?;
+        match attempt {
+            Attempt::Done(reply) => return Ok(reply),
+            Attempt::Build(library) => {
+                verifiers
+                    .get_or_build(&library)
+                    .map_err(|e| Refused::State(e.to_string()))?;
+                built_outside = true;
+                built();
+            }
         }
-        let Some((name, wanted)) = state.next_task(now_ms) else {
-            let reply = NextBatch {
-                batch: None,
-                wait: Some(wait(state, now_ms)),
-            };
-            return Ok((reply, Vec::new()));
-        };
-        let family =
-            task(name).ok_or_else(|| Refused::State(format!("there is no task {name:?}")))?;
-        let verifier = Verifier::new(state.library()).map_err(|e| Refused::State(e.to_string()))?;
-        let batch = state.batch_count();
-        let token = new_token()?;
-        let sent = payload(state, &verifier, &*family, batch, &token, wanted);
-        let text = serde_json::to_string(&sent)
-            .map_err(|e| Refused::State(format!("the payload does not serialise: {e}")))?;
-        let event = Event::BatchIssued(BatchIssued {
-            batch,
-            iteration: state.iteration(),
-            task: name.to_owned(),
-            wanted,
-            worker: worker.to_owned(),
-            token,
-            issued_ms: now_ms,
-            deadline_ms: now_ms.saturating_add(state.config().lease_ms),
-            payload: text,
-        });
+    }
+}
+
+/// [`next_batch`] under the run's lock. Builds a verifier only if
+/// `build_here`; otherwise asks for one to be built when `verifiers` has
+/// none for the run's library.
+fn issue(
+    state: &RunState,
+    worker: &str,
+    now_ms: u64,
+    verifiers: &VerifierCache,
+    build_here: bool,
+) -> Result<(Attempt, Vec<Event>), Refused> {
+    // One live batch at a time for each worker id, so that a proposer
+    // that keeps asking under one id cannot hold every slot. Ids are what
+    // the caller says, so one that uses many ids still can.
+    let held = state.leased(now_ms).find(|(_, b)| b.worker == worker);
+    if let Some((held, b)) = held {
+        let left = (b.deadline_ms - now_ms).div_ceil(1000).max(1);
         let reply = NextBatch {
-            batch: Some(sent),
-            wait: None,
+            batch: None,
+            wait: Some(Wait {
+                reason: format!(
+                    "you hold batch {held}; submit it with dc_submit, with its token, \
+                     before you ask for another. If you no longer have it, it is released \
+                     when its lease ends, in {left} seconds"
+                ),
+                retry_after_seconds: left,
+            }),
         };
-        Ok((reply, vec![event]))
-    })
+        return Ok((Attempt::Done(reply), Vec::new()));
+    }
+    let Some((name, wanted)) = state.next_task(now_ms) else {
+        let reply = NextBatch {
+            batch: None,
+            wait: Some(wait(state, now_ms)),
+        };
+        return Ok((Attempt::Done(reply), Vec::new()));
+    };
+    let family = task(name).ok_or_else(|| Refused::State(format!("there is no task {name:?}")))?;
+    // Only a verifier built for exactly the library under the lock is used.
+    let verifier: Arc<Verifier> = match verifiers.get(state.library()) {
+        Some(kept) => kept,
+        None if build_here => verifiers
+            .get_or_build(state.library())
+            .map_err(|e| Refused::State(e.to_string()))?,
+        None => return Ok((Attempt::Build(state.library().to_vec()), Vec::new())),
+    };
+    let batch = state.batch_count();
+    let token = new_token()?;
+    let sent = payload(state, &verifier, &*family, batch, &token, wanted);
+    let text = serde_json::to_string(&sent)
+        .map_err(|e| Refused::State(format!("the payload does not serialise: {e}")))?;
+    let event = Event::BatchIssued(BatchIssued {
+        batch,
+        iteration: state.iteration(),
+        task: name.to_owned(),
+        wanted,
+        worker: worker.to_owned(),
+        token,
+        issued_ms: now_ms,
+        deadline_ms: now_ms.saturating_add(state.config().lease_ms),
+        payload: text,
+    });
+    let reply = NextBatch {
+        batch: Some(sent),
+        wait: None,
+    };
+    Ok((Attempt::Done(reply), vec![event]))
 }
 
 /// What `dc_submit` returns. In the blind arm it says only what came in.
@@ -297,37 +360,53 @@ pub fn submit(
     Ok(receipt)
 }
 
+/// The library a pending submission is checked with.
+enum Library {
+    /// The verifier the cache keeps for it.
+    Kept(Arc<Verifier>),
+    /// A copy of it, when the cache keeps no verifier for it.
+    Copied(Vec<LibraryEntry>),
+}
+
 /// A submission that waits to be checked, and the library to check it with.
 struct Pending {
     batch: u64,
     task: String,
     wanted: usize,
     programs: Vec<String>,
-    library: Vec<LibraryEntry>,
+    library_len: usize,
+    library: Library,
 }
 
-fn first_pending(state: &RunState) -> Option<Pending> {
+fn first_pending(state: &RunState, verifiers: &VerifierCache) -> Option<Pending> {
     let batch = state.first_pending_check()?;
     let b = state.batch(batch)?;
+    // The library is copied only when the cache has no verifier for it.
+    let library = match verifiers.get(state.library()) {
+        Some(kept) => Library::Kept(kept),
+        None => Library::Copied(state.library().to_vec()),
+    };
     Some(Pending {
         batch,
         task: b.task.clone(),
         wanted: b.wanted as usize,
         programs: b.awaiting_check.clone().unwrap_or_default(),
-        library: state.library().to_vec(),
+        library_len: state.library().len(),
+        library,
     })
 }
 
-/// Checks `programs` for a batch of `task` that asked for `wanted`.
+/// Checks `programs` for a batch of `task` that asked for `wanted`, with a
+/// clone of `verifier`, so the checks do not add to the kept one.
 fn checks(
-    library: &[LibraryEntry],
+    verifier: &Verifier,
     task_name: &str,
     wanted: usize,
     programs: &[String],
 ) -> Result<Vec<Check>, Refused> {
     let family =
         task(task_name).ok_or_else(|| Refused::State(format!("there is no task {task_name:?}")))?;
-    let mut verifier = Verifier::new(library).map_err(|e| Refused::State(e.to_string()))?;
+    let mut verifier = verifier.clone();
     Ok(programs
         .iter()
         .enumerate()
@@ -343,23 +422,35 @@ fn checks(
 
 /// Checks every submission of `run` that waits to be checked, oldest first,
 /// and commits a [`Checked`] event for each. Returns how many it checked.
+/// The checks use the verifier `verifiers` keeps for the run's library; if
+/// it keeps none, one is built and kept.
 ///
-/// Checking runs the programs, so it runs without the run's lock, on a copy.
-/// If the library changed in the meantime, the commit is refused and the
-/// submission is checked again. If another server checked it first, nothing
-/// is written. An error leaves the rest waiting: a library that does not load
-/// stops every check until it is put right.
-pub fn check_pending(store: &Store, run: &RunId) -> Result<usize, Refused> {
+/// Checking runs the programs, so it runs without the run's lock, and so
+/// does a build of the verifier. If the library changed in the meantime, the
+/// commit is refused and the submission is checked again. If another server
+/// checked it first, nothing is written. An error leaves the rest waiting: a
+/// library that does not load stops every check until it is put right.
+pub fn check_pending(
+    store: &Store,
+    run: &RunId,
+    verifiers: &VerifierCache,
+) -> Result<usize, Refused> {
     let mut done = 0;
-    while let Some(p) = store.read(run, first_pending)? {
-        let checks = checks(&p.library, &p.task, p.wanted, &p.programs)?;
+    while let Some(p) = store.read(run, |state| first_pending(state, verifiers))? {
+        let verifier = match p.library {
+            Library::Kept(kept) => kept,
+            Library::Copied(library) => verifiers
+                .get_or_build(&library)
+                .map_err(|e| Refused::State(e.to_string()))?,
+        };
+        let checks = checks(&verifier, &p.task, p.wanted, &p.programs)?;
         let event = Event::Checked(Checked {
             batch: p.batch,
-            library_len: p.library.len() as u64,
+            library_len: p.library_len as u64,
             checks,
         });
         let wrote: bool = store.commit(run, |state| -> Result<_, Refused> {
-            let still = state.awaits_check(p.batch) && state.library().len() == p.library.len();
+            let still = state.awaits_check(p.batch) && state.library().len() == p.library_len;
             Ok(if still {
                 (true, vec![event])
             } else {
@@ -381,6 +472,24 @@ mod tests {
 
     const MERGE: &str = "collapse/merge";
     const CANCEL: &str = "collapse/cancel";
+
+    thread_local! {
+        /// The verifiers of this test's run, as one server keeps them.
+        static VERIFIERS: VerifierCache = VerifierCache::default();
+    }
+
+    fn next_batch(
+        store: &Store,
+        run: &RunId,
+        worker: &str,
+        now_ms: u64,
+    ) -> Result<NextBatch, Refused> {
+        VERIFIERS.with(|v| super::next_batch(store, run, worker, now_ms, v))
+    }
+
+    fn check_pending(store: &Store, run: &RunId) -> Result<usize, Refused> {
+        VERIFIERS.with(|v| super::check_pending(store, run, v))
+    }
 
     fn setup(quota: u32, per_batch: u32) -> (TempDir, Store, RunId) {
         let dir = TempDir::new().unwrap();
@@ -763,6 +872,103 @@ mod tests {
         assert_eq!(submissions(&store, &run)[3].standing, Standing::OnTime);
         check_pending(&store, &run).unwrap();
         assert_eq!(store.state(&run).unwrap().task_counts(0, MERGE).passed, 1);
+    }
+
+    /// A library entry that loads: the identity.
+    fn identity() -> LibraryEntry {
+        LibraryEntry {
+            arity: 1,
+            term: "(lam $0)".into(),
+        }
+    }
+
+    fn extend(store: &Store, run: &RunId) {
+        store
+            .append(
+                run,
+                vec![Event::LibraryExtended {
+                    entries: vec![identity()],
+                }],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_verifier_is_built_once_for_each_library_length() {
+        let (_dir, store, run) = setup(4, 1);
+        let start = crate::verify::builds();
+        let built = || crate::verify::builds() - start;
+        for (i, worker) in ["a", "b", "c"].into_iter().enumerate() {
+            let sent = next_batch(&store, &run, worker, 0).unwrap().batch.unwrap();
+            assert_eq!(sent.batch, i as u64);
+        }
+        sub(&store, &run, 0, "a", vec![solves_merge()], None, 1).unwrap();
+        sub(
+            &store,
+            &run,
+            1,
+            "b",
+            vec!["let solve xs = xs".into()],
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(check_pending(&store, &run).unwrap(), 2);
+        assert!(next_batch(&store, &run, "d", 2).unwrap().batch.is_some());
+        assert_eq!(built(), 1, "one build for the empty library");
+
+        // The library grows: the next batch and the next check use a new
+        // verifier, built once.
+        extend(&store, &run);
+        let sent = next_batch(&store, &run, "e", 3).unwrap().batch.unwrap();
+        assert!(sent.prompt.contains("fn_0"), "{}", sent.prompt);
+        sub(
+            &store,
+            &run,
+            2,
+            "c",
+            vec!["let solve xs = fn_0 xs".into()],
+            None,
+            4,
+        )
+        .unwrap();
+        assert_eq!(check_pending(&store, &run).unwrap(), 1);
+        assert!(next_batch(&store, &run, "f", 5).unwrap().batch.is_some());
+        assert_eq!(built(), 2, "one more build for the library of length 1");
+        let c = checked(&store, &run);
+        assert_eq!(c.last().unwrap().library_len, 1);
+        assert!(
+            !matches!(c.last().unwrap().checks[0], Check::Compile { .. }),
+            "{:?}",
+            c.last().unwrap().checks
+        );
+    }
+
+    #[test]
+    fn a_verifier_built_for_a_library_that_grew_meanwhile_is_not_used() {
+        let (_dir, store, run) = setup(1, 1);
+        let verifiers = VerifierCache::default();
+        let start = crate::verify::builds();
+        // The library grows after the verifier for the empty library is
+        // built without the lock, before the batch is issued under it.
+        let mut grown = false;
+        let sent = next_batch_with(&store, &run, "a", 0, &verifiers, || {
+            if !grown {
+                extend(&store, &run);
+                grown = true;
+            }
+        })
+        .unwrap()
+        .batch
+        .unwrap();
+        assert!(grown);
+        assert!(sent.prompt.contains("fn_0"), "{}", sent.prompt);
+        assert_eq!(crate::verify::builds() - start, 2);
+        // The verifier kept is the one for the grown library.
+        let library = store.read(&run, |s| s.library().to_vec()).unwrap();
+        assert_eq!(library.len(), 1);
+        assert!(verifiers.get(&library).is_some());
+        assert!(verifiers.get(&[]).is_none());
     }
 
     #[test]

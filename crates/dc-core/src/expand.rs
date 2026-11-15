@@ -153,7 +153,7 @@ pub fn expand(arena: &mut Arena, libs: &[LibDef], root: TermId) -> Result<TermId
 /// arena does. The tables
 /// for one program are dropped when its expansion ends, so they are not shared
 /// between programs.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Expander {
     /// For each library: its arity and its body with every library use expanded.
     /// The parameters are free in the body: `#i` at depth 0 is `$(arity - 1 - i)`.
@@ -532,7 +532,7 @@ enum Frame {
 struct SiteId(u32);
 
 /// One library use being instantiated.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Site {
     arity: u32,
     /// The supplied arguments, at most `arity`, as unexpanded terms of the use site.
@@ -570,7 +570,7 @@ struct Point {
 /// changes only the first breakpoint's position, and shifting the result changes
 /// only the first breakpoint's increase, so both build one list cell and share the
 /// rest. Each distinct renaming is interned once.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Renamings {
     /// The cells; entry 0 stands for the identity and is never read.
     points: Vec<Point>,
@@ -711,7 +711,7 @@ impl Renamings {
 }
 
 /// A memo of the head of each application spine and its number of arguments.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct SpineHeads {
     memo: Vec<Option<(TermId, u32)>>,
 }
@@ -746,7 +746,7 @@ impl SpineHeads {
 }
 
 /// A memo of [`Arena::free_depth`], computed with an explicit stack.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct FreeDepth {
     memo: Vec<Option<u32>>,
 }

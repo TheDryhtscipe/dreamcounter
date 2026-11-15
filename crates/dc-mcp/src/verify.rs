@@ -17,6 +17,7 @@
 //! not its body (spec §10).
 
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use dc_core::types::{check, infer};
 use dc_core::{sexpr, Arena, ExpandError, Expander, LibDef, LibId, Scheme, TermId};
@@ -58,8 +59,24 @@ impl std::fmt::Display for BadLibrary {
 
 impl std::error::Error for BadLibrary {}
 
+#[cfg(test)]
+thread_local! {
+    /// How many verifiers this thread has built, for tests.
+    static BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many verifiers this thread has built. Tests use it to count builds.
+#[cfg(test)]
+pub(crate) fn builds() -> u64 {
+    BUILDS.with(std::cell::Cell::get)
+}
+
 /// Checks programs against tasks under one library.
-#[derive(Debug)]
+///
+/// Building one loads the prelude and checks and expands the whole library,
+/// so a server keeps the latest in a [`VerifierCache`]. A check adds to the
+/// verifier's arena, so checks run on a clone, which is cheaper than a build.
+#[derive(Clone, Debug)]
 pub struct Verifier {
     arena: Arena,
     prelude: Prelude,
@@ -78,6 +95,8 @@ impl Verifier {
     /// A verifier for programs written against `library`, with the prelude
     /// on.
     pub fn new(library: &[LibraryEntry]) -> Result<Verifier, BadLibrary> {
+        #[cfg(test)]
+        BUILDS.with(|b| b.set(b.get() + 1));
         let prelude = Prelude::load().map_err(|e| BadLibrary {
             index: 0,
             reason: format!("the prelude does not load: {e}"),
@@ -125,6 +144,11 @@ impl Verifier {
             library: library.to_vec(),
             poisoned: false,
         })
+    }
+
+    /// The library the verifier was built for.
+    pub fn library(&self) -> &[LibraryEntry] {
+        &self.library
     }
 
     /// The prelude the programs are compiled with.
@@ -218,6 +242,49 @@ impl Verifier {
         }
         top.close_definition(&mut self.arena, ENTRY)
             .map_err(|e| e.to_string())
+    }
+}
+
+/// The verifier of a run's latest library, kept between requests, so that a
+/// server builds one verifier for each length of the library, not one for
+/// each request.
+///
+/// A run's library only grows, so its length names the library. A cache
+/// serves one run; it keeps one verifier, for the longest library it has
+/// been given. A verifier is handed out only for a library equal to the one
+/// it was built for, entry by entry, so a cache shared by mistake between
+/// runs costs builds, not wrong checks.
+#[derive(Debug, Default)]
+pub struct VerifierCache {
+    latest: Mutex<Option<Arc<Verifier>>>,
+}
+
+impl VerifierCache {
+    /// The kept verifier, if it was built for exactly `library`.
+    pub fn get(&self, library: &[LibraryEntry]) -> Option<Arc<Verifier>> {
+        let latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
+        latest
+            .as_ref()
+            .filter(|v| v.library.as_slice() == library)
+            .cloned()
+    }
+
+    /// A verifier for `library`: the kept one if it was built for exactly
+    /// `library`, or a new one. A new one is kept unless the kept one is for
+    /// a longer library.
+    pub fn get_or_build(&self, library: &[LibraryEntry]) -> Result<Arc<Verifier>, BadLibrary> {
+        if let Some(kept) = self.get(library) {
+            return Ok(kept);
+        }
+        let built = Arc::new(Verifier::new(library)?);
+        let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
+        if latest
+            .as_ref()
+            .is_none_or(|v| v.library.len() <= library.len())
+        {
+            *latest = Some(Arc::clone(&built));
+        }
+        Ok(built)
     }
 }
 
