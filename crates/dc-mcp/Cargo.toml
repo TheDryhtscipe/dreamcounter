@@ -10,7 +10,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+dc-compress.workspace = true
 dc-core.workspace = true
+dc-driver.workspace = true
 dc-eval.workspace = true
 dc-surface.workspace = true
 dc-tasks.workspace = true

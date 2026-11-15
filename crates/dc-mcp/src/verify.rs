@@ -17,7 +17,7 @@
 //! not its body (spec §10).
 
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use dc_core::types::{check, infer};
 use dc_core::{sexpr, Arena, ExpandError, Expander, LibDef, LibId, Scheme, TermId};
@@ -26,7 +26,7 @@ use dc_surface::TopLevel;
 use dc_tasks::harness::{check_examples, CheckFailure, HarnessConfig, RunFailure};
 use dc_tasks::task::TaskFamily;
 
-use crate::state::{Check, LibraryEntry};
+use crate::state::{Check, LibraryEntry, RunConfig};
 
 /// The name of the definition a submitted program is checked by.
 pub const ENTRY: &str = "solve";
@@ -58,6 +58,68 @@ impl std::fmt::Display for BadLibrary {
 }
 
 impl std::error::Error for BadLibrary {}
+
+/// The fingerprint of the prelude this build compiles programs with
+/// (`Prelude::fingerprint`), found once in each process. A new run stores it
+/// ([`RunConfig::prelude`]).
+///
+/// # Panics
+///
+/// If the shipped prelude does not load, which the tests of dc-surface rule
+/// out.
+pub fn shipped_prelude() -> u64 {
+    static SHIPPED: OnceLock<u64> = OnceLock::new();
+    *SHIPPED.get_or_init(|| {
+        Prelude::load()
+            .expect("the shipped prelude loads")
+            .fingerprint()
+    })
+}
+
+/// The run's stored programs were compiled with another prelude than the
+/// one in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreludeChanged {
+    /// The fingerprint the run stores.
+    pub run: u64,
+    /// The fingerprint of the prelude in use.
+    pub now: u64,
+}
+
+impl std::fmt::Display for PreludeChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the run's programs were compiled with another prelude (fingerprint {:016x}) than \
+             this server's ({:016x}). They name prelude functions by position, so they cannot \
+             be used. Serve the run with the dc-mcp build that made it",
+            self.run, self.now
+        )
+    }
+}
+
+impl std::error::Error for PreludeChanged {}
+
+/// Checks that a run with the settings `config` can be used under a prelude
+/// with the fingerprint `now`: that it is the prelude the run's programs
+/// were compiled with. A frontier member, a verified program or a library
+/// entry names a prelude function as `lib_<PRELUDE_LIB_BASE + i>`, by its
+/// position. Under a prelude with its definitions in another order the
+/// reference can name another function of the same type, such as `min` for
+/// `max`, and every type check still passes (decision D19, item 10).
+///
+/// Call it with [`shipped_prelude`] before a run's library, frontiers or
+/// verified programs are parsed, and before a program is compiled for it.
+pub fn check_prelude(config: &RunConfig, now: u64) -> Result<(), PreludeChanged> {
+    if config.prelude == now {
+        Ok(())
+    } else {
+        Err(PreludeChanged {
+            run: config.prelude,
+            now,
+        })
+    }
+}
 
 #[cfg(test)]
 thread_local! {

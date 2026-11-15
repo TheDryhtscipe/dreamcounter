@@ -107,6 +107,9 @@ fn build(past: u64) -> (TempDir, Store, RunId) {
                 programs_per_batch: 2,
                 lease_ms: 1000,
                 max_unchecked_per_batch: 3,
+                frontier_size: 5,
+                stitch: dc_mcp::state::StitchSettings::default(),
+                prelude: dc_mcp::verify::shipped_prelude(),
             },
             vec![MERGE.to_owned(), CANCEL.to_owned()],
         )
