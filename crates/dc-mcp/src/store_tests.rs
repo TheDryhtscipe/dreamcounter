@@ -1007,6 +1007,10 @@ fn a_lock_on_a_removed_directory_does_not_license_a_write_to_its_successor() {
         // call holds the directory that is about to go.
         let start = std::time::Instant::now();
         while store.waits.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            if waiting.is_finished() {
+                let result = waiting.join().unwrap();
+                panic!("the call returned without waiting for the lock: {result:?}");
+            }
             assert!(
                 start.elapsed() < std::time::Duration::from_secs(60),
                 "the call never waited for the lock"
