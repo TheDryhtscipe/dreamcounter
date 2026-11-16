@@ -429,3 +429,21 @@ fn the_state_issues_one_live_job_per_entry_and_per_worker() {
         "no entry 7",
     );
 }
+
+#[test]
+fn the_job_states_every_rule_the_checks_apply() {
+    let (_dir, store, run, v) = setup(true, 1);
+    let prompt = job(&store, &run, &v, "n", 0).job.unwrap().prompt;
+    for rule in [
+        format!("{MIN_ENTRY_NAME_LEN} to {MAX_ENTRY_NAME_LEN} bytes"),
+        "not a keyword".to_owned(),
+        format!("not `{ENTRY}`"),
+        "not fn_ followed by digits".to_owned(),
+        "not a primitive or\nprelude function".replace("\n", " "),
+        "not a name listed below".to_owned(),
+        "printable ASCII".to_owned(),
+        format!("at most {MAX_DOC_LEN} bytes"),
+    ] {
+        assert!(prompt.contains(&rule), "the prompt does not say {rule:?}");
+    }
+}

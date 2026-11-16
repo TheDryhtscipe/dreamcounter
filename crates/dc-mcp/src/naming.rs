@@ -195,9 +195,11 @@ pub fn naming_prompt(
          Call dc_submit_naming with job {job}, token \"{token}\", your name, and your \
          doc. Call it once.\n\n\
          Rules for the name: a lower-case letter or '_' first, then letters, digits, \
-         '_' or '\\''; at most {MAX_ENTRY_NAME_LEN} bytes; not a keyword, not \
-         `{ENTRY}`, not fn_ followed by digits, and not a name listed below. Rules \
-         for the doc: one line, at most {MAX_DOC_LEN} bytes. If the name breaks a \
+         '_' or '\\''; {MIN_ENTRY_NAME_LEN} to {MAX_ENTRY_NAME_LEN} bytes; not a \
+         keyword, not `{ENTRY}`, not fn_ followed by digits, not a primitive or \
+         prelude function, and not a name listed below. Rules for the doc: one line \
+         of printable ASCII (no em dashes, arrows, or curly quotes), at most \
+         {MAX_DOC_LEN} bytes. If the name breaks a \
          rule the function keeps the name {current}; if the doc does, it has no \
          doc.\n\n\
          ## The function\n\n{current} : {scheme}\nlet {current} = {body}\n\n",

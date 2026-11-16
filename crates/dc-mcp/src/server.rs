@@ -847,9 +847,12 @@ pub struct SubmitNamingArgs {
     pub job: u64,
     /// The job's token, from `dc_next_naming_job`.
     pub token: String,
-    /// The function's new name.
+    /// The function's new name: a lower-case letter or '_', then letters,
+    /// digits, '_' or '\''; 3 to 40 bytes; not a keyword, `solve`, `fn_`
+    /// and digits, a primitive or prelude function, or another library name.
     pub name: String,
-    /// One line that says what the function does.
+    /// One line of printable ASCII, at most 400 bytes, that says what the
+    /// function does.
     pub doc: String,
 }
 
