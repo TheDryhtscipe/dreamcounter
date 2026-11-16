@@ -874,7 +874,8 @@ pub enum ProposerMode {
 pub struct ProposerServer {
     store: Arc<Store>,
     run: RunId,
-    mode: ProposerMode,
+    /// The tools of the server's mode, the only ones it lists and takes.
+    tools: ToolRouter<ProposerServer>,
     clock: Arc<dyn Clock>,
     checker: Arc<Checker>,
     /// The verifier of the run's latest library, for batches and checks.
@@ -988,7 +989,10 @@ impl ProposerServer {
         ProposerServer {
             store: Arc::new(store),
             run,
-            mode,
+            tools: match mode {
+                ProposerMode::Batch => Self::batch_tools(),
+                ProposerMode::Naming => Self::naming_tools(),
+            },
             clock,
             checker: Arc::default(),
             verifiers: Arc::default(),
@@ -1133,18 +1137,8 @@ fn proposer_reply(run: &RunId, refused: Refused) -> String {
 
 /// The tools a server in its mode lists and takes. Only these are listed,
 /// and a call to any other is refused as a tool that is not there.
-#[tool_handler(router = self.tools())]
+#[tool_handler(router = self.tools)]
 impl ServerHandler for ProposerServer {}
-
-impl ProposerServer {
-    /// The tools of this server's mode.
-    fn tools(&self) -> ToolRouter<Self> {
-        match self.mode {
-            ProposerMode::Batch => Self::batch_tools(),
-            ProposerMode::Naming => Self::naming_tools(),
-        }
-    }
-}
 
 #[tool_router(router = batch_tools)]
 impl ProposerServer {

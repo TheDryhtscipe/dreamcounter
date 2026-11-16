@@ -682,6 +682,13 @@ fn a_proposer_sees_only_its_tools_and_gets_no_results() {
         ("dc_run_status", json!({ "run": "r1" })),
         ("dc_list_runs", json!({})),
         ("dc_proposal_stats", json!({ "run": "r1" })),
+        (
+            "dc_create_run",
+            json!({ "run": "r2", "seed": 1, "tasks": ["collapse/merge"] }),
+        ),
+        ("dc_check_pending", json!({ "run": "r1" })),
+        ("dc_finish_iteration", json!({ "run": "r1" })),
+        ("dc_add_note", json!({ "run": "r1", "text": "a note" })),
     ];
     let naming_tools = [
         ("dc_next_naming_job", json!({ "worker": "agent-1" })),

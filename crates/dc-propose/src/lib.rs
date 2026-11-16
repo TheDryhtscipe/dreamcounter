@@ -1,69 +1,69 @@
 //! Starts proposer sessions for a dc-mcp run (D11, D21).
 //!
-//! Each session is a headless Claude Code process (`claude -p`) that runs in
-//! a new, empty directory of its own, outside any git repository, the state
-//! directory and the log directory. It has no
-//! built-in tools, loads no user, project or local settings (so no rules,
-//! hooks or installed plugins; Claude Code's built-in plugins still load),
-//! gets only an allowlisted environment, and has one MCP server: the run's
-//! proposer server, started in the session's kind's mode. A session is one
-//! of two kinds, and sees and may call only its kind's two tools:
+//! Each session is a headless Claude Code process (`claude -p`) that runs in a
+//! new, empty directory of its own, outside any git repository, the state
+//! directory and the log directory. It has no built-in tools, loads no user,
+//! project or local settings (so no rules, hooks or installed plugins; Claude
+//! Code's built-in plugins still load), gets only an allowlisted environment,
+//! and has one MCP server: the run's proposer server, started in the session's
+//! kind's mode. A session is one of two kinds, and sees and may call only its
+//! kind's two tools:
 //!
 //! - A batch session has `dc_next_batch` and `dc_submit`, from
-//!   `dc-mcp --proposer`. Its brief,
-//!   which replaces Claude Code's default system prompt, tells it to take one
-//!   batch, write the programs the batch's prompt asks for, and submit them,
-//!   so each batch is written in a context of its own (D11 requirement 3).
+//!   `dc-mcp --proposer`. Its brief, which replaces Claude Code's default
+//!   system prompt, tells it to take one batch, write the programs the batch's
+//!   prompt asks for, and submit them, so each batch is written in a context of
+//!   its own (D11 requirement 3).
 //! - A naming session has `dc_next_naming_job` and `dc_submit_naming`, from
-//!   `dc-mcp --namer`. Its brief tells it to take one naming job and answer it with a name and
-//!   a doc for the new library function (D23).
+//!   `dc-mcp --namer`. Its brief tells it to take one naming job and answer it
+//!   with a name and a doc for the new library function (D23).
 //!
 //! The server in each mode lists and takes only that mode's two tools, so a
-//! session cannot see or call the other kind's tools. The session is
-//! allowed the two its server lists.
+//! session cannot see or call the other kind's tools. The session is allowed
+//! the two its server lists.
 //!
-//! When it is set up, the launcher reads from the state directory how many
-//! of the run's library functions wait to be named, as dc-mcp counts them
-//! (D23). It uses nothing else of the run, though the read replays the
-//! run's journal, and gives the sessions nothing of it. If some wait, the launch starts with naming sessions; otherwise
-//! with batch sessions. When a batch session's wait says that
-//! `names_pending` functions wait to be named (after the operator ends an
-//! iteration during the launch, say), the next sessions are naming
-//! sessions. Either way, at most that many naming sessions run at once.
-//! Fewer may, if naming sessions of an earlier phase are still running.
-//! Batch sessions start again once this launch has named that many, or a
-//! naming session finds nothing to name. A naming session that finds every function still to name held by
-//! a job stops new naming sessions until this launch's running ones have
-//! ended; if none is running, the launch stops, as it does when a batch
-//! session finds no batch. An outcome from a session started before the
-//! last such switch does not change what starts next.
+//! When it is set up, the launcher reads from the state directory how many of
+//! the run's library functions wait to be named, as dc-mcp counts them (D23).
+//! It uses nothing else of the run, though the read replays the run's journal,
+//! and gives the sessions nothing of it. If some wait, the launch starts with
+//! naming sessions; otherwise with batch sessions. When a batch session's wait
+//! says that `names_pending` functions wait to be named (after the operator
+//! ends an iteration during the launch, say), the next sessions are naming
+//! sessions. Either way, at most that many naming sessions run at once. Fewer
+//! may, if naming sessions of an earlier phase are still running. Batch
+//! sessions start again once this launch has named that many, or a naming
+//! session finds nothing to name. A naming session that finds every function
+//! still to name held by a job stops new naming sessions until this launch's
+//! running ones have ended; if none is running, the launch stops, as it does
+//! when a batch session finds no batch. An outcome from a session started
+//! before the last such switch does not change what starts next.
 //!
 //! The launcher reads each session's stream-json transcript as it comes. The
 //! first event must be the session's `init` report, and it must show the
-//! lockdown: exactly its kind's two tools, exactly the one server, connected, only
-//! built-in plugins, the session's own directory, and the model asked for.
-//! The first request's input tokens are capped too. The cap leaves room for
-//! the brief, so it catches large additions without a tool (the user's
-//! rules, say), not small ones; `--restricted` is what keeps them out. A session
-//! that shows anything else is killed, and no further session starts. A
-//! session that leaves anything in its directory fails the same way. Every
-//! transcript, command line and MCP configuration is kept in the log
-//! directory, with a summary of every session.
+//! lockdown: exactly its kind's two tools, exactly the one server, connected,
+//! only built-in plugins, the session's own directory, and the model asked for.
+//! The first request's input tokens are capped too. The cap leaves room for the
+//! brief, so it catches large additions without a tool (the user's rules, say),
+//! not small ones; `--restricted` is what keeps them out. A session that shows
+//! anything else is killed, and no further session starts. A session that
+//! leaves anything in its directory fails the same way. Every transcript,
+//! command line and MCP configuration is kept in the log directory, with a
+//! summary of every session.
 //!
 //! The launcher does not create runs or finish iterations: those are the
 //! operator's tools. It starts sessions, of both kinds, until it has started
-//! the number asked for, or until a session finds no batch to take, or
-//! every function to name held with none of its own naming sessions
-//! running. Worker ids are unique, so "no batch" means every open slot is
-//! leased or being checked, and "held" means held by a job of another
-//! launch or of a session of this launch that has ended.
+//! the number asked for, or until a session finds no batch to take, or every
+//! function to name held with none of its own naming sessions running. Worker
+//! ids are unique, so "no batch" means every open slot is leased or being
+//! checked, and "held" means held by a job of another launch or of a session of
+//! this launch that has ended.
 //!
 //! With the environment allowlisted, Claude Code 2.1.318 makes no scratch
 //! directory for a session outside the session's own directory.
 //!
-//! A session's processes are one process group, killed with it. A process
-//! that leaves the group (`setsid`) outlives the kill. If the launcher itself
-//! is killed with SIGKILL, its sessions run on.
+//! A session's processes are one process group, killed with it. A process that
+//! leaves the group (`setsid`) outlives the kill. If the launcher itself is
+//! killed with SIGKILL, its sessions run on.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -595,9 +595,6 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
                     }
                     let reply: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     let wait = &reply["wait"];
-                    // A reply with no work after the session was given some
-                    // ("you hold batch 3") means it asked again instead of
-                    // answering: its own failure, not news about the run.
                     let pending = wait["names_pending"].as_u64().unwrap_or(0);
                     if name == SUBMIT {
                         if let (Some(batch), Some(received)) =
@@ -626,6 +623,10 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
                             leased.push(b);
                         } else if reply.get("batch").is_some_and(Value::is_null) {
                             let detail = wait_detail(wait);
+                            // A reply with no work after the session was
+                            // given some ("you hold batch 3") means it asked
+                            // again instead of answering: its own failure,
+                            // not news about the run.
                             if !leased.is_empty() {
                                 error = Some(format!("{name} again while it held work: {detail}"));
                                 continue;
@@ -644,6 +645,7 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
                             leased.push(j);
                         } else if reply.get("job").is_some_and(Value::is_null) {
                             let detail = wait_detail(wait);
+                            // As for a batch: the session's own failure.
                             if !leased.is_empty() {
                                 error = Some(format!("{name} again while it held work: {detail}"));
                                 continue;
