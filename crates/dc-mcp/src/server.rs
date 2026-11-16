@@ -27,6 +27,7 @@ use rmcp::{schemars, tool, tool_router, RoleServer};
 use serde::{Deserialize, Serialize};
 
 use crate::iterate::{finish_iteration_in_worker, WorkerStart};
+use crate::naming::{next_naming_job, submit_naming, NamingReceipt, NextNamingJob};
 use crate::proposer::{check_pending, next_batch, submit, Clock, NextBatch, Receipt, Refused};
 use crate::state::{
     Arm, Event, LogKind, LogRecord, RunConfig, RunId, RunState, StitchSettings,
@@ -76,6 +77,10 @@ pub struct CreateRun {
     /// space. A run stopped at this limit ends the iteration with no new
     /// abstractions. At least 512. If absent, 4096.
     pub stitch_memory_mib: Option<u64>,
+    /// Whether proposers name and document the abstractions each iteration
+    /// adds (decision D23). While a new abstraction has no name, no batch is
+    /// issued. If absent, true.
+    pub autodoc: Option<bool>,
 }
 
 /// The most programs one batch asks for when `dc_create_run` does not say.
@@ -150,6 +155,11 @@ pub struct RunStatus {
     pub tasks: Vec<TaskStatus>,
     /// How many definitions the library has.
     pub library_size: usize,
+    /// Whether proposers name new definitions (decision D23).
+    pub autodoc: bool,
+    /// How many definitions wait for a naming result. While any does, no
+    /// batch is issued.
+    pub unnamed: u64,
     /// How many log records of each kind the run has.
     pub log_counts: LogCounts,
     /// How many batches the run has issued, in all iterations.
@@ -189,6 +199,14 @@ impl RunStatus {
                 memory_mib: config.stitch.memory_bytes >> 20,
             },
             iteration: state.iteration(),
+            autodoc: config.autodoc,
+            unnamed: if config.autodoc {
+                (0..state.library().len() as u64)
+                    .filter(|&e| !state.is_named(e))
+                    .count() as u64
+            } else {
+                0
+            },
             tasks: state
                 .tasks()
                 .iter()
@@ -607,6 +625,7 @@ impl DcServer {
         }
         let defaults = StitchSettings::default();
         let config = RunConfig {
+            autodoc: arg.autodoc.unwrap_or(true),
             arm: Arm::Blind,
             seed: arg.seed,
             proposals_per_task: arg.proposals_per_task,
@@ -817,9 +836,26 @@ pub struct SubmitArgs {
     pub model: Option<String>,
 }
 
+/// The arguments of `dc_submit_naming`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitNamingArgs {
+    /// Your id: the one you gave `dc_next_naming_job` for this job.
+    pub worker: String,
+    /// The job's number, from `dc_next_naming_job`.
+    pub job: u64,
+    /// The job's token, from `dc_next_naming_job`.
+    pub token: String,
+    /// The function's new name.
+    pub name: String,
+    /// One line that says what the function does.
+    pub doc: String,
+}
+
 /// The MCP server a proposer connects to (decision D11). It serves one run
-/// and has two tools, `dc_next_batch` and `dc_submit`, so a proposer cannot
-/// list runs or see a run's library, frontiers or results.
+/// and has two tools for batches, `dc_next_batch` and `dc_submit`, and two
+/// for naming new abstractions, `dc_next_naming_job` and `dc_submit_naming`
+/// (decision D23). A proposer cannot list runs or see a run's results.
 #[derive(Clone, Debug)]
 pub struct ProposerServer {
     store: Arc<Store>,
@@ -1130,6 +1166,49 @@ impl ProposerServer {
         self.check_in_background();
         receipt
     }
+
+    /// Hands out a naming job (decision D23).
+    #[tool(
+        name = "dc_next_naming_job",
+        description = "Get a function of the run's library to name and document. The prompt \
+                       shows the function and says how to answer. If there is none now, \
+                       `job` is null and `wait` says why and when to ask again."
+    )]
+    async fn next_naming_job(
+        &self,
+        Parameters(arg): Parameters<NextBatchArgs>,
+    ) -> Result<Json<NextNamingJob>, String> {
+        let verifiers = Arc::clone(&self.verifiers);
+        self.blocking(move |store, run, now| {
+            next_naming_job(store, run, &arg.worker, now, &verifiers)
+        })
+        .await
+    }
+
+    /// Takes in a name and doc for a naming job (decision D23).
+    #[tool(
+        name = "dc_submit_naming",
+        description = "Name and document the function of a naming job, with the job's number \
+                       and token from dc_next_naming_job. The reply gives the name the function \
+                       now has: yours, or its old one if yours broke a rule."
+    )]
+    async fn submit_naming(
+        &self,
+        Parameters(arg): Parameters<SubmitNamingArgs>,
+    ) -> Result<Json<NamingReceipt>, String> {
+        self.blocking(move |store, run, _now| {
+            submit_naming(
+                store,
+                run,
+                &arg.worker,
+                arg.job,
+                &arg.token,
+                &arg.name,
+                &arg.doc,
+            )
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -1299,6 +1378,7 @@ mod tests {
                 .create_run(
                     &run,
                     RunConfig {
+                        autodoc: false,
                         arm: Arm::Blind,
                         seed: 3,
                         proposals_per_task: 1,

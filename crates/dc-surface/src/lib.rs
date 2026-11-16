@@ -65,6 +65,7 @@ use dc_core::Arena;
 
 pub use desugar::{compile_expression, TopLevel};
 pub use error::{ErrorKind, Span, SurfaceError};
+pub use lexer::is_variable_name;
 pub use pretty::pretty;
 
 /// The deepest nesting the front end accepts; deeper input is an

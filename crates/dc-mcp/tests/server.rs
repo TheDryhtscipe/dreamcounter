@@ -242,6 +242,8 @@ fn a_run_survives_a_kill_in_the_middle_of_an_iteration() {
                 },
                 Event::LibraryExtended {
                     entries: vec![LibraryEntry {
+                        name: None,
+                        doc: None,
                         arity: 1,
                         term: "(lam 0)".into(),
                     }],
@@ -646,7 +648,7 @@ fn solves_merge() -> String {
 }
 
 #[test]
-fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
+fn a_proposer_sees_only_its_tools_and_gets_no_results() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut operator = Client::start(dir.path());
     operator
@@ -660,7 +662,15 @@ fn a_proposer_sees_only_its_two_tools_and_gets_no_results() {
         .unwrap();
 
     let mut proposer = Client::start_proposer(dir.path(), "r1");
-    assert_eq!(tool_names(&mut proposer), ["dc_next_batch", "dc_submit"]);
+    assert_eq!(
+        tool_names(&mut proposer),
+        [
+            "dc_next_batch",
+            "dc_next_naming_job",
+            "dc_submit",
+            "dc_submit_naming"
+        ]
+    );
     // An operator's tool is not there for a proposer.
     for (tool, arguments) in [
         ("dc_run_status", json!({ "run": "r1" })),
@@ -1198,12 +1208,48 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
         assert_eq!(task["frontier_size"], 1, "{task}");
     }
     assert_eq!(status["current"]["quota_in"], false);
+    assert_eq!(status["unnamed"].as_u64().unwrap(), found);
 
     // The same again is refused: iteration 1 has no programs yet.
     let again = operator
         .call("dc_finish_iteration", json!({ "run": "r1" }))
         .unwrap_err();
     assert!(again.contains("iteration 1 cannot end yet"), "{again}");
+    assert_eq!(created["autodoc"], true);
+
+    // No batch until each new function is named (decision D23).
+    let waiting = proposer
+        .call("dc_next_batch", json!({ "worker": "agent-9" }))
+        .unwrap();
+    assert_eq!(waiting["batch"], Value::Null);
+    let reason = waiting["wait"]["reason"].as_str().unwrap();
+    assert!(reason.contains("dc_next_naming_job"), "{reason}");
+    for k in 0..found {
+        let worker = format!("namer-{k}");
+        let job = proposer
+            .call("dc_next_naming_job", json!({ "worker": worker }))
+            .unwrap();
+        let prompt = job["job"]["prompt"].as_str().unwrap();
+        assert!(prompt.contains(&format!("let fn_{k} = ")), "{prompt}");
+        let named = proposer
+            .call(
+                "dc_submit_naming",
+                json!({
+                    "worker": worker, "job": job["job"]["job"], "token": job["job"]["token"],
+                    "name": format!("abs_{k}"), "doc": format!("Abstraction {k}.")
+                }),
+            )
+            .unwrap();
+        assert_eq!(named["name"], format!("abs_{k}"), "{named}");
+    }
+    let none = proposer
+        .call("dc_next_naming_job", json!({ "worker": "namer-x" }))
+        .unwrap();
+    assert_eq!(none["job"], Value::Null, "{none}");
+    let status = operator
+        .call("dc_run_status", json!({ "run": "r1" }))
+        .unwrap();
+    assert_eq!(status["unnamed"], 0, "{status}");
 
     // The proposer's server, which was running all along, hands out work
     // for iteration 1 with the new library, and checks a program that uses
@@ -1212,7 +1258,8 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
         .call("dc_next_batch", json!({ "worker": "agent-9" }))
         .unwrap();
     let prompt = got["batch"]["prompt"].as_str().unwrap();
-    assert!(prompt.contains("fn_0"), "{prompt}");
+    assert!(prompt.contains("-- Abstraction 0.\nabs_0 : "), "{prompt}");
+    assert!(!prompt.contains("fn_0"), "{prompt}");
     let batch = got["batch"]["batch"].as_u64().unwrap();
     let task = store
         .read(&run, |s| s.batch(batch).unwrap().task.clone())
@@ -1222,7 +1269,7 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
             "dc_submit",
             json!({
                 "worker": "agent-9", "batch": batch, "token": got["batch"]["token"],
-                "programs": [format!("{}\nlet unused = fn_0\n", solves(&task))]
+                "programs": [format!("{}\nlet unused = abs_0\n", solves(&task))]
             }),
         )
         .unwrap();

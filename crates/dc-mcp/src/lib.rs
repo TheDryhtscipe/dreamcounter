@@ -32,6 +32,7 @@
 
 pub mod iterate;
 pub mod journal;
+pub mod naming;
 pub mod prompt;
 pub mod proposer;
 pub mod server;

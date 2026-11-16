@@ -108,6 +108,12 @@ pub struct RunConfig {
     /// a prelude function by its position, so it keeps its meaning only
     /// under that prelude: see [`crate::verify::check_prelude`].
     pub prelude: u64,
+    /// Whether proposers name and document new abstractions (LILO's
+    /// AutoDoc, decision D23). While it is on, no batch is issued until
+    /// every library entry has a naming result. A run made before the
+    /// setting has it off.
+    #[serde(default)]
+    pub autodoc: bool,
 }
 
 /// The settings of the Stitch run that ends each iteration: what Stitch
@@ -161,13 +167,20 @@ fn default_max_unchecked_per_batch() -> u32 {
 }
 
 /// One definition in the library.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LibraryEntry {
     /// The number of parameters.
     pub arity: u32,
     /// The closed term `λ^arity. body`, as an s-expression (`dc_core::sexpr`).
     pub term: String,
+    /// The name a proposer gave it (decision D23), if any. Without one it is
+    /// `fn_i`. A [`Event::LibraryExtended`] entry has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// What it does, in one line, as a proposer wrote it, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
 }
 
 /// One program in a task's frontier.
@@ -406,6 +419,55 @@ pub struct Checked {
     pub checks: Vec<Check>,
 }
 
+/// A naming job is handed to a proposer (decision D23).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamingIssued {
+    /// The job's number. Jobs are numbered 0, 1, ... over the whole run.
+    pub job: u64,
+    /// The library entry to name.
+    pub entry: u64,
+    /// The worker id the proposer gave.
+    pub worker: String,
+    /// The secret the proposer must give back with its answer.
+    pub token: String,
+    /// When the job was issued, in milliseconds since the Unix epoch.
+    pub issued_ms: u64,
+    /// When its lease ends. After that the entry can get another job.
+    pub deadline_ms: u64,
+    /// The prompt the proposer was given.
+    pub prompt: String,
+}
+
+/// A naming job ends (decision D23).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamingDone {
+    /// The job.
+    pub job: u64,
+    /// The entry it named, which is the job's.
+    pub entry: u64,
+    /// The name the entry gets, or `None` if it keeps `fn_i`.
+    pub name: Option<String>,
+    /// The doc the entry gets, if any.
+    pub doc: Option<String>,
+    /// What the proposer gave that was refused, and why, in words.
+    pub refused: Vec<String>,
+}
+
+/// What the state keeps of a naming job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamingJob {
+    /// The library entry to name.
+    pub entry: u64,
+    /// The worker id the proposer gave.
+    pub worker: String,
+    /// The job's secret.
+    pub token: String,
+    /// When its lease ends.
+    pub deadline_ms: u64,
+}
+
 /// One change to a run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -439,6 +501,10 @@ pub enum Event {
         /// The new definitions, at least one.
         entries: Vec<LibraryEntry>,
     },
+    /// A naming job for a library entry is handed to a proposer (D23).
+    NamingIssued(NamingIssued),
+    /// A naming job ends: the entry gets its name and doc, or keeps `fn_i`.
+    NamingDone(NamingDone),
     /// The current iteration ends and the next one starts.
     IterationFinished {
         /// The iteration that ends.
@@ -452,7 +518,7 @@ pub enum Event {
 
 /// Whether `given` is `secret`, taking a time that does not depend on where
 /// they first differ.
-fn same_secret(secret: &str, given: &str) -> bool {
+pub(crate) fn same_secret(secret: &str, given: &str) -> bool {
     secret.len() == given.len()
         && secret
             .bytes()
@@ -584,6 +650,8 @@ pub enum Rejected {
         /// The iteration the event names.
         given: u64,
     },
+    /// A naming event does not fit the run, in words (decision D23).
+    Naming(String),
     /// A `LibraryExtended` event has no entries.
     NoEntries,
     /// The iteration number would overflow.
@@ -661,6 +729,7 @@ impl fmt::Display for Rejected {
                 "the event names iteration {given}, but the run is in iteration {current}"
             ),
             Rejected::NoEntries => write!(f, "a library extension needs at least one entry"),
+            Rejected::Naming(why) => f.write_str(why),
             Rejected::IterationOverflow => write!(f, "the iteration number would overflow"),
             Rejected::WrongBatchNumber { next, given } => write!(
                 f,
@@ -824,6 +893,8 @@ pub struct RunState {
     task_counts: ByIteration<BTreeMap<String, TaskCounts>>,
     iteration_counts: ByIteration<IterationCounts>,
     verified: Vec<Verified>,
+    naming_jobs: Vec<NamingJob>,
+    named: Vec<bool>,
 }
 
 /// Changes the counts of `task` in `iteration` by `change`. The task's name
@@ -894,6 +965,8 @@ impl RunState {
             task_counts: ByIteration::default(),
             iteration_counts: ByIteration::default(),
             verified: Vec::new(),
+            naming_jobs: Vec::new(),
+            named: Vec::new(),
         })
     }
 
@@ -954,8 +1027,18 @@ impl RunState {
                 if entries.is_empty() {
                     return Err(Rejected::NoEntries);
                 }
+                if entries.iter().any(|e| e.name.is_some() || e.doc.is_some()) {
+                    return Err(Rejected::Naming(
+                        "a library extension's entries have no name or doc; they are \
+                         named by naming jobs"
+                            .to_owned(),
+                    ));
+                }
                 self.library.extend(entries.iter().cloned());
+                self.named.resize(self.library.len(), false);
             }
+            Event::NamingIssued(issued) => self.issue_naming(issued)?,
+            Event::NamingDone(done) => self.finish_naming(done)?,
             Event::IterationFinished { iteration, used } => {
                 self.check_iteration(*iteration)?;
                 if let Some(b) = self.awaiting.first() {
@@ -1266,6 +1349,118 @@ impl RunState {
         &self.tasks
     }
 
+    /// Applies a [`NamingIssued`] event, with every check first.
+    fn issue_naming(&mut self, issued: &NamingIssued) -> Result<(), Rejected> {
+        let bad = |why: String| Err(Rejected::Naming(why));
+        if !self.config.autodoc {
+            return bad("the run does not name abstractions (autodoc is off)".to_owned());
+        }
+        let next = self.naming_jobs.len() as u64;
+        if issued.job != next {
+            return bad(format!(
+                "the event issues naming job {}, but the next job is {next}",
+                issued.job
+            ));
+        }
+        if issued.deadline_ms <= issued.issued_ms {
+            return bad("a naming job must end after it starts".to_owned());
+        }
+        match self.named.get(issued.entry as usize) {
+            None => return bad(format!("the library has no entry {}", issued.entry)),
+            Some(true) => return bad(format!("entry {} is already named", issued.entry)),
+            Some(false) => {}
+        }
+        if let Some((job, _)) = self
+            .live_naming(issued.issued_ms)
+            .find(|(_, j)| j.entry == issued.entry || j.worker == issued.worker)
+        {
+            return bad(format!(
+                "naming job {job} is still live for that entry or worker"
+            ));
+        }
+        self.naming_jobs.push(NamingJob {
+            entry: issued.entry,
+            worker: issued.worker.clone(),
+            token: issued.token.clone(),
+            deadline_ms: issued.deadline_ms,
+        });
+        Ok(())
+    }
+
+    /// Applies a [`NamingDone`] event, with every check first.
+    fn finish_naming(&mut self, done: &NamingDone) -> Result<(), Rejected> {
+        let bad = |why: String| Err(Rejected::Naming(why));
+        let Some(job) = self.naming_jobs.get(done.job as usize) else {
+            return bad(format!("the run has no naming job {}", done.job));
+        };
+        if job.entry != done.entry {
+            return bad(format!(
+                "naming job {} is for entry {}, not {}",
+                done.job, job.entry, done.entry
+            ));
+        }
+        let index = done.entry as usize;
+        if self.named.get(index) != Some(&false) {
+            return bad(format!("entry {} is already named", done.entry));
+        }
+        if let Some(name) = &done.name {
+            crate::naming::check_name(name, index, &self.library).map_err(Rejected::Naming)?;
+        }
+        if let Some(doc) = &done.doc {
+            crate::naming::check_doc(doc).map_err(Rejected::Naming)?;
+        }
+        let entry = &mut self.library[index];
+        entry.name.clone_from(&done.name);
+        entry.doc.clone_from(&done.doc);
+        self.named[index] = true;
+        Ok(())
+    }
+
+    /// The naming jobs whose lease has not ended at `now_ms` and whose
+    /// entry has no naming result, with their numbers.
+    pub fn live_naming(&self, now_ms: u64) -> impl Iterator<Item = (u64, &NamingJob)> + '_ {
+        self.naming_jobs
+            .iter()
+            .enumerate()
+            .filter(move |(_, j)| j.deadline_ms > now_ms && !self.named[j.entry as usize])
+            .map(|(i, j)| (i as u64, j))
+    }
+
+    /// Naming job `job`, if the run has issued it.
+    pub fn naming_job(&self, job: u64) -> Option<&NamingJob> {
+        self.naming_jobs.get(usize::try_from(job).ok()?)
+    }
+
+    /// How many naming jobs the run has issued.
+    pub fn naming_job_count(&self) -> u64 {
+        self.naming_jobs.len() as u64
+    }
+
+    /// Whether library entry `entry` has a naming result.
+    pub fn is_named(&self, entry: u64) -> bool {
+        usize::try_from(entry)
+            .ok()
+            .and_then(|i| self.named.get(i))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Whether batches wait for naming: autodoc is on and some library
+    /// entry has no naming result (decision D23, item 7).
+    pub fn naming_pending(&self) -> bool {
+        self.config.autodoc && self.named.iter().any(|n| !n)
+    }
+
+    /// The first library entry with no naming result and no live job at
+    /// `now_ms`, if autodoc is on.
+    pub fn next_unnamed(&self, now_ms: u64) -> Option<u64> {
+        if !self.config.autodoc {
+            return None;
+        }
+        let held: BTreeSet<u64> = self.live_naming(now_ms).map(|(_, j)| j.entry).collect();
+        (0..self.named.len() as u64).find(|&e| !self.named[e as usize] && !held.contains(&e))
+    }
+
     /// The library. Entry `i` is library definition `i`.
     pub fn library(&self) -> &[LibraryEntry] {
         &self.library
@@ -1391,6 +1586,7 @@ mod tests {
 
     fn config() -> RunConfig {
         RunConfig {
+            autodoc: false,
             arm: Arm::Blind,
             seed: 7,
             proposals_per_task: 4,
@@ -1434,6 +1630,7 @@ mod tests {
             Err(Rejected::DuplicateTask("a".into()))
         );
         let zero = RunConfig {
+            autodoc: false,
             proposals_per_task: 0,
             ..config()
         };
@@ -1442,6 +1639,7 @@ mod tests {
             Err(Rejected::ZeroSetting("proposals_per_task"))
         );
         let zero = RunConfig {
+            autodoc: false,
             max_unchecked_per_batch: 0,
             frontier_size: 5,
             stitch: crate::state::StitchSettings::default(),
@@ -1456,6 +1654,7 @@ mod tests {
             (
                 "frontier_size",
                 RunConfig {
+                    autodoc: false,
                     frontier_size: 0,
                     ..config()
                 },
@@ -1463,6 +1662,7 @@ mod tests {
             (
                 "stitch.iterations",
                 RunConfig {
+                    autodoc: false,
                     stitch: StitchSettings {
                         iterations: 0,
                         ..StitchSettings::default()
@@ -1473,6 +1673,7 @@ mod tests {
             (
                 "stitch.wall_ms",
                 RunConfig {
+                    autodoc: false,
                     stitch: StitchSettings {
                         wall_ms: 0,
                         ..StitchSettings::default()
@@ -1491,6 +1692,7 @@ mod tests {
             (MIN_STITCH_MEMORY_BYTES - 1, false),
         ] {
             let c = RunConfig {
+                autodoc: false,
                 stitch: StitchSettings {
                     memory_bytes: bytes,
                     ..StitchSettings::default()
@@ -1505,6 +1707,7 @@ mod tests {
             (MAX_PROGRAMS_PER_BATCH + 1, false),
         ] {
             let c = RunConfig {
+                autodoc: false,
                 programs_per_batch: n,
                 ..config()
             };
@@ -1532,6 +1735,8 @@ mod tests {
         assert_eq!(s.frontier("b"), Some(&[][..]));
 
         let entry = LibraryEntry {
+            name: None,
+            doc: None,
             arity: 1,
             term: "(lam 0)".into(),
         };
@@ -2084,6 +2289,7 @@ mod tests {
     fn the_quota_is_in_when_every_task_has_its_programs_checked() {
         let mut s = RunState::create(
             RunConfig {
+                autodoc: false,
                 proposals_per_task: 1,
                 ..config()
             },

@@ -24,6 +24,7 @@ const K: u32 = 2;
 
 fn config(quota: u32, prelude: u64) -> RunConfig {
     RunConfig {
+        autodoc: false,
         arm: Arm::Blind,
         seed: 3,
         proposals_per_task: quota,
@@ -478,6 +479,7 @@ fn a_worker_stopped_at_the_runs_time_limit_ends_the_iteration_without_abstractio
     let store = Store::open(dir.path()).unwrap();
     let run = RunId::new("r").unwrap();
     let settings = RunConfig {
+        autodoc: false,
         stitch: StitchSettings {
             wall_ms: 200,
             ..StitchSettings::default()

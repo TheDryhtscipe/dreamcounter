@@ -24,6 +24,7 @@ const COMMITS_PER_ITERATION: u64 = 5;
 
 fn config() -> RunConfig {
     RunConfig {
+        autodoc: false,
         arm: Arm::Blind,
         seed: 3,
         proposals_per_task: 1,

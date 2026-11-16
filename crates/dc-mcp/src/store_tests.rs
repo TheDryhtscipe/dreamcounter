@@ -9,6 +9,7 @@ use crate::state::{Arm, FrontierMember, LibraryEntry, LogKind, Rejected};
 
 fn config() -> RunConfig {
     RunConfig {
+        autodoc: false,
         arm: Arm::Blind,
         seed: 11,
         proposals_per_task: 3,
@@ -61,6 +62,8 @@ fn mid_iteration(store: &Store, run: &RunId) {
                 frontier("sum", "(lam 0)"),
                 Event::LibraryExtended {
                     entries: vec![LibraryEntry {
+                        name: None,
+                        doc: None,
                         arity: 2,
                         term: "(lam (lam 1))".into(),
                     }],
@@ -1349,6 +1352,8 @@ fn random_event(rng: &mut Rng, state: &RunState, now_ms: u64) -> Event {
         },
         8 => Event::LibraryExtended {
             entries: vec![LibraryEntry {
+                name: None,
+                doc: None,
                 arity: 1,
                 term: "(lam 0)".into(),
             }],
@@ -1389,6 +1394,7 @@ fn two_stores_agree_with_the_journal(seed: u64, steps: u32) -> Outcomes {
     let run = id("r1");
     // A cap of 1, so that refusals are common.
     let capped = RunConfig {
+        autodoc: false,
         max_unchecked_per_batch: 1,
         frontier_size: 5,
         stitch: crate::state::StitchSettings::default(),
