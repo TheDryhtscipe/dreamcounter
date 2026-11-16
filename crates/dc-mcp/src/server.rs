@@ -1,9 +1,11 @@
 //! The MCP tools.
 //!
 //! There are two servers. [`DcServer`] is the operator's: it creates runs and
-//! reports on them. [`ProposerServer`] is a proposer's: it serves one run and
-//! has only `dc_next_batch` and `dc_submit` (see [`crate::proposer`]). The
-//! `dc-mcp` binary serves one or the other.
+//! reports on them. [`ProposerServer`] is a proposer's: it serves one run in
+//! one [`ProposerMode`], and has only that mode's two tools: `dc_next_batch`
+//! and `dc_submit` (see [`crate::proposer`]), or `dc_next_naming_job` and
+//! `dc_submit_naming` (see [`crate::naming`]). The `dc-mcp` binary serves one
+//! of these.
 //!
 //! Every tool reads or writes through the [`Store`], which brings its copy of
 //! the run up to the journal on disk first. A request the server cannot carry
@@ -21,9 +23,10 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, TryLockError};
 use std::time::Duration;
 
 use dc_driver::CompressionReport;
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::service::RequestContext;
-use rmcp::{schemars, tool, tool_router, RoleServer};
+use rmcp::{schemars, tool, tool_handler, tool_router, RoleServer, ServerHandler};
 use serde::{Deserialize, Serialize};
 
 use crate::iterate::{finish_iteration_in_worker, WorkerStart};
@@ -850,14 +853,28 @@ pub struct SubmitNamingArgs {
     pub doc: String,
 }
 
+/// Which of a proposer's two jobs a [`ProposerServer`] serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProposerMode {
+    /// Batches: `dc_next_batch` and `dc_submit` (decision D11).
+    Batch,
+    /// Naming new abstractions: `dc_next_naming_job` and `dc_submit_naming`
+    /// (decision D23).
+    Naming,
+}
+
 /// The MCP server a proposer connects to (decision D11). It serves one run
-/// and has two tools for batches, `dc_next_batch` and `dc_submit`, and two
-/// for naming new abstractions, `dc_next_naming_job` and `dc_submit_naming`
-/// (decision D23). A proposer cannot list runs or see a run's results.
+/// in one [`ProposerMode`], and lists and takes only that mode's two tools.
+/// A call to any other tool, the other mode's included, is refused as a
+/// tool that is not there. A proposer cannot list runs or see a run's
+/// results.
+///
+/// Either mode checks the run's pending submissions in the background.
 #[derive(Clone, Debug)]
 pub struct ProposerServer {
     store: Arc<Store>,
     run: RunId,
+    mode: ProposerMode,
     clock: Arc<dyn Clock>,
     checker: Arc<Checker>,
     /// The verifier of the run's latest library, for batches and checks.
@@ -960,12 +977,18 @@ const CHECK_RETRY_FIRST: Duration = Duration::from_secs(5);
 const CHECK_RETRY_MAX: Duration = Duration::from_secs(300);
 
 impl ProposerServer {
-    /// A server for proposers of `run` in `store`, with leases timed by
-    /// `clock`.
-    pub fn new(store: Store, run: RunId, clock: Arc<dyn Clock>) -> ProposerServer {
+    /// A server for proposers of `run` in `store`, in `mode`, with leases
+    /// timed by `clock`.
+    pub fn new(
+        store: Store,
+        run: RunId,
+        mode: ProposerMode,
+        clock: Arc<dyn Clock>,
+    ) -> ProposerServer {
         ProposerServer {
             store: Arc::new(store),
             run,
+            mode,
             clock,
             checker: Arc::default(),
             verifiers: Arc::default(),
@@ -1108,7 +1131,22 @@ fn proposer_reply(run: &RunId, refused: Refused) -> String {
     }
 }
 
-#[tool_router(server_handler)]
+/// The tools a server in its mode lists and takes. Only these are listed,
+/// and a call to any other is refused as a tool that is not there.
+#[tool_handler(router = self.tools())]
+impl ServerHandler for ProposerServer {}
+
+impl ProposerServer {
+    /// The tools of this server's mode.
+    fn tools(&self) -> ToolRouter<Self> {
+        match self.mode {
+            ProposerMode::Batch => Self::batch_tools(),
+            ProposerMode::Naming => Self::naming_tools(),
+        }
+    }
+}
+
+#[tool_router(router = batch_tools)]
 impl ProposerServer {
     /// Hands out a batch of work.
     #[tool(
@@ -1164,7 +1202,10 @@ impl ProposerServer {
         self.check_in_background();
         receipt
     }
+}
 
+#[tool_router(router = naming_tools)]
+impl ProposerServer {
     /// Hands out a naming job (decision D23).
     #[tool(
         name = "dc_next_naming_job",
@@ -1406,7 +1447,12 @@ mod tests {
                 1,
             )
             .unwrap();
-            let server = ProposerServer::new(store, run, Arc::new(crate::proposer::SystemClock));
+            let server = ProposerServer::new(
+                store,
+                run,
+                ProposerMode::Batch,
+                Arc::new(crate::proposer::SystemClock),
+            );
             let reader = Store::open(dir.path()).unwrap();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()

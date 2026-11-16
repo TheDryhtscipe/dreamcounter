@@ -6,20 +6,21 @@
 //! built-in tools, loads no user, project or local settings (so no rules,
 //! hooks or installed plugins; Claude Code's built-in plugins still load),
 //! gets only an allowlisted environment, and has one MCP server: the run's
-//! proposer server, `dc-mcp --proposer`. A session is one of two kinds, and
-//! may call only its kind's two tools of that server:
+//! proposer server, started in the session's kind's mode. A session is one
+//! of two kinds, and sees and may call only its kind's two tools:
 //!
-//! - A batch session may call `dc_next_batch` and `dc_submit`. Its brief,
+//! - A batch session has `dc_next_batch` and `dc_submit`, from
+//!   `dc-mcp --proposer`. Its brief,
 //!   which replaces Claude Code's default system prompt, tells it to take one
 //!   batch, write the programs the batch's prompt asks for, and submit them,
 //!   so each batch is written in a context of its own (D11 requirement 3).
-//! - A naming session may call `dc_next_naming_job` and `dc_submit_naming`.
-//!   Its brief tells it to take one naming job and answer it with a name and
+//! - A naming session has `dc_next_naming_job` and `dc_submit_naming`, from
+//!   `dc-mcp --namer`. Its brief tells it to take one naming job and answer it with a name and
 //!   a doc for the new library function (D23).
 //!
-//! The server lists all four tools to every session, so a session is
-//! allowed its kind's two tools and denied the other kind's two; denied
-//! tools are not shown to it.
+//! The server in each mode lists and takes only that mode's two tools, so a
+//! session cannot see or call the other kind's tools. The session is
+//! allowed the two its server lists.
 //!
 //! When it is set up, the launcher reads from the state directory how many
 //! of the run's library functions wait to be named, as dc-mcp counts them
@@ -135,14 +136,6 @@ impl Kind {
         match self {
             Kind::Batch => [NEXT_BATCH, SUBMIT],
             Kind::Naming => [NEXT_NAMING_JOB, SUBMIT_NAMING],
-        }
-    }
-
-    /// The other kind.
-    pub fn other(self) -> Kind {
-        match self {
-            Kind::Batch => Kind::Naming,
-            Kind::Naming => Kind::Batch,
         }
     }
 
@@ -422,19 +415,23 @@ pub fn naming_brief(worker: &str) -> String {
     )
 }
 
-/// The MCP configuration of a session: the run's proposer server only.
-pub fn mcp_config(dc_mcp: &Path, state_dir: &Path, run: &str) -> Value {
+/// The MCP configuration of a session of `kind`: the run's proposer server
+/// only, in the kind's mode, so it lists only the kind's two tools.
+pub fn mcp_config(dc_mcp: &Path, state_dir: &Path, run: &str, kind: Kind) -> Value {
+    let mode = match kind {
+        Kind::Batch => "--proposer",
+        Kind::Naming => "--namer",
+    };
     json!({"mcpServers": {SERVER: {
         "type": "stdio",
         "command": dc_mcp,
-        "args": ["--state-dir", state_dir, "--proposer", run],
+        "args": ["--state-dir", state_dir, mode, run],
     }}})
 }
 
 /// The arguments `claude` is started with, for a session of `kind`.
 pub fn claude_args(kind: Kind, model: &str, mcp_config: &Path, brief: &str) -> Vec<OsString> {
     let [next, submit] = kind.tools();
-    let [other_next, other_submit] = kind.other().tools();
     let mut args: Vec<OsString> = [
         "-p",
         "Begin.",
@@ -458,12 +455,6 @@ pub fn claude_args(kind: Kind, model: &str, mcp_config: &Path, brief: &str) -> V
             "--allowedTools",
             next,
             submit,
-            // The server lists both kinds' tools, and an allowed tool is
-            // only a permission: without this the session would see the
-            // other kind's tools too.
-            "--disallowedTools",
-            other_next,
-            other_submit,
             "--system-prompt",
             brief,
             "--no-session-persistence",
@@ -1079,7 +1070,7 @@ impl Launcher {
         let config_path = log(".mcp.json");
         fs::write(
             &config_path,
-            mcp_config(&c.dc_mcp, &self.state_dir, &c.run).to_string(),
+            mcp_config(&c.dc_mcp, &self.state_dir, &c.run, kind).to_string(),
         )
         .map_err(|e| io_error("cannot write", &config_path, &e))?;
         let config_path = config_path

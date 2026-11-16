@@ -1061,19 +1061,34 @@ fn the_launch_names_new_functions_before_it_asks_for_batches() {
         let args = f.argv(call);
         let mut allowed = values_after(&args, "--allowedTools");
         allowed.sort_unstable();
-        let mut denied = values_after(&args, "--disallowedTools");
-        denied.sort_unstable();
+        // The server lists only the kind's tools, so none is denied.
+        assert!(!args.contains(&"--disallowedTools".to_owned()), "{args:?}");
         let brief = value_after(&args, "--system-prompt");
         let worker = summary["sessions"][i]["worker"].as_str().unwrap();
         assert!(brief.contains(worker), "{brief}");
+        // Each kind's MCP configuration, kept in the log directory, starts
+        // the server in that kind's mode, so the server lists only the
+        // kind's two tools.
+        let config_path = value_after(&args, "--mcp-config");
+        assert!(
+            config_path.ends_with(&format!("{worker}.mcp.json")),
+            "{config_path}"
+        );
+        let config: Value =
+            serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+        let state = f.path("state").canonicalize().unwrap();
+        let mode = if i == 0 { "--namer" } else { "--proposer" };
+        assert_eq!(
+            config["mcpServers"]["dc"]["args"],
+            json!(["--state-dir", state.to_str().unwrap(), mode, "r1"]),
+            "session {i}"
+        );
         if i == 0 {
             assert_eq!(allowed, [NEXT_NAMING, SUBMIT_NAMING]);
-            assert_eq!(denied, [NEXT, SUBMIT]);
             assert!(brief.contains("dc_next_naming_job"), "{brief}");
             assert!(!brief.contains("dc_next_batch"), "{brief}");
         } else {
             assert_eq!(allowed, [NEXT, SUBMIT]);
-            assert_eq!(denied, [NEXT_NAMING, SUBMIT_NAMING]);
             assert!(!brief.contains("naming"), "{brief}");
         }
     }
