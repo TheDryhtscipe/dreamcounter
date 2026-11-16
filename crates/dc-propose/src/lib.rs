@@ -6,15 +6,28 @@
 //! built-in tools, loads no user, project or local settings (so no rules,
 //! hooks or installed plugins; Claude Code's built-in plugins still load),
 //! gets only an allowlisted environment, and has one MCP server: the run's
-//! proposer server, `dc-mcp --proposer`, whose two tools are the only ones it
-//! may call. Its brief, which replaces Claude Code's default system prompt,
-//! tells it to take one batch, write the programs the batch's prompt asks
-//! for, and submit them, so each batch is written in a context of its own
-//! (D11 requirement 3).
+//! proposer server, `dc-mcp --proposer`. A session is one of two kinds, and
+//! may call only its kind's two tools of that server:
+//!
+//! - A batch session may call `dc_next_batch` and `dc_submit`. Its brief,
+//!   which replaces Claude Code's default system prompt, tells it to take one
+//!   batch, write the programs the batch's prompt asks for, and submit them,
+//!   so each batch is written in a context of its own (D11 requirement 3).
+//! - A naming session may call `dc_next_naming_job` and `dc_submit_naming`.
+//!   Its brief tells it to take one naming job and answer it with a name and
+//!   a doc for the new library function (D23).
+//!
+//! Sessions start as batch sessions. When a batch session's wait says that
+//! new functions wait to be named (`names_pending`), the next sessions are
+//! naming sessions, until one finds nothing to name; then batch sessions
+//! start again. A naming session that finds every function still to name
+//! held by another job waits for this launch's other naming sessions to end
+//! before the next session starts; if none is running, the launch stops, as
+//! it does when a batch session finds no batch.
 //!
 //! The launcher reads each session's stream-json transcript as it comes. The
 //! first event must be the session's `init` report, and it must show the
-//! lockdown: exactly the two tools, exactly the one server, connected, only
+//! lockdown: exactly its kind's two tools, exactly the one server, connected, only
 //! built-in plugins, the session's own directory, and the model asked for.
 //! The first request's input tokens are capped too. The cap leaves room for
 //! the brief, so it catches large additions without a tool (the user's
@@ -25,9 +38,10 @@
 //! directory, with a summary of every session.
 //!
 //! The launcher does not create runs or finish iterations: those are the
-//! operator's tools. It starts sessions until it has started the number
-//! asked for, or until a session finds no batch to take. Worker ids are
-//! unique, so "no batch" means every open slot is leased or being checked.
+//! operator's tools. It starts sessions, of both kinds, until it has started
+//! the number asked for, or until a session finds no batch to take. Worker
+//! ids are unique, so "no batch" means every open slot is leased or being
+//! checked.
 //!
 //! With the environment allowlisted, Claude Code 2.1.318 makes no scratch
 //! directory for a session outside the session's own directory.
@@ -45,7 +59,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rustix::process::{kill_process_group, test_kill_process_group, Pid, Signal};
@@ -57,6 +71,11 @@ pub const SERVER: &str = "dc";
 pub const NEXT_BATCH: &str = "mcp__dc__dc_next_batch";
 /// The proposer's tool that takes a batch's programs, as the session names it.
 pub const SUBMIT: &str = "mcp__dc__dc_submit";
+/// The proposer's tool that hands out a naming job, as the session names it.
+pub const NEXT_NAMING_JOB: &str = "mcp__dc__dc_next_naming_job";
+/// The proposer's tool that takes a naming job's answer, as the session
+/// names it.
+pub const SUBMIT_NAMING: &str = "mcp__dc__dc_submit_naming";
 /// The prefix of each session's directory name.
 pub const DIR_PREFIX: &str = "dc-proposer-";
 /// The environment variables a session gets, if the launcher has them.
@@ -75,6 +94,42 @@ pub const DEFAULT_MAX_CONTEXT_TOKENS: u64 = 4000;
 const GRACE: Duration = Duration::from_secs(2);
 /// How often a waiting session checks for an interrupt.
 const TICK: Duration = Duration::from_millis(100);
+
+/// What a session does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// It takes a batch and submits programs for it.
+    Batch,
+    /// It takes a naming job and answers it (D23).
+    Naming,
+}
+
+impl Kind {
+    /// The kind's name in the summary.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Batch => "batch",
+            Kind::Naming => "naming",
+        }
+    }
+
+    /// The two tools a session of this kind may call: the one that hands out
+    /// work, then the one that takes the answer.
+    pub fn tools(self) -> [&'static str; 2] {
+        match self {
+            Kind::Batch => [NEXT_BATCH, SUBMIT],
+            Kind::Naming => [NEXT_NAMING_JOB, SUBMIT_NAMING],
+        }
+    }
+
+    /// The brief a session of this kind gets.
+    pub fn brief(self, worker: &str, model: &str) -> String {
+        match self {
+            Kind::Batch => brief(worker, model),
+            Kind::Naming => naming_brief(worker),
+        }
+    }
+}
 
 /// What the launcher is asked to do.
 #[derive(Clone, Debug)]
@@ -113,8 +168,36 @@ pub enum Outcome {
         /// How many programs the server received.
         received: u64,
     },
+    /// It took a naming job and the server took its answer.
+    Named {
+        /// The job.
+        job: u64,
+        /// The name the function has now: the session's, or its generated
+        /// name if the server refused the session's.
+        name: String,
+        /// What the server refused, and why.
+        refused: Vec<String>,
+    },
     /// The server had no batch for it.
     NoBatch {
+        /// What the server said.
+        detail: String,
+    },
+    /// The server had no batch for it because new functions wait to be
+    /// named. The next sessions are naming sessions.
+    NamesPending {
+        /// What the server said.
+        detail: String,
+    },
+    /// The server had no naming job for it: no function waits to be named.
+    /// The next sessions are batch sessions.
+    NothingToName {
+        /// What the server said.
+        detail: String,
+    },
+    /// The server had no naming job for it: every function still to name is
+    /// held by another job.
+    NamingHeld {
         /// What the server said.
         detail: String,
     },
@@ -140,7 +223,11 @@ impl Outcome {
     pub fn name(&self) -> &'static str {
         match self {
             Outcome::Submitted { .. } => "submitted",
+            Outcome::Named { .. } => "named",
             Outcome::NoBatch { .. } => "no_batch",
+            Outcome::NamesPending { .. } => "names_pending",
+            Outcome::NothingToName { .. } => "nothing_to_name",
+            Outcome::NamingHeld { .. } => "naming_held",
             Outcome::Lockdown { .. } => "lockdown",
             Outcome::Timeout => "timeout",
             Outcome::Interrupted => "interrupted",
@@ -150,7 +237,15 @@ impl Outcome {
 
     /// Whether the launch counts this session as a failure.
     pub fn is_failure(&self) -> bool {
-        !matches!(self, Outcome::Submitted { .. } | Outcome::NoBatch { .. })
+        !matches!(
+            self,
+            Outcome::Submitted { .. }
+                | Outcome::Named { .. }
+                | Outcome::NoBatch { .. }
+                | Outcome::NamesPending { .. }
+                | Outcome::NothingToName { .. }
+                | Outcome::NamingHeld { .. }
+        )
     }
 }
 
@@ -159,6 +254,8 @@ impl Outcome {
 pub struct Session {
     /// The worker id the session was given.
     pub worker: String,
+    /// What it was started to do.
+    pub kind: Kind,
     /// How it ended.
     pub outcome: Outcome,
     /// Whether it was killed for running past its time (after it submitted,
@@ -169,19 +266,22 @@ pub struct Session {
     /// The `usage`, `total_cost_usd`, `num_turns` and `duration_ms` of its
     /// final `result` event, as it gave them.
     pub result: Map<String, Value>,
-    /// How many times it called `dc_next_batch` and `dc_submit`.
+    /// How many times it called its kind's two tools: the one that hands out
+    /// work, then the one that takes the answer.
     pub calls: (u64, u64),
-    /// The batches `dc_next_batch` gave it, in order. Their slots stay
-    /// leased until each lease ends, whatever the session did.
+    /// The batches `dc_next_batch` gave it, or the jobs `dc_next_naming_job`
+    /// gave it, in order. Each stays held until its lease ends, whatever the
+    /// session did.
     pub leased: Vec<u64>,
     /// How long it ran, in milliseconds, as the launcher saw it.
     pub elapsed_ms: u64,
 }
 
 impl Session {
-    fn ended(worker: &str, outcome: Outcome) -> Self {
+    fn ended(worker: &str, kind: Kind, outcome: Outcome) -> Self {
         Session {
             worker: worker.to_owned(),
+            kind,
             outcome,
             timed_out: false,
             model: None,
@@ -195,19 +295,36 @@ impl Session {
     fn to_json(&self) -> Value {
         let mut s = Map::new();
         s.insert("worker".into(), json!(self.worker));
+        s.insert("kind".into(), json!(self.kind.name()));
         s.insert("outcome".into(), json!(self.outcome.name()));
         s.insert("timed_out".into(), json!(self.timed_out));
         s.insert("model".into(), json!(self.model));
-        s.insert("next_batch_calls".into(), json!(self.calls.0));
-        s.insert("submit_calls".into(), json!(self.calls.1));
-        s.insert("leased_batches".into(), json!(self.leased));
+        let (next, submit, leased) = match self.kind {
+            Kind::Batch => ("next_batch_calls", "submit_calls", "leased_batches"),
+            Kind::Naming => (
+                "next_naming_job_calls",
+                "submit_naming_calls",
+                "leased_jobs",
+            ),
+        };
+        s.insert(next.into(), json!(self.calls.0));
+        s.insert(submit.into(), json!(self.calls.1));
+        s.insert(leased.into(), json!(self.leased));
         s.insert("elapsed_ms".into(), json!(self.elapsed_ms));
         match &self.outcome {
             Outcome::Submitted { batch, received } => {
                 s.insert("batch".into(), json!(batch));
                 s.insert("received".into(), json!(received));
             }
+            Outcome::Named { job, name, refused } => {
+                s.insert("job".into(), json!(job));
+                s.insert("name".into(), json!(name));
+                s.insert("refused".into(), json!(refused));
+            }
             Outcome::NoBatch { detail }
+            | Outcome::NamesPending { detail }
+            | Outcome::NothingToName { detail }
+            | Outcome::NamingHeld { detail }
             | Outcome::Lockdown { detail }
             | Outcome::Failed { detail } => {
                 s.insert("detail".into(), json!(detail));
@@ -257,6 +374,25 @@ pub fn brief(worker: &str, model: &str) -> String {
     )
 }
 
+/// The brief a naming session gets as its whole system prompt.
+pub fn naming_brief(worker: &str) -> String {
+    format!(
+        "You name functions for a research server. You have two tools, \
+         dc_next_naming_job and dc_submit_naming, and nothing else. No one \
+         will answer questions, so do not ask any.\n\
+         \n\
+         1. Call dc_next_naming_job with worker \"{worker}\". Call it once.\n\
+         2. If its reply has no job, stop and reply NO_JOB.\n\
+         3. Otherwise, read the job's prompt. It shows a function, how it is \
+         used, and the rules a name and a doc must follow. Choose a name and a \
+         one-line doc that say what the function does.\n\
+         4. Call dc_submit_naming with worker \"{worker}\", the job's number and \
+         token, your name, and your doc. Your first answer ends the job, so \
+         answer once.\n\
+         5. Reply with one line: NAMED and the job's number.\n"
+    )
+}
+
 /// The MCP configuration of a session: the run's proposer server only.
 pub fn mcp_config(dc_mcp: &Path, state_dir: &Path, run: &str) -> Value {
     json!({"mcpServers": {SERVER: {
@@ -266,8 +402,9 @@ pub fn mcp_config(dc_mcp: &Path, state_dir: &Path, run: &str) -> Value {
     }}})
 }
 
-/// The arguments `claude` is started with.
-pub fn claude_args(model: &str, mcp_config: &Path, brief: &str) -> Vec<OsString> {
+/// The arguments `claude` is started with, for a session of `kind`.
+pub fn claude_args(kind: Kind, model: &str, mcp_config: &Path, brief: &str) -> Vec<OsString> {
+    let [next, submit] = kind.tools();
     let mut args: Vec<OsString> = [
         "-p",
         "Begin.",
@@ -289,8 +426,8 @@ pub fn claude_args(model: &str, mcp_config: &Path, brief: &str) -> Vec<OsString>
     args.extend(
         [
             "--allowedTools",
-            NEXT_BATCH,
-            SUBMIT,
+            next,
+            submit,
             "--system-prompt",
             brief,
             "--no-session-persistence",
@@ -304,9 +441,10 @@ pub fn claude_args(model: &str, mcp_config: &Path, brief: &str) -> Vec<OsString>
     args
 }
 
-/// Checks a session's `init` event against the lockdown, for a session that
-/// runs in `cwd` (canonical) on `model`. `Err` says what it showed instead.
-pub fn check_init(init: &Value, cwd: &Path, model: &str) -> Result<(), String> {
+/// Checks a session's `init` event against the lockdown, for a session of
+/// `kind` that runs in `cwd` (canonical) on `model`. `Err` says what it
+/// showed instead.
+pub fn check_init(init: &Value, kind: Kind, cwd: &Path, model: &str) -> Result<(), String> {
     let mut tools: Vec<&str> = init["tools"]
         .as_array()
         .ok_or("the init event lists no tools")?
@@ -314,7 +452,7 @@ pub fn check_init(init: &Value, cwd: &Path, model: &str) -> Result<(), String> {
         .map(|t| t.as_str().unwrap_or("?"))
         .collect();
     tools.sort_unstable();
-    let mut want = [NEXT_BATCH, SUBMIT];
+    let mut want = kind.tools();
     want.sort_unstable();
     if tools != want {
         return Err(format!("the session has the tools {tools:?}"));
@@ -382,9 +520,20 @@ fn result_text(content: &Value) -> String {
     }
 }
 
-/// How a session ended, from its events; how many times it called
-/// `dc_next_batch` and `dc_submit`; and the batches it was given, in order. A received submission wins over
-/// anything else; then a reply with no batch; otherwise the session failed,
+/// What a reply with no work says: its reason and when to ask again.
+fn wait_detail(wait: &Value) -> String {
+    let reason = wait["reason"].as_str().unwrap_or("no reason given");
+    match wait["retry_after_seconds"].as_u64() {
+        Some(s) => format!("{reason}; ask again in {s} s"),
+        None => reason.to_owned(),
+    }
+}
+
+/// How a session ended, from its events; how many times it called the tool
+/// that hands out work (`dc_next_batch` or `dc_next_naming_job`) and the one
+/// that takes the answer (`dc_submit` or `dc_submit_naming`); and the batches
+/// or jobs it was given, in order. An answer the server took wins over
+/// anything else; then a reply with no work; otherwise the session failed,
 /// and the last tool error or its last words say how.
 pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
     let mut names: Vec<(String, String)> = Vec::new();
@@ -399,9 +548,9 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
             match b["type"].as_str() {
                 Some("tool_use") => {
                     let name = b["name"].as_str().unwrap_or("?").to_owned();
-                    if name == NEXT_BATCH {
+                    if name == NEXT_BATCH || name == NEXT_NAMING_JOB {
                         calls.0 += 1;
-                    } else if name == SUBMIT {
+                    } else if name == SUBMIT || name == SUBMIT_NAMING {
                         calls.1 += 1;
                     }
                     names.push((b["id"].as_str().unwrap_or("").to_owned(), name));
@@ -418,24 +567,52 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
                         continue;
                     }
                     let reply: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    let wait = &reply["wait"];
+                    let pending = wait["names_pending"].as_bool() == Some(true);
                     if name == SUBMIT {
                         if let (Some(batch), Some(received)) =
                             (reply["batch"].as_u64(), reply["received"].as_u64())
                         {
                             submitted = Some(Outcome::Submitted { batch, received });
                         }
-                    } else if let Some(b) = reply["batch"]["batch"].as_u64() {
-                        if name == NEXT_BATCH {
-                            leased.push(b);
+                    } else if name == SUBMIT_NAMING {
+                        if let (Some(job), Some(given)) =
+                            (reply["job"].as_u64(), reply["name"].as_str())
+                        {
+                            let refused = reply["refused"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|r| r.as_str().map_or_else(|| r.to_string(), str::to_owned))
+                                .collect();
+                            submitted = Some(Outcome::Named {
+                                job,
+                                name: given.to_owned(),
+                                refused,
+                            });
                         }
-                    } else if name == NEXT_BATCH && reply.get("batch").is_some_and(Value::is_null) {
-                        let wait = &reply["wait"];
-                        let reason = wait["reason"].as_str().unwrap_or("no reason given");
-                        let detail = match wait["retry_after_seconds"].as_u64() {
-                            Some(s) => format!("{reason}; ask again in {s} s"),
-                            None => reason.to_owned(),
-                        };
-                        no_batch = Some(Outcome::NoBatch { detail });
+                    } else if name == NEXT_BATCH {
+                        if let Some(b) = reply["batch"]["batch"].as_u64() {
+                            leased.push(b);
+                        } else if reply.get("batch").is_some_and(Value::is_null) {
+                            let detail = wait_detail(wait);
+                            no_batch = Some(if pending {
+                                Outcome::NamesPending { detail }
+                            } else {
+                                Outcome::NoBatch { detail }
+                            });
+                        }
+                    } else if name == NEXT_NAMING_JOB {
+                        if let Some(j) = reply["job"]["job"].as_u64() {
+                            leased.push(j);
+                        } else if reply.get("job").is_some_and(Value::is_null) {
+                            let detail = wait_detail(wait);
+                            no_batch = Some(if pending {
+                                Outcome::NamingHeld { detail }
+                            } else {
+                                Outcome::NothingToName { detail }
+                            });
+                        }
                     }
                 }
                 _ => {}
@@ -544,6 +721,24 @@ enum Ending {
     Interrupted,
 }
 
+/// Which kind of session starts next, shared by a launch's threads.
+#[derive(Debug, Default)]
+struct Plan {
+    /// Whether naming sessions start: set when a batch session hears that
+    /// names are pending, cleared when a naming session finds nothing to
+    /// name.
+    naming: bool,
+    /// How many naming sessions are running.
+    naming_running: usize,
+    /// Whether a naming session found every function to name held while
+    /// another was running; cleared when a naming session ends.
+    held: bool,
+}
+
+fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The launcher, set up for one launch.
 #[derive(Debug)]
 pub struct Launcher {
@@ -611,34 +806,78 @@ impl Launcher {
     }
 
     /// Starts the sessions, at most `parallel` at once, and returns their
-    /// records in the order they started. No session starts after one finds
-    /// no batch or fails the lockdown, or after an interrupt.
+    /// records in the order they started. Each starts as the kind the module
+    /// docs say. No session starts after one finds no batch, finds every
+    /// function to name held while no other naming session of this launch
+    /// runs, or fails the lockdown, or after an interrupt.
     pub fn launch(&self) -> Vec<Session> {
         let next = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
+        let plan = Mutex::new(Plan::default());
+        let changed = Condvar::new();
         let done: Mutex<Vec<(usize, Session)>> = Mutex::new(Vec::new());
         let workers = self.config.parallel.min(self.config.sessions);
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| loop {
-                    if stop.load(Ordering::SeqCst) || self.is_interrupted() {
-                        return;
-                    }
-                    let n = next.fetch_add(1, Ordering::SeqCst);
-                    if n >= self.config.sessions {
-                        return;
-                    }
-                    let session = self.session(n);
-                    if matches!(
-                        session.outcome,
-                        Outcome::NoBatch { .. } | Outcome::Lockdown { .. }
-                    ) {
-                        stop.store(true, Ordering::SeqCst);
+                    let (n, kind) = {
+                        let mut p = locked(&plan);
+                        loop {
+                            if stop.load(Ordering::SeqCst) || self.is_interrupted() {
+                                return;
+                            }
+                            // Every function to name is held by this launch's
+                            // naming sessions: wait for one to end.
+                            if p.naming && p.held && p.naming_running > 0 {
+                                p = changed
+                                    .wait_timeout(p, TICK)
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .0;
+                                continue;
+                            }
+                            break;
+                        }
+                        let n = next.fetch_add(1, Ordering::SeqCst);
+                        if n >= self.config.sessions {
+                            return;
+                        }
+                        let kind = if p.naming { Kind::Naming } else { Kind::Batch };
+                        if kind == Kind::Naming {
+                            p.naming_running += 1;
+                        }
+                        (n, kind)
+                    };
+                    let session = self.session(n, kind);
+                    {
+                        let mut p = locked(&plan);
+                        if kind == Kind::Naming {
+                            p.naming_running -= 1;
+                        }
+                        match session.outcome {
+                            Outcome::NamesPending { .. } => p.naming = true,
+                            Outcome::NothingToName { .. } => {
+                                p.naming = false;
+                                p.held = false;
+                            }
+                            Outcome::NamingHeld { .. } if p.naming_running == 0 => {
+                                stop.store(true, Ordering::SeqCst);
+                            }
+                            Outcome::NamingHeld { .. } => p.held = true,
+                            Outcome::NoBatch { .. } | Outcome::Lockdown { .. } => {
+                                stop.store(true, Ordering::SeqCst);
+                            }
+                            // A naming session that ended may have freed a
+                            // function to name.
+                            _ if kind == Kind::Naming => p.held = false,
+                            _ => {}
+                        }
+                        changed.notify_all();
                     }
                     let _ = writeln!(
                         std::io::stderr(),
-                        "dc-propose: {} {}",
+                        "dc-propose: {} {} {}",
                         session.worker,
+                        session.kind.name(),
                         session.outcome.name()
                     );
                     done.lock()
@@ -666,13 +905,13 @@ impl Launcher {
         })
     }
 
-    /// Runs session `n` to its end.
-    fn session(&self, n: usize) -> Session {
+    /// Runs session `n`, of `kind`, to its end.
+    fn session(&self, n: usize, kind: Kind) -> Session {
         let worker = format!("{}-{n}", self.launch);
         let started = Instant::now();
         let mut session = self
-            .run_session(&worker, started)
-            .unwrap_or_else(|e| Session::ended(&worker, Outcome::Failed { detail: e.0 }));
+            .run_session(&worker, kind, started)
+            .unwrap_or_else(|e| Session::ended(&worker, kind, Outcome::Failed { detail: e.0 }));
         session.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         session
     }
@@ -692,7 +931,12 @@ impl Launcher {
         ))
     }
 
-    fn run_session(&self, worker: &str, started: Instant) -> Result<Session, LaunchError> {
+    fn run_session(
+        &self,
+        worker: &str,
+        kind: Kind,
+        started: Instant,
+    ) -> Result<Session, LaunchError> {
         let c = &self.config;
         let dir = tempfile::Builder::new()
             .prefix(DIR_PREFIX)
@@ -703,7 +947,7 @@ impl Launcher {
             .canonicalize()
             .map_err(|e| io_error("cannot open", dir.path(), &e))?;
         if let Some(detail) = self.misplaced(&cwd) {
-            return Ok(Session::ended(worker, Outcome::Lockdown { detail }));
+            return Ok(Session::ended(worker, kind, Outcome::Lockdown { detail }));
         }
         let log = |suffix: &str| c.log_dir.join(format!("{worker}{suffix}"));
         let config_path = log(".mcp.json");
@@ -715,7 +959,7 @@ impl Launcher {
         let config_path = config_path
             .canonicalize()
             .map_err(|e| io_error("cannot open", &config_path, &e))?;
-        let args = claude_args(&c.model, &config_path, &brief(worker, &c.model));
+        let args = claude_args(kind, &c.model, &config_path, &kind.brief(worker, &c.model));
         let env: Vec<(String, OsString)> = ENV_ALLOW
             .iter()
             .copied()
@@ -781,12 +1025,12 @@ impl Launcher {
                     let Ok(event) = serde_json::from_str::<Value>(&line) else {
                         continue;
                     };
-                    let kind = event["type"].as_str().unwrap_or("?").to_owned();
+                    let event_type = event["type"].as_str().unwrap_or("?").to_owned();
                     if !init_seen {
-                        if kind != "system" || event["subtype"] != "init" {
+                        if event_type != "system" || event["subtype"] != "init" {
                             stopped = Some(Outcome::Lockdown {
                                 detail: format!(
-                                    "the session sent a {kind} event ({}) before its init event",
+                                    "the session sent a {event_type} event ({}) before its init event",
                                     event["subtype"]
                                 ),
                             });
@@ -794,11 +1038,11 @@ impl Launcher {
                         }
                         init_seen = true;
                         model = event["model"].as_str().map(str::to_owned);
-                        if let Err(detail) = check_init(&event, &cwd, &c.model) {
+                        if let Err(detail) = check_init(&event, kind, &cwd, &c.model) {
                             stopped = Some(Outcome::Lockdown { detail });
                             break;
                         }
-                    } else if kind == "assistant" && !asked {
+                    } else if event_type == "assistant" && !asked {
                         asked = true;
                         let detail = match input_tokens(&event) {
                             None => Some("the session's first request reports no usage".into()),
@@ -814,7 +1058,7 @@ impl Launcher {
                         }
                     }
                     events.push(event);
-                    if kind == "result" {
+                    if event_type == "result" {
                         finished = true;
                         break;
                     }
@@ -863,8 +1107,14 @@ impl Launcher {
             _ if !left.is_empty() => Outcome::Lockdown {
                 detail: format!("the session left {left:?} in its directory"),
             },
-            // Programs the server took count, whatever came after.
-            _ if matches!(classified, Outcome::Submitted { .. }) => classified,
+            // Programs or a name the server took count, whatever came after.
+            _ if matches!(
+                classified,
+                Outcome::Submitted { .. } | Outcome::Named { .. }
+            ) =>
+            {
+                classified
+            }
             Some(o) => o,
             None if !init_seen => Outcome::Lockdown {
                 detail: "the session never sent its init event".to_owned(),
@@ -875,6 +1125,7 @@ impl Launcher {
         drop(dir);
         Ok(Session {
             worker: worker.to_owned(),
+            kind,
             outcome,
             timed_out,
             model,

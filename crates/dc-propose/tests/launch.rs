@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 const MODEL: &str = "claude-test-1";
 const NEXT: &str = "mcp__dc__dc_next_batch";
 const SUBMIT: &str = "mcp__dc__dc_submit";
+const NEXT_NAMING: &str = "mcp__dc__dc_next_naming_job";
+const SUBMIT_NAMING: &str = "mcp__dc__dc_submit_naming";
 
 /// The fake `claude`. Each call records its arguments (NUL-separated), its
 /// working directory and what that directory holds, then plays the first
@@ -263,6 +265,74 @@ fn no_batch() -> Vec<String> {
             false,
         ),
         result("NO_BATCH"),
+    ]
+}
+
+/// A batch session told that new functions wait to be named.
+fn names_pending() -> Vec<String> {
+    vec![
+        good_init(),
+        tool_use("t1", NEXT, json!({"worker": "w"})),
+        tool_result(
+            "t1",
+            &json!({"batch": null, "wait": {"reason": "new library functions are being named",
+                                              "retry_after_seconds": 5,
+                                              "names_pending": true}})
+            .to_string(),
+            false,
+        ),
+        result("NO_BATCH"),
+    ]
+}
+
+fn naming_init() -> String {
+    init(
+        &[NEXT_NAMING, SUBMIT_NAMING],
+        json!([{"name": "dc", "status": "connected"}]),
+        MODEL,
+        "@CWD@",
+    )
+}
+
+/// A naming session that names job `job`'s function `ident`.
+fn named(job: u64) -> Vec<String> {
+    vec![
+        naming_init(),
+        tool_use("t1", NEXT_NAMING, json!({"worker": "w"})),
+        tool_result(
+            "t1",
+            &json!({"job": {"job": job, "token": "ab", "lease_seconds": 1800,
+                            "prompt": "name it"}, "wait": null})
+            .to_string(),
+            false,
+        ),
+        tool_use(
+            "t2",
+            SUBMIT_NAMING,
+            json!({"job": job, "token": "ab", "name": "ident", "doc": "Returns x."}),
+        ),
+        tool_result(
+            "t2",
+            &json!({"job": job, "name": "ident", "doc": "Returns x.", "refused": []}).to_string(),
+            false,
+        ),
+        result(&format!("NAMED {job}")),
+    ]
+}
+
+/// A naming session that finds no job, with `names_pending` as the wait says.
+fn no_job(reason: &str, names_pending: bool) -> Vec<String> {
+    vec![
+        naming_init(),
+        tool_use("t1", NEXT_NAMING, json!({"worker": "w"})),
+        tool_result(
+            "t1",
+            &json!({"job": null, "wait": {"reason": reason, "retry_after_seconds": 60,
+                                            "names_pending": names_pending}})
+            .to_string(),
+            false,
+        ),
+        result("NO_JOB"),
     ]
 }
 
@@ -899,4 +969,141 @@ fn zero_sessions_is_a_usage_error() {
     let f = Fixture::new();
     let out = f.run(&["--sessions", "0"]);
     assert_eq!(out.status.code(), Some(2), "{out:?}");
+}
+
+#[test]
+fn the_launch_names_new_functions_before_it_asks_for_batches() {
+    let f = Fixture::new();
+    f.queue("1", &names_pending());
+    f.queue("2", &named(0));
+    f.queue("3", &no_job("no function waits to be named", false));
+    let out = f.run(&["--sessions", "4", "--parallel", "1"]);
+    assert!(out.status.success(), "{out:?}");
+    let summary = f.summary();
+    assert_eq!(
+        outcomes(&summary),
+        ["names_pending", "named", "nothing_to_name", "submitted"]
+    );
+    let kinds: Vec<&str> = summary["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["batch", "naming", "naming", "batch"]);
+    let session = &summary["sessions"][1];
+    assert_eq!(session["job"], 0);
+    assert_eq!(session["name"], "ident");
+    assert_eq!(session["next_naming_job_calls"], 1);
+    assert_eq!(session["submit_naming_calls"], 1);
+    assert_eq!(session["leased_jobs"], json!([0]));
+
+    let calls = f.calls();
+    assert_eq!(calls.len(), 4);
+    for (i, call) in calls.iter().enumerate() {
+        let args = f.argv(call);
+        let mut tools = values_after(&args, "--allowedTools");
+        tools.sort_unstable();
+        let brief = value_after(&args, "--system-prompt");
+        let worker = summary["sessions"][i]["worker"].as_str().unwrap();
+        assert!(brief.contains(worker), "{brief}");
+        if kinds[i] == "naming" {
+            assert_eq!(tools, [NEXT_NAMING, SUBMIT_NAMING]);
+            assert!(brief.contains("dc_next_naming_job"), "{brief}");
+            assert!(!brief.contains("dc_next_batch"), "{brief}");
+        } else {
+            assert_eq!(tools, [NEXT, SUBMIT]);
+            assert!(!brief.contains("naming"), "{brief}");
+        }
+    }
+}
+
+#[test]
+fn a_naming_session_with_the_batch_tools_is_stopped() {
+    let f = Fixture::new();
+    f.queue("1", &names_pending());
+    // The default transcript's init shows the batch tools.
+    let out = f.run(&["--sessions", "3", "--parallel", "1"]);
+    assert!(!out.status.success(), "{out:?}");
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["names_pending", "lockdown"]);
+    let detail = summary["sessions"][1]["detail"].as_str().unwrap();
+    assert!(detail.contains(NEXT), "{detail}");
+}
+
+#[test]
+fn the_launch_stops_when_every_function_to_name_is_held_elsewhere() {
+    let f = Fixture::new();
+    f.queue("1", &names_pending());
+    f.queue(
+        "2",
+        &no_job("every function still to name is held by another job", true),
+    );
+    let out = f.run(&["--sessions", "5", "--parallel", "1"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(f.calls().len(), 2);
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["names_pending", "naming_held"]);
+    assert_eq!(
+        summary["sessions"][1]["detail"],
+        "every function still to name is held by another job; ask again in 60 s"
+    );
+}
+
+#[test]
+fn a_session_that_finds_the_names_held_by_this_launch_waits_for_them() {
+    let f = Fixture::new();
+    f.queue("1", &names_pending());
+    f.queue("2", &names_pending());
+    let mut slow = named(0);
+    slow.insert(1, "@SLEEP 2".to_owned());
+    f.queue("3", &slow);
+    f.queue(
+        "4",
+        &no_job("every function still to name is held by another job", true),
+    );
+    f.queue("5", &no_job("no function waits to be named", false));
+    let out = f.run(&["--sessions", "5", "--parallel", "2"]);
+    assert!(out.status.success(), "{out:?}");
+    // The session that found the name held did not end the launch: it
+    // waited for this launch's other naming session to end, then went on,
+    // so the last session started with no other running.
+    let calls = f.calls();
+    assert_eq!(calls.len(), 5);
+    assert_eq!(f.read(&format!("fake/conc.{}", calls[4])).trim(), "1");
+    let mut got = outcomes(&f.summary());
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            "named",
+            "names_pending",
+            "names_pending",
+            "naming_held",
+            "nothing_to_name"
+        ]
+    );
+}
+
+#[test]
+fn a_naming_session_killed_after_its_answer_was_taken_still_named() {
+    let f = Fixture::new();
+    f.queue("1", &names_pending());
+    let mut lines = named(3);
+    // No result event: the session hangs after the server took its answer.
+    lines[5] = "@SLEEP 30".to_owned();
+    f.queue("2", &lines);
+    let out = f.run(&[
+        "--sessions",
+        "2",
+        "--session-timeout",
+        "2",
+        "--parallel",
+        "1",
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let summary = f.summary();
+    assert_eq!(outcomes(&summary), ["names_pending", "named"]);
+    assert_eq!(summary["sessions"][1]["job"], 3);
+    assert_eq!(summary["sessions"][1]["timed_out"], true);
 }
