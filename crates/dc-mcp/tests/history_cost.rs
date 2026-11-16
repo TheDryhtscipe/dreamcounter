@@ -101,6 +101,7 @@ fn build(past: u64) -> (TempDir, Store, RunId) {
         .create_run(
             &run,
             RunConfig {
+                autodoc: false,
                 arm: Arm::Blind,
                 seed: 1,
                 proposals_per_task: 4,

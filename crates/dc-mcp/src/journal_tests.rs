@@ -4,6 +4,7 @@ use crate::state::{Arm, Event, LogKind, LogRecord, RunConfig};
 fn created() -> Event {
     Event::Created {
         config: RunConfig {
+            autodoc: false,
             arm: Arm::Blind,
             seed: 1,
             proposals_per_task: 2,

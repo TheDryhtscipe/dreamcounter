@@ -46,6 +46,7 @@ fn a_claim_held_by_a_killed_process_does_not_strand_its_submission() {
         .create_run(
             &run,
             RunConfig {
+                autodoc: false,
                 arm: Arm::Blind,
                 seed: 3,
                 proposals_per_task: 1,

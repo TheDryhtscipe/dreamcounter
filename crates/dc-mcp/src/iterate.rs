@@ -411,6 +411,8 @@ fn finish(store: &Store, run: &RunId, runner: Runner<'_>) -> Result<Finished, Fi
                 .new_library
                 .iter()
                 .map(|e| LibraryEntry {
+                    name: None,
+                    doc: None,
                     arity: e.arity,
                     term: e.term.clone(),
                 })

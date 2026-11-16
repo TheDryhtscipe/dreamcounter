@@ -111,6 +111,7 @@ fn check_cold_reads(notes: u64, note_bytes: usize) {
     let run = RunId::new(RUN).unwrap();
     let store = Store::open(dir.path()).unwrap();
     let config = RunConfig {
+        autodoc: false,
         arm: Arm::Blind,
         seed: 5,
         proposals_per_task: 1,

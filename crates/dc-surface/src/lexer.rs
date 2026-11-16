@@ -136,6 +136,17 @@ pub(crate) fn is_keyword(word: &str) -> bool {
     keyword(word).is_some()
 }
 
+/// Whether `word` lexes as one variable name: a lower-case letter or `_`,
+/// then letters, digits, `_` and `'`, and not a keyword.
+pub fn is_variable_name(word: &str) -> bool {
+    let b = word.as_bytes();
+    match b.first() {
+        Some(&c) if c.is_ascii_lowercase() || c == b'_' => {}
+        _ => return false,
+    }
+    b.iter().all(|&c| is_name_byte(c)) && !is_keyword(word)
+}
+
 fn is_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'\''
 }
@@ -332,6 +343,21 @@ mod tests {
                 Tok::Eof
             ]
         );
+    }
+
+    #[test]
+    fn variable_names_are_what_lexes_as_one_ident() {
+        for good in ["x", "_y", "map_pairs", "f'", "a1"] {
+            assert!(is_variable_name(good), "{good}");
+            assert_eq!(
+                toks(good),
+                vec![Tok::Ident(good.into()), Tok::Eof],
+                "{good}"
+            );
+        }
+        for bad in ["", "Foo", "1a", "mod", "let", "_", "a-b", "a b", "é", "a.b"] {
+            assert!(!is_variable_name(bad), "{bad}");
+        }
     }
 
     #[test]

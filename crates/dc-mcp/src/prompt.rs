@@ -19,7 +19,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{BatchIssued, Event, IssuedPayload, PromptPart, RunState};
-use crate::verify::{library_name, Verifier, ENTRY};
+use crate::verify::{entry_name, library_name, Verifier, ENTRY};
 
 /// The most programs of other tasks a payload shows.
 pub const MAX_SOLVED_EXAMPLES: usize = 3;
@@ -47,7 +47,7 @@ pub struct Payload {
 /// The language guide. The types of primitives and prelude functions follow
 /// it in the prompt. The tests in `prompt_guide_tests.rs` check its claims
 /// against the parser and type checker by reading them out of this text.
-const GUIDE: &str = "\
+pub(crate) const GUIDE: &str = "\
 ## The dc language
 
 dc is a small, strict, purely functional language with OCaml-like syntax.
@@ -106,7 +106,7 @@ fn instructions(wanted: u32, batch: u64, token: &str) -> String {
 }
 
 /// One line for each primitive: `name : type`.
-fn primitives() -> String {
+pub(crate) fn primitives() -> String {
     let mut out = String::from(
         "## Primitives\n\nEach can be used by its name. The operators are add (+), sub (-), \
          mul (*), div (/), mod, int_eq (=), lt (<), le (<=), eq (==) and cons (::).\n\n",
@@ -118,7 +118,7 @@ fn primitives() -> String {
 }
 
 /// One line for each prelude function: `name : type`.
-fn prelude(verifier: &Verifier) -> String {
+pub(crate) fn prelude(verifier: &Verifier) -> String {
     let mut out = String::from("## Prelude functions\n\n");
     for e in verifier.prelude().entries() {
         out.push_str(&format!("{} : {}\n", e.name(), e.scheme()));
@@ -127,16 +127,22 @@ fn prelude(verifier: &Verifier) -> String {
 }
 
 /// The names programs use for library references: prelude names and `fn_i`.
-fn lib_name(verifier: &Verifier) -> impl Fn(LibId) -> String + Sync + '_ {
+pub(crate) fn lib_name(verifier: &Verifier) -> impl Fn(LibId) -> String + Sync + '_ {
     move |id| match verifier.prelude().name(id) {
         Some(name) => name.to_owned(),
-        None => library_name(id.0 as usize),
+        None => {
+            let i = id.0 as usize;
+            verifier
+                .library()
+                .get(i)
+                .map_or_else(|| library_name(i), |e| entry_name(i, e))
+        }
     }
 }
 
 /// `text`, a closed core term, as surface syntax, or `None` if it cannot be
 /// printed.
-fn surface(verifier: &Verifier, text: &str) -> Option<String> {
+pub(crate) fn surface(verifier: &Verifier, text: &str) -> Option<String> {
     let mut arena = Arena::new();
     let term = sexpr::parse(&mut arena, text).ok()?;
     pretty(&arena, term, lib_name(verifier)).ok()
@@ -152,7 +158,10 @@ fn library(state: &RunState, verifier: &Verifier) -> String {
          definition written out.\n\n",
     );
     for (i, (entry, scheme)) in state.library().iter().zip(verifier.schemes()).enumerate() {
-        let name = library_name(i);
+        let name = entry_name(i, entry);
+        if let Some(doc) = &entry.doc {
+            out.push_str(&format!("-- {doc}\n"));
+        }
         out.push_str(&format!("{name} : {scheme}\n"));
         match surface(verifier, &entry.term) {
             Some(body) => out.push_str(&format!("let {name} = {body}\n\n")),
@@ -432,6 +441,7 @@ mod tests {
     fn state(tasks: &[&str]) -> RunState {
         RunState::create(
             RunConfig {
+                autodoc: false,
                 arm: Arm::Blind,
                 seed: 11,
                 proposals_per_task: 2,
@@ -478,6 +488,8 @@ mod tests {
         let v0 = Verifier::new(&[]).unwrap();
         let reverse = v0.prelude().get("reverse").unwrap().lib().0;
         let entry = LibraryEntry {
+            name: None,
+            doc: None,
             arity: 1,
             term: format!("(lam (lib_{reverse} (lib_{reverse} $0)))"),
         };

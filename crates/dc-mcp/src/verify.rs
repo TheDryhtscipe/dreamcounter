@@ -36,6 +36,12 @@ pub fn library_name(index: usize) -> String {
     format!("fn_{index}")
 }
 
+/// What library entry `index` is called in payloads: the name a proposer
+/// gave it (decision D23), or [`library_name`].
+pub fn entry_name(index: usize, entry: &LibraryEntry) -> String {
+    entry.name.clone().unwrap_or_else(|| library_name(index))
+}
+
 /// The longest error text kept for a program, in bytes. The rest is cut.
 pub const MAX_ERROR_LEN: usize = 2000;
 
@@ -183,6 +189,11 @@ impl Verifier {
             let reference = arena.lib(LibId(id));
             top.define_inline(&arena, &library_name(index), reference)
                 .map_err(|e| bad(e.to_string()))?;
+            // A named entry is in scope by its name too (decision D23).
+            if let Some(name) = &entry.name {
+                top.define_inline(&arena, name, reference)
+                    .map_err(|e| bad(e.to_string()))?;
+            }
         }
         let expander = Expander::new(&mut arena, &defs).map_err(|e| {
             let index = match e {
@@ -478,6 +489,8 @@ mod tests {
         let prelude = Prelude::load().unwrap();
         let reverse = prelude.get("reverse").unwrap().lib();
         let entry = LibraryEntry {
+            name: None,
+            doc: None,
             arity: 1,
             term: format!("(lam (lib_{r} (lib_{r} $0)))", r = reverse.0),
         };
@@ -494,6 +507,8 @@ mod tests {
     #[test]
     fn a_library_entry_that_does_not_type_is_refused() {
         let entry = LibraryEntry {
+            name: None,
+            doc: None,
             arity: 1,
             term: "(lam (add $0 true))".into(),
         };

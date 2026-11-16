@@ -245,6 +245,25 @@ fn issue(
         };
         return Ok((Attempt::Done(reply), Vec::new()));
     }
+    if state.naming_pending() {
+        // Every batch of an iteration sees the same library text (D23).
+        let retry = state
+            .live_naming(now_ms)
+            .map(|(_, j)| j.deadline_ms)
+            .min()
+            .map_or(5, |d| (d - now_ms).div_ceil(1000).max(1));
+        let reply = NextBatch {
+            batch: None,
+            wait: Some(Wait {
+                reason: "new library functions are being named; no batch is issued until \
+                         each has a name. A proposer that can name them calls \
+                         dc_next_naming_job"
+                    .to_owned(),
+                retry_after_seconds: retry,
+            }),
+        };
+        return Ok((Attempt::Done(reply), Vec::new()));
+    }
     let Some((name, wanted)) = state.next_task(now_ms) else {
         let reply = NextBatch {
             batch: None,
@@ -337,7 +356,7 @@ pub struct Receipt {
 }
 
 /// A new batch token: 128 bits from the operating system, in hex.
-fn new_token() -> Result<String, Refused> {
+pub(crate) fn new_token() -> Result<String, Refused> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes)
         .map_err(|e| Refused::State(format!("no random bytes for a batch token: {e}")))?;
@@ -694,6 +713,7 @@ mod tests {
             .create_run(
                 &run,
                 RunConfig {
+                    autodoc: false,
                     arm: Arm::Blind,
                     seed: 3,
                     proposals_per_task: quota,
@@ -870,6 +890,7 @@ mod tests {
     #[test]
     fn a_journal_with_whole_payloads_reads_back_and_goes_on() {
         let config = RunConfig {
+            autodoc: false,
             arm: Arm::Blind,
             seed: 3,
             proposals_per_task: 1,
@@ -1165,6 +1186,8 @@ mod tests {
                 &run,
                 vec![Event::LibraryExtended {
                     entries: vec![LibraryEntry {
+                        name: None,
+                        doc: None,
                         arity: 1,
                         term: "(lam $0)".into(),
                     }],
@@ -1190,6 +1213,8 @@ mod tests {
                 &run,
                 vec![Event::LibraryExtended {
                     entries: vec![LibraryEntry {
+                        name: None,
+                        doc: None,
                         arity: 1,
                         term: "(lam (add $0 true))".into(),
                     }],
@@ -1279,6 +1304,8 @@ mod tests {
     /// A library entry that loads: the identity.
     fn identity() -> LibraryEntry {
         LibraryEntry {
+            name: None,
+            doc: None,
             arity: 1,
             term: "(lam $0)".into(),
         }
@@ -1392,6 +1419,7 @@ mod tests {
     /// The config of `setup(1, 1)`, for a run made again.
     fn config() -> RunConfig {
         RunConfig {
+            autodoc: false,
             arm: Arm::Blind,
             seed: 3,
             proposals_per_task: 1,
