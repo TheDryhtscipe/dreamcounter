@@ -1295,3 +1295,68 @@ fn a_naming_session_killed_after_its_answer_was_taken_still_named() {
     assert_eq!(summary["sessions"][1]["job"], 3);
     assert_eq!(summary["sessions"][1]["timed_out"], true);
 }
+
+/// A session that takes work, asks again while it holds it, and stops.
+fn asks_again_while_holding(
+    kind_next: &str,
+    work: Value,
+    wait: Value,
+    init: String,
+) -> Vec<String> {
+    vec![
+        init,
+        tool_use("t1", kind_next, json!({"worker": "w"})),
+        tool_result("t1", &work.to_string(), false),
+        tool_use("t2", kind_next, json!({"worker": "w"})),
+        tool_result("t2", &wait.to_string(), false),
+        result("NO_BATCH"),
+    ]
+}
+
+#[test]
+fn a_batch_session_that_asks_again_while_it_holds_a_batch_failed_and_the_launch_goes_on() {
+    let f = Fixture::new();
+    f.queue(
+        "1",
+        &asks_again_while_holding(
+            NEXT,
+            json!({"batch": {"batch": 0, "token": "ab", "programs_wanted": 1,
+                             "lease_seconds": 1800, "prompt": "write solve"}, "wait": null}),
+            json!({"batch": null, "wait": {"reason": "you hold batch 0", "retry_after_seconds": 9,
+                                            "names_pending": 0}}),
+            good_init(),
+        ),
+    );
+    let out = f.run(&["--sessions", "2", "--parallel", "1"]);
+    assert!(!out.status.success(), "{out:?}");
+    assert_eq!(kinds(&f.summary()), ["batch:failed", "batch:submitted"]);
+}
+
+#[test]
+fn a_naming_session_that_asks_again_while_it_holds_a_job_failed_and_the_launch_goes_on() {
+    let f = Fixture::with_names_pending(2);
+    f.queue(
+        "1",
+        &asks_again_while_holding(
+            NEXT_NAMING,
+            json!({"job": {"job": 0, "token": "ab", "lease_seconds": 1800, "prompt": "name it"},
+                   "wait": null}),
+            json!({"job": null, "wait": {"reason": "you hold naming job 0",
+                                          "retry_after_seconds": 9, "names_pending": 2}}),
+            naming_init(),
+        ),
+    );
+    f.queue("2", &named(1));
+    f.queue("3", &named(2));
+    let out = f.run(&["--sessions", "4", "--parallel", "1"]);
+    assert!(!out.status.success(), "{out:?}");
+    assert_eq!(
+        kinds(&f.summary()),
+        [
+            "naming:failed",
+            "naming:named",
+            "naming:named",
+            "batch:submitted"
+        ]
+    );
+}

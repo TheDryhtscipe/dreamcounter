@@ -23,15 +23,15 @@
 //!
 //! When it is set up, the launcher reads from the state directory how many
 //! of the run's library functions wait to be named, as dc-mcp counts them
-//! (D23). It reads nothing else of the run, and gives the sessions nothing
-//! of it. If some wait, the launch starts with naming sessions; otherwise
+//! (D23). It uses nothing else of the run, though the read replays the
+//! run's journal, and gives the sessions nothing of it. If some wait, the launch starts with naming sessions; otherwise
 //! with batch sessions. When a batch session's wait says that
 //! `names_pending` functions wait to be named (after the operator ends an
 //! iteration during the launch, say), the next sessions are naming
 //! sessions. Either way, at most that many naming sessions run at once.
-//! Fewer may, if naming sessions of an earlier phase are still running. Batch sessions start again once
-//! this launch has named that many, or a naming session finds nothing to
-//! name. A naming session that finds every function still to name held by
+//! Fewer may, if naming sessions of an earlier phase are still running.
+//! Batch sessions start again once this launch has named that many, or a
+//! naming session finds nothing to name. A naming session that finds every function still to name held by
 //! a job stops new naming sessions until this launch's running ones have
 //! ended; if none is running, the launch stops, as it does when a batch
 //! session finds no batch. An outcome from a session started before the
@@ -604,10 +604,9 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
                     }
                     let reply: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     let wait = &reply["wait"];
-                    // Any wait with names pending is read as such, whatever
-                    // its reason. The other waits that can carry a count, "you
-                    // hold batch" and "you hold naming job", need a worker id
-                    // used twice, and this launcher never reuses one.
+                    // A reply with no work after the session was given some
+                    // ("you hold batch 3") means it asked again instead of
+                    // answering: its own failure, not news about the run.
                     let pending = wait["names_pending"].as_u64().unwrap_or(0);
                     if name == SUBMIT {
                         if let (Some(batch), Some(received)) =
@@ -636,6 +635,10 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
                             leased.push(b);
                         } else if reply.get("batch").is_some_and(Value::is_null) {
                             let detail = wait_detail(wait);
+                            if !leased.is_empty() {
+                                error = Some(format!("{name} again while it held work: {detail}"));
+                                continue;
+                            }
                             no_batch = Some(if pending > 0 {
                                 Outcome::NamesPending {
                                     detail,
@@ -650,6 +653,10 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
                             leased.push(j);
                         } else if reply.get("job").is_some_and(Value::is_null) {
                             let detail = wait_detail(wait);
+                            if !leased.is_empty() {
+                                error = Some(format!("{name} again while it held work: {detail}"));
+                                continue;
+                            }
                             no_batch = Some(if pending > 0 {
                                 Outcome::NamingHeld { detail }
                             } else {
@@ -767,8 +774,8 @@ enum Ending {
 /// Which kind of session starts next, shared by a launch's threads.
 #[derive(Debug, Default)]
 struct Plan {
-    /// Whether naming sessions start: set when a batch session hears that
-    /// names are pending, cleared when this launch has named as many
+    /// Whether naming sessions start: set at the start if the run has names
+    /// pending, or when a batch session hears that names are pending; cleared when this launch has named as many
     /// functions as were pending or a naming session finds nothing to name.
     naming: bool,
     /// Goes up each time `naming` changes. An outcome from a session started
