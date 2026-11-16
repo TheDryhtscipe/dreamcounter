@@ -1038,40 +1038,41 @@ fn a_lock_on_a_removed_directory_does_not_license_a_write_to_its_successor() {
 
 #[test]
 fn create_does_not_write_to_the_successor_of_a_removed_directory() {
-    // The call must be waiting for the lock when the directory goes. If the
-    // machine is busy it may not be there yet. It then finds the new
-    // directory locked, which shows nothing, so the test waits longer and
-    // tries again.
-    for pause in [200, 800, 3200] {
-        let dir = TempDir::new().unwrap();
-        let run = id("r1");
-        // The lock wait is longer than the longest pause, so a call that is
-        // on time is still waiting when the directory goes.
-        let store =
-            Store::open_with_lock_wait(dir.path(), std::time::Duration::from_secs(5)).unwrap();
-        fs::create_dir(dir.path().join("r1")).unwrap();
-        let old_lock = fs::File::open(dir.path().join("r1")).unwrap();
-        old_lock.lock().unwrap();
+    let dir = TempDir::new().unwrap();
+    let run = id("r1");
+    // The wait is far longer than the steps below take, even on a busy
+    // machine, so the call is still waiting when the old lock is released.
+    let store = Store::open_with_lock_wait(dir.path(), std::time::Duration::from_secs(60)).unwrap();
+    fs::create_dir(dir.path().join("r1")).unwrap();
+    let old_lock = fs::File::open(dir.path().join("r1")).unwrap();
+    old_lock.lock().unwrap();
 
-        let result = std::thread::scope(|scope| {
-            let waiting = scope.spawn(|| store.create_run(&run, config(), tasks()));
-            std::thread::sleep(std::time::Duration::from_millis(pause));
-            fs::remove_dir(dir.path().join("r1")).unwrap();
-            fs::create_dir(dir.path().join("r1")).unwrap();
-            // Another server holds the new directory. The old lock is released.
-            let new_lock = fs::File::open(dir.path().join("r1")).unwrap();
-            new_lock.lock().unwrap();
-            drop(old_lock);
-            waiting.join().unwrap()
-        });
-        assert_eq!(fs::read_dir(dir.path().join("r1")).unwrap().count(), 0);
-        if matches!(result, Err(StoreError::Busy(_))) {
-            continue;
+    let result = std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| store.create_run(&run, config(), tasks()));
+        // The directory goes only once the call has found it locked, so the
+        // call holds the directory that is about to go.
+        let start = std::time::Instant::now();
+        while store.waits.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            if waiting.is_finished() {
+                let result = waiting.join().unwrap();
+                panic!("the call returned without waiting for the lock: {result:?}");
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(60),
+                "the call never waited for the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert!(matches!(result, Err(StoreError::Replaced(_))), "{result:?}");
-        return;
-    }
-    panic!("the call never waited on the directory that was removed");
+        fs::remove_dir(dir.path().join("r1")).unwrap();
+        fs::create_dir(dir.path().join("r1")).unwrap();
+        // Another server holds the new directory. The old lock is released.
+        let new_lock = fs::File::open(dir.path().join("r1")).unwrap();
+        new_lock.lock().unwrap();
+        drop(old_lock);
+        waiting.join().unwrap()
+    });
+    assert_eq!(fs::read_dir(dir.path().join("r1")).unwrap().count(), 0);
+    assert!(matches!(result, Err(StoreError::Replaced(_))), "{result:?}");
 }
 
 /// The names and contents of the files set aside in a run's directory.
