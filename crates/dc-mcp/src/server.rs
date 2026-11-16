@@ -79,7 +79,8 @@ pub struct CreateRun {
     pub stitch_memory_mib: Option<u64>,
     /// Whether proposers name and document the abstractions each iteration
     /// adds (decision D23). While a new abstraction has no name, no batch is
-    /// issued. If absent, true.
+    /// issued, so turn it on only when proposers will pull naming jobs. If
+    /// absent, false.
     pub autodoc: Option<bool>,
 }
 
@@ -625,7 +626,7 @@ impl DcServer {
         }
         let defaults = StitchSettings::default();
         let config = RunConfig {
-            autodoc: arg.autodoc.unwrap_or(true),
+            autodoc: arg.autodoc.unwrap_or(false),
             arm: Arm::Blind,
             seed: arg.seed,
             proposals_per_task: arg.proposals_per_task,

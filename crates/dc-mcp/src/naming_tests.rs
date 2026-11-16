@@ -54,6 +54,14 @@ fn batch(store: &Store, run: &RunId, v: &VerifierCache, worker: &str) -> NextBat
     next_batch(store, run, worker, 0, v).unwrap()
 }
 
+/// That `result` is a refusal whose text has `why`.
+fn assert_rejected(result: Result<(), crate::store::StoreError>, why: &str) {
+    match result {
+        Ok(()) => panic!("accepted; expected a refusal with {why:?}"),
+        Err(e) => assert!(e.to_string().contains(why), "{e}"),
+    }
+}
+
 fn lib(store: &Store, run: &RunId) -> Vec<LibraryEntry> {
     store.state(run).unwrap().library().to_vec()
 }
@@ -81,8 +89,8 @@ fn names_are_checked_against_the_language_the_prelude_and_the_library() {
     assert_eq!(check_name("taken", 1, &library), Ok(()));
     let long = "a".repeat(MAX_ENTRY_NAME_LEN + 1);
     for bad in [
-        "", "Twice", "let", "mod", "solve", "fn_3", "fn_12", "map", "foldr", "taken", "a b", "x-y",
-        &long,
+        "", "x", "xs", "Twice", "let", "mod", "solve", "fn_3", "fn_12", "map", "foldr", "taken",
+        "a b", "x-y", &long,
     ] {
         assert!(
             check_name(bad, 0, &library).is_err(),
@@ -98,7 +106,16 @@ fn names_are_checked_against_the_language_the_prelude_and_the_library() {
 fn docs_are_one_bounded_line() {
     assert_eq!(check_doc("Applies f twice."), Ok(()));
     let long = "a".repeat(MAX_DOC_LEN + 1);
-    for bad in ["", "   ", "two\nlines", "tab\there", &long] {
+    for bad in [
+        "",
+        "   ",
+        "two\nlines",
+        "tab\there",
+        "line\u{2028}separator",
+        "bidi\u{202e}override",
+        "zero\u{200b}width",
+        &long,
+    ] {
         assert!(check_doc(bad).is_err(), "{bad:?} was accepted");
     }
 }
@@ -223,7 +240,9 @@ fn a_job_is_held_for_its_lease_then_handed_out_again() {
         held.reason
     );
     // After the lease, b gets a new job for the same entry.
-    let second = job(&store, &run, &v, "b", 1000).job.unwrap();
+    // At its deadline the job is still held, as a batch is.
+    assert!(job(&store, &run, &v, "b", 1000).job.is_none());
+    let second = job(&store, &run, &v, "b", 1001).job.unwrap();
     assert_eq!(second.job, 1);
     // The first answer in wins; the later one is refused.
     submit_naming(&store, &run, "a", 0, &first.token, "ident", "Doc.").unwrap();
@@ -297,11 +316,11 @@ fn the_job_shows_frontier_programs_that_use_the_function() {
         "{}",
         got.prompt
     );
-    assert!(
-        got.prompt.contains(&format!("-- task {MERGE}\n")),
-        "{}",
-        got.prompt
-    );
+    assert!(got.prompt.contains("fun x -> fn_0 x\n"), "{}", got.prompt);
+    // Payloads never name a task.
+    for task in [MERGE, CANCEL] {
+        assert!(!got.prompt.contains(task), "{}", got.prompt);
+    }
 }
 
 #[test]
@@ -316,7 +335,7 @@ fn the_state_refuses_names_that_do_not_come_from_a_checked_job() {
             doc: None,
         }],
     };
-    assert!(store.append(&run, vec![named]).is_err());
+    assert_rejected(store.append(&run, vec![named]), "no name or doc");
     let done = |job: u64, name: &str| {
         Event::NamingDone(NamingDone {
             job,
@@ -327,14 +346,38 @@ fn the_state_refuses_names_that_do_not_come_from_a_checked_job() {
         })
     };
     // A result for a job never issued.
-    assert!(store.append(&run, vec![done(0, "ident")]).is_err());
+    assert_rejected(
+        store.append(&run, vec![done(0, "ident")]),
+        "no naming job 0",
+    );
     job(&store, &run, &v, "n", 0).job.unwrap();
-    // A name the check refuses.
-    assert!(store.append(&run, vec![done(0, "map")]).is_err());
-    assert!(store.append(&run, vec![done(0, "solve")]).is_err());
+    // A name whose form the check refuses.
+    assert_rejected(store.append(&run, vec![done(0, "solve")]), "entry point");
+    assert_rejected(store.append(&run, vec![done(0, "ab")]), "3 to 40 bytes");
+    assert_rejected(
+        store.append(&run, vec![done(0, "Ident")]),
+        "not a variable name",
+    );
     store.append(&run, vec![done(0, "ident")]).unwrap();
     // The entry is named once.
-    assert!(store.append(&run, vec![done(0, "other")]).is_err());
+    assert_rejected(store.append(&run, vec![done(0, "other")]), "already named");
+}
+
+#[test]
+fn replay_does_not_check_names_against_the_builds_primitives_and_prelude() {
+    // A journal stays readable if a later build gains a primitive or prelude
+    // function with a name the run used; the server alone refuses those.
+    let (_dir, store, run, v) = setup(true, 1);
+    job(&store, &run, &v, "n", 0).job.unwrap();
+    let done = Event::NamingDone(NamingDone {
+        job: 0,
+        entry: 0,
+        name: Some("map".into()),
+        doc: None,
+        refused: vec![],
+    });
+    store.append(&run, vec![done]).unwrap();
+    assert_eq!(lib(&store, &run)[0].name.as_deref(), Some("map"));
 }
 
 #[test]
@@ -365,12 +408,24 @@ fn the_state_issues_one_live_job_per_entry_and_per_worker() {
     };
     store.append(&run, vec![issued(0, 0, "a", 0)]).unwrap();
     // Entry 0 is held, and so is worker a, until 1000.
-    assert!(store.append(&run, vec![issued(1, 0, "b", 10)]).is_err());
-    assert!(store.append(&run, vec![issued(1, 1, "a", 10)]).is_err());
+    assert_rejected(
+        store.append(&run, vec![issued(1, 0, "b", 10)]),
+        "still live",
+    );
+    assert_rejected(
+        store.append(&run, vec![issued(1, 1, "a", 10)]),
+        "still live",
+    );
     store.append(&run, vec![issued(1, 1, "b", 10)]).unwrap();
     // After the lease, both can be issued again.
-    store.append(&run, vec![issued(2, 0, "a", 1000)]).unwrap();
+    store.append(&run, vec![issued(2, 0, "a", 1001)]).unwrap();
     // Job numbers run in order, and the entry must exist.
-    assert!(store.append(&run, vec![issued(9, 0, "c", 5000)]).is_err());
-    assert!(store.append(&run, vec![issued(3, 7, "c", 5000)]).is_err());
+    assert_rejected(
+        store.append(&run, vec![issued(9, 0, "c", 5000)]),
+        "next job is 3",
+    );
+    assert_rejected(
+        store.append(&run, vec![issued(3, 7, "c", 5000)]),
+        "no entry 7",
+    );
 }

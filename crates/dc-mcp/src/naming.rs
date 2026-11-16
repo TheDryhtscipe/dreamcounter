@@ -28,6 +28,10 @@ use crate::verify::{
 /// The longest name, in bytes.
 pub const MAX_ENTRY_NAME_LEN: usize = 40;
 
+/// The shortest name, in bytes: names such as `x` or `f` read as local
+/// variables, which programs often bind and so shadow.
+pub const MIN_ENTRY_NAME_LEN: usize = 3;
+
 /// The longest doc, in bytes.
 pub const MAX_DOC_LEN: usize = 400;
 
@@ -53,13 +57,28 @@ fn is_generated(name: &str) -> bool {
         .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Checks `name` as the name of library entry `index` of `library`: it is a
-/// variable name of at most [`MAX_ENTRY_NAME_LEN`] bytes, and it is not a
-/// primitive or prelude name, the entry point, a generated name, or another entry's name.
+/// Checks `name` as the name of library entry `index` of `library`: the
+/// checks of [`check_name_form`], and it is not a primitive or prelude name.
+///
+/// The server runs this check. Replaying a journal runs only
+/// [`check_name_form`], so that a later build whose primitives or prelude
+/// gain a name a run already used still reads the run (its prelude
+/// fingerprint check then refuses work on it, if the prelude changed).
 pub fn check_name(name: &str, index: usize, library: &[LibraryEntry]) -> Result<(), String> {
-    if name.is_empty() || name.len() > MAX_ENTRY_NAME_LEN {
+    check_name_form(name, index, library)?;
+    if builtin_names().contains(name) {
+        return Err(format!("{name:?} is a primitive or prelude function"));
+    }
+    Ok(())
+}
+
+/// Checks `name` as the name of library entry `index` of `library`: it is a
+/// variable name of [`MIN_ENTRY_NAME_LEN`] to [`MAX_ENTRY_NAME_LEN`] bytes,
+/// and it is not the entry point, a generated name, or another entry's name.
+pub fn check_name_form(name: &str, index: usize, library: &[LibraryEntry]) -> Result<(), String> {
+    if name.len() < MIN_ENTRY_NAME_LEN || name.len() > MAX_ENTRY_NAME_LEN {
         return Err(format!(
-            "the name must have 1 to {MAX_ENTRY_NAME_LEN} bytes"
+            "the name must have {MIN_ENTRY_NAME_LEN} to {MAX_ENTRY_NAME_LEN} bytes"
         ));
     }
     if !dc_surface::is_variable_name(name) {
@@ -76,9 +95,6 @@ pub fn check_name(name: &str, index: usize, library: &[LibraryEntry]) -> Result<
             "{name:?} has the form of a generated name (fn_ and digits)"
         ));
     }
-    if builtin_names().contains(name) {
-        return Err(format!("{name:?} is a primitive or prelude function"));
-    }
     let taken = library
         .iter()
         .enumerate()
@@ -89,16 +105,18 @@ pub fn check_name(name: &str, index: usize, library: &[LibraryEntry]) -> Result<
     Ok(())
 }
 
-/// Checks a doc: at most [`MAX_DOC_LEN`] bytes, not blank, one line, and no
-/// control characters.
+/// Checks a doc: at most [`MAX_DOC_LEN`] bytes, not blank, and only
+/// printable ASCII, so it is one line with no control, format or separator
+/// characters (such as U+2028 or a bidi override) that could change how
+/// other proposers' prompts read.
 pub fn check_doc(doc: &str) -> Result<(), String> {
     if doc.trim().is_empty() || doc.len() > MAX_DOC_LEN {
         return Err(format!(
             "the doc must have 1 to {MAX_DOC_LEN} bytes and not be blank"
         ));
     }
-    if doc.chars().any(char::is_control) {
-        return Err("the doc must be one line with no control characters".to_owned());
+    if !doc.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        return Err("the doc must be one line of printable ASCII".to_owned());
     }
     Ok(())
 }
@@ -197,7 +215,8 @@ pub fn naming_prompt(
                 out.push_str("## Programs that use it\n\n");
             }
             if let Some(text) = surface(verifier, &m.program) {
-                out.push_str(&format!("-- task {task}\n{text}\n\n"));
+                // No task name: payloads never show one (see `prompt`).
+                out.push_str(&format!("{text}\n\n"));
                 shown += 1;
             }
         }

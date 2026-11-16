@@ -1404,7 +1404,7 @@ impl RunState {
             return bad(format!("entry {} is already named", done.entry));
         }
         if let Some(name) = &done.name {
-            crate::naming::check_name(name, index, &self.library).map_err(Rejected::Naming)?;
+            crate::naming::check_name_form(name, index, &self.library).map_err(Rejected::Naming)?;
         }
         if let Some(doc) = &done.doc {
             crate::naming::check_doc(doc).map_err(Rejected::Naming)?;
@@ -1422,7 +1422,7 @@ impl RunState {
         self.naming_jobs
             .iter()
             .enumerate()
-            .filter(move |(_, j)| j.deadline_ms > now_ms && !self.named[j.entry as usize])
+            .filter(move |(_, j)| now_ms <= j.deadline_ms && !self.named[j.entry as usize])
             .map(|(i, j)| (i as u64, j))
     }
 

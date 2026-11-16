@@ -651,7 +651,7 @@ fn solves_merge() -> String {
 fn a_proposer_sees_only_its_tools_and_gets_no_results() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut operator = Client::start(dir.path());
-    operator
+    let created = operator
         .call(
             "dc_create_run",
             json!({
@@ -660,6 +660,9 @@ fn a_proposer_sees_only_its_tools_and_gets_no_results() {
             }),
         )
         .unwrap();
+    // Naming is off unless asked for (D23).
+    assert_eq!(created["autodoc"], false);
+    assert_eq!(created["unnamed"], 0);
 
     let mut proposer = Client::start_proposer(dir.path(), "r1");
     assert_eq!(
@@ -1148,7 +1151,7 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
             json!({
                 "run": "r1", "seed": 5, "proposals_per_task": 1, "frontier_size": 2,
                 "stitch_wall_seconds": 120, "stitch_memory_mib": 2048,
-                "tasks": tasks
+                "autodoc": true, "tasks": tasks
             }),
         )
         .unwrap();
