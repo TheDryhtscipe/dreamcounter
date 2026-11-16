@@ -33,9 +33,14 @@ impl Client {
         Client::start_with(dir, &[], stderr)
     }
 
-    /// Starts a proposer's server for `run` in `dir`.
+    /// Starts a proposer's server for `run` in `dir`, in batch mode.
     fn start_proposer(dir: &Path, run: &str) -> Client {
         Client::start_with(dir, &["--proposer", run], Stdio::null())
+    }
+
+    /// Starts a proposer's server for `run` in `dir`, in naming mode.
+    fn start_namer(dir: &Path, run: &str) -> Client {
+        Client::start_with(dir, &["--namer", run], Stdio::null())
     }
 
     /// Starts the server on `dir` with `args` after the state directory.
@@ -664,28 +669,60 @@ fn a_proposer_sees_only_its_tools_and_gets_no_results() {
     assert_eq!(created["autodoc"], false);
     assert_eq!(created["unnamed"], 0);
 
+    // A batch-mode server lists the two batch tools only (decision D23).
     let mut proposer = Client::start_proposer(dir.path(), "r1");
+    assert_eq!(tool_names(&mut proposer), ["dc_next_batch", "dc_submit"]);
+    // A naming-mode server lists the two naming tools only.
+    let mut namer = Client::start_namer(dir.path(), "r1");
     assert_eq!(
-        tool_names(&mut proposer),
-        [
-            "dc_next_batch",
-            "dc_next_naming_job",
-            "dc_submit",
-            "dc_submit_naming"
-        ]
+        tool_names(&mut namer),
+        ["dc_next_naming_job", "dc_submit_naming"]
     );
-    // An operator's tool is not there for a proposer.
-    for (tool, arguments) in [
+    let operator_tools = [
         ("dc_run_status", json!({ "run": "r1" })),
         ("dc_list_runs", json!({})),
         ("dc_proposal_stats", json!({ "run": "r1" })),
+        (
+            "dc_create_run",
+            json!({ "run": "r2", "seed": 1, "tasks": ["collapse/merge"] }),
+        ),
+        ("dc_check_pending", json!({ "run": "r1" })),
+        ("dc_finish_iteration", json!({ "run": "r1" })),
+        ("dc_add_note", json!({ "run": "r1", "text": "a note" })),
+    ];
+    let naming_tools = [
+        ("dc_next_naming_job", json!({ "worker": "agent-1" })),
+        (
+            "dc_submit_naming",
+            json!({ "worker": "agent-1", "job": 0, "token": "t", "name": "abc", "doc": "A." }),
+        ),
+    ];
+    let batch_tools = [
+        ("dc_next_batch", json!({ "worker": "agent-1" })),
+        (
+            "dc_submit",
+            json!({ "worker": "agent-1", "batch": 0, "token": "t", "programs": [] }),
+        ),
+    ];
+    // Neither mode takes an operator's tool or the other mode's tools.
+    for (client, refused_tools) in [
+        (&mut proposer, operator_tools.iter().chain(&naming_tools)),
+        (&mut namer, operator_tools.iter().chain(&batch_tools)),
     ] {
-        let refused = proposer.raw_request(
-            "tools/call",
-            json!({ "name": tool, "arguments": arguments }),
-        );
-        assert_eq!(refused["error"]["message"], "tool not found", "{refused}");
+        for (tool, arguments) in refused_tools {
+            let refused = client.raw_request(
+                "tools/call",
+                json!({ "name": tool, "arguments": arguments }),
+            );
+            assert_eq!(refused["error"]["message"], "tool not found", "{refused}");
+        }
     }
+    // The refused calls left nothing behind: no batch was issued.
+    let status = operator
+        .call("dc_run_status", json!({ "run": "r1" }))
+        .unwrap();
+    assert_eq!(status["batches_issued"], 0, "{status}");
+    namer.kill();
 
     let first = proposer
         .call("dc_next_batch", json!({ "worker": "agent-1" }))
@@ -1103,25 +1140,38 @@ fn a_proposer_that_waits_for_an_abandoned_check_gets_it_done() {
 #[test]
 fn a_proposer_server_needs_a_run_that_exists() {
     let dir = tempfile::TempDir::new().unwrap();
-    for run in ["nosuch", "Not A Run"] {
+    for (mode, run) in [
+        ("--proposer", "nosuch"),
+        ("--proposer", "Not A Run"),
+        ("--namer", "nosuch"),
+        ("--namer", "Not A Run"),
+    ] {
         let out = Command::new(env!("CARGO_BIN_EXE_dc-mcp"))
             .arg("--state-dir")
             .arg(dir.path())
-            .args(["--proposer", run])
+            .args([mode, run])
             .stdin(Stdio::null())
             .output()
             .unwrap();
-        assert!(!out.status.success(), "{run}");
-        assert!(!String::from_utf8_lossy(&out.stderr).is_empty());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{mode} {run}");
+        // Refused for the run, not for a flag the binary does not know.
+        assert!(!stderr.is_empty() && !stderr.contains("usage"), "{stderr}");
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_dc-mcp"))
-        .arg("--state-dir")
-        .arg(dir.path())
-        .arg("--proposer")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(2));
+    for mode in [
+        &["--proposer"][..],
+        &["--namer"],
+        &["--proposer", "r1", "--namer", "r1"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_dc-mcp"))
+            .arg("--state-dir")
+            .arg(dir.path())
+            .args(mode)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{mode:?}");
+    }
 }
 
 /// A program that solves `task`: its good reference.
@@ -1227,14 +1277,16 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
     assert_eq!(waiting["batch"], Value::Null);
     let reason = waiting["wait"]["reason"].as_str().unwrap();
     assert!(reason.contains("dc_next_naming_job"), "{reason}");
+    // A naming-mode server of the same run names them.
+    let mut namer = Client::start_namer(dir.path(), "r1");
     for k in 0..found {
         let worker = format!("namer-{k}");
-        let job = proposer
+        let job = namer
             .call("dc_next_naming_job", json!({ "worker": worker }))
             .unwrap();
         let prompt = job["job"]["prompt"].as_str().unwrap();
         assert!(prompt.contains(&format!("let fn_{k} = ")), "{prompt}");
-        let named = proposer
+        let named = namer
             .call(
                 "dc_submit_naming",
                 json!({
@@ -1245,7 +1297,7 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
             .unwrap();
         assert_eq!(named["name"], format!("abs_{k}"), "{named}");
     }
-    let none = proposer
+    let none = namer
         .call("dc_next_naming_job", json!({ "worker": "namer-x" }))
         .unwrap();
     assert_eq!(none["job"], Value::Null, "{none}");

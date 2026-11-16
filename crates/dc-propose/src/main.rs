@@ -10,9 +10,13 @@
 //! SIGINT, SIGTERM or SIGHUP kills the running sessions and writes the
 //! summary.
 //!
+//! Sessions take batches, or name new library functions when the run has
+//! some waiting to be named (D23); the library docs say when each kind
+//! starts.
+//!
 //! Writes `summary.json` to the log directory and prints it. Exits 0 when
-//! every session submitted or found no batch, 1 when one failed or the launch
-//! was interrupted, and 2 on a usage error. The project lead starts every run (D11 requirement 5).
+//! every session submitted programs, answered a naming job, or found no work,
+//! 1 when one failed or the launch was interrupted, and 2 on a usage error. The project lead starts every run (D11 requirement 5).
 
 use std::ffi::OsString;
 use std::path::PathBuf;

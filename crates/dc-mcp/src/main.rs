@@ -1,8 +1,12 @@
 //! `dc-mcp --state-dir <dir>`: serves the operator's tools for the runs in
 //! `<dir>` over stdio.
 //!
-//! `dc-mcp --state-dir <dir> --proposer <run>`: serves a proposer's tools for
-//! the run `<run>` in `<dir>` over stdio. The run must exist.
+//! `dc-mcp --state-dir <dir> --proposer <run>`: serves a proposer's batch
+//! tools, `dc_next_batch` and `dc_submit`, for the run `<run>` in `<dir>`
+//! over stdio. The run must exist.
+//!
+//! `dc-mcp --state-dir <dir> --namer <run>`: the same, with a proposer's
+//! naming tools, `dc_next_naming_job` and `dc_submit_naming`, instead.
 //!
 //! `dc-mcp --stitch-worker`: runs Stitch once, as the worker process of the
 //! operator's `dc_finish_iteration` (`dc_compress::worker`). The server
@@ -16,12 +20,12 @@ use std::sync::Arc;
 
 use dc_mcp::iterate::{WorkerStart, WORKER_ARG};
 use dc_mcp::proposer::SystemClock;
-use dc_mcp::server::{DcServer, ProposerServer};
+use dc_mcp::server::{DcServer, ProposerMode, ProposerServer};
 use dc_mcp::state::RunId;
 use dc_mcp::store::Store;
 use rmcp::ServiceExt;
 
-const USAGE: &str = "usage: dc-mcp --state-dir <dir> [--proposer <run>]\n       \
+const USAGE: &str = "usage: dc-mcp --state-dir <dir> [--proposer <run> | --namer <run>]\n       \
                      dc-mcp --stitch-worker";
 
 /// The stack of the runtime's threads, where tool calls and the checks of
@@ -34,13 +38,21 @@ const USAGE: &str = "usage: dc-mcp --state-dir <dir> [--proposer <run>]\n       
 /// deep parsing, leaves a wide margin for builds with larger frames.
 const THREAD_STACK_BYTES: usize = 8 << 20;
 
-/// The state directory, and the run if the server is a proposer's.
-fn arguments() -> Option<(PathBuf, Option<String>)> {
+/// The state directory, and the run and mode if the server is a
+/// proposer's.
+fn arguments() -> Option<(PathBuf, Option<(String, ProposerMode)>)> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match args.as_slice() {
         [flag, dir] if flag == "--state-dir" => Some((PathBuf::from(dir), None)),
-        [flag, dir, role, run] if flag == "--state-dir" && role == "--proposer" => {
-            Some((PathBuf::from(dir), Some(run.to_str()?.to_owned())))
+        [flag, dir, role, run] if flag == "--state-dir" => {
+            let mode = if role == "--proposer" {
+                ProposerMode::Batch
+            } else if role == "--namer" {
+                ProposerMode::Naming
+            } else {
+                return None;
+            };
+            Some((PathBuf::from(dir), Some((run.to_str()?.to_owned(), mode))))
         }
         _ => None,
     }
@@ -57,7 +69,10 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    match serve(&dir, proposer.as_deref()) {
+    match serve(
+        &dir,
+        proposer.as_ref().map(|(run, mode)| (run.as_str(), *mode)),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("dc-mcp: {error}");
@@ -67,15 +82,18 @@ fn main() -> ExitCode {
 }
 
 /// Serves until the client closes the connection.
-fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn serve(
+    dir: &std::path::Path,
+    proposer: Option<(&str, ProposerMode)>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(dir)?;
     // A proposer's run must exist: its server cannot make one.
     let proposer = match proposer {
         None => None,
-        Some(run) => {
+        Some((run, mode)) => {
             let run = RunId::new(run)?;
             store.state(&run)?;
-            Some(run)
+            Some((run, mode))
         }
     };
     // A mistyped directory would otherwise look like a store with no runs.
@@ -86,7 +104,10 @@ fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn st
         "dc-mcp: serving {} in {}",
         proposer.as_ref().map_or_else(
             || "the runs".to_owned(),
-            |r| format!("proposers of run {r}")
+            |(r, mode)| match mode {
+                ProposerMode::Batch => format!("proposers of run {r}"),
+                ProposerMode::Naming => format!("namers of run {r}"),
+            }
         ),
         shown.display()
     );
@@ -112,8 +133,8 @@ fn serve(dir: &std::path::Path, proposer: Option<&str>) -> Result<(), Box<dyn st
                 server.shut_down();
                 return served;
             }
-            Some(run) => {
-                let server = ProposerServer::new(store, run, Arc::new(SystemClock));
+            Some((run, mode)) => {
+                let server = ProposerServer::new(store, run, mode, Arc::new(SystemClock));
                 // Check what a server that stopped left unchecked.
                 server.check_in_background();
                 let service = server.serve(rmcp::transport::stdio()).await?;

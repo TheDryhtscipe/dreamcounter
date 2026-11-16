@@ -23,9 +23,11 @@
 //! `dc_proposal_stats`, `dc_check_pending`, `dc_finish_iteration`,
 //! `dc_add_note`, and `dc_list_runs`. They show a run's
 //! library, frontier sizes and results, which a proposer in the blind arm must
-//! not see. A proposer's server (`dc-mcp --state-dir <dir> --proposer <run>`)
-//! serves one run and has only `dc_next_batch` and `dc_submit`. Connect a
-//! proposer session only to a proposer's server.
+//! not see. A proposer's server serves one run in one mode and has only that
+//! mode's two tools: `dc-mcp --state-dir <dir> --proposer <run>` has
+//! `dc_next_batch` and `dc_submit`, and `dc-mcp --state-dir <dir> --namer
+//! <run>` has `dc_next_naming_job` and `dc_submit_naming` (decision D23).
+//! Connect a proposer session only to a proposer's server.
 //!
 //! Started as `dc-mcp --stitch-worker`, the binary is the Stitch worker
 //! process of `dc_finish_iteration` and serves nothing (see [`iterate`]).

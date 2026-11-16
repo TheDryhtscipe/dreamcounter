@@ -1448,7 +1448,16 @@ impl RunState {
     /// Whether batches wait for naming: autodoc is on and some library
     /// entry has no naming result (decision D23, item 7).
     pub fn naming_pending(&self) -> bool {
-        self.config.autodoc && self.named.iter().any(|n| !n)
+        self.names_pending() > 0
+    }
+
+    /// How many library entries have no naming result, if autodoc is on;
+    /// 0 if it is off.
+    pub fn names_pending(&self) -> u64 {
+        if !self.config.autodoc {
+            return 0;
+        }
+        self.named.iter().filter(|n| !**n).count() as u64
     }
 
     /// The first library entry with no naming result and no live job at

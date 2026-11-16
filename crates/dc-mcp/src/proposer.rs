@@ -112,6 +112,11 @@ pub struct Wait {
     pub reason: String,
     /// When to ask again, in seconds.
     pub retry_after_seconds: u64,
+    /// How many new library functions have no naming result yet (D23).
+    /// While any has none, no batch is issued, and `dc_next_naming_job`
+    /// hands out the work there is. Some may be held by naming jobs.
+    #[serde(default)]
+    pub names_pending: u64,
 }
 
 /// What `dc_next_batch` returns: a batch, or why there is none now.
@@ -143,6 +148,7 @@ fn wait(state: &RunState, now_ms: u64) -> Wait {
                      not started"
                 .to_owned(),
             retry_after_seconds: QUOTA_IN_RETRY_SECONDS,
+            names_pending: state.names_pending(),
         };
     }
     let first_free = state.leased(now_ms).map(|(_, b)| b.deadline_ms).min();
@@ -150,11 +156,13 @@ fn wait(state: &RunState, now_ms: u64) -> Wait {
         return Wait {
             reason: "the programs still needed have come in and are being checked".to_owned(),
             retry_after_seconds: 1,
+            names_pending: state.names_pending(),
         };
     };
     Wait {
         reason: "every program still needed is held by another batch".to_owned(),
         retry_after_seconds: (first_free - now_ms).div_ceil(1000).max(1),
+        names_pending: state.names_pending(),
     }
 }
 
@@ -241,6 +249,7 @@ fn issue(
                      when its lease ends, in {left} seconds"
                 ),
                 retry_after_seconds: left,
+                names_pending: state.names_pending(),
             }),
         };
         return Ok((Attempt::Done(reply), Vec::new()));
@@ -260,6 +269,7 @@ fn issue(
                          dc_next_naming_job"
                     .to_owned(),
                 retry_after_seconds: retry,
+                names_pending: state.names_pending(),
             }),
         };
         return Ok((Attempt::Done(reply), Vec::new()));
