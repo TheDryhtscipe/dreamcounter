@@ -272,7 +272,7 @@ pub fn next_naming_job(
                          when its lease ends, in {left} seconds"
                     ),
                     retry_after_seconds: left,
-                    names_pending: state.naming_pending(),
+                    names_pending: state.names_pending(),
                 }),
             };
             return Ok((reply, Vec::new()));
@@ -282,12 +282,12 @@ pub fn next_naming_job(
                 Some(first) => Wait {
                     reason: "every function still to name is held by another job".to_owned(),
                     retry_after_seconds: (first - now_ms).div_ceil(1000).max(1),
-                    names_pending: state.naming_pending(),
+                    names_pending: state.names_pending(),
                 },
                 None => Wait {
                     reason: "no function waits to be named".to_owned(),
                     retry_after_seconds: 60,
-                    names_pending: state.naming_pending(),
+                    names_pending: state.names_pending(),
                 },
             };
             return Ok((

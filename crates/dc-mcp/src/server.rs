@@ -201,13 +201,7 @@ impl RunStatus {
             },
             iteration: state.iteration(),
             autodoc: config.autodoc,
-            unnamed: if config.autodoc {
-                (0..state.library().len() as u64)
-                    .filter(|&e| !state.is_named(e))
-                    .count() as u64
-            } else {
-                0
-            },
+            unnamed: state.names_pending(),
             tasks: state
                 .tasks()
                 .iter()

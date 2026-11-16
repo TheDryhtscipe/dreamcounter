@@ -17,13 +17,19 @@
 //!   Its brief tells it to take one naming job and answer it with a name and
 //!   a doc for the new library function (D23).
 //!
+//! The server lists all four tools to every session, so a session is
+//! allowed its kind's two tools and denied the other kind's two; denied
+//! tools are not shown to it.
+//!
 //! Sessions start as batch sessions. When a batch session's wait says that
-//! new functions wait to be named (`names_pending`), the next sessions are
-//! naming sessions, until one finds nothing to name; then batch sessions
-//! start again. A naming session that finds every function still to name
-//! held by another job waits for this launch's other naming sessions to end
-//! before the next session starts; if none is running, the launch stops, as
-//! it does when a batch session finds no batch.
+//! `names_pending` functions wait to be named, the next sessions are naming
+//! sessions, at most that many at once. Batch sessions start again once
+//! this launch has named that many, or a naming session finds nothing to
+//! name. A naming session that finds every function still to name held by
+//! a job stops new naming sessions until this launch's running ones have
+//! ended; if none is running, the launch stops, as it does when a batch
+//! session finds no batch. An outcome from a session started before the
+//! last such switch does not change what starts next.
 //!
 //! The launcher reads each session's stream-json transcript as it comes. The
 //! first event must be the session's `init` report, and it must show the
@@ -122,6 +128,14 @@ impl Kind {
         }
     }
 
+    /// The other kind.
+    pub fn other(self) -> Kind {
+        match self {
+            Kind::Batch => Kind::Naming,
+            Kind::Naming => Kind::Batch,
+        }
+    }
+
     /// The brief a session of this kind gets.
     pub fn brief(self, worker: &str, model: &str) -> String {
         match self {
@@ -188,6 +202,8 @@ pub enum Outcome {
     NamesPending {
         /// What the server said.
         detail: String,
+        /// How many functions have no naming result yet, as the server said.
+        count: u64,
     },
     /// The server had no naming job for it: no function waits to be named.
     /// The next sessions are batch sessions.
@@ -321,8 +337,11 @@ impl Session {
                 s.insert("name".into(), json!(name));
                 s.insert("refused".into(), json!(refused));
             }
+            Outcome::NamesPending { detail, count } => {
+                s.insert("detail".into(), json!(detail));
+                s.insert("names_pending".into(), json!(count));
+            }
             Outcome::NoBatch { detail }
-            | Outcome::NamesPending { detail }
             | Outcome::NothingToName { detail }
             | Outcome::NamingHeld { detail }
             | Outcome::Lockdown { detail }
@@ -405,6 +424,7 @@ pub fn mcp_config(dc_mcp: &Path, state_dir: &Path, run: &str) -> Value {
 /// The arguments `claude` is started with, for a session of `kind`.
 pub fn claude_args(kind: Kind, model: &str, mcp_config: &Path, brief: &str) -> Vec<OsString> {
     let [next, submit] = kind.tools();
+    let [other_next, other_submit] = kind.other().tools();
     let mut args: Vec<OsString> = [
         "-p",
         "Begin.",
@@ -428,6 +448,12 @@ pub fn claude_args(kind: Kind, model: &str, mcp_config: &Path, brief: &str) -> V
             "--allowedTools",
             next,
             submit,
+            // The server lists both kinds' tools, and an allowed tool is
+            // only a permission: without this the session would see the
+            // other kind's tools too.
+            "--disallowedTools",
+            other_next,
+            other_submit,
             "--system-prompt",
             brief,
             "--no-session-persistence",
@@ -568,7 +594,7 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
                     }
                     let reply: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     let wait = &reply["wait"];
-                    let pending = wait["names_pending"].as_bool() == Some(true);
+                    let pending = wait["names_pending"].as_u64().unwrap_or(0);
                     if name == SUBMIT {
                         if let (Some(batch), Some(received)) =
                             (reply["batch"].as_u64(), reply["received"].as_u64())
@@ -596,8 +622,11 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
                             leased.push(b);
                         } else if reply.get("batch").is_some_and(Value::is_null) {
                             let detail = wait_detail(wait);
-                            no_batch = Some(if pending {
-                                Outcome::NamesPending { detail }
+                            no_batch = Some(if pending > 0 {
+                                Outcome::NamesPending {
+                                    detail,
+                                    count: pending,
+                                }
                             } else {
                                 Outcome::NoBatch { detail }
                             });
@@ -607,7 +636,7 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
                             leased.push(j);
                         } else if reply.get("job").is_some_and(Value::is_null) {
                             let detail = wait_detail(wait);
-                            no_batch = Some(if pending {
+                            no_batch = Some(if pending > 0 {
                                 Outcome::NamingHeld { detail }
                             } else {
                                 Outcome::NothingToName { detail }
@@ -725,14 +754,84 @@ enum Ending {
 #[derive(Debug, Default)]
 struct Plan {
     /// Whether naming sessions start: set when a batch session hears that
-    /// names are pending, cleared when a naming session finds nothing to
-    /// name.
+    /// names are pending, cleared when this launch has named as many
+    /// functions as were pending or a naming session finds nothing to name.
     naming: bool,
+    /// Goes up each time `naming` changes. An outcome from a session started
+    /// in an earlier phase does not change the plan: what it heard may be
+    /// out of date.
+    phase: u64,
+    /// In a naming phase, how many functions this launch still expects to
+    /// name. At most this many naming sessions run at once.
+    to_name: u64,
     /// How many naming sessions are running.
-    naming_running: usize,
-    /// Whether a naming session found every function to name held while
-    /// another was running; cleared when a naming session ends.
+    naming_running: u64,
+    /// In a naming phase, whether a naming session found every function
+    /// still to name held by a job while another naming session ran. No
+    /// naming session starts until those have ended.
     held: bool,
+}
+
+/// What a launch thread does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Next {
+    /// Start a session of this kind, in this phase.
+    Start(Kind, u64),
+    /// Wait for a running naming session to end.
+    Wait,
+}
+
+impl Plan {
+    fn next(&self) -> Next {
+        if !self.naming {
+            return Next::Start(Kind::Batch, self.phase);
+        }
+        if self.naming_running > 0 && (self.held || self.naming_running >= self.to_name) {
+            return Next::Wait;
+        }
+        Next::Start(Kind::Naming, self.phase)
+    }
+
+    fn switch(&mut self, naming: bool, to_name: u64) {
+        self.naming = naming;
+        self.to_name = to_name;
+        self.held = false;
+        self.phase += 1;
+    }
+
+    /// Records that a session of `kind`, started in `phase`, ended with
+    /// `outcome`. Returns whether the launch stops.
+    fn finished(&mut self, kind: Kind, phase: u64, outcome: &Outcome) -> bool {
+        if kind == Kind::Naming {
+            self.naming_running = self.naming_running.saturating_sub(1);
+        }
+        if matches!(outcome, Outcome::NoBatch { .. } | Outcome::Lockdown { .. }) {
+            return true;
+        }
+        // In a phase, every session is of one kind: batch sessions report
+        // only names pending, naming sessions only the rest.
+        if phase != self.phase {
+            return false;
+        }
+        match outcome {
+            Outcome::NamesPending { count, .. } => self.switch(true, *count),
+            Outcome::Named { .. } => {
+                self.to_name = self.to_name.saturating_sub(1);
+                if self.to_name == 0 {
+                    self.switch(false, 0);
+                }
+            }
+            Outcome::NothingToName { .. } => self.switch(false, 0),
+            Outcome::NamingHeld { .. } => {
+                if self.naming_running == 0 {
+                    return true;
+                }
+                self.held = true;
+            }
+            _ => {}
+        }
+        false
+    }
 }
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -807,9 +906,10 @@ impl Launcher {
 
     /// Starts the sessions, at most `parallel` at once, and returns their
     /// records in the order they started. Each starts as the kind the module
-    /// docs say. No session starts after one finds no batch, finds every
-    /// function to name held while no other naming session of this launch
-    /// runs, or fails the lockdown, or after an interrupt.
+    /// docs say. No session starts after one finds no batch, fails the
+    /// lockdown, or finds every function to name held while no other naming
+    /// session of this launch runs; nor after an interrupt, or after a
+    /// session's thread panics.
     pub fn launch(&self) -> Vec<Session> {
         let next = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
@@ -820,59 +920,50 @@ impl Launcher {
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| loop {
-                    let (n, kind) = {
+                    let (n, kind, phase) = {
                         let mut p = locked(&plan);
-                        loop {
+                        let (kind, phase) = loop {
                             if stop.load(Ordering::SeqCst) || self.is_interrupted() {
                                 return;
                             }
-                            // Every function to name is held by this launch's
-                            // naming sessions: wait for one to end.
-                            if p.naming && p.held && p.naming_running > 0 {
-                                p = changed
-                                    .wait_timeout(p, TICK)
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .0;
-                                continue;
+                            match p.next() {
+                                Next::Start(kind, phase) => break (kind, phase),
+                                Next::Wait => {
+                                    p = changed
+                                        .wait_timeout(p, TICK)
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .0;
+                                }
                             }
-                            break;
-                        }
+                        };
                         let n = next.fetch_add(1, Ordering::SeqCst);
                         if n >= self.config.sessions {
                             return;
                         }
-                        let kind = if p.naming { Kind::Naming } else { Kind::Batch };
                         if kind == Kind::Naming {
                             p.naming_running += 1;
                         }
-                        (n, kind)
+                        (n, kind, phase)
                     };
-                    let session = self.session(n, kind);
-                    {
-                        let mut p = locked(&plan);
-                        if kind == Kind::Naming {
-                            p.naming_running -= 1;
-                        }
-                        match session.outcome {
-                            Outcome::NamesPending { .. } => p.naming = true,
-                            Outcome::NothingToName { .. } => {
-                                p.naming = false;
-                                p.held = false;
-                            }
-                            Outcome::NamingHeld { .. } if p.naming_running == 0 => {
-                                stop.store(true, Ordering::SeqCst);
-                            }
-                            Outcome::NamingHeld { .. } => p.held = true,
-                            Outcome::NoBatch { .. } | Outcome::Lockdown { .. } => {
-                                stop.store(true, Ordering::SeqCst);
-                            }
-                            // A naming session that ended may have freed a
-                            // function to name.
-                            _ if kind == Kind::Naming => p.held = false,
-                            _ => {}
-                        }
-                        changed.notify_all();
+                    // A panic must not leave the plan counting a running
+                    // naming session, or the other threads would wait on it.
+                    let session = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.session(n, kind)
+                    }))
+                    .unwrap_or_else(|_| {
+                        stop.store(true, Ordering::SeqCst);
+                        Session::ended(
+                            &format!("{}-{n}", self.launch),
+                            kind,
+                            Outcome::Failed {
+                                detail: "the launcher's thread for this session panicked".into(),
+                            },
+                        )
+                    });
+                    if locked(&plan).finished(kind, phase, &session.outcome) {
+                        stop.store(true, Ordering::SeqCst);
                     }
+                    changed.notify_all();
                     let _ = writeln!(
                         std::io::stderr(),
                         "dc-propose: {} {} {}",
