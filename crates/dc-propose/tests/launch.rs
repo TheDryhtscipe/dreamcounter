@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+use dc_mcp::state::{Arm, Event, LibraryEntry, RunConfig, RunId, StitchSettings};
+use dc_mcp::store::Store;
 use serde_json::{json, Value};
 
 const MODEL: &str = "claude-test-1";
@@ -56,7 +58,14 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// A fixture whose run has no function waiting to be named.
     fn new() -> Self {
+        Fixture::with_names_pending(0)
+    }
+
+    /// A fixture whose run has `pending` library functions waiting to be
+    /// named (autodoc on if there are any).
+    fn with_names_pending(pending: usize) -> Self {
         let root = tempfile::tempdir().unwrap();
         for d in ["fake", "fake/queue", "state", "logs"] {
             fs::create_dir(root.path().join(d)).unwrap();
@@ -66,6 +75,35 @@ impl Fixture {
         fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
         let fixture = Fixture { root };
         fixture.set_default(&submitted(0));
+        let store = Store::open(&fixture.path("state")).unwrap();
+        let run = RunId::new("r1").unwrap();
+        let config = RunConfig {
+            autodoc: pending > 0,
+            arm: Arm::Blind,
+            seed: 3,
+            proposals_per_task: 1,
+            programs_per_batch: 1,
+            lease_ms: 60_000,
+            max_unchecked_per_batch: 3,
+            frontier_size: 5,
+            stitch: StitchSettings::default(),
+            prelude: dc_mcp::verify::shipped_prelude(),
+        };
+        store
+            .create_run(&run, config, vec!["collapse/merge".into()])
+            .unwrap();
+        if pending > 0 {
+            let entries = (0..pending)
+                .map(|_| LibraryEntry {
+                    arity: 1,
+                    term: "(lam $0)".into(),
+                    ..LibraryEntry::default()
+                })
+                .collect();
+            store
+                .append(&run, vec![Event::LibraryExtended { entries }])
+                .unwrap();
+        }
         fixture
     }
 
@@ -998,24 +1036,18 @@ fn slow(mut transcript: Vec<String>, seconds: u64) -> Vec<String> {
 
 #[test]
 fn the_launch_names_new_functions_before_it_asks_for_batches() {
-    let f = Fixture::new();
-    f.queue("1", &names_pending(1));
-    f.queue("2", &named(0));
-    let out = f.run(&["--sessions", "4", "--parallel", "1"]);
+    let f = Fixture::with_names_pending(1);
+    f.queue("1", &named(0));
+    let out = f.run(&["--sessions", "3", "--parallel", "1"]);
     assert!(out.status.success(), "{out:?}");
     let summary = f.summary();
-    // Once the one pending name is given, batches start again at once.
+    assert_eq!(summary["names_pending_at_start"], 1);
+    // Once the one pending name is given, batches start.
     assert_eq!(
         kinds(&summary),
-        [
-            "batch:names_pending",
-            "naming:named",
-            "batch:submitted",
-            "batch:submitted"
-        ]
+        ["naming:named", "batch:submitted", "batch:submitted"]
     );
-    assert_eq!(summary["sessions"][0]["names_pending"], 1);
-    let session = &summary["sessions"][1];
+    let session = &summary["sessions"][0];
     assert_eq!(session["job"], 0);
     assert_eq!(session["name"], "ident");
     assert_eq!(session["refused"], json!([]));
@@ -1024,7 +1056,7 @@ fn the_launch_names_new_functions_before_it_asks_for_batches() {
     assert_eq!(session["leased_jobs"], json!([0]));
 
     let calls = f.calls();
-    assert_eq!(calls.len(), 4);
+    assert_eq!(calls.len(), 3);
     for (i, call) in calls.iter().enumerate() {
         let args = f.argv(call);
         let mut allowed = values_after(&args, "--allowedTools");
@@ -1034,7 +1066,7 @@ fn the_launch_names_new_functions_before_it_asks_for_batches() {
         let brief = value_after(&args, "--system-prompt");
         let worker = summary["sessions"][i]["worker"].as_str().unwrap();
         assert!(brief.contains(worker), "{brief}");
-        if i == 1 {
+        if i == 0 {
             assert_eq!(allowed, [NEXT_NAMING, SUBMIT_NAMING]);
             assert_eq!(denied, [NEXT, SUBMIT]);
             assert!(brief.contains("dc_next_naming_job"), "{brief}");
@@ -1045,6 +1077,50 @@ fn the_launch_names_new_functions_before_it_asks_for_batches() {
             assert!(!brief.contains("naming"), "{brief}");
         }
     }
+}
+
+#[test]
+fn a_launch_whose_run_has_no_names_pending_starts_with_batches() {
+    let f = Fixture::new();
+    let out = f.run(&["--sessions", "2", "--parallel", "1"]);
+    assert!(out.status.success(), "{out:?}");
+    let summary = f.summary();
+    assert_eq!(summary["names_pending_at_start"], 0);
+    assert_eq!(kinds(&summary), ["batch:submitted", "batch:submitted"]);
+}
+
+#[test]
+fn a_launch_for_a_run_that_does_not_exist_starts_no_session() {
+    let f = Fixture::new();
+    let out = f
+        .command(&["--sessions", "2"])
+        .args(["--run", "r2"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(f.calls().is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot read run r2"), "{stderr}");
+}
+
+#[test]
+fn names_that_become_pending_during_a_launch_are_named_before_more_batches() {
+    let f = Fixture::new();
+    // The operator ends an iteration that adds a function during the launch.
+    f.queue("1", &submitted(0));
+    f.queue("2", &names_pending(1));
+    f.queue("3", &named(0));
+    let out = f.run(&["--sessions", "4", "--parallel", "1"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        kinds(&f.summary()),
+        [
+            "batch:submitted",
+            "batch:names_pending",
+            "naming:named",
+            "batch:submitted"
+        ]
+    );
 }
 
 #[test]
@@ -1096,22 +1172,22 @@ fn the_launch_stops_when_every_function_to_name_is_held_elsewhere() {
 
 #[test]
 fn no_more_naming_sessions_run_at_once_than_names_are_pending() {
-    let f = Fixture::new();
-    for i in 1..=4 {
-        f.queue(&format!("a{i}"), &names_pending(1));
-    }
-    f.queue("b", &slow(named(0), 1));
+    let f = Fixture::with_names_pending(1);
+    f.queue("1", &slow(named(0), 1));
     // Any further naming session would play the default, a batch session's
-    // transcript, and fail the lockdown.
-    let out = f.run(&["--sessions", "8", "--parallel", "4"]);
+    // transcript, and fail the lockdown. No batch session starts while the
+    // name is being given.
+    let out = f.run(&["--sessions", "5", "--parallel", "4"]);
     assert!(out.status.success(), "{out:?}");
     let mut got = kinds(&f.summary());
     got.sort();
-    let mut want = vec!["batch:names_pending"; 4];
-    want.push("naming:named");
-    want.extend(["batch:submitted"; 3]);
+    let mut want = vec!["naming:named"];
+    want.extend(["batch:submitted"; 4]);
     want.sort_unstable();
     assert_eq!(got, want);
+    let calls = f.calls();
+    assert_eq!(f.read(&format!("fake/conc.{}", calls[0])).trim(), "1");
+    assert!(f.argv(&calls[1]).iter().any(|a| a == NEXT));
 }
 
 #[test]

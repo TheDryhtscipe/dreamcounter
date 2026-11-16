@@ -233,11 +233,9 @@ fn a_job_is_held_for_its_lease_then_handed_out_again() {
     let (_dir, store, run, v) = setup(true, 1);
     let first = job(&store, &run, &v, "a", 0).job.unwrap();
     // A worker holds one job; the only entry is held, so b waits.
-    assert!(job(&store, &run, &v, "a", 10)
-        .wait
-        .unwrap()
-        .reason
-        .contains("you hold"));
+    let own = job(&store, &run, &v, "a", 10).wait.unwrap();
+    assert!(own.reason.contains("you hold"), "{}", own.reason);
+    assert_eq!(own.names_pending, 1);
     let held = job(&store, &run, &v, "b", 10).wait.unwrap();
     assert!(
         held.reason.contains("held by another job"),
@@ -469,9 +467,26 @@ fn a_wait_says_how_many_names_are_pending() {
     let none = job(&store, &run, &v, "c", 0).wait.unwrap();
     assert!(none.reason.contains("no function waits"), "{}", none.reason);
     assert_eq!(none.names_pending, 0);
-    // A batch's wait with no names pending says so too.
-    let first = batch(&store, &run, &v, "c");
-    assert!(first.batch.is_some());
-    let busy = batch(&store, &run, &v, "c").wait.unwrap();
-    assert_eq!(busy.names_pending, 0, "{}", busy.reason);
+}
+
+#[test]
+fn a_worker_that_holds_a_batch_hears_of_names_that_became_pending() {
+    let (_dir, store, run, v) = setup(true, 0);
+    assert!(batch(&store, &run, &v, "a").batch.is_some());
+    let entry = LibraryEntry {
+        arity: 1,
+        term: "(lam $0)".into(),
+        ..LibraryEntry::default()
+    };
+    store
+        .append(
+            &run,
+            vec![Event::LibraryExtended {
+                entries: vec![entry],
+            }],
+        )
+        .unwrap();
+    let held = batch(&store, &run, &v, "a").wait.unwrap();
+    assert!(held.reason.contains("you hold batch"), "{}", held.reason);
+    assert_eq!(held.names_pending, 1);
 }

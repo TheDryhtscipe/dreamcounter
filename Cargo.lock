@@ -356,6 +356,7 @@ dependencies = [
 name = "dc-propose"
 version = "0.1.0"
 dependencies = [
+ "dc-mcp",
  "getrandom 0.3.4",
  "rustix",
  "serde_json",

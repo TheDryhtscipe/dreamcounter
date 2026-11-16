@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+dc-mcp.workspace = true
 getrandom.workspace = true
 rustix.workspace = true
 serde_json.workspace = true

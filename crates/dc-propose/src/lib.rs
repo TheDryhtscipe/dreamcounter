@@ -21,9 +21,15 @@
 //! allowed its kind's two tools and denied the other kind's two; denied
 //! tools are not shown to it.
 //!
-//! Sessions start as batch sessions. When a batch session's wait says that
-//! `names_pending` functions wait to be named, the next sessions are naming
-//! sessions, at most that many at once. Batch sessions start again once
+//! When it is set up, the launcher reads from the state directory how many
+//! of the run's library functions wait to be named, as dc-mcp counts them
+//! (D23). It reads nothing else of the run, and gives the sessions nothing
+//! of it. If some wait, the launch starts with naming sessions; otherwise
+//! with batch sessions. When a batch session's wait says that
+//! `names_pending` functions wait to be named (after the operator ends an
+//! iteration during the launch, say), the next sessions are naming
+//! sessions. Either way, at most that many naming sessions run at once.
+//! Fewer may, if naming sessions of an earlier phase are still running. Batch sessions start again once
 //! this launch has named that many, or a naming session finds nothing to
 //! name. A naming session that finds every function still to name held by
 //! a job stops new naming sessions until this launch's running ones have
@@ -45,9 +51,11 @@
 //!
 //! The launcher does not create runs or finish iterations: those are the
 //! operator's tools. It starts sessions, of both kinds, until it has started
-//! the number asked for, or until a session finds no batch to take. Worker
-//! ids are unique, so "no batch" means every open slot is leased or being
-//! checked.
+//! the number asked for, or until a session finds no batch to take, or
+//! every function to name held with none of its own naming sessions
+//! running. Worker ids are unique, so "no batch" means every open slot is
+//! leased or being checked, and "held" means held by a job of another
+//! launch or of a session of this launch that has ended.
 //!
 //! With the environment allowlisted, Claude Code 2.1.318 makes no scratch
 //! directory for a session outside the session's own directory.
@@ -68,6 +76,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use dc_mcp::state::RunId;
+use dc_mcp::store::Store;
 use rustix::process::{kill_process_group, test_kill_process_group, Pid, Signal};
 use serde_json::{json, Map, Value};
 
@@ -594,6 +604,10 @@ pub fn classify(events: &[Value]) -> (Outcome, (u64, u64), Vec<u64>) {
                     }
                     let reply: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     let wait = &reply["wait"];
+                    // Any wait with names pending is read as such, whatever
+                    // its reason. The other waits that can carry a count, "you
+                    // hold batch" and "you hold naming job", need a worker id
+                    // used twice, and this launcher never reuses one.
                     let pending = wait["names_pending"].as_u64().unwrap_or(0);
                     if name == SUBMIT {
                         if let (Some(batch), Some(received)) =
@@ -850,11 +864,14 @@ pub struct Launcher {
     launch: String,
     /// Set when the launcher is told to stop.
     interrupted: Arc<AtomicBool>,
+    /// How many of the run's library functions waited to be named when the
+    /// launcher was set up.
+    names_pending: u64,
 }
 
 impl Launcher {
-    /// Checks `config`, makes the log directory, and gives the launch a
-    /// random id.
+    /// Checks `config`, makes the log directory, reads how many of the run's
+    /// functions wait to be named, and gives the launch a random id.
     pub fn new(config: Config) -> Result<Self, LaunchError> {
         if config.sessions == 0 || config.parallel == 0 {
             return Err(LaunchError(
@@ -873,6 +890,11 @@ impl Launcher {
             .map_err(|e| io_error("cannot open the log directory", &config.log_dir, &e))?;
         // The repository is any git repository (see `misplaced`).
         let forbidden = vec![state_dir.clone(), log_dir];
+        let run = RunId::new(&config.run)
+            .map_err(|e| LaunchError(format!("bad run id {:?}: {e}", config.run)))?;
+        let names_pending = Store::open(&state_dir)
+            .and_then(|store| store.read(&run, dc_mcp::state::RunState::names_pending))
+            .map_err(|e| LaunchError(format!("cannot read run {}: {e}", config.run)))?;
         let mut bytes = [0u8; 4];
         getrandom::fill(&mut bytes)
             .map_err(|e| LaunchError(format!("cannot make a launch id: {e}")))?;
@@ -886,6 +908,7 @@ impl Launcher {
             forbidden,
             launch,
             interrupted: Arc::new(AtomicBool::new(false)),
+            names_pending,
         })
     }
 
@@ -913,7 +936,11 @@ impl Launcher {
     pub fn launch(&self) -> Vec<Session> {
         let next = AtomicUsize::new(0);
         let stop = AtomicBool::new(false);
-        let plan = Mutex::new(Plan::default());
+        let mut start = Plan::default();
+        if self.names_pending > 0 {
+            start.switch(true, self.names_pending);
+        }
+        let plan = Mutex::new(start);
         let changed = Condvar::new();
         let done: Mutex<Vec<(usize, Session)>> = Mutex::new(Vec::new());
         let workers = self.config.parallel.min(self.config.sessions);
@@ -992,6 +1019,7 @@ impl Launcher {
             "model": self.config.model,
             "state_dir": self.state_dir,
             "interrupted": self.is_interrupted(),
+            "names_pending_at_start": self.names_pending,
             "sessions": sessions.iter().map(Session::to_json).collect::<Vec<_>>(),
         })
     }
