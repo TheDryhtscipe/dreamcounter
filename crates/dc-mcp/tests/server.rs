@@ -1280,24 +1280,44 @@ fn a_run_ready_to_end(dir: &Path, operator: &mut Client) {
     wait_for_checks(operator, &mut proposer, "r1");
 }
 
+/// Runs `command` with `to` appended, and checks that it succeeds.
+#[cfg(target_os = "linux")]
+fn run_in_child(command: &[&str], to: &Path) {
+    let status = Command::new(command[0])
+        .args(&command[1..])
+        .arg(to)
+        .status()
+        .unwrap();
+    assert!(status.success(), "{command:?} {to:?}: {status}");
+}
+
 /// A server whose file was replaced after it started, as an upgrade does,
 /// still starts its own build as the worker.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_server_whose_file_was_replaced_still_runs_its_own_worker() {
-    use std::os::unix::fs::PermissionsExt;
-
     let bin = tempfile::TempDir::new().unwrap();
     let binary = bin.path().join("dc-mcp");
-    std::fs::copy(env!("CARGO_BIN_EXE_dc-mcp"), &binary).unwrap();
+    // Files made here are made by child processes. A file this process wrote
+    // keeps a write descriptor that a parallel test's fork can inherit, and
+    // executing it then fails with "Text file busy".
+    run_in_child(&["cp", env!("CARGO_BIN_EXE_dc-mcp")], &binary);
     let dir = tempfile::TempDir::new().unwrap();
     let mut operator = Client::start_binary(&binary, dir.path(), &[], Stdio::null());
     a_run_ready_to_end(dir.path(), &mut operator);
 
     // Another program takes the path. Started as the worker, it would fail.
     let other = bin.path().join("other");
-    std::fs::write(&other, "#!/bin/sh\nexit 2\n").unwrap();
-    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let made = Command::new("sh")
+        .args([
+            "-c",
+            "printf '#!/bin/sh\\nexit 2\\n' > \"$1\" && chmod 755 \"$1\"",
+            "sh",
+        ])
+        .arg(&other)
+        .status()
+        .unwrap();
+    assert!(made.success());
     std::fs::rename(&other, &binary).unwrap();
     assert_eq!(Command::new(&binary).status().unwrap().code(), Some(2));
 
