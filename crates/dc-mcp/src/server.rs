@@ -85,6 +85,16 @@ pub struct CreateRun {
     /// issued, so turn it on only when proposers will pull naming jobs. If
     /// absent, false.
     pub autodoc: Option<bool>,
+    /// Whether the run learns a library. If false, the run is the LLM-only
+    /// baseline (decision D24): each iteration selects frontiers as usual,
+    /// but no Stitch run ends it and the library stays empty, so autodoc
+    /// must be off. To match it with the run it is compared with on
+    /// proposals, give it the same tasks, proposals_per_task,
+    /// programs_per_batch, lease_seconds, frontier_size, seed and number of
+    /// iterations, then compare the batches and payload bytes that
+    /// `dc_proposal_stats` reports for the two runs. Nothing checks that
+    /// the settings match, and tokens are not matched. If absent, true.
+    pub library_learning: Option<bool>,
 }
 
 /// The most programs one batch asks for when `dc_create_run` does not say.
@@ -161,6 +171,9 @@ pub struct RunStatus {
     pub library_size: usize,
     /// Whether proposers name new definitions (decision D23).
     pub autodoc: bool,
+    /// Whether the run learns a library. False for the LLM-only baseline
+    /// (decision D24), whose library stays empty.
+    pub library_learning: bool,
     /// How many definitions wait for a naming result. While any does, no
     /// batch is issued.
     pub unnamed: u64,
@@ -204,6 +217,7 @@ impl RunStatus {
             },
             iteration: state.iteration(),
             autodoc: config.autodoc,
+            library_learning: config.library_learning,
             unnamed: state.names_pending(),
             tasks: state
                 .tasks()
@@ -280,8 +294,22 @@ pub struct IterationStats {
     pub payload_bytes: u64,
     /// Bytes of program text received.
     pub submission_bytes: u64,
+    /// What came in from each model the proposers named, in the models'
+    /// order, with those that named none first (decision D24).
+    pub models: Vec<ModelStats>,
     /// Each task, in the run's order.
     pub tasks: Vec<TaskStats>,
+}
+
+/// What came in during one iteration from proposers that named one model.
+#[derive(Debug, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct ModelStats {
+    /// The model the proposers named, or none if they named none.
+    pub model: Option<String>,
+    /// Submissions received, of any standing.
+    pub submissions: u64,
+    /// Programs in those submissions.
+    pub programs: u64,
 }
 
 impl IterationStats {
@@ -327,6 +355,15 @@ impl IterationStats {
             refused_foreign: refusals.iteration(iteration).foreign,
             payload_bytes: counts.payload_bytes,
             submission_bytes: counts.submission_bytes,
+            models: state
+                .model_counts(iteration)
+                .into_iter()
+                .map(|(model, c)| ModelStats {
+                    model,
+                    submissions: c.submissions,
+                    programs: c.programs,
+                })
+                .collect(),
             tasks,
         }
     }
@@ -362,6 +399,7 @@ pub struct FinishReport {
     /// What the Stitch run did. `ran`: it finished. `failed`: it was
     /// stopped at a limit or went wrong, so the library is unchanged.
     /// `no_programs`: there was no program to compress, so it did not run.
+    /// `off`: the run does not learn a library, so it did not run.
     pub compression: String,
     /// Why the Stitch run failed, if it did.
     pub compression_error: Option<String>,
@@ -549,6 +587,7 @@ impl DcServer {
                 CompressionReport::Ran { .. } => ("ran", None),
                 CompressionReport::Failed { error, .. } => ("failed", Some(error.clone())),
                 CompressionReport::NoPrograms { .. } => ("no_programs", None),
+                CompressionReport::Off => ("off", None),
             };
             // The step is committed. If this read fails, say so, not that
             // the step failed.
@@ -624,6 +663,7 @@ impl DcServer {
         let defaults = StitchSettings::default();
         let config = RunConfig {
             autodoc: arg.autodoc.unwrap_or(false),
+            library_learning: arg.library_learning.unwrap_or(true),
             arm: Arm::Blind,
             seed: arg.seed,
             proposals_per_task: arg.proposals_per_task,
@@ -713,7 +753,8 @@ impl DcServer {
         description = "Report, for each iteration of a DreamCounter run, what proposers sent: \
                        for each task the batches issued, the programs checked, how many \
                        compiled, typed and passed their examples, and whether the task was \
-                       solved; and the bytes of payload and program text."
+                       solved; the bytes of payload and program text; and the submissions \
+                       and programs from each model the proposers named."
     )]
     async fn proposal_stats(
         &self,
@@ -1384,6 +1425,74 @@ mod tests {
         signalled.join().unwrap();
     }
 
+    /// `dc_proposal_stats` reports, for each iteration, what came in from
+    /// each model the proposers named (D24 accounting).
+    #[test]
+    fn proposal_stats_count_submissions_by_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let run = RunId::new("r").unwrap();
+        store
+            .create_run(
+                &run,
+                RunConfig {
+                    autodoc: false,
+                    arm: Arm::Blind,
+                    library_learning: true,
+                    seed: 3,
+                    proposals_per_task: 8,
+                    programs_per_batch: 2,
+                    lease_ms: 1_000_000,
+                    max_unchecked_per_batch: 3,
+                    frontier_size: 5,
+                    stitch: crate::state::StitchSettings::default(),
+                    prelude: crate::verify::shipped_prelude(),
+                },
+                vec!["collapse/merge".into()],
+            )
+            .unwrap();
+        let verifiers = VerifierCache::default();
+        let models = [Some("model-b"), None, Some("model-a"), Some("model-b")];
+        for (i, model) in models.iter().enumerate() {
+            let worker = format!("w{i}");
+            let sent = next_batch(&store, &run, &worker, 0, &verifiers)
+                .unwrap()
+                .batch
+                .unwrap();
+            let programs = vec!["let solve = (".to_owned(); i % 2 + 1];
+            submit(
+                &store,
+                &run,
+                sent.batch,
+                &worker,
+                &sent.token,
+                programs,
+                model.map(str::to_owned),
+                1,
+            )
+            .unwrap();
+        }
+        let stats = store
+            .read_with_refusals(&run, |state, refusals| {
+                IterationStats::of(state, refusals, 0)
+            })
+            .unwrap();
+        let row = |model: Option<&str>, submissions, programs| ModelStats {
+            model: model.map(str::to_owned),
+            submissions,
+            programs,
+        };
+        assert_eq!(
+            stats.models,
+            vec![
+                row(None, 1, 2),
+                row(Some("model-a"), 1, 1),
+                row(Some("model-b"), 2, 3),
+            ]
+        );
+        assert_eq!(stats.submissions, 4);
+    }
+
     /// A proposer server of a run with one submission waiting to be checked.
     struct Fixture {
         dir: tempfile::TempDir,
@@ -1413,6 +1522,7 @@ mod tests {
                     RunConfig {
                         autodoc: false,
                         arm: Arm::Blind,
+                        library_learning: true,
                         seed: 3,
                         proposals_per_task: 1,
                         programs_per_batch: 1,

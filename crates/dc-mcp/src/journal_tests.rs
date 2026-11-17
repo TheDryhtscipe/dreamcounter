@@ -6,6 +6,7 @@ fn created() -> Event {
         config: RunConfig {
             autodoc: false,
             arm: Arm::Blind,
+            library_learning: true,
             seed: 1,
             proposals_per_task: 2,
             programs_per_batch: 1,

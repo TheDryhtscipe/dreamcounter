@@ -124,8 +124,10 @@ pub struct Candidate {
 pub struct DriverConfig {
     /// The most programs a task's frontier keeps. It is positive.
     pub frontier_size: usize,
-    /// The settings of the Stitch run.
-    pub compress: CompressConfig,
+    /// The settings of the Stitch run, or `None` for a step with no
+    /// compression: it selects the frontiers and leaves the library as it is,
+    /// as an LLM-only baseline needs (decision D24).
+    pub compress: Option<CompressConfig>,
 }
 
 /// The input of one step. Every name in `frontiers` and every program in it is
@@ -318,6 +320,9 @@ pub enum CompressionReport {
         /// The error.
         error: String,
     },
+    /// Compression is off for the run ([`DriverConfig::compress`] is
+    /// `None`), so Stitch did not run.
+    Off,
     /// The run finished.
     Ran {
         /// The programs left out of the run.
@@ -781,6 +786,8 @@ fn select(
 
 /// How the Stitch run of step 3 ended.
 enum StitchRun {
+    /// Compression is off, so Stitch was not asked.
+    Off,
     /// No program was left to give Stitch.
     NoPrograms,
     /// The run failed, but not because it was interrupted: see
@@ -1025,16 +1032,20 @@ pub fn run_iteration(
     )?;
 
     let mut left_out = Vec::new();
-    let run = run_stitch(
-        &mut arena,
-        &library,
-        input.tasks,
-        &kept,
-        &cfg.compress,
-        stitch,
-        &mut left_out,
-    )?;
+    let run = match &cfg.compress {
+        None => StitchRun::Off,
+        Some(compress) => run_stitch(
+            &mut arena,
+            &library,
+            input.tasks,
+            &kept,
+            compress,
+            stitch,
+            &mut left_out,
+        )?,
+    };
     let (new_library, compression) = match run {
+        StitchRun::Off => (Vec::new(), CompressionReport::Off),
         StitchRun::NoPrograms => (Vec::new(), CompressionReport::NoPrograms { left_out }),
         StitchRun::Failed(error) => (Vec::new(), CompressionReport::Failed { left_out, error }),
         StitchRun::Ran { slots, compression } => update_library(

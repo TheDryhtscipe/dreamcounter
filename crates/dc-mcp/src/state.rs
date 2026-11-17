@@ -114,6 +114,18 @@ pub struct RunConfig {
     /// setting has it off.
     #[serde(default)]
     pub autodoc: bool,
+    /// Whether the run learns a library: each iteration's step runs Stitch
+    /// and adds what it finds. With it off the step only selects frontiers
+    /// and the library stays empty, which makes the run the LLM-only
+    /// baseline (decisions D8 and D24). A run made before the setting has
+    /// it on.
+    #[serde(default = "learns_library")]
+    pub library_learning: bool,
+}
+
+/// The [`RunConfig::library_learning`] of a run made before the setting.
+fn learns_library() -> bool {
+    true
 }
 
 /// The settings of the Stitch run that ends each iteration: what Stitch
@@ -654,6 +666,11 @@ pub enum Rejected {
     Naming(String),
     /// A `LibraryExtended` event has no entries.
     NoEntries,
+    /// A `LibraryExtended` event came in a run that does not learn a
+    /// library ([`RunConfig::library_learning`] is off).
+    NoLearning,
+    /// The settings turn autodoc on in a run that does not learn a library.
+    AutodocWithoutLearning,
     /// The iteration number would overflow.
     IterationOverflow,
     /// A `BatchIssued` event does not have the next batch number.
@@ -729,6 +746,17 @@ impl fmt::Display for Rejected {
                 "the event names iteration {given}, but the run is in iteration {current}"
             ),
             Rejected::NoEntries => write!(f, "a library extension needs at least one entry"),
+            Rejected::NoLearning => {
+                write!(
+                    f,
+                    "the run does not learn a library (library_learning is off)"
+                )
+            }
+            Rejected::AutodocWithoutLearning => write!(
+                f,
+                "autodoc needs library learning: a run that does not learn a library has \
+                 nothing to name"
+            ),
             Rejected::Naming(why) => f.write_str(why),
             Rejected::IterationOverflow => write!(f, "the iteration number would overflow"),
             Rejected::WrongBatchNumber { next, given } => write!(
@@ -839,6 +867,16 @@ pub struct IterationCounts {
     pub foreign: u64,
 }
 
+/// What came in during one iteration from proposers that named one model, or
+/// from those that named none (decision D24).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModelCounts {
+    /// Submissions received, of any standing.
+    pub submissions: u64,
+    /// Programs in those submissions.
+    pub programs: u64,
+}
+
 /// A program that passed its task's examples and that no iteration step has
 /// taken yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -892,6 +930,7 @@ pub struct RunState {
     awaiting: BTreeSet<u64>,
     task_counts: ByIteration<BTreeMap<String, TaskCounts>>,
     iteration_counts: ByIteration<IterationCounts>,
+    model_counts: ByIteration<BTreeMap<Option<String>, ModelCounts>>,
     verified: Vec<Verified>,
     naming_jobs: Vec<NamingJob>,
     named: Vec<bool>,
@@ -945,6 +984,9 @@ impl RunState {
         if config.stitch.memory_bytes < MIN_STITCH_MEMORY_BYTES {
             return Err(Rejected::TooLittleStitchMemory(config.stitch.memory_bytes));
         }
+        if config.autodoc && !config.library_learning {
+            return Err(Rejected::AutodocWithoutLearning);
+        }
         let mut frontiers = BTreeMap::new();
         for task in &tasks {
             if frontiers.insert(task.clone(), Vec::new()).is_some() {
@@ -964,6 +1006,7 @@ impl RunState {
             awaiting: BTreeSet::new(),
             task_counts: ByIteration::default(),
             iteration_counts: ByIteration::default(),
+            model_counts: ByIteration::default(),
             verified: Vec::new(),
             naming_jobs: Vec::new(),
             named: Vec::new(),
@@ -1024,6 +1067,9 @@ impl RunState {
                 self.frontiers.insert(task.clone(), members.clone());
             }
             Event::LibraryExtended { entries } => {
+                if !self.config.library_learning {
+                    return Err(Rejected::NoLearning);
+                }
                 if entries.is_empty() {
                     return Err(Rejected::NoEntries);
                 }
@@ -1236,6 +1282,13 @@ impl RunState {
                 c.received += received;
             });
         }
+        let by_model = self
+            .model_counts
+            .entry(s.iteration)
+            .entry(s.model.clone())
+            .or_default();
+        by_model.submissions = by_model.submissions.saturating_add(1);
+        by_model.programs = by_model.programs.saturating_add(s.programs.len() as u64);
         let counts = self.iteration_counts.entry(s.iteration);
         counts.submissions += 1;
         let bytes: u64 = s.programs.iter().map(|p| p.len() as u64).sum();
@@ -1517,6 +1570,15 @@ impl RunState {
             .unwrap_or_default()
     }
 
+    /// What came in during `iteration` for each model the proposers named,
+    /// with `None` for those that named none, in the models' order.
+    pub fn model_counts(&self, iteration: u64) -> Vec<(Option<String>, ModelCounts)> {
+        self.model_counts
+            .get(iteration)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default()
+    }
+
     /// What came in during `iteration`.
     pub fn iteration_counts(&self, iteration: u64) -> IterationCounts {
         self.iteration_counts
@@ -1597,6 +1659,7 @@ mod tests {
         RunConfig {
             autodoc: false,
             arm: Arm::Blind,
+            library_learning: true,
             seed: 7,
             proposals_per_task: 4,
             programs_per_batch: 2,
@@ -1606,6 +1669,59 @@ mod tests {
             stitch: crate::state::StitchSettings::default(),
             prelude: 0,
         }
+    }
+
+    /// A run with library learning off (the LLM-only baseline, D24) cannot
+    /// name abstractions, and its library takes no entries.
+    #[test]
+    fn a_run_without_library_learning_has_no_naming_and_no_library() {
+        let baseline = RunConfig {
+            library_learning: false,
+            ..config()
+        };
+        let named = RunConfig {
+            autodoc: true,
+            ..baseline.clone()
+        };
+        assert_eq!(
+            RunState::create(named, vec!["a".into()]),
+            Err(Rejected::AutodocWithoutLearning)
+        );
+        let mut state = RunState::create(baseline, vec!["a".into()]).unwrap();
+        let entry = LibraryEntry {
+            name: None,
+            doc: None,
+            arity: 1,
+            term: "(lam $0)".into(),
+        };
+        assert_eq!(
+            state.apply(&Event::LibraryExtended {
+                entries: vec![entry.clone()]
+            }),
+            Err(Rejected::NoLearning)
+        );
+        assert!(state.library().is_empty());
+        // The same entry joins a run that learns a library.
+        let mut learning = new_state();
+        learning
+            .apply(&Event::LibraryExtended {
+                entries: vec![entry],
+            })
+            .unwrap();
+        assert_eq!(learning.library().len(), 1);
+    }
+
+    /// A run written before the setting learns a library.
+    #[test]
+    fn settings_written_before_library_learning_read_back_with_it_on() {
+        let mut json = serde_json::to_value(RunConfig {
+            library_learning: false,
+            ..config()
+        })
+        .unwrap();
+        json.as_object_mut().unwrap().remove("library_learning");
+        let read: RunConfig = serde_json::from_value(json).unwrap();
+        assert!(read.library_learning);
     }
 
     fn new_state() -> RunState {

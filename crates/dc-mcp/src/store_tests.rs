@@ -11,6 +11,7 @@ fn config() -> RunConfig {
     RunConfig {
         autodoc: false,
         arm: Arm::Blind,
+        library_learning: true,
         seed: 11,
         proposals_per_task: 3,
         programs_per_batch: 1,
