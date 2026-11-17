@@ -88,8 +88,12 @@ pub struct CreateRun {
     /// Whether the run learns a library. If false, the run is the LLM-only
     /// baseline (decision D24): each iteration selects frontiers as usual,
     /// but no Stitch run ends it and the library stays empty, so autodoc
-    /// must be off. Give it the same tasks, proposals_per_task and number
-    /// of iterations as the run it is compared with. If absent, true.
+    /// must be off. To match it with the run it is compared with on
+    /// proposals, give it the same tasks, proposals_per_task,
+    /// programs_per_batch, lease_seconds, frontier_size, seed and number of
+    /// iterations, then compare the batches and payload bytes that
+    /// `dc_proposal_stats` reports for the two runs. Nothing checks that
+    /// the settings match, and tokens are not matched. If absent, true.
     pub library_learning: Option<bool>,
 }
 

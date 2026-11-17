@@ -428,7 +428,6 @@ fn a_run_made_under_another_prelude_is_not_served() {
     assert_eq!(journal(&dir), before, "a refused call wrote to the run");
 }
 
-/// A worker that never answers: `sleep`, which does not read its request.
 /// A run with library learning off (the LLM-only baseline, D24) ends its
 /// iterations with frontiers and no Stitch run. Its programs share code, as
 /// in [`ending_an_iteration_commits_the_whole_step_as_one_record`], so a
@@ -474,6 +473,7 @@ fn a_run_without_library_learning_ends_its_iterations_without_stitch() {
     }
 }
 
+/// A worker that never answers: `sleep`, which does not read its request.
 fn sleeper() -> WorkerStart {
     WorkerStart {
         program: "sleep".into(),

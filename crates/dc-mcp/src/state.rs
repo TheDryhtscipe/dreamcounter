@@ -1287,7 +1287,7 @@ impl RunState {
             .entry(s.iteration)
             .entry(s.model.clone())
             .or_default();
-        by_model.submissions += 1;
+        by_model.submissions = by_model.submissions.saturating_add(1);
         by_model.programs = by_model.programs.saturating_add(s.programs.len() as u64);
         let counts = self.iteration_counts.entry(s.iteration);
         counts.submissions += 1;
