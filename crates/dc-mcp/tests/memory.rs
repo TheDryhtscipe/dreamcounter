@@ -113,6 +113,7 @@ fn check_cold_reads(notes: u64, note_bytes: usize) {
     let config = RunConfig {
         autodoc: false,
         arm: Arm::Blind,
+        library_learning: true,
         seed: 5,
         proposals_per_task: 1,
         programs_per_batch: 1,

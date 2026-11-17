@@ -26,6 +26,7 @@ fn config(quota: u32, prelude: u64) -> RunConfig {
     RunConfig {
         autodoc: false,
         arm: Arm::Blind,
+        library_learning: true,
         seed: 3,
         proposals_per_task: quota,
         programs_per_batch: 1,
@@ -428,6 +429,51 @@ fn a_run_made_under_another_prelude_is_not_served() {
 }
 
 /// A worker that never answers: `sleep`, which does not read its request.
+/// A run with library learning off (the LLM-only baseline, D24) ends its
+/// iterations with frontiers and no Stitch run. Its programs share code, as
+/// in [`ending_an_iteration_commits_the_whole_step_as_one_record`], so a
+/// Stitch run would find abstractions; and a step that tried to start its
+/// worker would fail, since there is none.
+#[test]
+fn a_run_without_library_learning_ends_its_iterations_without_stitch() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("r").unwrap();
+    let config = RunConfig {
+        library_learning: false,
+        ..config(2, shipped_prelude())
+    };
+    let tasks = TASKS.iter().map(|t| (*t).to_owned()).collect();
+    store.create_run(&run, config, tasks).unwrap();
+    let missing = WorkerStart {
+        program: dir.path().join("no-such-worker"),
+        args: Vec::new(),
+    };
+    let cancel = AtomicBool::new(false);
+    for iteration in 0..2 {
+        fill(&store, &run, iteration * 10_000);
+        let before = events(&store, &run).len();
+        let done = finish_iteration_in_worker(&store, &run, &missing, &cancel).unwrap();
+        assert_eq!(done.iteration, iteration);
+        assert_eq!(done.used, 6);
+        assert_eq!(done.new_abstractions, 0);
+        assert_eq!(done.report.compression, CompressionReport::Off);
+        let added = &events(&store, &run)[before..];
+        assert!(
+            !added
+                .iter()
+                .any(|e| matches!(e, Event::LibraryExtended { .. })),
+            "{added:?}"
+        );
+        let state = store.state(&run).unwrap();
+        assert!(state.library().is_empty());
+        for task in TASKS {
+            let members = state.frontier(task).unwrap();
+            assert!(!members.is_empty() && members.len() <= K as usize, "{task}");
+        }
+    }
+}
+
 fn sleeper() -> WorkerStart {
     WorkerStart {
         program: "sleep".into(),

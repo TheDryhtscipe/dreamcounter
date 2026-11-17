@@ -688,7 +688,7 @@ mod tests {
 
     use super::*;
     use crate::prompt::PromptTable;
-    use crate::state::{Arm, RunConfig};
+    use crate::state::{Arm, ModelCounts, RunConfig};
     use tempfile::TempDir;
 
     const MERGE: &str = "collapse/merge";
@@ -725,6 +725,7 @@ mod tests {
                 RunConfig {
                     autodoc: false,
                     arm: Arm::Blind,
+                    library_learning: true,
                     seed: 3,
                     proposals_per_task: quota,
                     programs_per_batch: per_batch,
@@ -902,6 +903,7 @@ mod tests {
         let config = RunConfig {
             autodoc: false,
             arm: Arm::Blind,
+            library_learning: true,
             seed: 3,
             proposals_per_task: 1,
             programs_per_batch: 1,
@@ -1165,6 +1167,22 @@ mod tests {
         assert_eq!((ic.submissions, ic.repeats, ic.foreign), (3, 1, 1));
         assert_eq!(state.iteration_counts(1).late, 1);
         assert_eq!(state.task_counts(1, CANCEL).programs, 0);
+
+        // Each iteration counts its submissions and their programs by the
+        // model they name, of any standing (D24 accounting).
+        let counts = |submissions, programs| ModelCounts {
+            submissions,
+            programs,
+        };
+        assert_eq!(
+            state.model_counts(0),
+            vec![
+                (None, counts(2, 2)),
+                (Some("model-x".to_owned()), counts(1, 3))
+            ]
+        );
+        assert_eq!(state.model_counts(1), vec![(None, counts(1, 1))]);
+        assert_eq!(state.model_counts(2), vec![]);
     }
 
     #[test]
@@ -1431,6 +1449,7 @@ mod tests {
         RunConfig {
             autodoc: false,
             arm: Arm::Blind,
+            library_learning: true,
             seed: 3,
             proposals_per_task: 1,
             programs_per_batch: 1,

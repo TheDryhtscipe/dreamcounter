@@ -66,7 +66,8 @@ use dc_surface::prelude::Prelude;
 
 use crate::proposer::check_pending;
 use crate::state::{
-    Event, FrontierMember, LibraryEntry, LogKind, LogRecord, RunId, RunState, StitchSettings,
+    Event, FrontierMember, LibraryEntry, LogKind, LogRecord, RunConfig, RunId, RunState,
+    StitchSettings,
 };
 use crate::store::{Store, StoreError};
 use crate::verify::{check_prelude, shipped_prelude, task, PreludeChanged, VerifierCache};
@@ -191,15 +192,15 @@ impl From<StoreError> for FinishError {
     }
 }
 
-/// The settings of the step for a run with the settings `stitch` and the
-/// frontier size `frontier_size`.
-fn driver_config(frontier_size: u32, stitch: &StitchSettings) -> DriverConfig {
+/// The settings of the step for a run with the settings `config`. A run that
+/// does not learn a library gets a step with no compression (D24).
+fn driver_config(config: &RunConfig) -> DriverConfig {
     DriverConfig {
-        frontier_size: frontier_size as usize,
-        compress: CompressConfig {
-            iterations: stitch.iterations as usize,
-            max_arity: stitch.max_arity,
-        },
+        frontier_size: config.frontier_size as usize,
+        compress: config.library_learning.then_some(CompressConfig {
+            iterations: config.stitch.iterations as usize,
+            max_arity: config.stitch.max_arity,
+        }),
     }
 }
 
@@ -260,7 +261,7 @@ fn snapshot(state: &RunState) -> Result<Snapshot, FinishError> {
                 program: v.program.clone(),
             })
             .collect(),
-        config: driver_config(state.config().frontier_size, &state.config().stitch),
+        config: driver_config(state.config()),
         stitch: state.config().stitch,
     })
 }

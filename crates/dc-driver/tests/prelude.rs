@@ -42,7 +42,7 @@ fn candidate(task: &str, program: String) -> Candidate {
 fn config() -> DriverConfig {
     DriverConfig {
         frontier_size: 5,
-        compress: CompressConfig::default(),
+        compress: Some(CompressConfig::default()),
     }
 }
 

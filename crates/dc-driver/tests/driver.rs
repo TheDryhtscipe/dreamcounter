@@ -36,7 +36,7 @@ fn candidate(task: &str, program: &str) -> Candidate {
 fn config(k: usize) -> DriverConfig {
     DriverConfig {
         frontier_size: k,
-        compress: CompressConfig::default(),
+        compress: Some(CompressConfig::default()),
     }
 }
 
@@ -778,6 +778,34 @@ fn with_no_programs_stitch_does_not_run() {
         CompressionReport::NoPrograms { left_out: vec![] }
     );
     assert_eq!(out.frontiers["a"], Vec::<String>::new());
+}
+
+/// With compression off, a step on programs that Stitch compresses (see
+/// [`a_real_stitch_run_extends_the_library_and_rewrites_the_frontiers`])
+/// calls no Stitch runner, adds nothing to the library, and keeps each
+/// selected program as it came in.
+#[test]
+fn with_compression_off_stitch_does_not_run() {
+    let tasks = shared_tasks();
+    let cands = shared_candidates();
+    let cfg = DriverConfig {
+        frontier_size: 5,
+        compress: None,
+    };
+    let mut stitch = Nothing::default();
+    let out = run(&tasks, &[], &BTreeMap::new(), &cands, &cfg, &mut stitch).unwrap();
+    assert!(stitch.calls.is_empty(), "{:?}", stitch.calls);
+    assert_eq!(out.report.compression, CompressionReport::Off);
+    assert!(out.new_library.is_empty(), "{:?}", out.new_library);
+    for (t, p) in SHARED {
+        assert_eq!(out.frontiers[t], vec![p.to_owned()], "task {t}");
+    }
+
+    // The same step with a real Stitch run in its place: compression off is
+    // what keeps the library as it is.
+    let out = run(&tasks, &[], &BTreeMap::new(), &cands, &cfg, &mut InProcess).unwrap();
+    assert_eq!(out.report.compression, CompressionReport::Off);
+    assert!(out.new_library.is_empty(), "{:?}", out.new_library);
 }
 
 /// One case of bad input: the tasks, the library, the frontiers, the frontier

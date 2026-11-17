@@ -103,6 +103,7 @@ fn build(past: u64) -> (TempDir, Store, RunId) {
             RunConfig {
                 autodoc: false,
                 arm: Arm::Blind,
+                library_learning: true,
                 seed: 1,
                 proposals_per_task: 4,
                 programs_per_batch: 2,
