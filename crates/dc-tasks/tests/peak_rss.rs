@@ -3,6 +3,10 @@
 //!
 //! This file holds one test, so the process runs nothing else while it
 //! measures its own peak resident set (`VmHWM`). Linux only.
+//!
+//! Each run is measured from the resident memory before it. Memory the
+//! allocator keeps after earlier runs is resident too, and is not part of
+//! this bound: see `dc_tasks::harness::DEFAULT_MAX_MEMORY`.
 
 #![cfg(target_os = "linux")]
 
@@ -66,7 +70,17 @@ fn one_runaway_run_keeps_the_peak_resident_memory_near_the_limit() {
     const LIMIT: u64 = 64 << 20;
     // Each runaway candidate gets fuel to hold four times the limit, so with
     // no memory limit the peak would be at least 256 MB above the start.
-    let runaways: [(&str, u64); 3] = [
+    let runaways: [(&str, u64); 5] = [
+        // A list of ints, and a list of pairs: dropping them when the run
+        // stops frees them one cell at a time.
+        (
+            "(lam (length (loop 1000000000 nil (lam (lam (cons $1 $0))))))",
+            16,
+        ),
+        (
+            "(lam (length (loop 1000000000 nil (lam (lam (cons (pair $1 $1) $0))))))",
+            32,
+        ),
         (
             "(lam (array_size (array_tabulate 1000000000000 (lam $0))))",
             32,
@@ -81,8 +95,12 @@ fn one_runaway_run_keeps_the_peak_resident_memory_near_the_limit() {
             300,
         ),
     ];
-    let start = status_kb("VmRSS:") << 10;
     for (src, per_step) in runaways {
+        // Freed memory stays resident for this thread, so each run is
+        // measured from its own start: writing 5 to `clear_refs` resets the
+        // peak to the resident memory now.
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+        let start = status_kb("VmRSS:") << 10;
         let mut arena = Arena::new();
         let p = sexpr::parse(&mut arena, src).unwrap();
         let config = HarnessConfig {
@@ -94,7 +112,7 @@ fn one_runaway_run_keeps_the_peak_resident_memory_near_the_limit() {
         let peak = status_kb("VmHWM:") << 10;
         // The allocator's own overhead (headers, rounding of small blocks)
         // puts the resident memory a little above the count it keeps:
-        // measured on Linux with glibc, 64 to 66 MB for a 64 MiB limit.
+        // measured on Linux with glibc, 64 to 76 MB for a 64 MiB limit.
         assert!(
             peak.saturating_sub(start) <= LIMIT + LIMIT / 4,
             "{src}: peak resident memory {} MB above the start, limit {} MB",

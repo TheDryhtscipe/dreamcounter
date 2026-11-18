@@ -80,14 +80,18 @@ pub const DEFAULT_FUEL_MULTIPLIER: u64 = 10;
 pub const DEFAULT_MAX_FUEL: u64 = 50_000_000;
 /// The default memory limit for one run, in bytes: 2 GiB.
 ///
-/// It bounds the heap one run holds beyond its inputs ([`Limits::memory`]).
-/// The evaluator checks it before every step and inside the steps that
-/// build a whole collection, so one run's heap stays within this plus a few
-/// kilobytes (`dc-eval`'s `tests/memory.rs` measures the overshoot). Correct
-/// programs on the corpus's sizes and gates hold far less. Each run that
-/// goes on at the same time, such as one per `dc-mcp` server, can hold this
-/// much, so a machine running `k` at once needs `k` times it free. Raise it
-/// on a machine with more memory.
+/// It bounds the heap one run holds beyond its inputs ([`Limits::memory`]):
+/// the evaluator stops the run before it would go over, and what it can
+/// still allocate unchecked is a few kilobytes (`dc_eval::memory` says what
+/// and how; `dc-eval`'s `tests/memory.rs` measures it). The references of
+/// the corpus hold far less on their sweeps and gates.
+///
+/// The resident memory of the process can be higher. The system allocator
+/// keeps memory a thread has freed for that thread, so each thread that has
+/// run a program up to the limit can keep up to about this much resident
+/// after the run ends. A process whose runs go on in `k` threads, at once or
+/// one after another, such as `dc-mcp`'s blocking tasks, can need `k` times
+/// this. Raise or lower it to fit the machine.
 pub const DEFAULT_MAX_MEMORY: u64 = 2 << 30;
 /// The default fuel for one example run. Examples are small; this stops a
 /// non-terminating candidate (`unfold` can loop) early.
