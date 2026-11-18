@@ -350,29 +350,35 @@ let solve xs ys ws =
     foldl max 0 (array_to_list (snd res))
 "#;
 
-#[test]
-fn programs_a_proposer_wrote_pass_the_gate() {
+/// A program a proposer wrote for `v` passes the examples and the gate.
+/// One test per program, as each takes minutes of CPU.
+fn proposed_program_passes_the_gate(v: Variant, source: &str) {
     let c = HarnessConfig::default();
-    for (v, source) in [
-        (Variant::Longest, PROPOSED_LONGEST),
-        (Variant::Heaviest, PROPOSED_HEAVIEST),
-    ] {
-        let family = Chains(v);
-        let mut arena = Arena::new();
-        let p = compile(&mut arena, source, "solve");
-        let passed = check_examples(&family, &arena, p, &c).expect("it passes the examples");
-        let steps = check_gate(&family, &arena, &passed, &c)
-            .unwrap_or_else(|f| panic!("{} on the gate: {f:?}", family.name()))
-            .expect("a gate");
-        println!("PROPOSED {}: {steps} steps", family.name());
-    }
+    let family = Chains(v);
+    let mut arena = Arena::new();
+    let p = compile(&mut arena, source, "solve");
+    let passed = check_examples(&family, &arena, p, &c).expect("it passes the examples");
+    let steps = check_gate(&family, &arena, &passed, &c)
+        .unwrap_or_else(|f| panic!("{} on the gate: {f:?}", family.name()))
+        .expect("a gate");
+    println!("PROPOSED {}: {steps} steps", family.name());
 }
 
 #[test]
-fn the_gate_lets_through_a_less_careful_n_log2_n_program() {
-    // The good reference with its two merges of sorted lists replaced by a
-    // merge sort of the joined lists: still n log^2 n, with a larger
-    // constant, as a proposer might well write it.
+fn a_proposers_longest_program_passes_the_gate() {
+    proposed_program_passes_the_gate(Variant::Longest, PROPOSED_LONGEST);
+}
+
+#[test]
+fn a_proposers_heaviest_program_passes_the_gate() {
+    proposed_program_passes_the_gate(Variant::Heaviest, PROPOSED_HEAVIEST);
+}
+
+/// The good reference with its two merges of sorted lists replaced by a
+/// merge sort of the joined lists: still `n log² n`, with a larger constant,
+/// as a proposer might well write it. It passes the gate on `v` with a third
+/// of the fuel to spare. One test per variant, as each takes minutes of CPU.
+fn the_gate_lets_through_a_less_careful_n_log2_n_program(v: Variant) {
     let joined_points = "merge_by by_x ls (self by_pos))";
     let tagged = "merge_by (fun (a, wa, _, _, _, _, _) (b, wb, _, _, _, _, _) -> a < b || (a = b && wa <= wb))\n      (tag 1 l) (tag 0 r)";
     assert!(chains::SOURCE.contains(joined_points) && chains::SOURCE.contains(tagged));
@@ -383,23 +389,31 @@ fn the_gate_lets_through_a_less_careful_n_log2_n_program() {
             "msort_by (fun (a, wa, _, _, _, _, _) (b, wb, _, _, _, _, _) -> a < b || (a = b && wa <= wb))\n      (append (tag 1 l) (tag 0 r))",
         );
     let c = HarnessConfig::default();
-    for v in [Variant::Longest, Variant::LongestCount] {
-        let family = Chains(v);
-        let mut arena = Arena::new();
-        let p = compile(&mut arena, &source, v.good());
-        let passed = check_examples(&family, &arena, p, &c).expect("it passes the examples");
-        let steps = check_gate(&family, &arena, &passed, &c)
-            .unwrap_or_else(|f| panic!("{} on the gate: {f:?}", family.name()))
-            .expect("a gate");
-        println!("CARELESS {}: {steps} steps", family.name());
-        // Room to spare: the gate must allow about one and a half times this
-        // program's steps, so that a program a little slower still passes.
-        assert!(
-            steps <= GATE_FUEL * 2 / 3,
-            "{}: {steps} steps of {GATE_FUEL}",
-            family.name()
-        );
-    }
+    let family = Chains(v);
+    let mut arena = Arena::new();
+    let p = compile(&mut arena, &source, v.good());
+    let passed = check_examples(&family, &arena, p, &c).expect("it passes the examples");
+    let steps = check_gate(&family, &arena, &passed, &c)
+        .unwrap_or_else(|f| panic!("{} on the gate: {f:?}", family.name()))
+        .expect("a gate");
+    println!("CARELESS {}: {steps} steps", family.name());
+    // Room to spare: the gate must allow about one and a half times this
+    // program's steps, so that a program a little slower still passes.
+    assert!(
+        steps <= GATE_FUEL * 2 / 3,
+        "{}: {steps} steps of {GATE_FUEL}",
+        family.name()
+    );
+}
+
+#[test]
+fn the_gate_lets_through_a_less_careful_longest_program() {
+    the_gate_lets_through_a_less_careful_n_log2_n_program(Variant::Longest);
+}
+
+#[test]
+fn the_gate_lets_through_a_less_careful_longest_count_program() {
+    the_gate_lets_through_a_less_careful_n_log2_n_program(Variant::LongestCount);
 }
 
 /// A sort that is `n²` on sorted input: a quicksort with the first element
