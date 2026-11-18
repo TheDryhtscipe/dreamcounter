@@ -231,7 +231,15 @@ fn an_incorrect_member_is_never_selected_and_a_task_of_only_incorrect_members_ha
 #[test]
 fn lambda_must_be_finite_and_not_negative() {
     let frontiers = BTreeMap::from([("t".to_owned(), vec![too_noisy(1)])]);
-    for lambda in [-1.0, -1e-12, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+    for lambda in [
+        -1.0,
+        -1e-12,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        MAX_LAMBDA * 2.0,
+        f64::MAX,
+    ] {
         assert!(matches!(
             objective(0, &frontiers, lambda),
             Err(ObjectiveError::BadLambda(_))
@@ -295,4 +303,23 @@ fn the_timeout_penalty_is_fixed_whatever_the_task_holds() {
         let costs = member_costs(&members);
         assert_eq!(costs[0].expect("correct").c, TIMEOUT_COST, "{members:?}");
     }
+}
+
+#[test]
+fn the_largest_lambda_keeps_j_finite() {
+    let frontiers = BTreeMap::from([
+        ("a".to_owned(), vec![member(u64::MAX, Growth::TimedOut)]),
+        (
+            "b".to_owned(),
+            vec![fitted(u64::MAX, GrowthClass::Exponential)],
+        ),
+    ]);
+    let j = objective(u64::MAX, &frontiers, MAX_LAMBDA).expect("lambda is valid");
+    assert!(j.total.is_finite());
+    // One step of C outweighs the largest gap in description length.
+    let members = [
+        fitted(u64::MAX, GrowthClass::Constant),
+        fitted(0, GrowthClass::Log),
+    ];
+    assert_eq!(selected(&members, MAX_LAMBDA).index, 0);
 }

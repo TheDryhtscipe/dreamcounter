@@ -49,6 +49,11 @@ pub const TIMEOUT_COST: u32 = 8;
 /// member: one past `2ⁿ`.
 pub const NO_FITTED_REFUSAL_COST: u32 = 7;
 
+/// The largest λ accepted: `2⁶⁴`. Above it one step of `C` outweighs any
+/// difference in description length, which is a `u64`, so a larger λ
+/// selects the same members. The bound keeps every score and `J(L)` finite.
+pub const MAX_LAMBDA: f64 = 18_446_744_073_709_551_616.0;
+
 /// Why estimator C named no class for a sweep with no timeout in its window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -168,14 +173,16 @@ pub struct Selection {
     pub dl: u64,
     /// Its `C(p)`, and the cause if it has no fitted class.
     pub cost: MemberCost,
-    /// `DL(p | L) + λ · C(p)`.
+    /// `DL(p | L) + λ · C(p)`, rounded to `f64`. The selection is made by
+    /// comparing gaps ([`select`]), so in rare near-ties a member it beat can
+    /// have a score one rounding smaller.
     pub score: f64,
 }
 
 /// Why `J(L)` cannot be computed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ObjectiveError {
-    /// λ must be finite and at least 0.
+    /// λ must be finite, at least 0, and at most [`MAX_LAMBDA`].
     BadLambda(f64),
 }
 
@@ -183,7 +190,10 @@ impl fmt::Display for ObjectiveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ObjectiveError::BadLambda(l) => {
-                write!(f, "lambda must be finite and at least 0, not {l}")
+                write!(
+                    f,
+                    "lambda must be finite, at least 0 and at most {MAX_LAMBDA}, not {l}"
+                )
             }
         }
     }
@@ -192,7 +202,7 @@ impl fmt::Display for ObjectiveError {
 impl std::error::Error for ObjectiveError {}
 
 fn check_lambda(lambda: f64) -> Result<(), ObjectiveError> {
-    if lambda.is_finite() && lambda >= 0.0 {
+    if lambda.is_finite() && (0.0..=MAX_LAMBDA).contains(&lambda) {
         Ok(())
     } else {
         Err(ObjectiveError::BadLambda(lambda))
@@ -209,7 +219,8 @@ fn check_lambda(lambda: f64) -> Result<(), ObjectiveError> {
 ///
 /// # Errors
 ///
-/// [`ObjectiveError::BadLambda`] if λ is not finite or is negative.
+/// [`ObjectiveError::BadLambda`] if λ is not finite, is negative, or is
+/// above [`MAX_LAMBDA`].
 pub fn select(members: &[Member], lambda: f64) -> Result<Option<Selection>, ObjectiveError> {
     check_lambda(lambda)?;
     let mut best: Option<Selection> = None;
@@ -258,7 +269,8 @@ impl Objective {
 ///
 /// # Errors
 ///
-/// [`ObjectiveError::BadLambda`] if λ is not finite or is negative.
+/// [`ObjectiveError::BadLambda`] if λ is not finite, is negative, or is
+/// above [`MAX_LAMBDA`].
 pub fn objective(
     library_dl: u64,
     frontiers: &BTreeMap<String, Vec<Member>>,
