@@ -336,6 +336,9 @@ struct Machine<'a> {
     last_walk_at: u64,
     /// The step count before which no reachability walk starts.
     next_walk_at: u64,
+    /// The step count of the last release of tables made because the
+    /// evaluation held more than half its memory limit.
+    last_low_memory_release: u64,
     /// The work of every reachability walk so far. Only tests read it.
     walk_work: u64,
     /// The partial applications of primitives built so far. Only tests read it.
@@ -375,7 +378,7 @@ const MAX_FRAMES_PER_STEP: usize = 4;
 
 /// A step that builds a whole collection checks the memory limit once per
 /// this many elements.
-const CHECK_EVERY: usize = 1024;
+const CHECK_EVERY: usize = 256;
 
 impl<'a> Machine<'a> {
     fn new(arena: &'a Arena, limits: Limits) -> Machine<'a> {
@@ -390,6 +393,7 @@ impl<'a> Machine<'a> {
             pruning: PRUNING,
             last_walk_at: 0,
             next_walk_at: 0,
+            last_low_memory_release: 0,
             walk_work: 0,
             partials_built: 0,
         }
@@ -1039,7 +1043,16 @@ impl<'a> Machine<'a> {
         table: Rc<RefCell<MemoTable>>,
         args: &[Value],
     ) -> Result<(), OverMemory> {
-        if self.pruning.eager || self.memo_tables.len() >= self.memo_prune_at {
+        // Dead tables can hold most of the memory limit long before their
+        // count doubles. So once the evaluation holds more than half its
+        // limit, they are also released at each new table, at most once per
+        // as many steps as there are tables, so at amortised O(1) per step.
+        let low = self.budget.past_half()
+            && self.steps - self.last_low_memory_release >= self.memo_tables.len() as u64;
+        if low {
+            self.last_low_memory_release = self.steps;
+        }
+        if self.pruning.eager || low || self.memo_tables.len() >= self.memo_prune_at {
             // Strong references: this vector, plus any `MemoStore` frame. Weak
             // references: every `self` of this table that is still alive.
             self.memo_tables
@@ -1089,8 +1102,10 @@ impl<'a> Machine<'a> {
             frame_parts(frame, &mut parts, reach)?;
         }
         reach.walk(parts)?;
-        // The map of tables is a fraction of the size of the tables it names.
-        reach.check_memory(bytes_of::<(TableId, usize)>(self.memo_tables.len() * 2))?;
+        reach.check_memory(crate::budget::table_bytes::<(
+            TableId,
+            &Rc<RefCell<MemoTable>>,
+        )>(self.memo_tables.len()))?;
         let tables: FxHashMap<TableId, &Rc<RefCell<MemoTable>>> = self
             .memo_tables
             .iter()

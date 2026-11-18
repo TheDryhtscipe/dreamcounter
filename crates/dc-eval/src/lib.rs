@@ -51,23 +51,38 @@ pub use machine::{
 ///
 /// # The bound
 ///
-/// An evaluation's count stays within its limit plus a few kilobytes. The
+/// An evaluation's count stays within its limit plus what one step can
+/// allocate unchecked, which `tests/memory.rs` holds within 64 KiB. The
 /// machine checks the limit before every step. Within a step, every buffer
 /// that can grow in proportion to the data the evaluation holds grows only
 /// after a check that the larger buffer fits: the continuation stack, an
 /// `unfold`'s output, `tree_fold`'s work lists, memo tables, the list of
 /// memo tables, and the scratch space of `eq`, of building a memo key and of
-/// a reachability walk. `array_of_list`, `array_to_list`, `foldr`'s copy of
-/// its list and the end of `unfold` check every 1024 elements. Dropping a
-/// list or tree frees it one cell or node at a time, so it needs no memory in
-/// proportion to its length.
+/// a reachability walk, including its copy of a table's entries.
+/// `array_of_list`, `array_to_list`, `foldr`'s copy of its list and the end
+/// of `unfold` check every 256 elements.
+///
+/// Dropping a value never takes the count above where it was when the drop
+/// started, whatever the value's length or nesting: each part waiting on the
+/// drop's work list is one pointer, put there only after the larger cell,
+/// node or box that held it was freed.
 ///
 /// What a step can still allocate unchecked is bounded by the program text
 /// and the kind of step, not by the data: the values, environments and
 /// frames of the term nodes it passes through, an `array_set`'s path copy (a
-/// few `imbl` chunks), and up to 1024 elements of a collection step. The
-/// tests in `tests/memory.rs` hold the measured peak of each kind of runaway
-/// program within the limit plus 64 KiB.
+/// few `imbl` chunks of about 4 KB), and up to 256 elements of a collection
+/// step (about 22 KB for list cells).
+///
+/// Because a buffer's growth is checked before it happens, and a buffer may
+/// grow by more than it then uses, a program whose peak with no limit is
+/// within some tens of kilobytes of the limit can stop with
+/// [`Outcome::MemoryLimit`]. A run that finishes takes the same steps and
+/// gives the same result as with no limit.
+///
+/// Memo tables the program can no longer reach are released when the count
+/// of tables doubles, and also at each new table once the evaluation holds
+/// more than half its limit. Tables that only a reachability walk can find
+/// dead are released only when a walk is due and finishes.
 ///
 /// The count is of bytes asked of the allocator. The resident memory of the
 /// process is higher by the allocator's overhead, and by freed memory it

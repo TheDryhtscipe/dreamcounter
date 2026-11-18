@@ -17,7 +17,7 @@ const LIMIT: u64 = 12 << 20;
 /// How far above the limit the measured peak may be: what a step can still
 /// allocate unchecked (see `dc_eval::memory`). Every buffer that grows with
 /// the data is checked before it grows, and a collection step checks every
-/// 1024 elements.
+/// 256 elements.
 const SLACK: u64 = 64 << 10;
 
 /// Runs `src` on `inputs` within `limits`, and returns its outcome and the
@@ -242,4 +242,108 @@ fn dropping_a_long_list_of_ints_after_the_stop_needs_no_scratch() {
     // allocates nothing in proportion to the list.
     let src = "(loop 1000000000 nil (lam (lam (cons $1 $0))))";
     assert_stopped_near_the_limit(src, &[], UNLIMITED, LIMIT);
+}
+
+#[test]
+fn dropping_a_value_nested_in_its_heads_needs_no_scratch() {
+    // The machine drops what it holds when the run stops. Nesting in a list's
+    // heads, a tree's left subtrees, or pairs and options, leaves one part of
+    // each level waiting while the drop goes down the other.
+    for src in [
+        "(loop 1000000000 nil (lam (lam (cons $0 (cons 0 nil)))))",
+        "(loop 1000000000 leaf (lam (lam (node $0 0 (node leaf 0 leaf)))))",
+        "(loop 1000000000 (pair 0 0) (lam (lam (pair $0 (pair $1 $1)))))",
+        "(loop 1000000000 none (lam (lam (some (cons $0 (cons $1 nil))))))",
+        "(loop 1000000000 nil (lam (lam (cons (array_of_list (cons $1 nil)) (cons $0 nil)))))",
+    ] {
+        assert_stopped_near_the_limit(src, &[], UNLIMITED, LIMIT);
+    }
+}
+
+/// A memo table of `n` int entries, with its call on -1 pending while `tables`
+/// more tables are made. Each of those stores its own `self` in its entries,
+/// so only a reachability walk can tell it is no longer reachable; the 64th
+/// starts one, and the walk reaches the first table's entries.
+fn tables_while_one_is_pending(n: u64, tables: u64) -> String {
+    let filler = "(memorec 1000000000 (lam (lam (if (lt $0 0) \
+                  (loop 2000 0 (lam (lam (let ($3 $1) 0)))) $1))) -1)";
+    format!(
+        "(memorec 1000000000 (lam (lam (if (lt $0 0) \
+         (let (loop {n} 0 (lam (lam (add $0 ($3 $1))))) \
+         (loop {tables} $0 (lam (lam (let {filler} $1))))) $0))) -1)"
+    )
+}
+
+#[test]
+fn a_reachability_walk_stays_within_the_limit() {
+    let (_, before) = measure(
+        &tables_while_one_is_pending(100_000, 63),
+        &[],
+        Limits::fuel(UNLIMITED),
+    );
+    let src = tables_while_one_is_pending(100_000, 64);
+    let limit = before + (8 << 10);
+    let (free, peak) = measure(&src, &[], Limits::fuel(UNLIMITED));
+    assert!(matches!(free, Outcome::Value(..)), "{free}");
+    // With no limit, the walk's scratch space takes the peak well past it.
+    assert!(peak > limit + SLACK, "with no limit the peak is {peak} B");
+    let (outcome, peak) = measure(
+        &src,
+        &[],
+        Limits {
+            fuel: UNLIMITED,
+            memory: limit,
+        },
+    );
+    assert!(
+        matches!(outcome, Outcome::Value(..) | Outcome::MemoryLimit(_)),
+        "{outcome}"
+    );
+    assert!(
+        peak <= limit + SLACK,
+        "peak {peak} B is above the limit {limit} B by more than {SLACK} B"
+    );
+}
+
+#[test]
+fn dead_memo_tables_do_not_stop_a_run_that_holds_little() {
+    // Each of `n` memorecs fills a table of 20k entries and returns an int, so
+    // its table is dead once it returns. At most about two tables are alive at
+    // a time, but the machine releases dead tables only every so many tables.
+    let src = |n: u64| {
+        format!(
+            "(loop {n} 0 (lam (lam (add $0 (memorec 1000000000 (lam (lam (if (lt $0 0) \
+             (loop 20000 0 (lam (lam (add $0 ($3 $1))))) $0))) -1)))))"
+        )
+    };
+    let (_, one) = measure(&src(1), &[], Limits::fuel(UNLIMITED));
+    let (free, all) = measure(&src(100), &[], Limits::fuel(UNLIMITED));
+    let limit = 4 * one;
+    assert!(all > limit, "with no limit the peak is {all} B");
+    let (limited, peak) = measure(
+        &src(100),
+        &[],
+        Limits {
+            fuel: UNLIMITED,
+            memory: limit,
+        },
+    );
+    assert_eq!(limited.to_string(), free.to_string(), "peak {peak} B");
+}
+
+#[test]
+fn array_to_list_stops_within_the_slack_wherever_the_limit_falls() {
+    // The list is built 64 + 24 bytes a cell, with a check every so many
+    // cells; a sweep of limits 1 KiB apart over more than the bytes between
+    // two checks finds the worst place for the limit to fall.
+    let array = Value::array((0..50_000).map(Value::Int));
+    for k in 0..100u64 {
+        let limit = (4 << 20) + k * 1024;
+        assert_stopped_near_the_limit(
+            "(lam (array_to_list $0))",
+            std::slice::from_ref(&array),
+            UNLIMITED,
+            limit,
+        );
+    }
 }

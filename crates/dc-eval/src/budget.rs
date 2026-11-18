@@ -61,6 +61,11 @@ impl Budget {
         self.limit.saturating_sub(self.used())
     }
 
+    /// Whether the evaluation holds more than half its limit.
+    pub(crate) fn past_half(&self) -> bool {
+        !self.unlimited() && self.used() > self.limit / 2
+    }
+
     /// Fails if the evaluation holds more than its limit, or would after
     /// allocating `extra` more bytes.
     pub(crate) fn check(&self, extra: u64) -> Result<(), OverMemory> {
@@ -127,7 +132,7 @@ impl Budget {
 /// type `T`: the standard library's table has a power of two of buckets, at
 /// least 8/7 of its items, with one control byte each, plus a group of
 /// control bytes.
-fn table_bytes<T>(items: usize) -> u64 {
+pub(crate) fn table_bytes<T>(items: usize) -> u64 {
     let buckets = items
         .saturating_mul(8)
         .div_ceil(7)

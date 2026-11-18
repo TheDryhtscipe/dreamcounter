@@ -82,9 +82,10 @@ pub const DEFAULT_MAX_FUEL: u64 = 50_000_000;
 ///
 /// It bounds the heap one run holds beyond its inputs ([`Limits::memory`]):
 /// the evaluator stops the run before it would go over, and what it can
-/// still allocate unchecked is a few kilobytes (`dc_eval::memory` says what
-/// and how; `dc-eval`'s `tests/memory.rs` measures it). The references of
-/// the corpus hold far less on their sweeps and gates.
+/// still allocate unchecked is what one step allocates, at most 64 KiB in
+/// `dc-eval`'s `tests/memory.rs` (`dc_eval::memory` says what and how). The
+/// corpus references stay far below it: a test process that runs all of them
+/// on their sweeps peaks at about 121 MB resident.
 ///
 /// The resident memory of the process can be higher. The system allocator
 /// keeps memory a thread has freed for that thread, so each thread that has

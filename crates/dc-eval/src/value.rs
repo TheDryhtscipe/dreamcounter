@@ -542,83 +542,136 @@ impl Drop for Tree {
     }
 }
 
-/// Moves the uniquely owned children of `v` onto `out`, leaving `v` with nothing
-/// that a recursive drop would descend into. Shared children are left alone: dropping
-/// them only decrements a count.
-fn detach_children(v: &mut Value, out: &mut Vec<Value>) {
-    match v {
+/// A uniquely owned part of a value being dropped, waiting on the drop's work
+/// list. Each is one pointer (16 bytes with its tag), and is pushed only after
+/// the cell, node or box that held it has been freed, which is larger. So the
+/// work list never holds more bytes than the drop has already freed, whatever
+/// the nesting of the value: dropping never takes the heap above where it was
+/// when the drop started (bead dreamcounter-a3db93).
+enum Doomed {
+    Cons(Rc<Cons>),
+    Node(Rc<TreeNode>),
+    Some(Rc<Value>),
+    Pair(Rc<(Value, Value)>),
+    Fun(Rc<Fun>),
+    /// A pair or function taken while this thread's placeholders are gone,
+    /// during thread teardown.
+    Boxed(Box<Value>),
+}
+
+thread_local! {
+    /// Shared placeholders put in place of a pair or function moved onto a
+    /// drop's work list. They are never unique, so dropping one only
+    /// decrements a count.
+    static EMPTY_PAIR: Rc<(Value, Value)> = Rc::new((Value::Unit, Value::Unit));
+    static EMPTY_FUN: Rc<Fun> = Rc::new(Fun::Partial {
+        prim: Prim::ALL[0],
+        args: Vec::new(),
+    });
+}
+
+/// Moves `child` onto `out` if it owns something unique that a recursive drop
+/// would descend into, leaving a value whose drop does no work. Shared parts
+/// are left alone: dropping them only decrements a count.
+fn defer(child: &mut Value, out: &mut Vec<Doomed>) {
+    match child {
         Value::Int(_) | Value::Bool(_) | Value::Unit | Value::Option(None) => {}
         // `imbl` drops its elements itself, which would recurse once per level of
         // array nesting. Instead the vector is queued and dropped by the outermost
         // drop on this thread. Dropping a shared vector there only decrements a
         // count, so this costs O(1) per array, not O(size).
         Value::Array(a) => defer_array_drop(mem::take(a)),
-        Value::Pair(rc) => {
-            if let Some(p) = Rc::get_mut(rc) {
-                take_child(&mut p.0, out);
-                take_child(&mut p.1, out);
-            }
-        }
-        Value::Option(Some(rc)) => {
-            if let Some(x) = Rc::get_mut(rc) {
-                take_child(x, out);
-            }
-        }
-        // A list or tree is detached one cell or node at a time: its rest goes
-        // on the work list as a value of its own, below the element. So the
-        // work list grows with the nesting of what is dropped, not with the
-        // length of a list, and dropping a long list needs no memory in
-        // proportion to it (bead dreamcounter-a3db93).
         Value::List(l) => {
-            if let Some(Ok(mut cell)) = l.0.take().map(Rc::try_unwrap) {
-                if cell.tail.0.is_some() {
-                    out.push(Value::List(List(cell.tail.0.take())));
-                }
-                take_child(&mut cell.head, out);
+            if l.0.as_ref().is_some_and(|c| Rc::strong_count(c) == 1) {
+                out.extend(l.0.take().map(Doomed::Cons));
             }
         }
         Value::Tree(t) => {
-            if let Some(Ok(mut node)) = t.0.take().map(Rc::try_unwrap) {
-                for sub in [node.right.0.take(), node.left.0.take()]
-                    .into_iter()
-                    .flatten()
-                {
-                    out.push(Value::Tree(Tree(Some(sub))));
+            if t.0.as_ref().is_some_and(|n| Rc::strong_count(n) == 1) {
+                out.extend(t.0.take().map(Doomed::Node));
+            }
+        }
+        Value::Option(o) => {
+            if o.as_ref().is_some_and(|x| Rc::strong_count(x) == 1) {
+                out.extend(o.take().map(Doomed::Some));
+            }
+        }
+        Value::Pair(rc) => {
+            if Rc::strong_count(rc) == 1 {
+                match EMPTY_PAIR.try_with(Rc::clone) {
+                    Ok(empty) => out.push(Doomed::Pair(mem::replace(rc, empty))),
+                    Err(_) => out.push(Doomed::Boxed(Box::new(mem::replace(child, Value::Unit)))),
                 }
-                take_child(&mut node.value, out);
             }
         }
         Value::Fun(rc) => {
-            if let Some(f) = Rc::get_mut(rc) {
-                match f {
-                    Fun::Closure { env, .. } => detach_env(env, out),
-                    Fun::Partial { args, .. } => out.append(args),
-                    Fun::BfixSelf { f, .. } => out.push(mem::replace(f, Value::Unit)),
-                    Fun::MemoSelf { f, .. } => out.push(mem::replace(f, Value::Unit)),
+            if Rc::strong_count(rc) == 1 {
+                match EMPTY_FUN.try_with(Rc::clone) {
+                    Ok(empty) => out.push(Doomed::Fun(mem::replace(rc, empty))),
+                    Err(_) => out.push(Doomed::Boxed(Box::new(mem::replace(child, Value::Unit)))),
                 }
             }
         }
     }
 }
 
-/// Moves `child` onto `out` unless it is a scalar, which drops without work. So a
-/// pair or option emptied by an earlier detach adds nothing to the work list.
-fn take_child(child: &mut Value, out: &mut Vec<Value>) {
-    if !matches!(
-        child,
-        Value::Int(_) | Value::Bool(_) | Value::Unit | Value::Option(None)
-    ) {
-        out.push(mem::replace(child, Value::Unit));
+/// Frees `part` if nothing else holds it, after moving the parts it owns onto
+/// `out`. `Rc::try_unwrap` frees the cell before anything is pushed.
+fn free(part: Doomed, out: &mut Vec<Doomed>) {
+    match part {
+        Doomed::Cons(rc) => {
+            if let Ok(mut cell) = Rc::try_unwrap(rc) {
+                out.extend(cell.tail.0.take().map(Doomed::Cons));
+                defer(&mut cell.head, out);
+            }
+        }
+        Doomed::Node(rc) => {
+            if let Ok(mut node) = Rc::try_unwrap(rc) {
+                out.extend(node.right.0.take().map(Doomed::Node));
+                out.extend(node.left.0.take().map(Doomed::Node));
+                defer(&mut node.value, out);
+            }
+        }
+        Doomed::Some(rc) => {
+            if let Ok(mut x) = Rc::try_unwrap(rc) {
+                defer(&mut x, out);
+            }
+        }
+        Doomed::Pair(rc) => {
+            if let Ok((mut a, mut b)) = Rc::try_unwrap(rc) {
+                defer(&mut b, out);
+                defer(&mut a, out);
+            }
+        }
+        Doomed::Fun(rc) => {
+            if let Ok(mut f) = Rc::try_unwrap(rc) {
+                match &mut f {
+                    Fun::Closure { env, .. } => defer_env(env, out),
+                    Fun::Partial { args, .. } => {
+                        for a in args.iter_mut() {
+                            defer(a, out);
+                        }
+                    }
+                    Fun::BfixSelf { f, .. } | Fun::MemoSelf { f, .. } => defer(f, out),
+                }
+            }
+        }
+        Doomed::Boxed(b) => {
+            let mut v = *b;
+            defer(&mut v, out);
+        }
     }
 }
 
-fn detach_env(env: &mut Env, out: &mut Vec<Value>) {
+/// Frees the uniquely owned nodes at the front of `env`, moving their values
+/// onto `out`.
+fn defer_env(env: &mut Env, out: &mut Vec<Doomed>) {
     let mut next = env.0.take();
     while let Some(rc) = next {
         match Rc::try_unwrap(rc) {
             Ok(mut node) => {
-                take_child(&mut node.value, out);
                 next = node.next.0.take();
+                defer(&mut node.value, out);
             }
             Err(_) => break,
         }
@@ -697,10 +750,9 @@ impl Drop for Value {
             return;
         }
         let mut work = Vec::new();
-        detach_children(self, &mut work);
-        while let Some(mut v) = work.pop() {
-            detach_children(&mut v, &mut work);
-            // `v` now owns nothing unique, so its own drop does not recurse.
+        defer(self, &mut work);
+        while let Some(part) = work.pop() {
+            free(part, &mut work);
         }
         drain_array_drops();
     }
@@ -852,8 +904,6 @@ impl Reach {
         self.work
     }
 
-    /// Counts `n` parts about to be gathered for a walk as work, so gathering
-    /// them stays within the budget too.
     /// Fails if `extra` more bytes would take the evaluation past its memory
     /// budget.
     pub(crate) fn check_memory(&self, extra: u64) -> Result<(), OverBudget> {
@@ -869,6 +919,8 @@ impl Reach {
         self.memory.ensure_vec(parts, n).map_err(|_| OverBudget)
     }
 
+    /// Counts `n` parts about to be gathered for a walk as work, so gathering
+    /// them stays within the budget too.
     pub(crate) fn reserve(&mut self, n: usize) -> Result<(), OverBudget> {
         self.work = self.work.saturating_add(n as u64);
         if self.work > self.budget {
@@ -884,6 +936,7 @@ impl Reach {
         values: impl ExactSizeIterator<Item = &'v Value>,
     ) -> Result<(), OverBudget> {
         self.reserve(values.len())?;
+        self.check_memory(crate::budget::bytes_of::<Part<'_>>(values.len()))?;
         self.walk(values.map(Part::Value).collect())
     }
 
@@ -902,6 +955,7 @@ impl Reach {
         // first chunk, at most `ARRAYS_PER_KEY` for each.
         let mut arrays: FxHashMap<(usize, *const Value), Vec<&'v imbl::Vector<Value>>> =
             FxHashMap::default();
+        let memory = self.memory;
         while let Some(part) = parts.pop() {
             self.work += 1;
             if self.work > self.budget {
@@ -948,6 +1002,7 @@ impl Reach {
                             continue;
                         }
                         if same.len() < ARRAYS_PER_KEY {
+                            memory.ensure_vec(same, 1).map_err(|_| OverBudget)?;
                             same.push(a);
                         }
                         for chunk in a.leaves() {
