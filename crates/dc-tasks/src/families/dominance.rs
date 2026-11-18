@@ -12,12 +12,17 @@
 //! The family is the harder part of the development corpus. The pilot run
 //! (results log, 2026-11-18) showed a strong proposer solving every other
 //! development task with every program. Here each variant has a
-//! [`Gate`]: three inputs of [`GATE_N`] elements, each with [`GATE_FUEL`]
-//! steps (see [`TaskFamily::gate`] on [`Dominance`]). Every natural program
-//! that looks at each pair of positions takes at least 2 steps per pair, so
-//! more than `GATE_FUEL` on one input; the good references take at most 29 %
-//! of it (November 2026). The description states the size and the step
-//! limit, not the inputs.
+//! [`Gate`]: six inputs of [`GATE_N`] elements, each with [`GATE_FUEL`]
+//! steps ([`GATE_INPUTS`]). A program passes only if it answers all six
+//! within that fuel. The gate checks only these inputs. They are chosen so
+//! that the `n²` programs this module's tests know of run out of fuel on at
+//! least one: the naive references, which look at every pair of positions;
+//! an unbalanced search tree (sorted input); a quicksort that puts ties on
+//! one side (few values); and an array with a slot for each value (a wide
+//! range). A program that is slow only on some other input can pass. The
+//! good references take at most 29 % of the fuel on any input (November
+//! 2026). The description states the size and the step limit, not the
+//! inputs.
 //!
 //! Each variant has a naive dc reference that looks at every pair of
 //! positions (`n²`), which times out on the gate, and a good one (`n log n`)
@@ -264,6 +269,85 @@ fn values(kind: u64, n: u64, rng: &mut TaskRng) -> Vec<i64> {
     }
 }
 
+/// One input of the gate. Each is there because some common way to count
+/// is `n²` or worse on it and fast on the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateInput {
+    /// The input of seed 0: values from `-WIDE..=WIDE`.
+    Random,
+    /// The input of seed 1 (many ties) sorted up: the worst case of an
+    /// unbalanced search tree.
+    SortedUp,
+    /// The same, sorted down.
+    SortedDown,
+    /// The input of seed 2: a walk.
+    Walk,
+    /// Values from `0..=1`: the worst case of a quicksort that puts every
+    /// tie on one side, and of a search tree that sends ties one way.
+    FewValues,
+    /// Values from `-WIDE_GATE..=WIDE_GATE`, nearly all distinct: the worst
+    /// case of a program that keeps a slot or a step for each value in the
+    /// range.
+    WideRange,
+}
+
+/// The order of the gate's inputs.
+pub const GATE_INPUTS: [GateInput; 6] = [
+    GateInput::Random,
+    GateInput::SortedUp,
+    GateInput::SortedDown,
+    GateInput::Walk,
+    GateInput::FewValues,
+    GateInput::WideRange,
+];
+
+/// The value range of [`GateInput::WideRange`].
+pub const WIDE_GATE: i64 = 1_000_000;
+
+/// The seeds of the gate inputs that are not generated inputs. They are
+/// passed to [`TaskRng::new`] with [`GATE_N`], apart from the generator's.
+const FEW_VALUES_SEED: u64 = 1_000;
+const WIDE_RANGE_SEED: u64 = 1_001;
+
+/// A gate input of `family`. In [`Variant::Pairs2d`] each list is built
+/// the same way.
+fn gate_input(family: &Dominance, g: GateInput) -> Inputs {
+    let lists = if family.0 == Variant::Pairs2d { 2 } else { 1 };
+    let sorted = |down: bool| -> Inputs {
+        generate_input(family, GATE_N, 1)
+            .iter()
+            .map(|l| {
+                let mut xs = ints_of(l);
+                xs.sort_unstable();
+                if down {
+                    xs.reverse();
+                }
+                list(&xs)
+            })
+            .collect()
+    };
+    let drawn = |seed: u64, lo: i64, hi: i64| -> Inputs {
+        let mut rng = TaskRng::new(GATE_N, seed);
+        (0..lists)
+            .map(|_| {
+                list(
+                    &(0..GATE_N)
+                        .map(|_| rng.int_in(lo, hi))
+                        .collect::<Vec<i64>>(),
+                )
+            })
+            .collect()
+    };
+    match g {
+        GateInput::Random => generate_input(family, GATE_N, 0),
+        GateInput::SortedUp => sorted(false),
+        GateInput::SortedDown => sorted(true),
+        GateInput::Walk => generate_input(family, GATE_N, 2),
+        GateInput::FewValues => drawn(FEW_VALUES_SEED, 0, 1),
+        GateInput::WideRange => drawn(WIDE_RANGE_SEED, -WIDE_GATE, WIDE_GATE),
+    }
+}
+
 /// The text of the size and step limits, the same for every variant.
 macro_rules! limits {
     () => {
@@ -372,29 +456,13 @@ impl TaskFamily for Dominance {
         }
     }
 
-    /// Three inputs of [`GATE_N`] elements, with [`GATE_FUEL`] each: the
-    /// input of seed 0 (values from `-WIDE..=WIDE`), and the input of seed 1
-    /// (many ties) sorted up and sorted down. Sorted lists are the worst
-    /// case of an unbalanced search tree, a common way to count that is `n²`
-    /// at worst. In [`Variant::Pairs2d`] both lists are sorted.
+    /// The [`GateInput`]s in [`GATE_INPUTS`] order, each of [`GATE_N`]
+    /// elements, with [`GATE_FUEL`] each.
     fn gate(&self) -> Option<Gate> {
-        let random = generate_input(self, GATE_N, 0);
-        let ties = generate_input(self, GATE_N, 1);
-        let sorted = |down: bool| -> Inputs {
-            ties.iter()
-                .map(|l| {
-                    let mut xs = ints_of(l);
-                    xs.sort_unstable();
-                    if down {
-                        xs.reverse();
-                    }
-                    list(&xs)
-                })
-                .collect()
-        };
-        let inputs = [random, sorted(false), sorted(true)]
-            .into_iter()
-            .map(|i| {
+        let inputs = GATE_INPUTS
+            .iter()
+            .map(|&g| {
+                let i = gate_input(self, g);
                 let out = self.oracle(&i);
                 Example::new(i, out)
             })
@@ -529,7 +597,7 @@ mod tests {
         for f in all() {
             let gate = f.gate().expect("a gate");
             assert_eq!(gate.fuel, GATE_FUEL);
-            assert_eq!(gate.inputs.len(), 3);
+            assert_eq!(gate.inputs.len(), GATE_INPUTS.len());
             for e in &gate.inputs {
                 for input in &e.inputs {
                     assert_eq!(ints_of(input).len() as u64, GATE_N, "{}", f.name());
@@ -546,6 +614,29 @@ mod tests {
                         f.name()
                     );
                 }
+            }
+            // The input of few values has two, and the wide one has nearly
+            // as many distinct values as elements, over a range far wider
+            // than the list.
+            let distinct = |e: &Example| -> Vec<(usize, i64)> {
+                e.inputs
+                    .iter()
+                    .map(|l| {
+                        let xs = ints_of(l);
+                        let set: std::collections::BTreeSet<i64> = xs.iter().copied().collect();
+                        let lo = *set.first().unwrap();
+                        let hi = *set.last().unwrap();
+                        (set.len(), hi - lo)
+                    })
+                    .collect()
+            };
+            let at = |g: GateInput| &gate.inputs[GATE_INPUTS.iter().position(|&x| x == g).unwrap()];
+            for (d, _) in distinct(at(GateInput::FewValues)) {
+                assert_eq!(d, 2, "{}", f.name());
+            }
+            for (d, range) in distinct(at(GateInput::WideRange)) {
+                assert!(d as u64 > GATE_N * 99 / 100, "{}: {d}", f.name());
+                assert!(range as u64 > 100 * GATE_N, "{}: {range}", f.name());
             }
             for e in f.examples() {
                 assert!(ints_of(&e.inputs[0]).len() <= 8, "{}", f.name());

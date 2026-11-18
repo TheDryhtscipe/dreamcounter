@@ -15,7 +15,9 @@ mod common;
 
 use common::{check_class, compile, list_len, SeedsRefused};
 use dc_core::Arena;
-use dc_tasks::families::dominance::{self, Dominance, Variant, GATE_FUEL, GATE_N};
+use dc_tasks::families::dominance::{
+    self, Dominance, GateInput, Variant, GATE_FUEL, GATE_INPUTS, GATE_N,
+};
 use dc_tasks::growth::GrowthClass;
 use dc_tasks::harness::{
     check_examples, check_gate, check_input_sizes, run_on, validate_family, CheckFailure, FuelPlan,
@@ -216,4 +218,90 @@ fn the_gate_turns_away_a_program_that_is_quadratic_only_on_sorted_input() {
             failure: RunFailure::Timeout { fuel: GATE_FUEL }
         })
     );
+}
+
+/// Two increasing-subsequences programs that are fast on most inputs:
+/// the good reference with its value sort replaced by a quicksort that puts
+/// ties on one side (`n²` when there are few values), and a program with an
+/// array slot for each value in the range (`n · range`).
+const RANGE_AND_TIES: &str = r#"
+let qsort_by_value ps =
+  bfix (length ps + 1)
+    (fun self ys ->
+      let n = length ys in
+      if n <= 1 then ys
+      else
+        let m = n / 2 in
+        let (pv, pi) = nth ys m in
+        let rest = append (take m ys) (drop (m + 1) ys) in
+        append (self (filter (fun (v, _) -> v < pv) rest))
+          ((pv, pi) :: self (filter (fun (v, _) -> pv <= v) rest)))
+    ps
+
+let qs_increasing_subsequences xs =
+  let sorted = qsort_by_value (zip xs (range 0 (length xs))) in
+  let ranked =
+    match sorted with
+    | [] -> []
+    | first :: _ ->
+      let (_, _, acc) =
+        foldl
+          (fun (prev, r, acc) (v, i) ->
+            let r2 = r + (if v = prev then 0 else 1) in
+            (v, r2, (i, r2) :: acc))
+          (fst first, 0, []) sorted in
+      acc in
+  let by_pos = msort_by (fun (i, _) (j, _) -> i <= j) ranked in
+  let n = length xs in
+  let (_, total) =
+    foldl
+      (fun (t, total) (_, r) ->
+        let ending = addm 1 (tree_below t n r) in
+        (tree_add t n r ending, addm total ending))
+      (zeros_tree n, 0) by_pos in
+  total
+
+let arr_increasing_subsequences xs =
+  match xs with
+  | [] -> 0
+  | _ :: _ ->
+    let lo = foldl min max_int xs in
+    let hi = foldl max min_int xs in
+    let size = hi - lo + 1 in
+    let (_, _, total) =
+      foldl
+        (fun (a, t, total) x ->
+          let k = x - lo in
+          let s =
+            if k <= size - k then loop k 0 (fun i acc -> acc + array_get a i)
+            else t - loop (size - k) 0 (fun i acc -> acc + array_get a (k + i)) in
+          let ending = (1 + s) mod 1000003 in
+          (array_set a k (array_get a k + ending), t + ending, (total + ending) mod 1000003))
+        (array_tabulate size (fun _ -> 0), 0, 0) xs in
+    total
+"#;
+
+#[test]
+fn the_gate_turns_away_programs_slow_only_on_ties_or_a_wide_range() {
+    let family = Dominance(Variant::IncreasingSubsequences);
+    let c = HarnessConfig::default();
+    let mut arena = Arena::new();
+    let src = format!("{}\n{RANGE_AND_TIES}", dominance::SOURCE);
+    let index = |g: GateInput| GATE_INPUTS.iter().position(|&x| x == g).unwrap();
+    for (entry, slow_on) in [
+        ("qs_increasing_subsequences", GateInput::FewValues),
+        ("arr_increasing_subsequences", GateInput::WideRange),
+    ] {
+        let p = compile(&mut arena, &src, entry);
+        let passed = check_examples(&family, &arena, p, &c).expect("it passes the examples");
+        // It answers every gate input before the one it is slow on.
+        assert_eq!(
+            check_gate(&family, &arena, &passed, &c),
+            Err(CheckFailure::Gate {
+                index: index(slow_on),
+                failure: RunFailure::Timeout { fuel: GATE_FUEL }
+            }),
+            "{entry}"
+        );
+    }
 }

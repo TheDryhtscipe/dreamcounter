@@ -306,7 +306,7 @@ impl Verifier {
                 error: format!("example {index}: {}", describe(&failure)),
             },
             Err(CheckFailure::Gate { index, failure }) => Check::Run {
-                error: format!("large input {index}: {}", describe(&failure)),
+                error: format!("large input {index}: {}", describe_hidden(&failure)),
             },
             Err(other) => Check::Run {
                 error: format!("{other:?}"),
@@ -378,6 +378,16 @@ fn describe(failure: &RunFailure) -> String {
         ),
         RunFailure::Error { kind, steps } => format!("runtime error {kind:?} after {steps} steps"),
         RunFailure::Timeout { fuel } => format!("no result within {fuel} steps"),
+    }
+}
+
+/// A failure on a gate input, without the expected or the actual value.
+/// The gate is hidden from the prompt (decision D25), and a program's
+/// output could carry any feature of the hidden input.
+fn describe_hidden(failure: &RunFailure) -> String {
+    match failure {
+        RunFailure::WrongOutput { .. } => "wrong output".to_owned(),
+        other => describe(other),
     }
 }
 
@@ -564,5 +574,15 @@ mod tests {
             verifier.check(&*v.family, &text(good.entry)),
             Check::Passed { .. }
         ));
+        // A wrong output on a gate input names neither the expected value
+        // nor the program's: the program returns the input's length.
+        let wrong = format!(
+            "fun xs -> if length xs > 100 then length xs else {} xs",
+            good.entry
+        );
+        match verifier.check(&*v.family, &text(&wrong)) {
+            Check::Run { error } => assert_eq!(error, "large input 0: wrong output"),
+            other => panic!("{other:?}"),
+        }
     }
 }
