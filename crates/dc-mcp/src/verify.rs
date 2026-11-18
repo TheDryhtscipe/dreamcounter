@@ -234,6 +234,26 @@ impl Verifier {
         &self.schemes
     }
 
+    /// The arena the verifier's terms are in.
+    pub fn arena(&self) -> &Arena {
+        &self.arena
+    }
+
+    /// A stored program (`Check::Passed`'s text: core, with prelude and
+    /// library references in place), parsed into the verifier's arena and
+    /// expanded to a closed term the evaluator can run.
+    ///
+    /// # Errors
+    ///
+    /// Why it does not parse or expand under the verifier's library.
+    pub fn expand_stored(&mut self, program: &str) -> Result<TermId, String> {
+        let term = sexpr::parse(&mut self.arena, program).map_err(|e| e.to_string())?;
+        let term = self.prelude.expand(&mut self.arena, term);
+        self.expander
+            .expand(&mut self.arena, term)
+            .map_err(|e| e.to_string())
+    }
+
     /// Checks `text` against `family`. A panic in the checks is reported as a
     /// failure of the run stage, so the submission is still kept.
     pub fn check(&mut self, family: &dyn TaskFamily, text: &str) -> Check {

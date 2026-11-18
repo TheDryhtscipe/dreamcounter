@@ -57,6 +57,7 @@ fn batch(i: u64) -> Vec<Event> {
             task: format!("t{}", iteration % 2),
             members: vec![FrontierMember {
                 program: format!("(program {i})"),
+                cost: None,
             }],
         });
         events.push(Event::IterationFinished { iteration, used: 0 });
