@@ -703,6 +703,26 @@ pub fn run_sweep<F: TaskFamily + ?Sized>(
     plan: &FuelPlan,
     config: &HarnessConfig,
 ) -> Result<SweepReport, SweepError> {
+    let report = run_sweep_until(family, arena, passed, plan, config, &mut || false)?;
+    Ok(report.expect("a sweep that is never stopped finishes"))
+}
+
+/// As [`run_sweep`], but `stop` is called before each run of the program,
+/// and the sweep ends with `Ok(None)` the first time it returns `true`. A
+/// run, once started, is bounded only by its fuel, so a caller with a time
+/// budget is over it by at most one run.
+///
+/// # Errors
+///
+/// As for [`run_sweep`], checked before `stop` is first called.
+pub fn run_sweep_until<F: TaskFamily + ?Sized>(
+    family: &F,
+    arena: &Arena,
+    passed: &ExamplesPassed,
+    plan: &FuelPlan,
+    config: &HarnessConfig,
+    stop: &mut dyn FnMut() -> bool,
+) -> Result<Option<SweepReport>, SweepError> {
     for found in [passed.family(), plan.family()] {
         if found != family.name() {
             return Err(SweepError::WrongFamily {
@@ -720,7 +740,9 @@ pub fn run_sweep<F: TaskFamily + ?Sized>(
     let mut records = Vec::with_capacity(plan.sizes.len());
     let mut observations = Vec::with_capacity(plan.sizes.len());
     for &SizeFuel { n, fuel, .. } in &plan.sizes {
-        let run = run_size(family, arena, passed.program, n, fuel, config.seeds);
+        let Some(run) = run_size(family, arena, passed.program, n, fuel, config.seeds, stop) else {
+            return Ok(None);
+        };
         observations.push(match &run {
             SizeRun::Completed { steps } => SizeObservation::completed(n, steps.clone()),
             SizeRun::Failed {
@@ -731,15 +753,16 @@ pub fn run_sweep<F: TaskFamily + ?Sized>(
         });
         records.push(SizeRecord { n, fuel, run });
     }
-    Ok(SweepReport {
+    Ok(Some(SweepReport {
         records,
         // run_size runs seeds 0..seeds in order and completes only if every
         // seed does, so each completed size's k-th count is seed k's.
         sweep: Sweep::in_seed_order(observations)?,
-    })
+    }))
 }
 
 /// Runs seeds `0..seeds` at size `n`, stopping at the first failure.
+/// `None` if `stop` returned `true` before a run.
 fn run_size<F: TaskFamily + ?Sized>(
     family: &F,
     arena: &Arena,
@@ -747,15 +770,19 @@ fn run_size<F: TaskFamily + ?Sized>(
     n: u64,
     fuel: u64,
     seeds: u64,
-) -> SizeRun {
+    stop: &mut dyn FnMut() -> bool,
+) -> Option<SizeRun> {
     let mut steps = Vec::with_capacity(seeds as usize);
     for seed in 0..seeds {
+        if stop() {
+            return None;
+        }
         match run_generated(family, arena, program, n, seed, fuel) {
             Ok(s) => steps.push(s),
-            Err(failure) => return SizeRun::Failed { seed, failure },
+            Err(failure) => return Some(SizeRun::Failed { seed, failure }),
         }
     }
-    SizeRun::Completed { steps }
+    Some(SizeRun::Completed { steps })
 }
 
 /// The result of [`measure`].

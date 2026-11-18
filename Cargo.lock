@@ -317,6 +317,7 @@ dependencies = [
  "dc-core",
  "dc-stitch",
  "dc-surface",
+ "dc-tasks",
  "serde",
  "serde_json",
 ]

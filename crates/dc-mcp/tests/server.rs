@@ -174,6 +174,7 @@ fn the_server_lists_its_tools() {
             "dc_check_pending",
             "dc_create_run",
             "dc_finish_iteration",
+            "dc_frontiers",
             "dc_list_runs",
             "dc_proposal_stats",
             "dc_run_status"
@@ -235,6 +236,7 @@ fn a_run_survives_a_kill_in_the_middle_of_an_iteration() {
     };
     let member = |program: &str| FrontierMember {
         program: program.into(),
+        cost: None,
     };
     other
         .append(&run, {
@@ -682,6 +684,7 @@ fn a_proposer_sees_only_its_tools_and_gets_no_results() {
         ("dc_run_status", json!({ "run": "r1" })),
         ("dc_list_runs", json!({})),
         ("dc_proposal_stats", json!({ "run": "r1" })),
+        ("dc_frontiers", json!({ "run": "r1" })),
         (
             "dc_create_run",
             json!({ "run": "r2", "seed": 1, "tasks": ["collapse/merge"] }),
@@ -978,6 +981,7 @@ fn the_deepest_programs_a_proposer_can_send_do_not_crash_the_server() {
                 task: task.to_owned(),
                 members: vec![FrontierMember {
                     program: program.to_owned(),
+                    cost: None,
                 }],
             })
             .to_vec()
@@ -1262,6 +1266,47 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
     }
     assert_eq!(status["current"]["quota_in"], false);
     assert_eq!(status["unnamed"].as_u64().unwrap(), found);
+
+    // Each kept program was measured on its task's sweep, and the cost is
+    // in the journal: a new store reads it back from the file.
+    let fresh = Store::open(dir.path()).unwrap();
+    let kept = fresh
+        .read(&run, |s| s.kept_frontiers(0).cloned().unwrap())
+        .unwrap();
+    assert_eq!(kept.len(), tasks.len());
+    let frontiers = operator
+        .call("dc_frontiers", json!({ "run": "r1" }))
+        .unwrap();
+    let iterations = frontiers["iterations"].as_array().unwrap();
+    assert_eq!(iterations.len(), 1, "{frontiers}");
+    assert_eq!(iterations[0]["iteration"], 0);
+    let reported = iterations[0]["tasks"].as_array().unwrap();
+    assert_eq!(reported.len(), tasks.len());
+    for (task, frontier) in tasks.iter().zip(reported) {
+        assert_eq!(frontier["task"], *task);
+        let members = frontier["members"].as_array().unwrap();
+        assert_eq!(members.len(), 1, "{frontier}");
+        let cost = &members[0]["cost"]["measured"];
+        // The good references of collapse are linear.
+        assert_eq!(cost["verdict"], json!({ "class": "n" }), "{frontier}");
+        let sizes = cost["sizes"].as_array().unwrap();
+        assert!(sizes.len() >= 4, "{frontier}");
+        for size in sizes {
+            assert_eq!(size["steps"].as_array().unwrap().len(), 5, "{size}");
+            assert!(size["median"].as_u64().unwrap() > 0, "{size}");
+        }
+        // What the tool reports is what the journal holds.
+        let stored = serde_json::to_value(&kept[*task]).unwrap();
+        assert_eq!(frontier["members"], stored);
+    }
+    let one = operator
+        .call("dc_frontiers", json!({ "run": "r1", "iteration": 0 }))
+        .unwrap();
+    assert_eq!(one, frontiers);
+    let unfinished = operator
+        .call("dc_frontiers", json!({ "run": "r1", "iteration": 1 }))
+        .unwrap_err();
+    assert!(unfinished.contains("has not finished"), "{unfinished}");
 
     // The same again is refused: iteration 1 has no programs yet.
     let again = operator

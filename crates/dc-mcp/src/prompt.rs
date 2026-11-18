@@ -542,6 +542,7 @@ mod tests {
             task: "collapse/cancel".into(),
             members: vec![FrontierMember {
                 program: "(lam (lib_0 $0))".into(),
+                cost: None,
             }],
         })
         .unwrap();
@@ -576,6 +577,7 @@ mod tests {
                 task: (*t).into(),
                 members: vec![FrontierMember {
                     program: "(lam $0)".into(),
+                    cost: None,
                 }],
             })
             .unwrap();
@@ -659,6 +661,7 @@ mod tests {
             task: names[1].into(),
             members: vec![FrontierMember {
                 program: "(lam $0)".into(),
+                cost: None,
             }],
         })
         .unwrap();

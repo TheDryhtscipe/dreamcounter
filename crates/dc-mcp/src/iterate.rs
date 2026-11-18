@@ -1,7 +1,7 @@
 //! Ending an iteration: the step of `dc_driver` run on a run's state, and its
 //! result committed (decisions D18 and D19).
 //!
-//! [`finish_iteration`] does three things:
+//! [`finish_iteration`] does four things:
 //!
 //! 1. **Read.** Under the run's lock it copies what the step needs: the
 //!    library, each task's frontier, and the verified programs no step has
@@ -13,10 +13,14 @@
 //!    the Stitch runner it is given. This can take as long as the run's
 //!    Stitch limits allow. Proposers' servers go on meanwhile: a submission
 //!    for a batch whose lease ended can still come in and be checked.
-//! 3. **Commit.** In one record, so that a restart finds all of it or none:
-//!    a `FrontierSet` for each task, a `LibraryExtended` if abstractions
-//!    join the library, a log record of kind [`LogKind::Compression`] whose
-//!    text is the step's [`IterationReport`] as JSON, and an
+//! 3. **Measure.** Without the lock, it measures each program the step kept
+//!    on its task's growth sweep ([`crate::cost`]), within
+//!    [`MEASURE_BUDGET`]. This adds a cost to each frontier member and
+//!    changes nothing the step chose.
+//! 4. **Commit.** In one record, so that a restart finds all of it or none:
+//!    a `FrontierSet` for each task, its members with their costs, a
+//!    `LibraryExtended` if abstractions join the library, a log record of
+//!    kind [`LogKind::Compression`] whose text is the step's [`IterationReport`] as JSON, and an
 //!    `IterationFinished` that takes the verified programs the step read.
 //!    Programs verified during the step stay for the next one.
 //!
@@ -45,16 +49,17 @@
 //! record says why (D19, item 6).
 //!
 //! The cancel flag of [`finish_iteration_in_worker`] is read while Stitch
-//! runs, and under the run's lock at each attempt to commit. A flag set
-//! after the attempt that commits has read it does not stop the commit. It
-//! is not read while the step measures programs before Stitch.
+//! runs, before each run of a program while the frontiers are measured,
+//! and under the run's lock at each attempt to commit. A flag set after the
+//! attempt that commits has read it does not stop the commit. It is not
+//! read while the step measures programs before Stitch.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dc_compress::worker::{Limits, Worker};
 use dc_compress::CompressConfig;
@@ -64,6 +69,7 @@ use dc_driver::{
 };
 use dc_surface::prelude::Prelude;
 
+use crate::cost::{self, measure_frontiers, MEASURE_BUDGET};
 use crate::proposer::check_pending;
 use crate::state::{
     Event, FrontierMember, LibraryEntry, LogKind, LogRecord, RunConfig, RunId, RunState,
@@ -210,6 +216,8 @@ struct Snapshot {
     tasks: Vec<String>,
     library: Vec<dc_driver::LibraryEntry>,
     frontiers: BTreeMap<String, Vec<String>>,
+    /// Each task's frontier with its costs.
+    members: BTreeMap<String, Vec<FrontierMember>>,
     candidates: Vec<Candidate>,
     config: DriverConfig,
     stitch: StitchSettings,
@@ -252,6 +260,11 @@ fn snapshot(state: &RunState) -> Result<Snapshot, FinishError> {
                     members.iter().map(|m| m.program.clone()).collect(),
                 )
             })
+            .collect(),
+        members: state
+            .tasks()
+            .iter()
+            .map(|t| (t.clone(), state.frontier(t).unwrap_or_default().to_vec()))
             .collect(),
         candidates: state
             .verified()
@@ -329,7 +342,18 @@ pub fn finish_iteration(
     run: &RunId,
     stitch: &mut dyn Stitch,
 ) -> Result<Finished, FinishError> {
-    finish(store, run, Runner::Given(stitch))
+    finish(store, run, Runner::Given(stitch), MEASURE_BUDGET)
+}
+
+/// As [`finish_iteration`], with `budget` as the time for measuring the
+/// new frontiers ([`crate::cost`]) in place of [`MEASURE_BUDGET`].
+pub fn finish_iteration_with_budget(
+    store: &Store,
+    run: &RunId,
+    stitch: &mut dyn Stitch,
+    budget: Duration,
+) -> Result<Finished, FinishError> {
+    finish(store, run, Runner::Given(stitch), budget)
 }
 
 /// As [`finish_iteration`], with Stitch run in a worker process started as
@@ -344,10 +368,15 @@ pub fn finish_iteration_in_worker(
     start: &WorkerStart,
     cancel: &AtomicBool,
 ) -> Result<Finished, FinishError> {
-    finish(store, run, Runner::Worker { start, cancel })
+    finish(store, run, Runner::Worker { start, cancel }, MEASURE_BUDGET)
 }
 
-fn finish(store: &Store, run: &RunId, runner: Runner<'_>) -> Result<Finished, FinishError> {
+fn finish(
+    store: &Store,
+    run: &RunId,
+    runner: Runner<'_>,
+    budget: Duration,
+) -> Result<Finished, FinishError> {
     let (snap, journal) = store.read_journal(run, snapshot)?;
     let snap = snap?;
     let mut tasks = Vec::with_capacity(snap.tasks.len());
@@ -394,16 +423,45 @@ fn finish(store: &Store, run: &RunId, runner: Runner<'_>) -> Result<Finished, Fi
         other => FinishError::State(other),
     })?;
 
+    // The frontiers are chosen. Measuring them adds a cost to each member
+    // and changes nothing else; it is done without the lock.
+    let library: Vec<LibraryEntry> = snap
+        .library
+        .iter()
+        .chain(&outcome.new_library)
+        .map(|e| LibraryEntry {
+            name: None,
+            doc: None,
+            arity: e.arity,
+            term: e.term.clone(),
+        })
+        .collect();
+    let kept: BTreeMap<String, Vec<String>> = snap
+        .tasks
+        .iter()
+        .map(|t| {
+            (
+                t.clone(),
+                outcome.frontiers.get(t).cloned().unwrap_or_default(),
+            )
+        })
+        .collect();
+    let mut measured = measure_frontiers(
+        &library,
+        &kept,
+        &snap.members,
+        cost::Limits {
+            deadline: Instant::now() + budget,
+            cancel: cancelled,
+        },
+    );
+
     let used = snap.candidates.len() as u64;
     let mut events = Vec::with_capacity(snap.tasks.len() + 3);
     for name in &snap.tasks {
-        let members = outcome.frontiers.get(name).cloned().unwrap_or_default();
         events.push(Event::FrontierSet {
             task: name.clone(),
-            members: members
-                .into_iter()
-                .map(|program| FrontierMember { program })
-                .collect(),
+            members: measured.remove(name).unwrap_or_default(),
         });
     }
     if !outcome.new_library.is_empty() {

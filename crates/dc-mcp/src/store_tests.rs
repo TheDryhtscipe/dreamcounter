@@ -45,6 +45,7 @@ fn frontier(task: &str, program: &str) -> Event {
         task: task.into(),
         members: vec![FrontierMember {
             program: program.into(),
+            cost: None,
         }],
     }
 }
