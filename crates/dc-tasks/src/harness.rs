@@ -79,13 +79,14 @@ pub const DEFAULT_EXAMPLE_FUEL: u64 = 10_000_000;
 ///
 /// It is above [`DEFAULT_MAX_FUEL`] because a gate must let an `n log² n`
 /// program finish at a size where an `n²` one cannot: the chain family's
-/// gate needs 150,000,000 steps (bead dreamcounter-4593ae). Memory grows
+/// gate needs 500,000,000 steps (bead dreamcounter-4593ae). Memory grows
 /// with the cap: at about 16 bytes per step a runaway `unfold` on a gate
-/// input takes up to about 2.4 GB, an `array_tabulate` about 32 bytes per
-/// step (4.8 GB), and a loop that keeps every version of an array it
-/// updates with `array_set` about 300 bytes per step, which no cap here
-/// bounds to the memory of this machine (bead dreamcounter-a3db93).
-pub const DEFAULT_MAX_GATE_FUEL: u64 = 150_000_000;
+/// input takes up to about 8 GB, an `array_tabulate` about 32 bytes per
+/// step (16 GB), and a loop that keeps every version of an array it
+/// updates with `array_set` about 300 bytes per step, about 150 GB at this
+/// cap, which this cap does not bound to the memory of a workstation (bead
+/// dreamcounter-a3db93).
+pub const DEFAULT_MAX_GATE_FUEL: u64 = 500_000_000;
 
 /// Harness settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -10,7 +10,12 @@
 //! quadratic program. Two fast programs that a proposer model wrote in a
 //! probe, without running them, pass the gate. The good reference with a
 //! quicksort that takes its first element as pivot is fast on the random
-//! input and runs out of fuel on the input whose `xs` are sorted.
+//! input and runs out of fuel on the input whose `xs` are sorted. The good
+//! reference with its merges replaced by merge sorts, still `n log² n`,
+//! passes with a third of the fuel to spare. A program that searches only
+//! the chain lengths whose least `x` and `y` are below a point passes the
+//! other inputs and runs out of fuel on the antichain, with or without
+//! skipping repeated points.
 
 mod common;
 
@@ -145,9 +150,9 @@ fn variant_names_are_unique() {
     assert_eq!(names.len(), Variant::ALL.len(), "names are unique");
 }
 
-/// The longest chain by looking at every earlier position, with as few
-/// steps for each pair of positions as the leanest program written for
-/// this test: about 10.
+/// The longest chain by looking at every earlier position, with few steps
+/// for each pair of positions: about 10.5. A review wrote one with about
+/// 9.3; the gate allows fewer than 4.
 const LEAN_QUADRATIC: &str = r#"
 let lean xs ys =
   let (_, best) =
@@ -191,12 +196,12 @@ fn the_gate_turns_away_a_lean_quadratic_program() {
 /// positions, with a segment tree over `ys` in an array.
 const PROPOSED_LONGEST: &str = r#"
 let upd t y v =
-  fst (loop 14 (t, y + 8192) (fun k acc ->
+  fst (loop 15 (t, y + 16384) (fun k acc ->
     let (a, p) = acc in
     (array_set a p (max (array_get a p) v), p / 2)))
 
 let qry t y =
-  snd (loop 13 (y + 8192, 0) (fun k acc ->
+  snd (loop 14 (y + 16384, 0) (fun k acc ->
     let (r, res) = acc in
     if r mod 2 = 1 then (r / 2, max res (array_get t (r - 1)))
     else (r / 2, res)))
@@ -205,7 +210,7 @@ let bucket_sort key items =
   let bs = foldl (fun arr e ->
                     let k = key e in
                     array_set arr k (cons e (array_get arr k)))
-                 (array_tabulate 8192 (fun k -> []))
+                 (array_tabulate 16384 (fun k -> []))
                  (reverse items) in
   concat (array_to_list bs)
 
@@ -235,9 +240,9 @@ let solve xs ys =
   let n = length xs in
   let items = map (fun e -> let (i, p) = e in let (x, y) = p in (x, y, i))
                   (zip (range 0 n) (zip xs ys)) in
-  let s1 = bucket_sort (fun e -> let (x, y, i) = e in 8191 - y) items in
+  let s1 = bucket_sort (fun e -> let (x, y, i) = e in 16383 - y) items in
   let s = bucket_sort (fun e -> let (x, y, i) = e in x) s1 in
-  let d = cdq (array_tabulate 16384 (fun k -> 0))
+  let d = cdq (array_tabulate 32768 (fun k -> 0))
               (0, n, s, array_tabulate n (fun k -> 1)) in
   foldl max 0 (array_to_list d)
 "#;
@@ -245,22 +250,22 @@ let solve xs ys =
 /// A heaviest-chain program from the same probe: the same method, with
 /// the structure cleared after each pass.
 const PROPOSED_HEAVIEST: &str = r#"
-let m = 8192
+let m = 16384
 
 let seg_update t pos v =
-  snd (loop 14 (m + pos, t) (fun _ st ->
+  snd (loop 15 (m + pos, t) (fun _ st ->
     let (p, a) = st in
     if p < 1 then st
     else (p / 2, array_set a p (max (array_get a p) v))))
 
 let seg_clear t pos =
-  snd (loop 14 (m + pos, t) (fun _ st ->
+  snd (loop 15 (m + pos, t) (fun _ st ->
     let (p, a) = st in
     if p < 1 then st
     else (p / 2, array_set a p 0)))
 
 let seg_query t q =
-  snd (loop 14 ((m, m + q), 0) (fun _ st ->
+  snd (loop 15 ((m, m + q), 0) (fun _ st ->
     let (lr, res) = st in
     let (l, r) = lr in
     if l < r then
@@ -272,7 +277,7 @@ let seg_query t q =
     else st))
 
 let advance xa ya xr st =
-  bfix 8200 (fun self s ->
+  bfix 16400 (fun self s ->
     let (t, rest) = s in
     let (ls, rest2) = rest in
     let (ins, arr) = rest2 in
@@ -351,6 +356,40 @@ fn programs_a_proposer_wrote_pass_the_gate() {
     }
 }
 
+#[test]
+fn the_gate_lets_through_a_less_careful_n_log2_n_program() {
+    // The good reference with its two merges of sorted lists replaced by a
+    // merge sort of the joined lists: still n log^2 n, with a larger
+    // constant, as a proposer might well write it.
+    let joined_points = "merge_by by_x ls (self by_pos))";
+    let tagged = "merge_by (fun (a, wa, _, _, _, _, _) (b, wb, _, _, _, _, _) -> a < b || (a = b && wa <= wb))\n      (tag 1 l) (tag 0 r)";
+    assert!(chains::SOURCE.contains(joined_points) && chains::SOURCE.contains(tagged));
+    let source = chains::SOURCE
+        .replace(joined_points, "msort_by by_x (append ls (self by_pos)))")
+        .replace(
+            tagged,
+            "msort_by (fun (a, wa, _, _, _, _, _) (b, wb, _, _, _, _, _) -> a < b || (a = b && wa <= wb))\n      (append (tag 1 l) (tag 0 r))",
+        );
+    let c = HarnessConfig::default();
+    for v in [Variant::Longest, Variant::LongestCount] {
+        let family = Chains(v);
+        let mut arena = Arena::new();
+        let p = compile(&mut arena, &source, v.good());
+        let passed = check_examples(&family, &arena, p, &c).expect("it passes the examples");
+        let steps = check_gate(&family, &arena, &passed, &c)
+            .unwrap_or_else(|f| panic!("{} on the gate: {f:?}", family.name()))
+            .expect("a gate");
+        println!("CARELESS {}: {steps} steps", family.name());
+        // Room to spare: the gate must allow about one and a half times this
+        // program's steps, so that a program a little slower still passes.
+        assert!(
+            steps <= GATE_FUEL * 2 / 3,
+            "{}: {steps} steps of {GATE_FUEL}",
+            family.name()
+        );
+    }
+}
+
 /// A sort that is `n²` on sorted input: a quicksort with the first element
 /// as pivot.
 const FIRST_PIVOT_QUICKSORT: &str = r#"
@@ -398,3 +437,79 @@ fn the_gate_turns_away_a_program_that_is_quadratic_only_on_sorted_xs() {
         })
     );
 }
+
+/// A longest-chain program a review wrote: it keeps the points of each
+/// chain length in a list, with the least x and least y of each, and looks
+/// for a point below only in a length whose least x and y are both below.
+/// It is fast on random and sorted inputs, and `n²` when many points are
+/// above the least x and y of a long list that has no point below them.
+const LAYERED: &str = r#"
+let layered xs ys =
+  let n = length xs in
+  let big = n + 1 in
+  let st0 = (array_tabulate (n + 2) (fun _ -> []),
+             (array_tabulate (n + 2) (fun _ -> big),
+              (array_tabulate (n + 2) (fun _ -> big), 0))) in
+  let hit x y bucket =
+    bfix (length bucket + 1) (fun self l ->
+      match l with
+      | [] -> false
+      | e :: rest -> let (a, b) = e in if a < x then (if b < y then true else self rest) else self rest) bucket in
+  let find lv mx my top x y =
+    bfix (top + 2) (fun self lev ->
+      if lev < 1 then 0
+      else if array_get mx lev < x then
+        (if array_get my lev < y then (if hit x y (array_get lv lev) then lev else self (lev - 1)) else self (lev - 1))
+      else self (lev - 1)) top in
+  let final = foldl (fun st p ->
+      let (x, y) = p in
+      let (lv, r1) = st in
+      let (mx, r2) = r1 in
+      let (my, top) = r2 in
+      let f = 1 + find lv mx my top x y in
+      (array_set lv f ((x, y) :: array_get lv f),
+       (array_set mx f (min x (array_get mx f)),
+        (array_set my f (min y (array_get my f)), max top f)))) st0 (zip xs ys) in
+  snd (snd (snd final))
+"#;
+
+#[test]
+fn the_gate_turns_away_a_program_that_is_quadratic_on_an_antichain() {
+    let family = Chains(Variant::Longest);
+    let c = HarnessConfig::default();
+    let mut arena = Arena::new();
+    let antichain = GATE_INPUTS
+        .iter()
+        .position(|&g| g == GateInput::Antichain)
+        .expect("an antichain input");
+    // The same program, after it drops each point equal to the one before:
+    // that changes no answer, and makes runs of equal points cheap.
+    let skipping = format!("{LAYERED}{SKIP_REPEATS}");
+    for (source, entry) in [(LAYERED, "layered"), (skipping.as_str(), "skipping")] {
+        let p = compile(&mut arena, source, entry);
+        let passed = check_examples(&family, &arena, p, &c).expect("it passes the examples");
+        assert_eq!(
+            check_gate(&family, &arena, &passed, &c),
+            Err(CheckFailure::Gate {
+                index: antichain,
+                failure: RunFailure::Timeout { fuel: GATE_FUEL }
+            }),
+            "{entry}"
+        );
+    }
+}
+
+const SKIP_REPEATS: &str = r#"
+let skipping xs ys =
+  let kept =
+    foldr
+      (fun p acc ->
+        match acc with
+        | [] -> [p]
+        | q :: _ ->
+          let (a, b) = p in
+          let (c, d) = q in
+          if a = c && b = d then acc else p :: acc)
+      [] (zip xs ys) in
+  layered (map fst kept) (map snd kept)
+"#;

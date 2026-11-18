@@ -34,9 +34,11 @@
 //! are chosen so that the slow programs in the tests of `tests/chains.rs`
 //! run out of fuel on at least one. The naive references, which look at
 //! every earlier position, need about `8 n²/2` steps at the least, over
-//! 250,000,000. The good references take about 80,000,000, and about 88,000,000 for
-//! longest-count. The
-//! gate's fuel is above the harness's global cap
+//! 1,000,000,000. The good references take about 181,000,000, and about
+//! 200,000,000 for longest-count. A correct but less careful `n log² n`
+//! program in the tests takes about 1.5 times as many, and the gate allows
+//! it about 1.7 times its steps.
+//! The gate's fuel is above the harness's global cap
 //! ([`DEFAULT_MAX_FUEL`](crate::harness::DEFAULT_MAX_FUEL)): at a size where
 //! `n²` and `n log² n` programs are far enough apart, the good ones need
 //! more than that cap. The description states the size, the value range
@@ -78,7 +80,7 @@ pub const SOURCE: &str = include_str!("chains.dc");
 pub const SIZES: &[u64] = &[16, 32, 64, 128, 256, 512];
 
 /// The size of the gate.
-pub const GATE_N: u64 = 8192;
+pub const GATE_N: u64 = 16_384;
 
 /// The fuel of the gate: the harness's default gate cap.
 pub const GATE_FUEL: u64 = crate::harness::DEFAULT_MAX_GATE_FUEL;
@@ -245,16 +247,25 @@ pub enum GateInput {
     /// down, so the middle element is the largest. The worst case of a
     /// quicksort whose pivot is the middle, first, or last element.
     OrganPipe,
+    /// The points `(i, GATE_N - 1 - i)`, with the two end points first:
+    /// `i = 0` and `i = GATE_N - 1`, then `i` from 1 up. No two positions
+    /// form a chain, and the points are all different. A program that keeps
+    /// the points of each chain length with their least `x` and `y`, and
+    /// searches a length only when both are below the new point, has both
+    /// least values at 0 after two points, so each later point searches
+    /// every earlier one: `n²`.
+    Antichain,
 }
 
 /// The order of the gate's inputs.
-pub const GATE_INPUTS: [GateInput; 6] = [
+pub const GATE_INPUTS: [GateInput; 7] = [
     GateInput::Random,
     GateInput::XsSorted,
     GateInput::Crossing,
     GateInput::BothSorted,
     GateInput::FewValues,
     GateInput::OrganPipe,
+    GateInput::Antichain,
 ];
 
 /// The seed of the gate's input of few values, and of its weights, apart
@@ -295,6 +306,12 @@ fn gate_input(family: &Chains, g: GateInput) -> Inputs {
             (draw(), draw())
         }
         GateInput::OrganPipe => (organ_pipe(&xs), organ_pipe(&ys)),
+        GateInput::Antichain => {
+            let top = GATE_N as i64 - 1;
+            let xs: Vec<i64> = [0, top].into_iter().chain(1..top).collect();
+            let ys = xs.iter().map(|&x| top - x).collect();
+            (xs, ys)
+        }
     };
     let mut inputs = vec![list(&xs), list(&ys)];
     if family.0 == Variant::Heaviest {
@@ -309,18 +326,18 @@ fn gate_input(family: &Chains, g: GateInput) -> Inputs {
 /// The text of the size and step limits for two lists.
 macro_rules! limits {
     () => {
-        " Both lists have the same length, at most 8192 elements, each between \
-         0 and 8191. The program must finish within 150000000 evaluation \
-         steps on lists of 8192 elements."
+        " Both lists have the same length, at most 16384 elements, each between \
+         0 and 16383. The program must finish within 500000000 evaluation \
+         steps on lists of 16384 elements."
     };
 }
 
 /// The same, for three lists.
 macro_rules! limits_3 {
     () => {
-        " The three lists have the same length, at most 8192 elements, each \
-         between 0 and 8191. The program must finish within 150000000 \
-         evaluation steps on lists of 8192 elements."
+        " The three lists have the same length, at most 16384 elements, each \
+         between 0 and 16383. The program must finish within 500000000 \
+         evaluation steps on lists of 16384 elements."
     };
 }
 
@@ -621,6 +638,11 @@ mod tests {
             .position(|&g| g == GateInput::BothSorted)
             .unwrap();
         assert_eq!(ans(crossing), 1);
+        let antichain = GATE_INPUTS
+            .iter()
+            .position(|&g| g == GateInput::Antichain)
+            .unwrap();
+        assert_eq!(ans(antichain), 1);
         assert!(ans(both) > 1000, "{}", ans(both));
         assert!(ans(0) > 10, "{}", ans(0));
     }

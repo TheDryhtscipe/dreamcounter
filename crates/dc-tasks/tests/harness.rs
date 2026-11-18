@@ -185,15 +185,18 @@ fn default_global_cap_keeps_a_runaway_run_under_a_gigabyte() {
         c.max_fuel
     );
     assert!(c.example_fuel <= c.max_fuel);
-    // A run on a gate input has its own cap, which holds such a candidate
-    // to about 2.4 GB. These checks hold the caps to the assumed bytes per
-    // step; they do not measure memory, and other programs take more per
-    // step (see `DEFAULT_MAX_GATE_FUEL`).
-    assert!(
-        c.max_gate_fuel * BYTES_PER_RUNAWAY_STEP <= 5 << 29,
-        "max_gate_fuel = {}",
-        c.max_gate_fuel
-    );
+}
+
+#[test]
+fn default_gate_cap_is_one_chosen_for_the_chain_gate() {
+    // A run on a gate input has its own cap, `max_gate_fuel`, chosen for the
+    // chain family's gate (decision D28). At 16 bytes per step it lets a
+    // runaway `unfold` take about 8 GB, and other programs take more per
+    // step (see `DEFAULT_MAX_GATE_FUEL`). This test only pins the value, so
+    // that a change to it is deliberate; it does not bound memory.
+    let c = HarnessConfig::default();
+    assert_eq!(c.max_gate_fuel, 500_000_000);
+    assert!(c.max_fuel <= c.max_gate_fuel);
 }
 
 #[test]
