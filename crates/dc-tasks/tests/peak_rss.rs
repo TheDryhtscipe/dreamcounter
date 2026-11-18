@@ -109,7 +109,7 @@ fn one_runaway_run_keeps_the_peak_resident_memory_near_the_limit() {
                 .output()
                 .unwrap();
             assert!(
-                out.status.success(),
+                out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
                 "{}: {}{}",
                 src,
                 String::from_utf8_lossy(&out.stdout),

@@ -434,7 +434,7 @@ impl<'a> Machine<'a> {
     fn before_step(&mut self) -> Result<(), Halt> {
         // A stack that deep recursion grew gives back what it no longer
         // uses, so its spare room does not count against the limit for the
-        // rest of the evaluation. It halves when a quarter full, so each
+        // rest of the evaluation. It halves when less than a quarter full, so each
         // frame is copied O(1) times on average.
         let cap = self.stack.capacity();
         if cap > 1024 && self.stack.len() < cap / 4 {

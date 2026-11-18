@@ -86,8 +86,9 @@ pub use machine::{
 /// Memo tables the program can no longer reach are released when the count
 /// of tables doubles, and also at each new table once the evaluation holds
 /// more than half its limit, at most once per as many steps as there are
-/// tables. The continuation stack halves its buffer when it is a quarter
-/// full, so the room deep recursion left does not count after it returns. Tables that only a reachability walk can find
+/// tables. The continuation stack halves its buffer when it is less than a
+/// quarter full, so after deep recursion returns, its spare room counts for
+/// at most about three times the frames still in use. Tables that only a reachability walk can find
 /// dead are released only when a walk is due and finishes.
 ///
 /// The count is of bytes asked of the allocator. The resident memory of the
