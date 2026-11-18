@@ -28,19 +28,27 @@
 //! # Time
 //!
 //! Measuring runs without the run's lock, before the commit. It stops at a
-//! deadline and when the call is cancelled, checked before each run of a
-//! program. A run is bounded by its fuel, at most the harness's cap of
-//! 50 million steps, so the deadline is overrun by at most one run. A
-//! program it did not reach is [`ProgramCost::NotMeasured`]. Making a
-//! task's fuel plan, the first time a process measures the task, runs the
-//! reference over the sweep and is not stopped by the deadline; it takes
-//! seconds.
+//! deadline and when the call is cancelled, checked before each program's
+//! examples and before each run of a program on the sweep. A program it did
+//! not reach is [`ProgramCost::NotMeasured`]. The deadline is passed by
+//! whatever had started when it came:
+//!
+//! * one run, bounded by its fuel, at most the harness's cap of 50 million
+//!   steps;
+//! * one program's examples, each run bounded by the harness's example fuel;
+//! * making a task's fuel plan, the first time a process measures the task:
+//!   it runs the reference over the sweep, up to about ten seconds for a
+//!   development task.
+//!
+//! A cancel during measuring stops it, and the call then ends as
+//! interrupted with nothing written ([`crate::iterate`]).
 //!
 //! A cost is a function of the program's text, its task and the harness:
 //! a library only grows, so a program's text names the same definitions in
 //! every later iteration. A member whose text was in the task's frontier
-//! before keeps the cost it had, unless that was
-//! [`ProgramCost::NotMeasured`]. A run is served by one build (the prelude's
+//! before keeps the cost it had if that was [`ProgramCost::Measured`] or
+//! [`ProgramCost::Incorrect`]. Otherwise it is measured again: a refusal can
+//! come from a failure that does not recur. A run is served by one build (the prelude's
 //! fingerprint must match), so the harness is the same; a run served by a
 //! build with another harness or estimator keeps the earlier build's costs
 //! for programs it does not measure again.
@@ -65,6 +73,19 @@ use crate::state::{
 };
 use crate::verify::{task, Verifier};
 
+#[cfg(test)]
+thread_local! {
+    /// How many programs this thread has started to measure, for tests.
+    static STARTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many programs this thread has started to measure. Tests use it to
+/// see that a call measured, or did not.
+#[cfg(test)]
+pub(crate) fn started() -> u64 {
+    STARTED.with(std::cell::Cell::get)
+}
+
 /// How long [`crate::iterate`] measures the frontiers of one iteration
 /// before it records the rest as not measured.
 pub const MEASURE_BUDGET: Duration = Duration::from_secs(600);
@@ -84,15 +105,18 @@ pub const CANCELLED: &str = "the call was cancelled while frontiers were measure
 /// The task is not a development task, has no reference over the whole
 /// sweep, or its reference fails; the text says which.
 pub fn fuel_plan(name: &str) -> Result<Arc<FuelPlan>, String> {
-    type Plans = Mutex<BTreeMap<String, Result<Arc<FuelPlan>, String>>>;
+    type Plans = Mutex<BTreeMap<String, Arc<FuelPlan>>>;
     static PLANS: OnceLock<Plans> = OnceLock::new();
     let plans = PLANS.get_or_init(Plans::default);
-    // Held while a plan is made, so two threads do not both make it.
+    // Held while a plan is made, so two threads do not both make it. A plan
+    // that could not be made is not kept, so the next call tries again.
     let mut plans = plans.lock().unwrap_or_else(PoisonError::into_inner);
-    plans
-        .entry(name.to_owned())
-        .or_insert_with(|| make_plan(name).map(Arc::new))
-        .clone()
+    if let Some(plan) = plans.get(name) {
+        return Ok(Arc::clone(plan));
+    }
+    let plan = Arc::new(make_plan(name)?);
+    plans.insert(name.to_owned(), Arc::clone(&plan));
+    Ok(plan)
 }
 
 fn make_plan(name: &str) -> Result<FuelPlan, String> {
@@ -166,6 +190,13 @@ fn measure_unguarded(
         Err(e) => return refused(format!("the program does not expand: {e}")),
     };
     let config = HarnessConfig::default();
+    if stop() {
+        return ProgramCost::NotMeasured {
+            reason: stopped.to_owned(),
+        };
+    }
+    #[cfg(test)]
+    STARTED.with(|s| s.set(s.get() + 1));
     let passed = match check_examples(&*family, v.arena(), term, &config) {
         Ok(passed) => passed,
         Err(e) => return refused(format!("the program fails its task's checks: {e:?}")),
@@ -271,8 +302,8 @@ impl Stopper<'_> {
 /// step's order), with their costs. `library` is the library the programs
 /// were written against: the run's, with the step's new abstractions.
 /// `previous` is each task's frontier before the step; a member whose text
-/// was there keeps its cost, unless it was not measured. See the module
-/// docs.
+/// was there keeps its cost if it was measured or incorrect. See the
+/// module docs.
 pub fn measure_frontiers(
     library: &[LibraryEntry],
     kept: &BTreeMap<String, Vec<String>>,
@@ -293,7 +324,12 @@ pub fn measure_frontiers(
                 .iter()
                 .find(|m| &m.program == program)
                 .and_then(|m| m.cost.clone())
-                .filter(|c| !matches!(c, ProgramCost::NotMeasured { .. }));
+                .filter(|c| {
+                    matches!(
+                        c,
+                        ProgramCost::Measured { .. } | ProgramCost::Incorrect { .. }
+                    )
+                });
             let cost = match (known, &verifier) {
                 (Some(cost), _) => cost,
                 (None, Err(e)) => ProgramCost::Refused {

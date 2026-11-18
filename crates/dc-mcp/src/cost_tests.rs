@@ -128,7 +128,8 @@ fn the_pilot_runs_frontier_programs_get_the_expected_classes() {
             assert!(size.failed.is_none());
             let mut sorted = size.steps.clone();
             sorted.sort_unstable();
-            assert_eq!(size.median, Some(sorted[sorted.len() / 2]));
+            // The lower median, as dc_tasks::growth::median_steps takes it.
+            assert_eq!(size.median, Some(sorted[(sorted.len() - 1) / 2]));
         }
     }
 }
@@ -245,10 +246,13 @@ fn a_deadline_inside_a_sweep_stops_it() {
 }
 
 #[test]
-fn a_member_kept_from_the_previous_frontier_keeps_its_cost_unless_not_measured() {
+fn a_member_kept_from_the_previous_frontier_keeps_only_a_cost_that_measuring_gives_again() {
     let task = "collapse/cancel";
-    let marked = ProgramCost::Refused {
-        reason: "a cost from before".to_owned(),
+    // A cost no measuring gives, so that keeping it is seen.
+    let marked = ProgramCost::Incorrect {
+        sizes: Vec::new(),
+        n: 0,
+        seed: 99,
     };
     let previous = BTreeMap::from([(
         task.to_owned(),
@@ -263,19 +267,28 @@ fn a_member_kept_from_the_previous_frontier_keeps_its_cost_unless_not_measured()
                     reason: OUT_OF_TIME.to_owned(),
                 }),
             },
+            FrontierMember {
+                program: "(lam (lib_4294901767 $0))".to_owned(),
+                cost: Some(ProgramCost::Refused {
+                    reason: "a failure that need not recur".to_owned(),
+                }),
+            },
         ],
     )]);
     let programs = [
         PILOT[2].1,
         "(lam (lib_4294901767 (lib_4294901767 (lib_4294901767 $0))))",
+        "(lam (lib_4294901767 $0))",
     ];
     let out = measure_frontiers(&[], &kept(task, &programs), &previous, never());
     let members = &out[task];
     assert_eq!(members[0].cost, Some(marked));
-    // Measured again: it was not measured before. Reversing three times
-    // is not cancel's collapse, so it fails the examples.
-    assert!(matches!(
-        members[1].cost,
-        Some(ProgramCost::Refused { ref reason }) if reason.contains("checks")
-    ));
+    // Measured again: they were not measured, or were refused, before.
+    // Reversing is not cancel's collapse, so they fail the examples.
+    for m in &members[1..] {
+        assert!(
+            matches!(&m.cost, Some(ProgramCost::Refused { reason }) if reason.contains("checks")),
+            "{m:?}"
+        );
+    }
 }

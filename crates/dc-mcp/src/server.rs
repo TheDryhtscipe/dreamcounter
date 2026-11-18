@@ -919,8 +919,9 @@ impl DcServer {
                        growth sweep (dc_frontiers reports it), and starts the next iteration, \
                        all in one change to the run. The call first measures every program's \
                        size, then waits for Stitch for at most the run's stitch.wall_seconds, \
-                       then measures the kept programs' cost for at most 10 minutes (a program \
-                       not reached is recorded as not measured), then checks what \
+                       then measures the kept programs' cost, starting no program's run after \
+                       10 minutes (a program not reached is recorded as not measured), then \
+                       checks what \
                        proposers submitted meanwhile, up to 8 times. If Stitch is stopped at a \
                        limit the iteration still ends, with the library unchanged. If you \
                        cancel the call before its change is written, Stitch stops and the run \

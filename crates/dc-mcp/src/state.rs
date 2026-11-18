@@ -233,7 +233,9 @@ pub enum ProgramCost {
         seed: u64,
     },
     /// The program could not be run on the sweep: it did not expand, or it
-    /// failed its task's type or examples, or the task has no fuel plan.
+    /// failed its task's type or examples, or the task has no fuel plan, or
+    /// measuring it failed. The next iteration that keeps it measures it
+    /// again.
     Refused {
         /// Why.
         reason: String,
@@ -252,8 +254,9 @@ pub enum ProgramCost {
 pub struct SizeCost {
     /// The input size.
     pub n: u64,
-    /// The fuel of each run: ten times the task's reference at this size,
-    /// within the harness's cap.
+    /// The fuel of each run, from the task's fuel plan: ten times the
+    /// reference's steps at this size, within the harness's cap, or the cap
+    /// if the reference did not finish within it.
     pub fuel: u64,
     /// The step count of each seed, in seed order, if every seed finished
     /// with the right output; otherwise empty.

@@ -767,6 +767,51 @@ fn a_cancel_that_comes_when_no_worker_runs_still_stops_the_commit() {
 }
 
 #[test]
+fn a_cancel_stops_measuring_and_an_uncancelled_call_measures() {
+    // No library learning, so no Stitch worker starts and the flag is
+    // first read by measuring.
+    let setup_run = || {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let run = RunId::new("r").unwrap();
+        let settings = RunConfig {
+            library_learning: false,
+            ..config(1, shipped_prelude())
+        };
+        let tasks = TASKS.iter().map(|t| (*t).to_owned()).collect();
+        store.create_run(&run, settings, tasks).unwrap();
+        fill_with(&store, &run, 0, |task, _| solution(task, 1));
+        (dir, store, run)
+    };
+    let (dir, store, run) = setup_run();
+    let before = journal(&dir);
+    let cancel = AtomicBool::new(true);
+    let started = crate::cost::started();
+    let stopped = finish_iteration_in_worker(&store, &run, &sleeper(), &cancel).unwrap_err();
+    assert!(
+        matches!(stopped, FinishError::Interrupted(_)),
+        "{stopped:?}"
+    );
+    assert_eq!(crate::cost::started(), started, "no program was measured");
+    assert_eq!(journal(&dir), before);
+
+    // The same call, not cancelled, measures every kept program within the
+    // server's budget.
+    let (_dir, store, run) = setup_run();
+    let cancel = AtomicBool::new(false);
+    finish_iteration_in_worker(&store, &run, &sleeper(), &cancel).unwrap();
+    assert_eq!(crate::cost::started(), started + TASKS.len() as u64);
+    for members in kept(&store, &run, 0).values() {
+        assert!(
+            members
+                .iter()
+                .all(|m| matches!(m.cost, Some(ProgramCost::Measured { .. }))),
+            "{members:?}"
+        );
+    }
+}
+
+#[test]
 fn a_step_on_a_run_that_was_removed_and_made_again_writes_nothing() {
     let (dir, store, run) = setup(1);
     fill(&store, &run, 0);
