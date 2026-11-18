@@ -200,12 +200,12 @@ const MEMORY_SLACK: u64 = 64 << 10;
 
 #[test]
 fn default_limits_bound_one_runaway_run() {
-    // One run's heap, beyond its inputs, is at most `max_memory` plus a few
-    // kilobytes: the evaluator checks the limit before each step and inside
-    // the steps that build a whole collection. Fuel alone does not bound it:
+    // One run's heap, beyond its inputs, is at most `max_memory` plus what
+    // one step allocates unchecked: the evaluator checks the limit before
+    // each step and before each buffer a step grows with its data. Fuel alone does not bound it:
     // at the default fuel cap the array_set runaway would hold about 15 GB.
     let c = HarnessConfig::default();
-    assert_eq!(DEFAULT_MAX_MEMORY, 2 << 30);
+    assert_eq!(DEFAULT_MAX_MEMORY, 512 << 20);
     assert_eq!(c.max_memory, DEFAULT_MAX_MEMORY);
     assert_eq!(c.max_fuel, DEFAULT_MAX_FUEL);
     assert!(c.example_fuel <= c.max_fuel);

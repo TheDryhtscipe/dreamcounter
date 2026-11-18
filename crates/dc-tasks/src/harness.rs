@@ -78,14 +78,15 @@ pub const DEFAULT_FUEL_MULTIPLIER: u64 = 10;
 /// memory well: a program that keeps every version of an array it updates
 /// holds about 300 bytes per step. [`DEFAULT_MAX_MEMORY`] does.
 pub const DEFAULT_MAX_FUEL: u64 = 50_000_000;
-/// The default memory limit for one run, in bytes: 2 GiB.
+/// The default memory limit for one run, in bytes: 512 MiB.
 ///
 /// It bounds the heap one run holds beyond its inputs ([`Limits::memory`]):
 /// the evaluator stops the run before it would go over, and what it can
 /// still allocate unchecked is what one step allocates, at most 64 KiB in
 /// `dc-eval`'s `tests/memory.rs` (`dc_eval::memory` says what and how). The
 /// corpus references stay far below it: a test process that runs all of them
-/// on their sweeps peaks at about 121 MB resident.
+/// on their sweeps peaks at about 121 MB resident, and the slowest gate runs
+/// measured (the chains gate, up to 300M steps) hold at most 95 MB.
 ///
 /// The resident memory of the process can be higher. The system allocator
 /// keeps memory a thread has freed for that thread, so each thread that has
@@ -93,7 +94,7 @@ pub const DEFAULT_MAX_FUEL: u64 = 50_000_000;
 /// after the run ends. A process whose runs go on in `k` threads, at once or
 /// one after another, such as `dc-mcp`'s blocking tasks, can need `k` times
 /// this. Raise or lower it to fit the machine.
-pub const DEFAULT_MAX_MEMORY: u64 = 2 << 30;
+pub const DEFAULT_MAX_MEMORY: u64 = 512 << 20;
 /// The default fuel for one example run. Examples are small; this stops a
 /// non-terminating candidate (`unfold` can loop) early.
 pub const DEFAULT_EXAMPLE_FUEL: u64 = 10_000_000;
