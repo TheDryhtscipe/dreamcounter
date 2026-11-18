@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::proposer::{next_batch, submit, Refused};
-use crate::state::{Arm, RunConfig, Standing};
+use crate::state::{Arm, CostVerdict, ProgramCost, RunConfig, Standing};
 
 const MERGE: &str = "collapse/merge";
 const CANCEL: &str = "collapse/cancel";
@@ -235,6 +235,91 @@ fn ending_an_iteration_commits_the_whole_step_as_one_record() {
     let again = finish_iteration(&store, &run, &mut InProcess).unwrap();
     assert_eq!(again.iteration, 1);
     assert_eq!(store.read(&run, RunState::iteration).unwrap(), 2);
+}
+
+/// Each task's kept programs and their costs, as the run's state holds them
+/// after `iteration` ended.
+fn kept(store: &Store, run: &RunId, iteration: u64) -> BTreeMap<String, Vec<FrontierMember>> {
+    store
+        .read(run, |s| s.kept_frontiers(iteration).cloned().unwrap())
+        .unwrap()
+}
+
+fn programs(kept: &BTreeMap<String, Vec<FrontierMember>>) -> BTreeMap<String, Vec<String>> {
+    kept.iter()
+        .map(|(t, ms)| (t.clone(), ms.iter().map(|m| m.program.clone()).collect()))
+        .collect()
+}
+
+#[test]
+fn the_kept_programs_are_measured_and_measuring_changes_nothing_else() {
+    // Two runs filled alike; one has no time to measure.
+    let (_d1, measured, run) = setup(2);
+    let (_d2, unmeasured, _) = setup(2);
+    fill(&measured, &run, 0);
+    fill(&unmeasured, &run, 0);
+    let a = finish_iteration(&measured, &run, &mut InProcess).unwrap();
+    let b =
+        finish_iteration_with_budget(&unmeasured, &run, &mut InProcess, Duration::ZERO).unwrap();
+    assert_eq!(a, b, "the step's outcome does not depend on measuring");
+    let with = kept(&measured, &run, 0);
+    let without = kept(&unmeasured, &run, 0);
+    assert_eq!(programs(&with), programs(&without));
+    assert_eq!(
+        measured.read(&run, |s| s.library().to_vec()).unwrap(),
+        unmeasured.read(&run, |s| s.library().to_vec()).unwrap()
+    );
+    assert!(a.new_abstractions > 0);
+
+    // Every member was measured, under the library with the step's new
+    // abstractions: some kept programs use them.
+    let mut uses_new = 0;
+    for (task, members) in &with {
+        assert_eq!(members.len(), K as usize, "{task}");
+        for m in members {
+            let Some(ProgramCost::Measured { verdict, sizes }) = &m.cost else {
+                panic!("{task}: {:?}", m.cost);
+            };
+            assert!(
+                matches!(verdict, CostVerdict::Class(_)),
+                "{task}: {verdict:?}"
+            );
+            assert!(
+                sizes.iter().all(|s| s.median.is_some()),
+                "{task}: {sizes:?}"
+            );
+            uses_new += usize::from((0..a.new_abstractions).any(|i| {
+                m.program.contains(&format!("lib_{i} ")) || m.program.contains(&format!("lib_{i})"))
+            }));
+        }
+    }
+    assert!(uses_new > 0, "{with:?}");
+    for members in without.values() {
+        for m in members {
+            assert_eq!(
+                m.cost,
+                Some(ProgramCost::NotMeasured {
+                    reason: crate::cost::OUT_OF_TIME.to_owned()
+                })
+            );
+        }
+    }
+
+    // The next iteration measures what was not measured, and keeps the
+    // costs of programs it measured before.
+    fill(&measured, &run, 10_000);
+    fill(&unmeasured, &run, 10_000);
+    finish_iteration(&measured, &run, &mut InProcess).unwrap();
+    finish_iteration(&unmeasured, &run, &mut InProcess).unwrap();
+    let with = kept(&measured, &run, 1);
+    let caught_up = kept(&unmeasured, &run, 1);
+    assert_eq!(with, caught_up);
+    assert!(with
+        .values()
+        .flatten()
+        .all(|m| matches!(m.cost, Some(ProgramCost::Measured { .. }))));
+    // Iteration 0's frontiers are still there to read.
+    assert_eq!(programs(&kept(&measured, &run, 0)), programs(&without));
 }
 
 #[test]

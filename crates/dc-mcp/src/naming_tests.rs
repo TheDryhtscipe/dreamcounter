@@ -311,6 +311,7 @@ fn the_job_shows_frontier_programs_that_use_the_function() {
                 task: MERGE.into(),
                 members: vec![FrontierMember {
                     program: "(lam (lib_0 $0))".into(),
+                    cost: None,
                 }],
             }],
         )

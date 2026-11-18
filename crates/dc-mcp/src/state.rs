@@ -196,11 +196,150 @@ pub struct LibraryEntry {
 }
 
 /// One program in a task's frontier.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FrontierMember {
     /// The program, a core term as an s-expression (`dc_core::sexpr`).
     pub program: String,
+    /// What the program costs on its task's sweep, measured when the
+    /// iteration that kept it ended (`crate::cost`). `None` in a run made
+    /// before costs were measured. It plays no part in which programs are
+    /// kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<ProgramCost>,
+}
+
+/// What a frontier program costs on its task's sweep (`crate::cost`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProgramCost {
+    /// The program ran at every size of the sweep, and every run that
+    /// finished gave the right output.
+    Measured {
+        /// Each size of the sweep, in order.
+        sizes: Vec<SizeCost>,
+        /// Estimator C's verdict, with its default settings.
+        verdict: CostVerdict,
+    },
+    /// The program gave a wrong output or a runtime error on a generated
+    /// input. It passed its task's examples, but it is not a solution, so it
+    /// gets no verdict.
+    Incorrect {
+        /// Each size of the sweep, in order.
+        sizes: Vec<SizeCost>,
+        /// The smallest size with such a failure.
+        n: u64,
+        /// The seed that failed there.
+        seed: u64,
+    },
+    /// The program could not be run on the sweep: it did not expand, or it
+    /// failed its task's type or examples, or the task has no fuel plan.
+    Refused {
+        /// Why.
+        reason: String,
+    },
+    /// The program was not measured: the time for measuring ran out, or the
+    /// call was cancelled. The next iteration that keeps it measures it.
+    NotMeasured {
+        /// Why.
+        reason: String,
+    },
+}
+
+/// One size of a frontier program's sweep.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SizeCost {
+    /// The input size.
+    pub n: u64,
+    /// The fuel of each run: ten times the task's reference at this size,
+    /// within the harness's cap.
+    pub fuel: u64,
+    /// The step count of each seed, in seed order, if every seed finished
+    /// with the right output; otherwise empty.
+    pub steps: Vec<u64>,
+    /// The median of `steps`, if there are any.
+    pub median: Option<u64>,
+    /// The first seed that failed at this size, and how. Later seeds were
+    /// not run.
+    pub failed: Option<SizeFailure>,
+}
+
+/// The first failed run at one size of a sweep.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SizeFailure {
+    /// The seed.
+    pub seed: u64,
+    /// How it failed.
+    pub kind: FailureKind,
+}
+
+/// How a run on the sweep failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    /// It used all its fuel. This is a result, not an error.
+    Timeout,
+    /// It stopped with a runtime error.
+    Error,
+    /// It finished with the wrong output.
+    WrongOutput,
+}
+
+/// Estimator C's verdict on a sweep (`dc_tasks::growth::ClassVerdict`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum CostVerdict {
+    /// C names this class.
+    Class(CostClass),
+    /// The medians are too noisy to name a class. `best` has the smallest
+    /// misfit.
+    TooNoisy {
+        /// The class with the smallest misfit.
+        best: CostClass,
+    },
+    /// Some size has one seed, so the noise is unknown.
+    NoiseUnknown {
+        /// The class with the smallest misfit.
+        best: CostClass,
+    },
+    /// No class fits: the growth is between classes or outside them.
+    NoFit {
+        /// The class with the smallest misfit.
+        best: CostClass,
+    },
+    /// C did not fit the sweep, for example because sizes timed out.
+    NotFitted {
+        /// C's reason.
+        reason: String,
+    },
+}
+
+/// A growth class of estimator C (`dc_tasks::growth::GrowthClass`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum CostClass {
+    /// `1`.
+    #[serde(rename = "1")]
+    Constant,
+    /// `log n`.
+    #[serde(rename = "log n")]
+    Log,
+    /// `n`.
+    #[serde(rename = "n")]
+    Linear,
+    /// `n log n`.
+    #[serde(rename = "n log n")]
+    NLogN,
+    /// `n²`.
+    #[serde(rename = "n^2")]
+    Quadratic,
+    /// `n³`.
+    #[serde(rename = "n^3")]
+    Cubic,
+    /// `2ⁿ`.
+    #[serde(rename = "2^n")]
+    Exponential,
 }
 
 /// What a log record holds.
@@ -922,6 +1061,7 @@ pub struct RunState {
     tasks: Vec<String>,
     library: Vec<LibraryEntry>,
     frontiers: BTreeMap<String, Vec<FrontierMember>>,
+    kept: ByIteration<BTreeMap<String, Vec<FrontierMember>>>,
     iteration: u64,
     log_counts: BTreeMap<LogKind, u64>,
     batches: Batches,
@@ -998,6 +1138,7 @@ impl RunState {
             tasks,
             library: Vec::new(),
             frontiers,
+            kept: ByIteration::default(),
             iteration: 0,
             log_counts: BTreeMap::new(),
             batches: Batches::default(),
@@ -1065,6 +1206,9 @@ impl RunState {
             Event::FrontierSet { task, members } => {
                 self.check_task(task)?;
                 self.frontiers.insert(task.clone(), members.clone());
+                self.kept
+                    .entry(self.iteration)
+                    .insert(task.clone(), members.clone());
             }
             Event::LibraryExtended { entries } => {
                 if !self.config.library_learning {
@@ -1533,6 +1677,13 @@ impl RunState {
         self.frontiers.get(task).map(Vec::as_slice)
     }
 
+    /// The frontiers set while `iteration` was the current iteration: the
+    /// programs the step that ended it kept, by task, with their costs.
+    /// `None` if no frontier was set then, as before the iteration ends.
+    pub fn kept_frontiers(&self, iteration: u64) -> Option<&BTreeMap<String, Vec<FrontierMember>>> {
+        self.kept.get(iteration)
+    }
+
     /// The current iteration. The first is 0.
     pub fn iteration(&self) -> u64 {
         self.iteration
@@ -1850,6 +2001,7 @@ mod tests {
 
         let member = FrontierMember {
             program: "(lam 0)".into(),
+            cost: None,
         };
         s.apply(&Event::FrontierSet {
             task: "a".into(),

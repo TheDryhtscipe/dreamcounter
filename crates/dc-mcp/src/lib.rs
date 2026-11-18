@@ -15,13 +15,14 @@
 //! * [`prompt`]: the payload handed to a proposer.
 //! * [`proposer`]: handing out batches and taking in submissions.
 //! * [`iterate`]: ending an iteration with the step of `dc_driver`.
+//! * [`cost`]: measuring what frontier programs cost on their task's sweep.
 //!
 //! # Tools
 //!
 //! The binary serves one of two tool sets. The operator's server
 //! (`dc-mcp --state-dir <dir>`) has `dc_create_run`, `dc_run_status`,
-//! `dc_proposal_stats`, `dc_check_pending`, `dc_finish_iteration`,
-//! `dc_add_note`, and `dc_list_runs`. They show a run's
+//! `dc_proposal_stats`, `dc_frontiers`, `dc_check_pending`,
+//! `dc_finish_iteration`, `dc_add_note`, and `dc_list_runs`. They show a run's
 //! library, frontier sizes and results, which a proposer in the blind arm must
 //! not see. A proposer's server serves one run in one mode and has only that
 //! mode's two tools: `dc-mcp --state-dir <dir> --proposer <run>` has
@@ -32,6 +33,7 @@
 //! Started as `dc-mcp --stitch-worker`, the binary is the Stitch worker
 //! process of `dc_finish_iteration` and serves nothing (see [`iterate`]).
 
+pub mod cost;
 pub mod iterate;
 pub mod journal;
 pub mod naming;

@@ -865,6 +865,7 @@ mod tests {
                             task: CANCEL.into(),
                             members: vec![crate::state::FrontierMember {
                                 program: "(lam $0)".into(),
+                                cost: None,
                             }],
                         }],
                     )

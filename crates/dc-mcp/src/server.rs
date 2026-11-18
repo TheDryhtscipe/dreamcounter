@@ -33,7 +33,7 @@ use crate::iterate::{finish_iteration_in_worker, WorkerStart};
 use crate::naming::{next_naming_job, submit_naming, NamingReceipt, NextNamingJob};
 use crate::proposer::{check_pending, next_batch, submit, Clock, NextBatch, Receipt, Refused};
 use crate::state::{
-    Arm, Event, LogKind, LogRecord, RunConfig, RunId, RunState, StitchSettings,
+    Arm, Event, FrontierMember, LogKind, LogRecord, RunConfig, RunId, RunState, StitchSettings,
     DEFAULT_MAX_UNCHECKED_PER_BATCH, MIN_STITCH_MEMORY_BYTES,
 };
 use crate::store::{Refusals, Store, StoreError};
@@ -407,6 +407,82 @@ pub struct FinishReport {
     pub status: RunStatus,
 }
 
+/// The arguments of `dc_frontiers`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FrontiersArg {
+    /// The run's id.
+    pub run: String,
+    /// The iteration whose frontiers to report. Every finished iteration if
+    /// it is left out.
+    pub iteration: Option<u64>,
+}
+
+/// The result of `dc_frontiers`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FrontiersReport {
+    /// The run's id.
+    pub run: String,
+    /// Each finished iteration asked for, in order.
+    pub iterations: Vec<IterationFrontiers>,
+}
+
+/// The frontiers the step that ended an iteration kept.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct IterationFrontiers {
+    /// The iteration.
+    pub iteration: u64,
+    /// Each task's frontier, in the run's task order.
+    pub tasks: Vec<TaskFrontier>,
+}
+
+/// One task's frontier.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TaskFrontier {
+    /// The task.
+    pub task: String,
+    /// The kept programs, best first, each with what it costs on the task's
+    /// sweep. `cost` is left out for a run made before costs were measured.
+    pub members: Vec<FrontierMember>,
+}
+
+impl FrontiersReport {
+    /// The frontiers of `iteration`, or of every finished iteration.
+    fn of(run: &RunId, state: &RunState, iteration: Option<u64>) -> Result<Self, String> {
+        let wanted: Vec<u64> = match iteration {
+            Some(i) if i >= state.iteration() => {
+                return Err(format!(
+                    "iteration {i} has not finished; the run is in iteration {}",
+                    state.iteration()
+                ))
+            }
+            Some(i) => vec![i],
+            None => (0..state.iteration()).collect(),
+        };
+        let iterations = wanted
+            .into_iter()
+            .map(|i| {
+                let kept = state.kept_frontiers(i);
+                IterationFrontiers {
+                    iteration: i,
+                    tasks: state
+                        .tasks()
+                        .iter()
+                        .map(|t| TaskFrontier {
+                            task: t.clone(),
+                            members: kept.and_then(|k| k.get(t)).cloned().unwrap_or_default(),
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        Ok(FrontiersReport {
+            run: run.as_str().to_owned(),
+            iterations,
+        })
+    }
+}
+
 /// The result of `dc_proposal_stats`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ProposalStats {
@@ -774,6 +850,32 @@ impl DcServer {
         .await
     }
 
+    /// Reports each finished iteration's frontiers and what they cost.
+    #[tool(
+        name = "dc_frontiers",
+        description = "Report the frontiers of a DreamCounter run: for each finished iteration, \
+                       or the one given, each task's kept programs, best first, as core text, \
+                       each with its cost on the task's growth sweep. The cost is measured when \
+                       the iteration ends: the step counts of each seed at each size, their \
+                       median, and estimator C's growth class (or why it names none). A program \
+                       is incorrect if it fails a generated input, and not measured if the \
+                       time for measuring ran out. Read only."
+    )]
+    async fn frontiers(
+        &self,
+        Parameters(arg): Parameters<FrontiersArg>,
+    ) -> Result<Json<FrontiersReport>, String> {
+        let run = run_id(&arg.run)?;
+        self.blocking(move |store| {
+            store
+                .read(&run, |state| {
+                    FrontiersReport::of(&run, state, arg.iteration)
+                })
+                .map_err(|e| e.to_string())?
+        })
+        .await
+    }
+
     /// Checks the submissions of a run that wait to be checked.
     #[tool(
         name = "dc_check_pending",
@@ -813,9 +915,12 @@ impl DcServer {
         description = "End the current iteration of a DreamCounter run, once every task has its \
                        programs and all are checked (quota_in in dc_run_status). It keeps each \
                        task's best programs as its frontier, runs Stitch on them to find new \
-                       abstractions for the library, and starts the next iteration, all in one \
-                       change to the run. The call first measures every program, then waits for \
-                       Stitch for at most the run's stitch.wall_seconds, then checks what \
+                       abstractions for the library, measures each kept program on its task's \
+                       growth sweep (dc_frontiers reports it), and starts the next iteration, \
+                       all in one change to the run. The call first measures every program's \
+                       size, then waits for Stitch for at most the run's stitch.wall_seconds, \
+                       then measures the kept programs' cost for at most 10 minutes (a program \
+                       not reached is recorded as not measured), then checks what \
                        proposers submitted meanwhile, up to 8 times. If Stitch is stopped at a \
                        limit the iteration still ends, with the library unchanged. If you \
                        cancel the call before its change is written, Stitch stops and the run \
