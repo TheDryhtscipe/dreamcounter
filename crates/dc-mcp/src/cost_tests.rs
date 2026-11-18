@@ -281,12 +281,27 @@ fn a_task_with_no_fuel_plan_refuses_its_programs_without_measuring_them() {
             "{m:?}"
         );
     }
-    assert_eq!(started(), before, "no program was measured");
+    assert_eq!(started(), before);
     assert_eq!(
         plans_tried(),
         tried + 1,
         "the plan was tried once in the call"
     );
+
+    // After the deadline, no plan is tried: the programs are not measured.
+    let tried = plans_tried();
+    let past = Limits {
+        deadline: Instant::now(),
+        cancel: None,
+    };
+    let out = measure_frontiers(&[], &kept("no/such", &[PILOT[2].1]), &BTreeMap::new(), past);
+    assert_eq!(
+        out["no/such"][0].cost,
+        Some(ProgramCost::NotMeasured {
+            reason: OUT_OF_TIME.to_owned()
+        })
+    );
+    assert_eq!(plans_tried(), tried);
 }
 
 #[test]
@@ -302,7 +317,8 @@ fn a_member_kept_from_the_previous_frontier_keeps_only_a_cost_that_measuring_giv
         sizes: Vec::new(),
         verdict: CostVerdict::Class(CostClass::Cubic),
     };
-    // Reversing twice: right on no input of cancel, but kept by its cost.
+    // Reversing twice: it fails cancel's examples, so only its kept cost
+    // can make it measured.
     let twice = "(lam (lib_4294901767 (lib_4294901767 $0)))";
     let previous = BTreeMap::from([(
         task.to_owned(),
