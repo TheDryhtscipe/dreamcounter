@@ -10,8 +10,9 @@
 //! on, under the default fuel cap. On a family with a gate (decision D25),
 //! a reference passes it if [`Reference::passes_gate`] says so, and
 //! otherwise runs out of the gate's fuel. By default
-//! (`good_references_at_every_size_others_at_the_lower_half`) the good
-//! reference runs at every size and the slower ones at the lower half of
+//! (`good_references_at_every_size_others_at_the_lower_half` for the
+//! families without a gate, and a test of the same shape for each gated
+//! family) the good reference runs at every size and the slower ones at the lower half of
 //! the sweep only, so a naive reference wrong only in the upper half passes
 //! it; `every_reference_at_every_size`, ignored by default, runs all of
 //! them at every size. An oracle wrong on the last seed only fails the run (see
@@ -253,13 +254,35 @@ fn the_corpus_holds_every_variant_once() {
 }
 
 /// The good references at every size and the others at the lower half of
-/// the sweep. The naive references at the upper half take most of the time
+/// the sweep, on the variants of the development corpus that `keep`
+/// accepts. The naive references at the upper half take most of the time
 /// of the whole run (about 14 CPU-minutes in release in November 2026), too
 /// long for every `cargo test`; [`every_reference_at_every_size`] runs them.
+fn lower_half_sweep(keep: fn(&CorpusVariant) -> bool) {
+    let config = corpus_config();
+    let errors = errors_of(
+        || families::development().into_iter().filter(keep).collect(),
+        |v| check_variant(v, &config, Coverage::LowerHalf),
+    );
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+/// The lower-half sweep of every family without a gate. The gated families
+/// have tests of their own below, as their gates take minutes of CPU, so
+/// that each can run in its own CI job (scripts/test-shard.sh).
 #[test]
 fn good_references_at_every_size_others_at_the_lower_half() {
-    let config = corpus_config();
-    for_every_variant(|v| check_variant(v, &config, Coverage::LowerHalf));
+    lower_half_sweep(|v| v.source != chains::SOURCE && v.source != dominance::SOURCE);
+}
+
+#[test]
+fn chain_variants_good_at_every_size_others_at_the_lower_half() {
+    lower_half_sweep(|v| v.source == chains::SOURCE);
+}
+
+#[test]
+fn dominance_variants_good_at_every_size_others_at_the_lower_half() {
+    lower_half_sweep(|v| v.source == dominance::SOURCE);
 }
 
 /// Every reference at every size it can finish at. Run with
