@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+dc-alloc.workspace = true
 dc-core.workspace = true
 imbl.workspace = true
 rustc-hash.workspace = true

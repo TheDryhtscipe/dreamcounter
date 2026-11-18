@@ -74,8 +74,14 @@ fn gate_turns_away_naive(v: Variant) {
     let good = compile(&mut arena, chains::SOURCE, v.good());
     for e in family.examples() {
         for p in [naive, good] {
-            run_on(&arena, p, &e.inputs, &e.output, DEFAULT_EXAMPLE_FUEL)
-                .unwrap_or_else(|f| panic!("{}: {f:?} on {:?}", family.name(), e.inputs));
+            run_on(
+                &arena,
+                p,
+                &e.inputs,
+                &e.output,
+                c.limits(DEFAULT_EXAMPLE_FUEL),
+            )
+            .unwrap_or_else(|f| panic!("{}: {f:?} on {:?}", family.name(), e.inputs));
         }
     }
     let passed = check_examples(&family, &arena, good, &c).expect("the good reference passes");
@@ -176,8 +182,14 @@ fn the_gate_turns_away_a_lean_quadratic_program() {
     let passed = check_examples(&family, &arena, p, &c).expect("it passes the examples");
     // Its steps at 1024 elements, for the record: about n^2 / 2 pairs.
     let input = dc_tasks::task::generate_input(&family, 1024, 0);
-    let steps = run_on(&arena, p, &input, &family.oracle(&input), GATE_FUEL)
-        .expect("it answers 1024 elements");
+    let steps = run_on(
+        &arena,
+        p,
+        &input,
+        &family.oracle(&input),
+        c.limits(GATE_FUEL),
+    )
+    .expect("it answers 1024 elements");
     println!(
         "LEAN at 1024: {steps} steps, {:.2} per pair",
         steps as f64 / (1024.0 * 1023.0 / 2.0)
@@ -422,8 +434,14 @@ fn the_gate_turns_away_a_program_that_is_quadratic_only_on_sorted_xs() {
     let passed = check_examples(&family, &arena, p, &c).expect("it passes the examples");
     let gate = family.gate().expect("a gate");
     let random = &gate.inputs[0];
-    let steps = run_on(&arena, p, &random.inputs, &random.output, GATE_FUEL)
-        .expect("it answers the random input");
+    let steps = run_on(
+        &arena,
+        p,
+        &random.inputs,
+        &random.output,
+        c.limits(GATE_FUEL),
+    )
+    .expect("it answers the random input");
     println!("QUICKSORT on the random gate input: {steps} steps");
     let sorted = GATE_INPUTS
         .iter()

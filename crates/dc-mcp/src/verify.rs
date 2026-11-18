@@ -398,6 +398,9 @@ fn describe(failure: &RunFailure) -> String {
         ),
         RunFailure::Error { kind, steps } => format!("runtime error {kind:?} after {steps} steps"),
         RunFailure::Timeout { fuel } => format!("no result within {fuel} steps"),
+        RunFailure::MemoryLimit { limit } => {
+            format!("no result within the memory limit of {limit} bytes")
+        }
     }
 }
 
@@ -410,7 +413,7 @@ fn describe_hidden(failure: &RunFailure) -> String {
     match failure {
         RunFailure::WrongOutput { .. } => "wrong output".to_owned(),
         RunFailure::Error { kind, .. } => format!("runtime error {kind:?}"),
-        RunFailure::Timeout { .. } => describe(failure),
+        RunFailure::Timeout { .. } | RunFailure::MemoryLimit { .. } => describe(failure),
     }
 }
 
@@ -517,6 +520,20 @@ mod tests {
         let c = v.check(&*family, text);
         assert!(
             matches!(&c, Check::Run { error } if error.contains("no result within")),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn a_program_over_the_memory_limit_is_a_run_failure() {
+        let (family, _, _) = merge();
+        let mut v = Verifier::new(&[]).unwrap();
+        v.harness.max_memory = 1 << 20;
+        let text = "let solve xs = loop 1000000000 xs (fun i acc -> i :: acc)";
+        let c = v.check(&*family, text);
+        assert!(
+            matches!(&c, Check::Run { error }
+                if error.ends_with("no result within the memory limit of 1048576 bytes")),
             "{c:?}"
         );
     }

@@ -20,10 +20,13 @@
 //!    the first failure at a size (timeout, runtime error, wrong output) is
 //!    recorded for that size and the sweep goes on to the next size. Nothing
 //!    is dropped: a timeout is a result, not a failure of the sweep.
+//!    Every run is also held to [`HarnessConfig::max_memory`]; a run that
+//!    goes over it counts as a timeout, since it too ran out of a resource.
 //! 4. The resulting [`Sweep`] feeds a [`GrowthEstimator`]; [`measure`] does
 //!    steps 1, 3 and 4 in one call. A wrong output or runtime error at any
 //!    size, inside the fit window or below it, makes the candidate
-//!    [`Measurement::Incorrect`] with no fit: only a timeout is not a failure.
+//!    [`Measurement::Incorrect`] with no fit: only a timeout (or a run over
+//!    the memory limit) is not a failure.
 //!
 //! The [`ExamplesPassed`] token and the [`FuelPlan`] carry the family's name,
 //! and the plan its number of seeds; [`run_sweep`] refuses them for another
@@ -43,7 +46,11 @@
 //! [`check_input_sizes`] checks that generated inputs have the size asked for.
 //!
 //! Every step count is a deterministic function of the program and the
-//! input, and every input of `(n, seed)`, so a sweep repeats exactly.
+//! input, and every input of `(n, seed)`, so a sweep repeats exactly. The one
+//! exception is [`RunFailure::MemoryLimit`]: where a run goes over the memory
+//! limit depends on the sizes of the evaluator's data structures, so it can
+//! move with the platform or a dependency's version. Under the default limit
+//! it stops only runaway programs.
 //!
 //! Candidates must be closed and fully expanded: the type check uses no
 //! library abstractions, and the evaluator refuses unexpanded ones.
@@ -52,7 +59,7 @@ use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 
 use dc_core::{types, Arena, Scheme, TermId, TypeError};
-use dc_eval::{apply, ErrorKind, Outcome, Value};
+use dc_eval::{apply_within, ErrorKind, Limits, Outcome, Value};
 
 use crate::growth::{
     GrowthError, GrowthEstimator, GrowthFit, PowerLogGrid, SizeObservation, Sweep,
@@ -65,13 +72,29 @@ pub const DEFAULT_SEEDS: u64 = 5;
 pub const DEFAULT_FUEL_MULTIPLIER: u64 = 10;
 /// The default global cap on fuel for one run.
 ///
-/// The evaluator has no memory bound, so fuel is the only bound on memory: a
-/// non-terminating `unfold` allocates about 16 bytes per step, so this cap
-/// holds one runaway candidate to about 800 MB. A family whose reference
-/// needs more than a tenth of this at its largest sizes gets less than ten
-/// times the reference's steps there; such families declare smaller sweeps,
-/// or a caller raises the cap on a machine that has the memory.
+/// A family whose reference needs more than a tenth of this at its largest
+/// sizes gets less than ten times the reference's steps there; such families
+/// declare smaller sweeps, or a caller raises the cap. Fuel does not bound
+/// memory well: a program that keeps every version of an array it updates
+/// holds about 300 bytes per step. [`DEFAULT_MAX_MEMORY`] does.
 pub const DEFAULT_MAX_FUEL: u64 = 50_000_000;
+/// The default memory limit for one run, in bytes: 512 MiB.
+///
+/// It bounds the heap one run holds beyond its inputs ([`Limits::memory`]):
+/// the evaluator stops the run before it would go over, and what it can
+/// still allocate unchecked is what one step allocates, at most 64 KiB in
+/// `dc-eval`'s `tests/memory.rs` (`dc_eval::memory` says what and how). The
+/// corpus references stay far below it: a test process that runs all of them
+/// on their sweeps peaks at about 121 MB resident, and the slowest gate runs
+/// measured (the chains gate, up to 300M steps) hold at most 95 MB.
+///
+/// The resident memory of the process can be higher. The system allocator
+/// keeps memory a thread has freed for that thread, so each thread that has
+/// run a program up to the limit can keep up to about this much resident
+/// after the run ends. A process whose runs go on in `k` threads, at once or
+/// one after another, such as `dc-mcp`'s blocking tasks, can need `k` times
+/// this. Raise or lower it to fit the machine.
+pub const DEFAULT_MAX_MEMORY: u64 = 512 << 20;
 /// The default fuel for one example run. Examples are small; this stops a
 /// non-terminating candidate (`unfold` can loop) early.
 pub const DEFAULT_EXAMPLE_FUEL: u64 = 10_000_000;
@@ -79,13 +102,9 @@ pub const DEFAULT_EXAMPLE_FUEL: u64 = 10_000_000;
 ///
 /// It is above [`DEFAULT_MAX_FUEL`] because a gate must let an `n log² n`
 /// program finish at a size where an `n²` one cannot: the chain family's
-/// gate needs 500,000,000 steps (bead dreamcounter-4593ae). Memory grows
-/// with the cap: at about 16 bytes per step a runaway `unfold` on a gate
-/// input takes up to about 8 GB, an `array_tabulate` about 32 bytes per
-/// step (16 GB), and a loop that keeps every version of an array it
-/// updates with `array_set` about 300 bytes per step, about 150 GB at this
-/// cap, which this cap does not bound to the memory of a workstation (bead
-/// dreamcounter-a3db93).
+/// gate needs 500,000,000 steps (bead dreamcounter-4593ae). Fuel does not
+/// bound memory: a gate run is held to [`HarnessConfig::max_memory`] like
+/// any other (bead dreamcounter-a3db93).
 pub const DEFAULT_MAX_GATE_FUEL: u64 = 500_000_000;
 
 /// Harness settings.
@@ -102,6 +121,18 @@ pub struct HarnessConfig {
     /// The cap on fuel for one run on a gate input, in place of
     /// `max_fuel`.
     pub max_gate_fuel: u64,
+    /// The memory limit of any one run, in bytes ([`Limits::memory`]).
+    pub max_memory: u64,
+}
+
+impl HarnessConfig {
+    /// The limits of one run with `fuel` steps.
+    pub fn limits(&self, fuel: u64) -> Limits {
+        Limits {
+            fuel,
+            memory: self.max_memory,
+        }
+    }
 }
 
 impl Default for HarnessConfig {
@@ -112,6 +143,7 @@ impl Default for HarnessConfig {
             max_fuel: DEFAULT_MAX_FUEL,
             example_fuel: DEFAULT_EXAMPLE_FUEL,
             max_gate_fuel: DEFAULT_MAX_GATE_FUEL,
+            max_memory: DEFAULT_MAX_MEMORY,
         }
     }
 }
@@ -139,6 +171,23 @@ pub enum RunFailure {
         /// The fuel it had.
         fuel: u64,
     },
+    /// The program held more memory than its limit. Like a timeout, this is
+    /// a result, not a fault of the program.
+    MemoryLimit {
+        /// The limit, in bytes.
+        limit: u64,
+    },
+}
+
+impl RunFailure {
+    /// Whether the run ran out of a resource (fuel or memory) rather than
+    /// giving a wrong output or a runtime error.
+    pub fn is_resource_limit(&self) -> bool {
+        matches!(
+            self,
+            RunFailure::Timeout { .. } | RunFailure::MemoryLimit { .. }
+        )
+    }
 }
 
 /// Why a program failed a check.
@@ -175,20 +224,21 @@ pub enum CheckFailure {
     },
 }
 
-/// Runs `program` on `inputs` with `fuel` and compares the result with
+/// Runs `program` on `inputs` within `limits` and compares the result with
 /// `expected`. Returns the exact step count on success.
 ///
 /// # Errors
 ///
-/// The [`RunFailure`] if the result differs, or the run errs or times out.
+/// The [`RunFailure`] if the result differs, or the run errs, times out or
+/// goes over its memory limit.
 pub fn run_on(
     arena: &Arena,
     program: TermId,
     inputs: &[Value],
     expected: &Value,
-    fuel: u64,
+    limits: Limits,
 ) -> Result<u64, RunFailure> {
-    match apply(arena, program, inputs, fuel) {
+    match apply_within(arena, program, inputs, limits) {
         Outcome::Value(actual, steps) => {
             if actual == *expected {
                 Ok(steps)
@@ -200,7 +250,10 @@ pub fn run_on(
             }
         }
         Outcome::Error(kind, steps) => Err(RunFailure::Error { kind, steps }),
-        Outcome::Timeout(_) => Err(RunFailure::Timeout { fuel }),
+        Outcome::Timeout(_) => Err(RunFailure::Timeout { fuel: limits.fuel }),
+        Outcome::MemoryLimit(_) => Err(RunFailure::MemoryLimit {
+            limit: limits.memory,
+        }),
     }
 }
 
@@ -453,8 +506,14 @@ pub fn check_examples<F: TaskFamily + ?Sized>(
     types::check(arena, program, no_libs, &family.signature()).map_err(CheckFailure::Type)?;
     let fuel = config.example_fuel.min(config.max_fuel);
     for (index, example) in family.examples().iter().enumerate() {
-        run_on(arena, program, &example.inputs, &example.output, fuel)
-            .map_err(|failure| CheckFailure::Example { index, failure })?;
+        run_on(
+            arena,
+            program,
+            &example.inputs,
+            &example.output,
+            config.limits(fuel),
+        )
+        .map_err(|failure| CheckFailure::Example { index, failure })?;
     }
     Ok(ExamplesPassed {
         program,
@@ -484,8 +543,14 @@ pub fn check_gate<F: TaskFamily + ?Sized>(
     let fuel = gate.fuel.min(config.max_gate_fuel);
     let mut most = 0;
     for (index, e) in gate.inputs.iter().enumerate() {
-        let steps = run_on(arena, passed.program(), &e.inputs, &e.output, fuel)
-            .map_err(|failure| CheckFailure::Gate { index, failure })?;
+        let steps = run_on(
+            arena,
+            passed.program(),
+            &e.inputs,
+            &e.output,
+            config.limits(fuel),
+        )
+        .map_err(|failure| CheckFailure::Gate { index, failure })?;
         most = most.max(steps);
     }
     Ok(Some(most))
@@ -506,8 +571,15 @@ pub fn check_generated<F: TaskFamily + ?Sized>(
 ) -> Result<(), CheckFailure> {
     for &n in sizes {
         for seed in 0..config.seeds {
-            run_generated(family, arena, program, n, seed, config.max_fuel)
-                .map_err(|failure| CheckFailure::Generated { n, seed, failure })?;
+            run_generated(
+                family,
+                arena,
+                program,
+                n,
+                seed,
+                config.limits(config.max_fuel),
+            )
+            .map_err(|failure| CheckFailure::Generated { n, seed, failure })?;
         }
     }
     Ok(())
@@ -520,11 +592,11 @@ fn run_generated<F: TaskFamily + ?Sized>(
     program: TermId,
     n: u64,
     seed: u64,
-    fuel: u64,
+    limits: Limits,
 ) -> Result<u64, RunFailure> {
     let inputs = generate_input(family, n, seed);
     let expected = family.oracle(&inputs);
-    run_on(arena, program, &inputs, &expected, fuel)
+    run_on(arena, program, &inputs, &expected, limits)
 }
 
 /// The fuel for one size of a sweep.
@@ -581,9 +653,16 @@ impl FuelPlan {
         for n in family.sizes() {
             let mut most: Option<u64> = Some(0);
             for seed in 0..config.seeds {
-                match run_generated(family, arena, reference, n, seed, config.max_fuel) {
+                match run_generated(
+                    family,
+                    arena,
+                    reference,
+                    n,
+                    seed,
+                    config.limits(config.max_fuel),
+                ) {
                     Ok(steps) => most = most.map(|m| m.max(steps)),
-                    Err(RunFailure::Timeout { .. }) => {
+                    Err(f) if f.is_resource_limit() => {
                         most = None;
                         break;
                     }
@@ -693,11 +772,8 @@ impl SweepReport {
     /// failure. `None` if every size completed correctly or timed out.
     pub fn first_incorrect(&self) -> Option<(u64, u64, &RunFailure)> {
         self.records.iter().find_map(|r| match &r.run {
-            SizeRun::Failed {
-                failure: RunFailure::Timeout { .. },
-                ..
-            }
-            | SizeRun::Completed { .. } => None,
+            SizeRun::Completed { .. } => None,
+            SizeRun::Failed { failure, .. } if failure.is_resource_limit() => None,
             SizeRun::Failed { seed, failure } => Some((r.n, *seed, failure)),
         })
     }
@@ -756,15 +832,16 @@ pub fn run_sweep_until<F: TaskFamily + ?Sized>(
     let mut records = Vec::with_capacity(plan.sizes.len());
     let mut observations = Vec::with_capacity(plan.sizes.len());
     for &SizeFuel { n, fuel, .. } in &plan.sizes {
-        let Some(run) = run_size(family, arena, passed.program, n, fuel, config.seeds, stop) else {
+        let limits = config.limits(fuel);
+        let Some(run) = run_size(family, arena, passed.program, n, limits, config.seeds, stop)
+        else {
             return Ok(None);
         };
         observations.push(match &run {
             SizeRun::Completed { steps } => SizeObservation::completed(n, steps.clone()),
-            SizeRun::Failed {
-                failure: RunFailure::Timeout { .. },
-                ..
-            } => SizeObservation::timed_out(n),
+            SizeRun::Failed { failure, .. } if failure.is_resource_limit() => {
+                SizeObservation::timed_out(n)
+            }
             SizeRun::Failed { .. } => SizeObservation::errored(n),
         });
         records.push(SizeRecord { n, fuel, run });
@@ -784,7 +861,7 @@ fn run_size<F: TaskFamily + ?Sized>(
     arena: &Arena,
     program: TermId,
     n: u64,
-    fuel: u64,
+    limits: Limits,
     seeds: u64,
     stop: &mut dyn FnMut() -> bool,
 ) -> Option<SizeRun> {
@@ -793,7 +870,7 @@ fn run_size<F: TaskFamily + ?Sized>(
         if stop() {
             return None;
         }
-        match run_generated(family, arena, program, n, seed, fuel) {
+        match run_generated(family, arena, program, n, seed, limits) {
             Ok(s) => steps.push(s),
             Err(failure) => return Some(SizeRun::Failed { seed, failure }),
         }

@@ -284,6 +284,10 @@ pub struct SizeFailure {
 pub enum FailureKind {
     /// It used all its fuel. This is a result, not an error.
     Timeout,
+    /// It held more memory than the harness's limit
+    /// (`dc_tasks::harness::HarnessConfig::max_memory`). Like a timeout, this
+    /// is a result, not an error.
+    MemoryLimit,
     /// It stopped with a runtime error.
     Error,
     /// It finished with the wrong output.
