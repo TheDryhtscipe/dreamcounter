@@ -540,7 +540,8 @@ mod tests {
                 for input in &e.inputs {
                     let xs = ints_of(input);
                     assert!(
-                        xs.windows(2).all(|w| if down { w[0] >= w[1] } else { w[0] <= w[1] }),
+                        xs.windows(2)
+                            .all(|w| if down { w[0] >= w[1] } else { w[0] <= w[1] }),
                         "{}",
                         f.name()
                     );
