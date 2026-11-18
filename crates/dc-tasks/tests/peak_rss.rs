@@ -1,12 +1,10 @@
 //! The memory limit bounds the resident memory of the process, not only the
 //! allocator's count (bead dreamcounter-a3db93).
 //!
-//! This file holds one test, so the process runs nothing else while it
-//! measures its own peak resident set (`VmHWM`). Linux only.
-//!
-//! Each run is measured from the resident memory before it. Memory the
-//! allocator keeps after earlier runs is resident too, and is not part of
-//! this bound: see `dc_tasks::harness::DEFAULT_MAX_MEMORY`.
+//! Each runaway program runs in a child process of its own, which runs
+//! nothing else while it measures its own peak resident set (`VmHWM`). In
+//! one process, memory the allocator kept after an earlier run would be
+//! reused by the next, which would then not show its own peak. Linux only.
 
 #![cfg(target_os = "linux")]
 
@@ -65,6 +63,9 @@ fn status_kb(field: &str) -> u64 {
         .unwrap()
 }
 
+/// The environment variable that tells a child process which runaway to run.
+const CASE: &str = "DC_PEAK_RSS_CASE";
+
 #[test]
 fn one_runaway_run_keeps_the_peak_resident_memory_near_the_limit() {
     const LIMIT: u64 = 64 << 20;
@@ -95,10 +96,32 @@ fn one_runaway_run_keeps_the_peak_resident_memory_near_the_limit() {
             300,
         ),
     ];
-    for (src, per_step) in runaways {
-        // Freed memory stays resident for this thread, so each run is
-        // measured from its own start: writing 5 to `clear_refs` resets the
-        // peak to the resident memory now.
+    let Ok(case) = std::env::var(CASE) else {
+        for (case, (src, _)) in runaways.iter().enumerate() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "one_runaway_run_keeps_the_peak_resident_memory_near_the_limit",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CASE, case.to_string())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}: {}{}",
+                src,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        return;
+    };
+    {
+        let (src, per_step) = runaways[case.parse::<usize>().unwrap()];
+        // The peak is measured from the start of the run: writing 5 to
+        // `clear_refs` resets it to the resident memory now.
         std::fs::write("/proc/self/clear_refs", "5").unwrap();
         let start = status_kb("VmRSS:") << 10;
         let mut arena = Arena::new();

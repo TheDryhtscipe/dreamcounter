@@ -58,14 +58,18 @@ pub use machine::{
 /// after a check that the larger buffer fits: the continuation stack, an
 /// `unfold`'s output, `tree_fold`'s work lists, memo tables, the list of
 /// memo tables, and the scratch space of `eq`, of building a memo key and of
-/// a reachability walk, including its copy of a table's entries.
-/// `array_of_list`, `array_to_list`, `foldr`'s copy of its list and the end
-/// of `unfold` check every 256 elements.
+/// a reachability walk, including its copy of a table's entries. `foldr`
+/// and `array_to_list` check the limit for their copy before they make it.
+/// `array_of_list`, the list `array_to_list` builds, and the end of `unfold`
+/// check every 256 elements.
 ///
 /// Dropping a value never takes the count above where it was when the drop
 /// started, whatever the value's length or nesting: each part waiting on the
 /// drop's work list is one pointer, put there only after the larger cell,
-/// node or box that held it was freed.
+/// node or box that held it was freed. Arrays wait on a queue of their own,
+/// 64 bytes an array; the emptied value an array was taken from empties that
+/// queue as soon as it is itself dropped, so the queue holds about one array
+/// at a time. `tests/memory.rs` measures both.
 ///
 /// What a step can still allocate unchecked is bounded by the program text
 /// and the kind of step, not by the data: the values, environments and
@@ -81,7 +85,9 @@ pub use machine::{
 ///
 /// Memo tables the program can no longer reach are released when the count
 /// of tables doubles, and also at each new table once the evaluation holds
-/// more than half its limit. Tables that only a reachability walk can find
+/// more than half its limit, at most once per as many steps as there are
+/// tables. The continuation stack halves its buffer when it is a quarter
+/// full, so the room deep recursion left does not count after it returns. Tables that only a reachability walk can find
 /// dead are released only when a walk is due and finishes.
 ///
 /// The count is of bytes asked of the allocator. The resident memory of the

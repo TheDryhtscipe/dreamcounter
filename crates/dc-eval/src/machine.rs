@@ -432,6 +432,14 @@ impl<'a> Machine<'a> {
     /// continuation stack for the frames the step can push, so that the
     /// stack's growth is checked before it happens rather than after.
     fn before_step(&mut self) -> Result<(), Halt> {
+        // A stack that deep recursion grew gives back what it no longer
+        // uses, so its spare room does not count against the limit for the
+        // rest of the evaluation. It halves when a quarter full, so each
+        // frame is copied O(1) times on average.
+        let cap = self.stack.capacity();
+        if cap > 1024 && self.stack.len() < cap / 4 {
+            self.stack.shrink_to(cap / 2);
+        }
         self.budget
             .ensure_vec(&mut self.stack, MAX_FRAMES_PER_STEP)?;
         Ok(self.budget.check(0)?)

@@ -255,6 +255,9 @@ fn dropping_a_value_nested_in_its_heads_needs_no_scratch() {
         "(loop 1000000000 (pair 0 0) (lam (lam (pair $0 (pair $1 $1)))))",
         "(loop 1000000000 none (lam (lam (some (cons $0 (cons $1 nil))))))",
         "(loop 1000000000 nil (lam (lam (cons (array_of_list (cons $1 nil)) (cons $0 nil)))))",
+        // One array shared by every cell: each drop of the array only
+        // decrements its count, through the queue of arrays.
+        "(let (array_tabulate 10 (lam 0)) (loop 1000000000 nil (lam (lam (cons $2 $0)))))",
     ] {
         assert_stopped_near_the_limit(src, &[], UNLIMITED, LIMIT);
     }
@@ -346,4 +349,63 @@ fn array_to_list_stops_within_the_slack_wherever_the_limit_falls() {
             limit,
         );
     }
+}
+
+#[test]
+fn a_right_nested_memo_key_stops_within_the_slack_wherever_the_limit_falls() {
+    // Sizing a key nested to the right keeps a result per pending level.
+    let src = "(lam (memorec 1 (lam (lam 0)) (loop $0 0 (lam (lam (pair $1 $0))))))";
+    let input = [Value::Int(50_000)];
+    let (_, chain) = measure(
+        "(lam (loop $0 0 (lam (lam (pair $1 $0)))))",
+        &input,
+        Limits::fuel(UNLIMITED),
+    );
+    let (_, whole) = measure(src, &input, Limits::fuel(UNLIMITED));
+    for k in 0..40 {
+        let limit = chain + (whole - chain) * k / 40;
+        let (outcome, peak) = measure(
+            src,
+            &input,
+            Limits {
+                fuel: UNLIMITED,
+                memory: limit,
+            },
+        );
+        assert!(
+            matches!(outcome, Outcome::MemoryLimit(_)),
+            "limit {limit}: {outcome}"
+        );
+        assert!(
+            peak <= limit + SLACK,
+            "limit {limit}: peak {peak} B is above it by more than {SLACK} B"
+        );
+    }
+}
+
+#[test]
+fn the_stack_left_by_deep_recursion_does_not_count_once_it_returns() {
+    // Deep recursion, then a long list: never both at once.
+    let deep =
+        "(bfix 100000000 (lam (lam (list_case $0 (lam 0) (lam (lam (add $1 ($3 $0))))))) $0)";
+    let list = "(length (loop 200000 nil (lam (lam (cons $1 $0)))))";
+    let input = [range(200_000)];
+    let (_, a) = measure(&format!("(lam {deep})"), &input, Limits::fuel(UNLIMITED));
+    let (_, b) = measure(&format!("(lam {list})"), &input, Limits::fuel(UNLIMITED));
+    let both = format!("(lam (add {deep} {list}))");
+    let (free, _) = measure(&both, &input, Limits::fuel(UNLIMITED));
+    let limit = a.max(b) + a.max(b) / 4;
+    let (limited, peak) = measure(
+        &both,
+        &input,
+        Limits {
+            fuel: UNLIMITED,
+            memory: limit,
+        },
+    );
+    assert_eq!(
+        limited.to_string(),
+        free.to_string(),
+        "peak {peak} B, limit {limit} B"
+    );
 }

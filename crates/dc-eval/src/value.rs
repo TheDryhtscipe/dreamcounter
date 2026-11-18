@@ -1579,4 +1579,21 @@ mod tests {
         .join()
         .expect("test thread");
     }
+
+    #[test]
+    fn a_walk_over_many_distinct_parts_stays_within_its_memory_budget() {
+        // A list of 100k distinct pairs: the walk remembers each cell and
+        // pair it has seen, about 4 MB, so a 1 MiB budget stops it.
+        let v =
+            Value::list((0..100_000).map(|i| Value::Pair(Rc::new((Value::Int(i), Value::Int(i))))));
+        let limit = 1 << 20;
+        let base = crate::memory::live_bytes();
+        crate::memory::reset_peak();
+        let mut reach = Reach::new(u64::MAX, Budget::new(limit));
+        let walked = reach.walk(vec![Part::Value(&v)]);
+        drop(reach);
+        let peak = u64::try_from(crate::memory::peak_bytes() - base).unwrap_or(0);
+        assert!(walked.is_err());
+        assert!(peak <= limit + (64 << 10), "peak {peak} B");
+    }
 }

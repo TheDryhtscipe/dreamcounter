@@ -84,9 +84,10 @@ impl Budget {
             return Ok(());
         }
         let need = extra - (v.capacity() - v.len());
-        // The count sees a reallocation as its change in size. (A small
-        // buffer is copied, so the old one is held for a moment too; a large
-        // one is moved by remapping its pages.)
+        // The count sees a reallocation as its change in size. The system
+        // allocator may copy the buffer, holding the old one too for a
+        // moment, or (with glibc, above its mmap threshold) remap its pages;
+        // either way only resident memory sees it, not the count.
         let room = usize::try_from(self.room() / bytes_of::<T>(1)).unwrap_or(usize::MAX);
         let more = v.capacity().max(4).max(need).min(room);
         if more < need {
