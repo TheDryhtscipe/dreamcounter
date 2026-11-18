@@ -3,14 +3,14 @@
 //! written in core syntax without the prelude.
 
 use dc_core::{sexpr, Arena, Scheme, TermId};
-use dc_eval::{apply, Outcome, Value};
+use dc_eval::{apply, memory, Outcome, Value};
 use dc_tasks::growth::{
     median_steps, GrowthError, GrowthFit, LogLogSlope, SizeOutcome, Sweep, DEFAULT_SIZES,
 };
 use dc_tasks::harness::{
     check_examples, check_gate, check_generated, check_input_sizes, measure, run_sweep,
     validate_family, CheckFailure, FamilyDefect, FuelPlan, HarnessConfig, Measurement, RunFailure,
-    SizeRun, SweepError,
+    SizeRun, SweepError, DEFAULT_MAX_FUEL, DEFAULT_MAX_MEMORY,
 };
 use dc_tasks::rng::TaskRng;
 use dc_tasks::task::{generate_input, Example, Gate, Inputs, TaskFamily};
@@ -171,20 +171,115 @@ fn default_config_follows_the_spec() {
     assert_eq!(ListSum.sizes(), DEFAULT_SIZES.to_vec());
 }
 
+/// Runaway candidates of type `List Int -> Int`, one for each way a run was
+/// found to fill memory (bead dreamcounter-a3db93), with the bytes each holds
+/// per step when nothing stops it.
+const RUNAWAYS: [(&str, u64); 3] = [
+    // array_tabulate: about 32 bytes per step.
+    (
+        "(lam (array_size (array_tabulate 1000000000000 (lam $0))))",
+        32,
+    ),
+    // unfold: about 16 bytes per step.
+    (
+        "(lam (length (unfold (lam (some (pair $0 (add $0 1)))) 0)))",
+        16,
+    ),
+    // A loop that keeps every array_set version of an 8192-element array:
+    // about 300 bytes per step.
+    (
+        "(lam (array_size (fst (loop 1000000000 (pair (array_tabulate 8192 (lam 0)) nil) \
+         (lam (lam (pair (array_set (fst $0) (mod $1 8192) $1) (cons (fst $0) (snd $0)))))))))",
+        300,
+    ),
+];
+
+/// How far above `max_memory` one run's heap can get: `dc-eval`'s
+/// `tests/memory.rs` asserts the same bound on each kind of runaway program.
+const MEMORY_SLACK: u64 = 64 << 10;
+
 #[test]
-fn default_global_cap_keeps_a_runaway_run_under_a_gigabyte() {
-    // A non-terminating `unfold` candidate allocates about 16 bytes per step
-    // (measured in release: 159 MB peak RSS at 10M steps). Every run the
-    // harness makes is capped by `max_fuel`, so the default cap bounds the
-    // memory one looping candidate can take on a shared machine.
-    const BYTES_PER_RUNAWAY_STEP: u64 = 16;
+fn default_limits_bound_one_runaway_run() {
+    // One run's heap, beyond its inputs, is at most `max_memory` plus a few
+    // kilobytes: the evaluator checks the limit before each step and inside
+    // the steps that build a whole collection. Fuel alone does not bound it:
+    // at the default fuel cap the array_set runaway would hold about 15 GB.
     let c = HarnessConfig::default();
-    assert!(
-        c.max_fuel * BYTES_PER_RUNAWAY_STEP <= 1 << 30,
-        "max_fuel = {}",
-        c.max_fuel
-    );
+    assert_eq!(DEFAULT_MAX_MEMORY, 2 << 30);
+    assert_eq!(c.max_memory, DEFAULT_MAX_MEMORY);
+    assert_eq!(c.max_fuel, DEFAULT_MAX_FUEL);
     assert!(c.example_fuel <= c.max_fuel);
+    let (_, worst) = RUNAWAYS[2];
+    assert!(c.max_fuel * worst > 5 * c.max_memory);
+
+    // The same bound at a limit small enough for a test: each runaway
+    // candidate, given fuel to hold many times the limit, stops at the
+    // limit through the harness, and its measured peak is within the slack.
+    let limit: u64 = 12 << 20;
+    let small = HarnessConfig {
+        max_memory: limit,
+        ..HarnessConfig::default()
+    };
+    for (src, per_step) in RUNAWAYS {
+        let mut arena = Arena::new();
+        let p = parse(&mut arena, src);
+        let example_fuel = 8 * limit / per_step;
+        let c = HarnessConfig {
+            example_fuel,
+            ..small
+        };
+        let base = memory::live_bytes();
+        memory::reset_peak();
+        let got = check_examples(&ListSum, &arena, p, &c);
+        let peak = u64::try_from(memory::peak_bytes() - base).unwrap_or(0);
+        assert!(
+            matches!(
+                got,
+                Err(CheckFailure::Example {
+                    failure: RunFailure::MemoryLimit { limit: l },
+                    ..
+                }) if l == limit
+            ),
+            "{src}: {got:?}"
+        );
+        assert!(
+            peak <= limit + MEMORY_SLACK,
+            "{src}: peak {peak} B, limit {limit} B"
+        );
+    }
+}
+
+#[test]
+fn a_run_over_the_memory_limit_in_a_sweep_counts_as_a_timeout() {
+    // Sums lists shorter than 512 and runs away on longer ones.
+    let src = "(lam (if (lt (length $0) 512) (foldl (lam (lam (add $1 $0))) 0 $0) \
+               (array_size (array_tabulate 1000000000000 (lam $0)))))";
+    let mut arena = Arena::new();
+    let p = parse(&mut arena, src);
+    let c = HarnessConfig {
+        max_memory: 12 << 20,
+        ..config()
+    };
+    let plan = FuelPlan::uniform(&ListSum, c.max_fuel, &c);
+    let passed = check_examples(&ListSum, &arena, p, &c).unwrap();
+    let report = run_sweep(&ListSum, &arena, &passed, &plan, &c).unwrap();
+    let last = report.records.last().unwrap();
+    assert!(
+        matches!(
+            last.run,
+            SizeRun::Failed {
+                failure: RunFailure::MemoryLimit { limit },
+                ..
+            } if limit == 12 << 20
+        ),
+        "{last:?}"
+    );
+    assert_eq!(
+        report.sweep.observations().last().unwrap().outcome,
+        SizeOutcome::TimedOut
+    );
+    assert!(matches!(report.records[0].run, SizeRun::Completed { .. }));
+    assert_eq!(report.first_incorrect(), None);
 }
 
 #[test]

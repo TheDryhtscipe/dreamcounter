@@ -32,5 +32,44 @@ pub mod cost;
 mod machine;
 pub mod value;
 
-pub use machine::{apply, eval, ErrorKind, Outcome, OutcomeWithin, Stuck, UNLIMITED};
+pub use machine::{
+    apply, apply_within, eval, eval_within, ErrorKind, Limits, Outcome, OutcomeWithin, Stuck,
+    UNLIMITED,
+};
+
+/// The heap count behind [`Limits::memory`] (bead dreamcounter-a3db93).
+///
+/// Every binary that links `dc-eval` allocates through `dc_alloc`'s counting
+/// allocator, which keeps a count of each thread's live heap bytes. An
+/// evaluation runs on one thread, so the bytes it holds are its thread's live
+/// bytes less those when it started. That covers everything the machine
+/// allocates: environments, closures, continuation frames, memo tables,
+/// lists, trees, arrays (`imbl`'s chunks included) and work lists. The inputs
+/// of [`apply_within`], built before the evaluation starts, are not counted.
+///
+/// # How far above the limit an evaluation can get
+///
+/// The machine checks the limit before every step, so after each step the
+/// evaluation holds at most the limit plus what that one step allocated.
+/// The steps that could allocate a lot are checked inside:
+///
+/// - the continuation stack and an `unfold`'s output grow only after a check
+///   that the larger buffer fits, so they never take an evaluation over;
+/// - `array_of_list`, `array_to_list`, `foldr` (which copies its list) and the
+///   end of `unfold` (which builds its list) check every 1024 elements, so
+///   they overshoot by at most 1024 elements.
+///
+/// What a step can still allocate unchecked is a constant number of values,
+/// environments and frames for each term node it passes through; an
+/// `array_set` path copy (a few `imbl` chunks); and the scratch space of an
+/// `eq`, a `memorec` key, or a reachability walk over memo tables, which is at
+/// most proportional to values the evaluation already holds. The tests in
+/// `tests/memory.rs` measure the overshoot for each kind of runaway program.
+///
+/// The count is of bytes asked of the allocator. The resident memory of the
+/// process is higher by the allocator's own overhead and by freed memory it
+/// keeps; `dc-tasks`'s `tests/peak_rss.rs` measures that.
+pub mod memory {
+    pub use dc_alloc::{live_bytes, peak_bytes, reset_peak};
+}
 pub use value::{DisplayWithin, Env, Fun, List, MemoKey, Tree, Value, DEBUG_NODES};

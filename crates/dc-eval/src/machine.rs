@@ -33,13 +33,22 @@ pub enum Outcome {
     /// The global fuel ran out. The count is the first one above the fuel, or
     /// `u64::MAX` if that count does not fit in a `u64`.
     Timeout(u64),
+    /// The evaluation's heap went above its memory limit ([`Limits::memory`]).
+    /// The count is the steps taken before the machine stopped. Like a
+    /// timeout, this is a resource limit, not a fault of the program. Unlike a
+    /// step count, where it happens depends on the sizes of the host's data
+    /// structures, not only on the program and its inputs.
+    MemoryLimit(u64),
 }
 
 impl Outcome {
     /// The number of steps taken.
     pub fn steps(&self) -> u64 {
         match self {
-            Outcome::Value(_, s) | Outcome::Error(_, s) | Outcome::Timeout(s) => *s,
+            Outcome::Value(_, s)
+            | Outcome::Error(_, s)
+            | Outcome::Timeout(s)
+            | Outcome::MemoryLimit(s) => *s,
         }
     }
 
@@ -68,6 +77,7 @@ impl Outcome {
             Outcome::Value(v, s) => write!(f, "Value({}, {s})", v.display_within(limit)),
             Outcome::Error(k, s) => write!(f, "Error({k:?}, {s})"),
             Outcome::Timeout(s) => write!(f, "Timeout({s})"),
+            Outcome::MemoryLimit(s) => write!(f, "MemoryLimit({s})"),
         }
     }
 }
@@ -137,19 +147,58 @@ pub enum Stuck {
     UnexpandedLib(LibId),
 }
 
-/// No fuel limit in practice.
+/// No fuel limit, or no memory limit, in practice.
 pub const UNLIMITED: u64 = u64::MAX;
 
-/// Evaluates the closed term `term` with a global budget of `fuel` steps.
+/// The resource limits of one evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Limits {
+    /// The global budget of steps.
+    pub fuel: u64,
+    /// The most heap memory, in bytes, the evaluation may hold beyond what its
+    /// thread held when it started: its environments, continuations, memo
+    /// tables and the values it builds. [`UNLIMITED`] turns the check off.
+    /// The machine checks the limit before every step, before it grows its
+    /// continuation stack or an `unfold`'s output, and every
+    /// 1024 elements of a step that builds a whole collection
+    /// (`array_of_list`, `array_to_list`, `foldr`, the end of `unfold`). It
+    /// stops with [`Outcome::MemoryLimit`] when the limit is exceeded. See
+    /// [`crate::memory`] for what is counted and how far above the limit an
+    /// evaluation can get.
+    pub memory: u64,
+}
+
+impl Limits {
+    /// `fuel` steps and no memory limit.
+    pub fn fuel(fuel: u64) -> Limits {
+        Limits {
+            fuel,
+            memory: UNLIMITED,
+        }
+    }
+}
+
+/// Evaluates the closed term `term` with a global budget of `fuel` steps and no
+/// memory limit.
 pub fn eval(arena: &Arena, term: TermId, fuel: u64) -> Outcome {
-    Machine::new(arena, fuel).run(Control::Eval(term, Env::empty()))
+    eval_within(arena, term, Limits::fuel(fuel))
+}
+
+/// Evaluates the closed term `term` within `limits`.
+pub fn eval_within(arena: &Arena, term: TermId, limits: Limits) -> Outcome {
+    Machine::new(arena, limits).run(Control::Eval(term, Env::empty()))
 }
 
 /// Evaluates the closed term `program`, then applies the result to each of
-/// `inputs` in turn, all within one budget of `fuel` steps. Applying a closure to
-/// an input is a β step like any other.
+/// `inputs` in turn, all within one budget of `fuel` steps and no memory limit.
+/// Applying a closure to an input is a β step like any other.
 pub fn apply(arena: &Arena, program: TermId, inputs: &[Value], fuel: u64) -> Outcome {
-    let mut m = Machine::new(arena, fuel);
+    apply_within(arena, program, inputs, Limits::fuel(fuel))
+}
+
+/// As [`apply`], within `limits`.
+pub fn apply_within(arena: &Arena, program: TermId, inputs: &[Value], limits: Limits) -> Outcome {
+    let mut m = Machine::new(arena, limits);
     for x in inputs.iter().rev() {
         m.stack.push(Frame::ApplyTo(x.clone()));
     }
@@ -174,6 +223,7 @@ fn call(f: &Value, x: Value) -> Step {
 enum Halt {
     Error(ErrorKind),
     Timeout,
+    MemoryLimit,
 }
 
 type Step = Result<Control, Halt>;
@@ -266,6 +316,10 @@ struct Machine<'a> {
     stack: Vec<Frame>,
     steps: u64,
     fuel: u64,
+    /// [`Limits::memory`].
+    memory_limit: u64,
+    /// This thread's live heap bytes when the machine was made.
+    heap_base: i64,
     /// Every memo table this evaluation created and the program may still reach.
     /// The machine owns them until the evaluation ends; a `memorec` `self` holds
     /// only a weak reference, so a `self` stored in its own table cannot keep the
@@ -313,13 +367,28 @@ const MAX_PRIM_ARITY: usize = 3;
 /// The work a reachability walk may always do, whatever the steps since the last.
 const MEMO_WALK_MIN: u64 = 1024;
 
+/// The most continuation frames one step pushes. [`Machine::before_step`]
+/// keeps this much room on the stack, so a step never grows it.
+const MAX_FRAMES_PER_STEP: usize = 4;
+
+/// A step that builds a whole collection checks the memory limit once per
+/// this many elements.
+const CHECK_EVERY: usize = 1024;
+
+/// The bytes of `n` values of type `T`.
+fn bytes_of<T>(n: usize) -> u64 {
+    u64::try_from(n.saturating_mul(std::mem::size_of::<T>())).unwrap_or(u64::MAX)
+}
+
 impl<'a> Machine<'a> {
-    fn new(arena: &'a Arena, fuel: u64) -> Machine<'a> {
+    fn new(arena: &'a Arena, limits: Limits) -> Machine<'a> {
         Machine {
             arena,
             stack: Vec::new(),
             steps: 0,
-            fuel,
+            fuel: limits.fuel,
+            memory_limit: limits.memory,
+            heap_base: crate::memory::live_bytes(),
             memo_tables: Vec::new(),
             memo_prune_at: MEMO_PRUNE_MIN,
             pruning: PRUNING,
@@ -333,6 +402,9 @@ impl<'a> Machine<'a> {
     fn run(&mut self, start: Control) -> Outcome {
         let mut control = start;
         loop {
+            if let Err(halt) = self.before_step() {
+                return self.halted(halt);
+            }
             let next = match control {
                 Control::Eval(t, env) => self.eval_term(t, env),
                 Control::Return(v) => match self.stack.pop() {
@@ -343,10 +415,100 @@ impl<'a> Machine<'a> {
             };
             control = match next {
                 Ok(c) => c,
-                Err(Halt::Error(k)) => return Outcome::Error(k, self.steps),
-                Err(Halt::Timeout) => return Outcome::Timeout(self.steps),
+                Err(halt) => return self.halted(halt),
             };
         }
+    }
+
+    fn halted(&self, halt: Halt) -> Outcome {
+        match halt {
+            Halt::Error(k) => Outcome::Error(k, self.steps),
+            Halt::Timeout => Outcome::Timeout(self.steps),
+            Halt::MemoryLimit => Outcome::MemoryLimit(self.steps),
+        }
+    }
+
+    /// The heap bytes this evaluation holds: its thread's live bytes beyond
+    /// those when it started.
+    fn heap_used(&self) -> u64 {
+        u64::try_from(crate::memory::live_bytes().saturating_sub(self.heap_base)).unwrap_or(0)
+    }
+
+    /// Stops with [`Halt::MemoryLimit`] if the evaluation holds more than its
+    /// memory limit, or would after allocating `extra` more bytes.
+    fn check_memory(&self, extra: u64) -> Result<(), Halt> {
+        if self.memory_limit != UNLIMITED
+            && self.heap_used().saturating_add(extra) > self.memory_limit
+        {
+            return Err(Halt::MemoryLimit);
+        }
+        Ok(())
+    }
+
+    /// Checks the memory limit before a step, and makes room on the
+    /// continuation stack for the frames the step can push, so that the
+    /// stack's growth is checked before it happens rather than after.
+    fn before_step(&mut self) -> Result<(), Halt> {
+        if self.memory_limit == UNLIMITED {
+            return Ok(());
+        }
+        let spare = self.stack.capacity() - self.stack.len();
+        if spare < MAX_FRAMES_PER_STEP {
+            let more = self.stack.capacity().max(MAX_FRAMES_PER_STEP);
+            self.check_memory(bytes_of::<Frame>(more))?;
+            self.stack.reserve_exact(more);
+        }
+        self.check_memory(0)
+    }
+
+    /// Before a push onto a full `v`: checks the memory limit for doubling
+    /// `v`'s buffer, then doubles it.
+    fn grow_checked<T>(&self, v: &mut Vec<T>) -> Result<(), Halt> {
+        if v.len() == v.capacity() && self.memory_limit != UNLIMITED {
+            let more = v.capacity().max(4);
+            self.check_memory(bytes_of::<T>(more))?;
+            v.reserve_exact(more);
+        }
+        Ok(())
+    }
+
+    /// A vector of the `n` elements of `xs`, with the memory limit checked
+    /// for its buffer first.
+    fn vec_checked<'v>(
+        &self,
+        n: usize,
+        xs: impl Iterator<Item = &'v Value>,
+    ) -> Result<Vec<Value>, Halt> {
+        self.check_memory(bytes_of::<Value>(n))?;
+        let mut out = Vec::with_capacity(n);
+        out.extend(xs.cloned());
+        Ok(out)
+    }
+
+    /// The list of `items`, with the memory limit checked every
+    /// [`CHECK_EVERY`] cells.
+    fn list_checked(&self, items: Vec<Value>) -> Result<Value, Halt> {
+        let mut list = List::nil();
+        for (k, v) in items.into_iter().rev().enumerate() {
+            if k % CHECK_EVERY == 0 {
+                self.check_memory(0)?;
+            }
+            list = List::cons(v, list);
+        }
+        Ok(Value::List(list))
+    }
+
+    /// The array of the elements of `xs`, with the memory limit checked every
+    /// [`CHECK_EVERY`] elements.
+    fn array_checked<'v>(&self, xs: impl Iterator<Item = &'v Value>) -> Result<Value, Halt> {
+        let mut out = imbl::Vector::new();
+        for (k, v) in xs.enumerate() {
+            if k % CHECK_EVERY == 0 {
+                self.check_memory(0)?;
+            }
+            out.push_back(v.clone());
+        }
+        Ok(Value::Array(out))
     }
 
     /// Charges `n` steps. Stops with a timeout at the first charge that takes the
@@ -559,10 +721,11 @@ impl<'a> Machine<'a> {
             Frame::Foldr { f, elems } => self.foldr_next(f, elems, v),
             Frame::Loop { f, i, n } => self.loop_next(f, i, n, v),
             Frame::Unfold { g, mut out } => match &v {
-                Value::Option(None) => Ok(Control::Return(Value::list(out))),
+                Value::Option(None) => Ok(Control::Return(self.list_checked(out)?)),
                 Value::Option(Some(p)) => match &**p {
                     Value::Pair(p) => {
                         self.charge(cost::ITERATION)?;
+                        self.grow_checked(&mut out)?;
                         out.push(p.0.clone());
                         let next = p.1.clone();
                         self.stack.push(Frame::Unfold { g: g.clone(), out });
@@ -716,12 +879,12 @@ impl<'a> Machine<'a> {
             (Prim::ArraySize, [V::Array(a)]) => self.constant(V::Int(len_to_int(a.len() as u64))),
             (Prim::ArrayOfList, [V::List(xs)]) => {
                 self.charge(cost::array_convert(xs.len()))?;
-                ret(V::Array(xs.iter().cloned().collect()))
+                ret(self.array_checked(xs.iter())?)
             }
             (Prim::ArrayToList, [V::Array(a)]) => {
                 self.charge(cost::array_convert(a.len() as u64))?;
-                let items: Vec<Value> = a.iter().cloned().collect();
-                ret(V::list(items))
+                let items = self.vec_checked(a.len(), a.iter())?;
+                ret(self.list_checked(items)?)
             }
             (Prim::TreeFold, [z, f, V::Tree(t)]) => self.tree_fold_run(
                 z.clone(),
@@ -731,7 +894,8 @@ impl<'a> Machine<'a> {
             ),
             (Prim::Foldl, [f, z, V::List(xs)]) => self.foldl_next(f.clone(), xs.clone(), z.clone()),
             (Prim::Foldr, [f, z, V::List(xs)]) => {
-                let elems: Vec<Value> = xs.iter().cloned().collect();
+                let n = usize::try_from(xs.len()).unwrap_or(usize::MAX);
+                let elems = self.vec_checked(n, xs.iter())?;
                 self.foldr_next(f.clone(), elems, z.clone())
             }
             (Prim::Loop, [V::Int(n), z, f]) => self.loop_next(f.clone(), 0, *n, z.clone()),
@@ -1110,7 +1274,7 @@ mod tests {
     /// tables the machine still holds at the end.
     fn run_machine(arena: &mut Arena, src: &str, fuel: u64) -> (Outcome, usize) {
         let t = sexpr::parse(arena, src).expect("parse");
-        let mut m = Machine::new(arena, fuel);
+        let mut m = Machine::new(arena, Limits::fuel(fuel));
         let o = m.run(Control::Eval(t, Env::empty()));
         (o, m.memo_tables.len())
     }
@@ -1120,7 +1284,7 @@ mod tests {
     fn run_counting_partials(src: &str) -> (String, u64) {
         let mut arena = Arena::new();
         let t = sexpr::parse(&mut arena, src).expect("parse");
-        let mut m = Machine::new(&arena, UNLIMITED);
+        let mut m = Machine::new(&arena, Limits::fuel(UNLIMITED));
         let o = m.run(Control::Eval(t, Env::empty()));
         (format!("{o:?}"), m.partials_built)
     }
@@ -1159,7 +1323,7 @@ mod tests {
         let outcome = |src: &str, fuel: u64| -> (String, u64) {
             let mut arena = Arena::new();
             let t = sexpr::parse(&mut arena, src).expect("parse");
-            let mut m = Machine::new(&arena, fuel);
+            let mut m = Machine::new(&arena, Limits::fuel(fuel));
             let o = m.run(Control::Eval(t, Env::empty()));
             (format!("{o:?}"), m.partials_built)
         };
@@ -1192,7 +1356,7 @@ mod tests {
             let steps = {
                 let mut arena = Arena::new();
                 let t = sexpr::parse(&mut arena, &whole).expect("parse");
-                Machine::new(&arena, UNLIMITED)
+                Machine::new(&arena, Limits::fuel(UNLIMITED))
                     .run(Control::Eval(t, Env::empty()))
                     .steps()
             };
@@ -1301,7 +1465,7 @@ mod tests {
     #[test]
     fn a_charge_that_saturates_the_count_times_out_even_at_unlimited_fuel() {
         let arena = Arena::new();
-        let mut m = Machine::new(&arena, u64::MAX);
+        let mut m = Machine::new(&arena, Limits::fuel(u64::MAX));
         m.steps = u64::MAX - 1;
         assert!(matches!(m.charge(1), Ok(())));
         assert!(matches!(m.charge(1), Err(Halt::Timeout)));
@@ -1352,7 +1516,7 @@ mod tests {
     fn run_pruned(src: &str, pruning: Pruning) -> (Outcome, usize) {
         let mut arena = Arena::new();
         let t = sexpr::parse(&mut arena, src).expect("parse");
-        let mut m = Machine::new(&arena, UNLIMITED);
+        let mut m = Machine::new(&arena, Limits::fuel(UNLIMITED));
         m.pruning = pruning;
         m.memo_prune_at = pruning.min_tables;
         let o = m.run(Control::Eval(t, Env::empty()));
@@ -1546,7 +1710,7 @@ mod tests {
         );
         let t = sexpr::parse(&mut arena, &p).expect("parse");
         let xs: Vec<i64> = (0..100_000).collect();
-        let mut m = Machine::new(&arena, UNLIMITED);
+        let mut m = Machine::new(&arena, Limits::fuel(UNLIMITED));
         m.stack.push(Frame::ApplyTo(Value::int_list(&xs)));
         let o = m.run(Control::Eval(t, Env::empty()));
         assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
@@ -1570,7 +1734,7 @@ mod tests {
         );
         let mut arena = Arena::new();
         let t = sexpr::parse(&mut arena, &p).expect("parse");
-        let mut m = Machine::new(&arena, UNLIMITED);
+        let mut m = Machine::new(&arena, Limits::fuel(UNLIMITED));
         m.pruning = ALWAYS;
         let o = m.run(Control::Eval(t, Env::empty()));
         assert!(matches!(o, Outcome::Value(Value::Int(2), _)), "{o}");

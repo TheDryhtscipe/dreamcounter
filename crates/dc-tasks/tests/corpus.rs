@@ -394,8 +394,14 @@ fn corpus_cost_report() {
                         .map(|seed| {
                             let inputs = generate_input(family, n, seed);
                             let expected = family.oracle(&inputs);
-                            run_on(&arena, p, &inputs, &expected, config.max_fuel)
-                                .unwrap_or_else(|f| panic!("{} n {n} seed {seed}: {f:?}", r.entry))
+                            run_on(
+                                &arena,
+                                p,
+                                &inputs,
+                                &expected,
+                                config.limits(config.max_fuel),
+                            )
+                            .unwrap_or_else(|f| panic!("{} n {n} seed {seed}: {f:?}", r.entry))
                         })
                         .collect();
                     SizeObservation::completed(n, steps)

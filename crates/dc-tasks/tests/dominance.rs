@@ -77,8 +77,14 @@ fn gate_turns_away_naive(v: Variant) {
     let good = compile(&mut arena, dominance::SOURCE, v.good());
     for e in family.examples() {
         for p in [naive, good] {
-            run_on(&arena, p, &e.inputs, &e.output, DEFAULT_EXAMPLE_FUEL)
-                .unwrap_or_else(|f| panic!("{}: {f:?} on {:?}", family.name(), e.inputs));
+            run_on(
+                &arena,
+                p,
+                &e.inputs,
+                &e.output,
+                HarnessConfig::default().limits(DEFAULT_EXAMPLE_FUEL),
+            )
+            .unwrap_or_else(|f| panic!("{}: {f:?} on {:?}", family.name(), e.inputs));
         }
     }
     let passed = check_examples(&family, &arena, good, &c).expect("the good reference passes");
@@ -210,8 +216,14 @@ fn the_gate_turns_away_a_program_that_is_quadratic_only_on_sorted_input() {
     let passed = check_examples(&family, &arena, p, &c).expect("it passes the examples");
     let gate = family.gate().expect("a gate");
     let random = &gate.inputs[0];
-    let steps = run_on(&arena, p, &random.inputs, &random.output, GATE_FUEL)
-        .expect("it answers the random input");
+    let steps = run_on(
+        &arena,
+        p,
+        &random.inputs,
+        &random.output,
+        HarnessConfig::default().limits(GATE_FUEL),
+    )
+    .expect("it answers the random input");
     println!("TREE on the random gate input: {steps} steps");
     assert_eq!(
         check_gate(&family, &arena, &passed, &c),
