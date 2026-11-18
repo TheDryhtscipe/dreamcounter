@@ -5,9 +5,11 @@
 //! noisy, on at most the seeds [`check_variant`] allows.
 //!
 //! The gate: the naive and good references pass every example. The good
-//! reference passes the gate within a third of its fuel, and the naive one
-//! runs out of the gate's fuel, so a program that looks at every pair of
-//! positions does not solve the variant.
+//! reference passes each gate input within a third of the gate's fuel, and
+//! the naive one runs out of fuel on the first input. A program that is
+//! `n²` only on sorted input (it inserts into an unbalanced search tree)
+//! passes the examples and the random input, and runs out of fuel on the
+//! sorted ones.
 
 mod common;
 
@@ -89,6 +91,7 @@ fn gate_turns_away_naive(v: Variant) {
     assert_eq!(
         check_gate(&family, &arena, &passed, &c),
         Err(CheckFailure::Gate {
+            index: 0,
             failure: RunFailure::Timeout { fuel: GATE_FUEL }
         }),
         "{} on the gate",
@@ -144,4 +147,73 @@ fn variant_names_are_unique() {
         .map(|&v| Dominance(v).name().to_owned())
         .collect();
     assert_eq!(names.len(), Variant::ALL.len(), "names are unique");
+}
+
+/// Weighted inversions with an unbalanced search tree: `n log n` on random
+/// input, `n²` on sorted input. Each node holds a value, its position, and
+/// the count and position sum of its subtree.
+const TREE_WEIGHTED_INVERSIONS: &str = r#"
+let totals t =
+  match t with
+  | Leaf -> (0, 0)
+  | Node (_, p, _) -> let (_, _, c, s) = p in (c, s)
+
+let greater t x =
+  bfix (size_hint + 1)
+    (fun self t ->
+      match t with
+      | Leaf -> (0, 0)
+      | Node (l, p, r) ->
+        let (v, i, _, _) = p in
+        if v > x then
+          let (rc, rs) = totals r in
+          let (gc, gs) = self l in
+          (gc + rc + 1, gs + rs + i)
+        else self r)
+    t
+
+let insert t x j =
+  bfix (size_hint + 1)
+    (fun self t ->
+      match t with
+      | Leaf -> Node (Leaf, (x, j, 1, j), Leaf)
+      | Node (l, p, r) ->
+        let (v, vi, c, s) = p in
+        if x < v then Node (self l, (v, vi, c + 1, s + j), r)
+        else Node (l, (v, vi, c + 1, s + j), self r))
+    t
+
+let tree_weighted_inversions xs =
+  let (_, acc) =
+    foldl
+      (fun (t, acc) (x, j) ->
+        let (gc, gs) = greater t x in
+        (insert t x j, acc + gc * j - gs))
+      (Leaf, 0) (zip xs (range 0 (length xs))) in
+  acc
+"#;
+
+#[test]
+fn the_gate_turns_away_a_program_that_is_quadratic_only_on_sorted_input() {
+    let family = Dominance(Variant::WeightedInversions);
+    let c = HarnessConfig::default();
+    let mut arena = Arena::new();
+    let p = compile(
+        &mut arena,
+        &TREE_WEIGHTED_INVERSIONS.replace("size_hint", "100000"),
+        "tree_weighted_inversions",
+    );
+    let passed = check_examples(&family, &arena, p, &c).expect("it passes the examples");
+    let gate = family.gate().expect("a gate");
+    let random = &gate.inputs[0];
+    let steps = run_on(&arena, p, &random.inputs, &random.output, GATE_FUEL)
+        .expect("it answers the random input");
+    println!("TREE on the random gate input: {steps} steps");
+    assert_eq!(
+        check_gate(&family, &arena, &passed, &c),
+        Err(CheckFailure::Gate {
+            index: 1,
+            failure: RunFailure::Timeout { fuel: GATE_FUEL }
+        })
+    );
 }

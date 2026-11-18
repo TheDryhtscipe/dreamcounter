@@ -305,8 +305,8 @@ impl Verifier {
             Err(CheckFailure::Example { index, failure }) => Check::Run {
                 error: format!("example {index}: {}", describe(&failure)),
             },
-            Err(CheckFailure::Gate { failure }) => Check::Run {
-                error: format!("the large example: {}", describe(&failure)),
+            Err(CheckFailure::Gate { index, failure }) => Check::Run {
+                error: format!("large input {index}: {}", describe(&failure)),
             },
             Err(other) => Check::Run {
                 error: format!("{other:?}"),
@@ -554,7 +554,7 @@ mod tests {
             Check::Run { error } => assert_eq!(
                 error,
                 format!(
-                    "the large example: no result within {} steps",
+                    "large input 0: no result within {} steps",
                     dc_tasks::families::dominance::GATE_FUEL
                 )
             ),

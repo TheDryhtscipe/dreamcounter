@@ -12,8 +12,8 @@
 //! * [`subsequence_count`]: counting the subsets of positions that keep a
 //!   local rule.
 //! * [`dominance`]: counting pairs and chains of positions in order by both
-//!   position and value, with a gate that only a program better than `n²`
-//!   finishes within its fuel (decision D25).
+//!   position and value, with a gate of large inputs and a step limit that
+//!   pairwise programs exceed (decision D25).
 //!
 //! [`development`] lists every variant of these families with its reference
 //! solutions in one place, for checks that run over the whole corpus. A new
@@ -59,7 +59,7 @@ pub struct Reference {
     /// `false` only for a reference of a growth class that the gate is
     /// there to turn away, such as the naive references of [`dominance`].
     /// Such a reference still passes the examples, and must run out of the
-    /// gate's fuel.
+    /// gate's fuel on its first input.
     pub passes_gate: bool,
 }
 

@@ -12,10 +12,12 @@
 //! The family is the harder part of the development corpus. The pilot run
 //! (results log, 2026-11-18) showed a strong proposer solving every other
 //! development task with every program. Here each variant has a
-//! [`Gate`]: an input of [`GATE_N`] elements with [`GATE_FUEL`] steps. A
-//! program that looks at every pair of positions needs more than that, so
-//! only a program of a lower growth class passes. The description states
-//! the size and the step limit.
+//! [`Gate`]: three inputs of [`GATE_N`] elements, each with [`GATE_FUEL`]
+//! steps (see [`TaskFamily::gate`] on [`Dominance`]). Every natural program
+//! that looks at each pair of positions takes at least 2 steps per pair, so
+//! more than `GATE_FUEL` on one input; the good references take at most 29 %
+//! of it (November 2026). The description states the size and the step
+//! limit, not the inputs.
 //!
 //! Each variant has a naive dc reference that looks at every pair of
 //! positions (`n²`), which times out on the gate, and a good one (`n log n`)
@@ -57,10 +59,6 @@ pub const GATE_N: u64 = 8192;
 
 /// The fuel of the gate: the harness's default global cap.
 pub const GATE_FUEL: u64 = crate::harness::DEFAULT_MAX_FUEL;
-
-/// The seed the gate example is generated with: kind 0, values from
-/// `-WIDE..=WIDE`.
-pub const GATE_SEED: u64 = 0;
 
 /// Kind 0 draws values from `-WIDE..=WIDE`.
 pub const WIDE: i64 = 1000;
@@ -374,13 +372,35 @@ impl TaskFamily for Dominance {
         }
     }
 
-    /// An input of [`GATE_N`] elements from seed [`GATE_SEED`], with
-    /// [`GATE_FUEL`].
+    /// Three inputs of [`GATE_N`] elements, with [`GATE_FUEL`] each: the
+    /// input of seed 0 (values from `-WIDE..=WIDE`), and the input of seed 1
+    /// (many ties) sorted up and sorted down. Sorted lists are the worst
+    /// case of an unbalanced search tree, a common way to count that is `n²`
+    /// at worst. In [`Variant::Pairs2d`] both lists are sorted.
     fn gate(&self) -> Option<Gate> {
-        let inputs = generate_input(self, GATE_N, GATE_SEED);
-        let output = self.oracle(&inputs);
+        let random = generate_input(self, GATE_N, 0);
+        let ties = generate_input(self, GATE_N, 1);
+        let sorted = |down: bool| -> Inputs {
+            ties.iter()
+                .map(|l| {
+                    let mut xs = ints_of(l);
+                    xs.sort_unstable();
+                    if down {
+                        xs.reverse();
+                    }
+                    list(&xs)
+                })
+                .collect()
+        };
+        let inputs = [random, sorted(false), sorted(true)]
+            .into_iter()
+            .map(|i| {
+                let out = self.oracle(&i);
+                Example::new(i, out)
+            })
+            .collect();
         Some(Gate {
-            example: Example::new(inputs, output),
+            inputs,
             fuel: GATE_FUEL,
         })
     }
@@ -509,8 +529,22 @@ mod tests {
         for f in all() {
             let gate = f.gate().expect("a gate");
             assert_eq!(gate.fuel, GATE_FUEL);
-            for input in &gate.example.inputs {
-                assert_eq!(ints_of(input).len() as u64, GATE_N, "{}", f.name());
+            assert_eq!(gate.inputs.len(), 3);
+            for e in &gate.inputs {
+                for input in &e.inputs {
+                    assert_eq!(ints_of(input).len() as u64, GATE_N, "{}", f.name());
+                }
+            }
+            // The second and third are sorted up and down.
+            for (e, down) in gate.inputs[1..].iter().zip([false, true]) {
+                for input in &e.inputs {
+                    let xs = ints_of(input);
+                    assert!(
+                        xs.windows(2).all(|w| if down { w[0] >= w[1] } else { w[0] <= w[1] }),
+                        "{}",
+                        f.name()
+                    );
+                }
             }
             for e in f.examples() {
                 assert!(ints_of(&e.inputs[0]).len() <= 8, "{}", f.name());

@@ -121,6 +121,7 @@ fn check_variant(
             (Ok(_), _) if r.passes_gate => {}
             (
                 Err(CheckFailure::Gate {
+                    index: 0,
                     failure: RunFailure::Timeout { fuel },
                 }),
                 Some(g),

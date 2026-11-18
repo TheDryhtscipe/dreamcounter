@@ -892,14 +892,21 @@ impl TaskFamily for GatedReverse {
         ListReverse.examples()
     }
     fn gate(&self) -> Option<Gate> {
-        let xs: Vec<i64> = (0..GATE_LEN).collect();
-        let out: Vec<i64> = if self.right_output {
-            xs.iter().rev().copied().collect()
-        } else {
-            xs.clone()
-        };
+        // A short input that every program here answers, then the long one.
+        let inputs = [10, GATE_LEN]
+            .into_iter()
+            .map(|len| {
+                let xs: Vec<i64> = (0..len).collect();
+                let out: Vec<i64> = if self.right_output {
+                    xs.iter().rev().copied().collect()
+                } else {
+                    xs.clone()
+                };
+                Example::new(vec![Value::int_list(&xs)], Value::int_list(&out))
+            })
+            .collect();
         Some(Gate {
-            example: Example::new(vec![Value::int_list(&xs)], Value::int_list(&out)),
+            inputs,
             fuel: 20 * GATE_LEN as u64,
         })
     }
@@ -930,6 +937,7 @@ fn the_gate_turns_away_a_program_that_passes_every_example() {
     assert_eq!(
         check_gate(&gated, &arena, &passed, &c),
         Err(CheckFailure::Gate {
+            index: 1,
             failure: RunFailure::Timeout {
                 fuel: 20 * GATE_LEN as u64
             }
@@ -944,6 +952,7 @@ fn the_gate_turns_away_a_program_that_passes_every_example() {
     assert!(matches!(
         check_gate(&gated, &arena, &passed, &c),
         Err(CheckFailure::Gate {
+            index: 1,
             failure: RunFailure::WrongOutput { .. }
         })
     ));
@@ -966,6 +975,7 @@ fn the_gate_fuel_is_capped_by_the_global_cap() {
     assert_eq!(
         check_gate(&gated, &arena, &passed, &c),
         Err(CheckFailure::Gate {
+            index: 1,
             failure: RunFailure::Timeout { fuel: 500 }
         })
     );

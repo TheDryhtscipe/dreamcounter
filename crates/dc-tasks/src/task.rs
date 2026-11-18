@@ -10,8 +10,8 @@
 //! * an oracle in Rust, independent of dc, that gives the expected output for
 //!   any input,
 //! * the sweep of sizes over which cost growth is measured, and
-//! * optionally a [`Gate`]: one large example with its own fuel, which only
-//!   a program of a low enough growth class finishes (decision D25).
+//! * optionally a [`Gate`]: a few large inputs with their own fuel, which a
+//!   program must also answer within that fuel (decision D25).
 //!
 //! The generator receives a [`TaskRng`] seeded from `(n, seed)` rather than
 //! the seed itself, so a family cannot reach for another source of randomness
@@ -46,16 +46,18 @@ impl Example {
     }
 }
 
-/// A large example that a candidate must also pass, with its own fuel
-/// (decision D25). It is there to turn away programs of a growth class that
-/// cannot finish it within that fuel, such as every program that looks at
-/// each pair of positions. The family's description states its size and its
-/// fuel.
+/// Large inputs that a candidate must also answer, each within the gate's
+/// fuel (decision D25). A gate checks only these inputs and this fuel. A
+/// family chooses them so that programs of a growth class it means to turn
+/// away run out of fuel on at least one of them, and so that inputs which
+/// are a worst case for common algorithms are among them. The family's
+/// description states their size and the fuel. The prompt does not show
+/// them, so a program cannot be fitted to their answers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gate {
-    /// The input and the expected result.
-    pub example: Example,
-    /// The fuel the candidate gets for it, capped by the harness's
+    /// The inputs and their expected results.
+    pub inputs: Vec<Example>,
+    /// The fuel the candidate gets for each, capped by the harness's
     /// [`max_fuel`](crate::harness::HarnessConfig::max_fuel).
     pub fuel: u64,
 }
