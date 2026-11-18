@@ -8,12 +8,12 @@ use dc_tasks::growth::{
     median_steps, GrowthError, GrowthFit, LogLogSlope, SizeOutcome, Sweep, DEFAULT_SIZES,
 };
 use dc_tasks::harness::{
-    check_examples, check_generated, check_input_sizes, measure, run_sweep, validate_family,
-    CheckFailure, FamilyDefect, FuelPlan, HarnessConfig, Measurement, RunFailure, SizeRun,
-    SweepError,
+    check_examples, check_gate, check_generated, check_input_sizes, measure, run_sweep,
+    validate_family, CheckFailure, FamilyDefect, FuelPlan, HarnessConfig, Measurement, RunFailure,
+    SizeRun, SweepError,
 };
 use dc_tasks::rng::TaskRng;
-use dc_tasks::task::{generate_input, Example, Inputs, TaskFamily};
+use dc_tasks::task::{generate_input, Example, Gate, Inputs, TaskFamily};
 
 // ---------------------------------------------------------------------------
 // Families
@@ -862,4 +862,149 @@ fn a_fuel_plan_refuses_a_defective_family() {
         FuelPlan::from_reference(&f, &arena, sum, &config()),
         Err(CheckFailure::Family(FamilyDefect::NoExamples))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Gates (decision D25)
+
+/// The size of [`GatedReverse`]'s gate.
+const GATE_LEN: i64 = 1000;
+
+/// [`ListReverse`] with a gate: a list of [`GATE_LEN`] elements and a fuel
+/// of 20 steps per element, which the linear reverse (about 2 steps per
+/// element) finishes and the quadratic one (about `n² / 2`) does not.
+struct GatedReverse {
+    /// What the gate states as the output: the right one, or a wrong one.
+    right_output: bool,
+}
+
+impl TaskFamily for GatedReverse {
+    fn name(&self) -> &str {
+        "list-reverse-gated"
+    }
+    fn signature(&self) -> Scheme {
+        ListReverse.signature()
+    }
+    fn description(&self) -> &str {
+        ListReverse.description()
+    }
+    fn examples(&self) -> Vec<Example> {
+        ListReverse.examples()
+    }
+    fn gate(&self) -> Option<Gate> {
+        let xs: Vec<i64> = (0..GATE_LEN).collect();
+        let out: Vec<i64> = if self.right_output {
+            xs.iter().rev().copied().collect()
+        } else {
+            xs.clone()
+        };
+        Some(Gate {
+            example: Example::new(vec![Value::int_list(&xs)], Value::int_list(&out)),
+            fuel: 20 * GATE_LEN as u64,
+        })
+    }
+    fn generate(&self, n: u64, rng: &mut TaskRng) -> Inputs {
+        ListReverse.generate(n, rng)
+    }
+    fn oracle(&self, inputs: &[Value]) -> Value {
+        ListReverse.oracle(inputs)
+    }
+}
+
+#[test]
+fn the_gate_turns_away_a_program_that_passes_every_example() {
+    let mut arena = Arena::new();
+    let c = config();
+    let gated = GatedReverse { right_output: true };
+    let rev = parse(&mut arena, REV);
+    let passed = check_examples(&gated, &arena, rev, &c).unwrap();
+    let steps = check_gate(&gated, &arena, &passed, &c).unwrap();
+    assert!(
+        matches!(steps, Some(s) if s < 20 * GATE_LEN as u64),
+        "{steps:?}"
+    );
+    // The quadratic reverse passes every example, and fails the gate only
+    // because it runs out of the gate's fuel.
+    let rev2 = parse(&mut arena, REV_QUADRATIC);
+    let passed = check_examples(&gated, &arena, rev2, &c).unwrap();
+    assert_eq!(
+        check_gate(&gated, &arena, &passed, &c),
+        Err(CheckFailure::Gate {
+            failure: RunFailure::Timeout {
+                fuel: 20 * GATE_LEN as u64
+            }
+        })
+    );
+    // A program wrong on the gate alone fails it with a wrong output.
+    let wrong_on_large = parse(
+        &mut arena,
+        "(lam (if (lt 100 (length $0)) $0 (foldl (lam (lam (cons $0 $1))) nil $0)))",
+    );
+    let passed = check_examples(&gated, &arena, wrong_on_large, &c).unwrap();
+    assert!(matches!(
+        check_gate(&gated, &arena, &passed, &c),
+        Err(CheckFailure::Gate {
+            failure: RunFailure::WrongOutput { .. }
+        })
+    ));
+    // A family with no gate has nothing to fail.
+    let passed = check_examples(&ListReverse, &arena, rev2, &c).unwrap();
+    assert_eq!(check_gate(&ListReverse, &arena, &passed, &c), Ok(None));
+}
+
+#[test]
+fn the_gate_fuel_is_capped_by_the_global_cap() {
+    let mut arena = Arena::new();
+    let c = HarnessConfig {
+        max_fuel: 500,
+        example_fuel: 500,
+        ..config()
+    };
+    let gated = GatedReverse { right_output: true };
+    let rev = parse(&mut arena, REV);
+    let passed = check_examples(&gated, &arena, rev, &c).unwrap();
+    assert_eq!(
+        check_gate(&gated, &arena, &passed, &c),
+        Err(CheckFailure::Gate {
+            failure: RunFailure::Timeout { fuel: 500 }
+        })
+    );
+}
+
+#[test]
+fn a_fuel_plan_comes_from_a_reference_that_fails_the_gate() {
+    // The naive reference sets the plan; the gate is there to turn it away.
+    let mut arena = Arena::new();
+    let c = config();
+    let rev2 = parse(&mut arena, REV_QUADRATIC);
+    let gated = GatedReverse { right_output: true };
+    let plan = FuelPlan::from_reference(&gated, &arena, rev2, &c).unwrap();
+    let plain = FuelPlan::from_reference(&ListReverse, &arena, rev2, &c).unwrap();
+    assert_eq!(plan.sizes(), plain.sizes());
+    // It still has to pass the examples.
+    let identity = parse(&mut arena, REV_IDENTITY);
+    assert!(matches!(
+        FuelPlan::from_reference(&gated, &arena, identity, &c),
+        Err(CheckFailure::Example { index: 2, .. })
+    ));
+}
+
+#[test]
+fn a_gate_that_disagrees_with_the_oracle_is_a_defect() {
+    let c = config();
+    assert_eq!(
+        validate_family(&GatedReverse { right_output: true }, &c),
+        Ok(())
+    );
+    match validate_family(
+        &GatedReverse {
+            right_output: false,
+        },
+        &c,
+    ) {
+        Err(FamilyDefect::ExampleDisagrees { index, .. }) => {
+            assert_eq!(index, ListReverse.examples().len());
+        }
+        other => panic!("expected the gate to disagree; got {other:?}"),
+    }
 }

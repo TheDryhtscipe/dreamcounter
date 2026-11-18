@@ -1,0 +1,211 @@
+-- Reference solutions of the dominance-counting family (bead
+-- dreamcounter-4b0daa, decision D25), in dc surface syntax, compiled against
+-- the prelude. Each variant counts pairs or chains of positions that are in
+-- order both by position and by value. Each has two references:
+--
+-- * naive (n^2): every pair of positions is looked at. The naive ones scan
+--   in full, without stopping early, so their step counts barely depend on
+--   the input.
+-- * good (n log n): a merge sort that counts while it merges, or, for
+--   increasing subsequences, a tree of sums over the ranks of the values.
+--
+-- A condition that only picks which number to add is written as a factor
+-- (if c then 1 else 0) * x, so that both cases cost the same.
+
+let addm a b = (a + b) mod 1000003
+
+-- The number of elements of xs that satisfy p.
+let count_where p xs = foldl (fun acc y -> acc + (if p y then 1 else 0)) 0 xs
+
+-- Merges two lists that are sorted by le into one.
+let merge_by le a b =
+  bfix (length a + length b + 1)
+    (fun self (a, b) ->
+      match a with
+      | [] -> b
+      | x :: xs ->
+        match b with
+        | [] -> a
+        | y :: ys -> if le x y then x :: self (xs, b) else y :: self (a, ys))
+    (a, b)
+
+let msort_by le xs =
+  bfix (length xs + 1)
+    (fun self ys ->
+      if length ys <= 1 then ys
+      else
+        let (l, r) = split_at (length ys / 2) ys in
+        merge_by le (self l) (self r))
+    xs
+
+-- The shared step of the good references. An item is (v, i, c, s): a value,
+-- its position, and the count c and the sum s of the positions of the
+-- earlier items of smaller value seen so far.
+--
+-- Merges a, the items of the earlier half, and b, those of the later half,
+-- each sorted by value. A b item gains every a item of strictly smaller
+-- value: those taken before it. On equal values the b item goes first, so
+-- an equal a item does not count.
+let merge_smaller a b =
+  bfix (length a + length b + 1)
+    (fun self (a, b, k, s) ->
+      match a with
+      | [] -> map (fun (v, i, c, t) -> (v, i, c + k, t + s)) b
+      | x :: xs ->
+        match b with
+        | [] -> a
+        | y :: ys ->
+          let (xv, xi, _, _) = x in
+          let (yv, yi, yc, yt) = y in
+          if xv < yv then x :: self (xs, b, k + 1, s + xi)
+          else (yv, yi, yc + k, yt + s) :: self (a, ys, k, s))
+    (a, b, 0, 0)
+
+-- The items of xs, sorted by value, each with the count and the position
+-- sum of the earlier elements of strictly smaller value.
+let smaller_before xs =
+  bfix (length xs + 1)
+    (fun self ys ->
+      if length ys <= 1 then ys
+      else
+        let (l, r) = split_at (length ys / 2) ys in
+        merge_smaller (self l) (self r))
+    (map (fun (v, i) -> (v, i, 0, 0)) (zip xs (range 0 (length xs))))
+
+-- (a) Weighted inversions: the sum of j - i over the pairs i < j with
+-- xs[i] > xs[j].
+
+let weighted_inversions_naive xs =
+  bfix (length xs + 1)
+    (fun self (ys, i) ->
+      match ys with
+      | [] -> 0
+      | x :: rest ->
+        let (w, _) =
+          foldl (fun (acc, j) y -> (acc + (if x > y then 1 else 0) * (j - i), j + 1))
+            (0, i + 1) rest in
+        w + self (rest, i + 1))
+    (xs, 0)
+
+-- An earlier larger element is an earlier smaller one of the negated list;
+-- item j adds c j - s, the sum of j - i over those i.
+let weighted_inversions_good xs =
+  foldl (fun acc (_, j, c, s) -> acc + c * j - s) 0
+    (smaller_before (map (fun x -> 0 - x) xs))
+
+-- (b) Pairs in two dimensions: the pairs of positions (i, j) with
+-- xs[i] < xs[j] and ys[i] < ys[j].
+
+let pairs_2d_naive xs ys =
+  let ps = zip xs ys in
+  foldl
+    (fun acc (a, b) -> acc + count_where (fun (c, d) -> a < c && b < d) ps)
+    0 ps
+
+-- Sorted by a, and by b downwards among equal a, an earlier point of
+-- smaller b always has smaller a.
+let pairs_2d_good xs ys =
+  let sorted =
+    msort_by (fun (a, b) (c, d) -> a < c || (a = c && d <= b)) (zip xs ys) in
+  foldl (fun acc (_, _, c, _) -> acc + c) 0 (smaller_before (map snd sorted))
+
+-- (c) Increasing triples: the triples i < j < k with xs[i] < xs[j] < xs[k].
+
+let increasing_triples_naive xs =
+  bfix (length xs + 1)
+    (fun self (ys, seen) ->
+      match ys with
+      | [] -> 0
+      | x :: rest ->
+        count_where (fun y -> y < x) seen * count_where (fun y -> x < y) rest
+          + self (rest, x :: seen))
+    (xs, [])
+
+-- For each middle j: the earlier smaller elements times the later larger
+-- ones. A later larger element is an earlier smaller one of the reversed,
+-- negated list, where j is at n - 1 - j. The first counts go into an array
+-- by position, and the second look them up.
+let increasing_triples_good xs =
+  let n = length xs in
+  let left =
+    foldl (fun a (_, i, c, _) -> array_set a i c)
+      (array_tabulate n (fun _ -> 0)) (smaller_before xs) in
+  foldl (fun acc (_, i, r, _) -> acc + array_get left (n - 1 - i) * r) 0
+    (smaller_before (reverse (map (fun x -> 0 - x) xs)))
+
+-- (d) Increasing subsequences: the non-empty strictly increasing
+-- subsequences, mod 1000003. The count of those that end at j is 1 plus
+-- the counts of those that end at an earlier smaller element.
+
+let increasing_subsequences_naive xs =
+  let (_, total) =
+    foldl
+      (fun (seen, total) x ->
+        let ending =
+          addm 1
+            (foldl (fun acc (v, c) -> addm acc ((if v < x then 1 else 0) * c)) 0 seen) in
+        ((x, ending) :: seen, addm total ending))
+      ([], 0) xs in
+  total
+
+-- A tree of zeros over the ranks lo..hi - 1: a node holds the sum of its
+-- ranks, a leaf node one rank.
+let zeros_tree n =
+  bfix (n + 1)
+    (fun self (lo, hi) ->
+      if hi - lo <= 1 then Node (Leaf, 0, Leaf)
+      else
+        let mid = (lo + hi) / 2 in
+        Node (self (lo, mid), 0, self (mid, hi)))
+    (0, n)
+
+-- The sum of the ranks below r in a tree over lo..hi - 1.
+let tree_below t n r =
+  bfix (n + 1)
+    (fun self (t, lo, hi) ->
+      match t with
+      | Leaf -> 0
+      | Node (l, x, rt) ->
+        if hi <= r then x
+        else if r <= lo then 0
+        else
+          let mid = (lo + hi) / 2 in
+          addm (self (l, lo, mid)) (self (rt, mid, hi)))
+    (t, 0, n)
+
+-- The tree with c added at rank r.
+let tree_add t n r c =
+  bfix (n + 1)
+    (fun self (t, lo, hi) ->
+      match t with
+      | Leaf -> Leaf
+      | Node (l, x, rt) ->
+        if hi - lo <= 1 then Node (l, addm x c, rt)
+        else
+          let mid = (lo + hi) / 2 in
+          if r < mid then Node (self (l, lo, mid), addm x c, rt)
+          else Node (l, addm x c, self (rt, mid, hi)))
+    (t, 0, n)
+
+let increasing_subsequences_good xs =
+  let sorted = msort_by (fun (a, _) (b, _) -> a <= b) (zip xs (range 0 (length xs))) in
+  let ranked =
+    match sorted with
+    | [] -> []
+    | first :: _ ->
+      let (_, _, acc) =
+        foldl
+          (fun (prev, r, acc) (v, i) ->
+            let r2 = r + (if v = prev then 0 else 1) in
+            (v, r2, (i, r2) :: acc))
+          (fst first, 0, []) sorted in
+      acc in
+  let by_pos = msort_by (fun (i, _) (j, _) -> i <= j) ranked in
+  let n = length xs in
+  let (_, total) =
+    foldl
+      (fun (t, total) (_, r) ->
+        let ending = addm 1 (tree_below t n r) in
+        (tree_add t n r ending, addm total ending))
+      (zeros_tree n, 0) by_pos in
+  total

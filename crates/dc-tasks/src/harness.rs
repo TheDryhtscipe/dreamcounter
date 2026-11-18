@@ -29,6 +29,12 @@
 //! and the plan its number of seeds; [`run_sweep`] refuses them for another
 //! family or seed count.
 //!
+//! A family can also have a [`Gate`](crate::task::Gate) (decision D25): one large input with its
+//! own fuel. [`check_gate`] runs a program that passed its examples on it.
+//! A candidate solves the family only if it passes both. The gate is not
+//! part of the pipeline above: a program that fails it, such as the naive
+//! reference that sets the fuel plan, can still be measured.
+//!
 //! [`check_generated`] checks a program against the oracle on generated
 //! inputs without measuring it, to test families and reference solutions.
 //! [`validate_family`] checks a family's own definition (sizes, examples
@@ -134,6 +140,11 @@ pub enum CheckFailure {
         /// What went wrong.
         failure: RunFailure,
     },
+    /// The program failed the family's [`Gate`](crate::task::Gate).
+    Gate {
+        /// What went wrong; a timeout has the gate's fuel.
+        failure: RunFailure,
+    },
     /// The program failed on a generated input.
     Generated {
         /// The input size.
@@ -196,7 +207,8 @@ pub enum FamilyDefect {
     /// An example's stated output differs from the oracle's output on the
     /// example's inputs.
     ExampleDisagrees {
-        /// The example's position in [`TaskFamily::examples`].
+        /// The example's position in [`TaskFamily::examples`], or the
+        /// number of examples for the [`Gate`](crate::task::Gate).
         index: usize,
         /// The output the example states.
         stated: Box<Value>,
@@ -205,7 +217,8 @@ pub enum FamilyDefect {
     },
     /// The oracle panicked on an example's inputs.
     OraclePanicked {
-        /// The example's position in [`TaskFamily::examples`].
+        /// The example's position in [`TaskFamily::examples`], or the
+        /// number of examples for the [`Gate`](crate::task::Gate).
         index: usize,
         /// The panic message, or a placeholder if it was not a string.
         message: String,
@@ -237,10 +250,10 @@ pub enum FamilyDefect {
 
 /// Checks a family's definition before anything is run on it: its sizes are
 /// strictly increasing and positive, the upper half of them holds at least
-/// [`PowerLogGrid::MIN_POINTS`] sizes, it has examples and each agrees with
-/// the oracle (an oracle that panics on an example is a defect, not a panic
-/// here), its generator gives the same input twice for every size and seed
-/// `0..config.seeds`, and seeds 0 and 1 give different inputs at some size.
+/// [`PowerLogGrid::MIN_POINTS`] sizes, it has examples and each, and its
+/// [`Gate`](crate::task::Gate) if it has one, agrees with the oracle (an oracle that panics on
+/// an example is a defect, not a panic here), its generator gives the same
+/// input twice for every size and seed `0..config.seeds`, and seeds 0 and 1 give different inputs at some size.
 /// [`FuelPlan::from_reference`] calls it.
 ///
 /// # Errors
@@ -267,7 +280,8 @@ pub fn validate_family<F: TaskFamily + ?Sized>(
     if examples.is_empty() {
         return Err(FamilyDefect::NoExamples);
     }
-    for (index, e) in examples.iter().enumerate() {
+    let gate = family.gate().map(|g| g.example);
+    for (index, e) in examples.iter().chain(gate.iter()).enumerate() {
         // `AssertUnwindSafe`: on a panic the family is reported as defective
         // and nothing it holds is used again here.
         let oracle = match panic::catch_unwind(AssertUnwindSafe(|| family.oracle(&e.inputs))) {
@@ -401,7 +415,8 @@ impl From<GrowthError> for SweepError {
 
 /// Type-checks `program` against the family's signature, then runs it on
 /// every example with [`HarnessConfig::example_fuel`] (capped by
-/// [`HarnessConfig::max_fuel`]).
+/// [`HarnessConfig::max_fuel`]). It does not run the family's [`Gate`](crate::task::Gate):
+/// see [`check_gate`].
 ///
 /// # Errors
 ///
@@ -423,6 +438,35 @@ pub fn check_examples<F: TaskFamily + ?Sized>(
         program,
         family: family.name().to_string(),
     })
+}
+
+/// Runs a program that passed its examples on the family's [`Gate`](crate::task::Gate), with
+/// the gate's fuel capped by [`HarnessConfig::max_fuel`]. A candidate solves
+/// the family only if this passes as well. Returns the steps on the gate,
+/// or `None` if the family has no gate.
+///
+/// # Errors
+///
+/// [`CheckFailure::Gate`] with the failure; a timeout has the capped fuel.
+pub fn check_gate<F: TaskFamily + ?Sized>(
+    family: &F,
+    arena: &Arena,
+    passed: &ExamplesPassed,
+    config: &HarnessConfig,
+) -> Result<Option<u64>, CheckFailure> {
+    let Some(gate) = family.gate() else {
+        return Ok(None);
+    };
+    let fuel = gate.fuel.min(config.max_fuel);
+    run_on(
+        arena,
+        passed.program(),
+        &gate.example.inputs,
+        &gate.example.output,
+        fuel,
+    )
+    .map(Some)
+    .map_err(|failure| CheckFailure::Gate { failure })
 }
 
 /// Runs `program` on seeds `0..config.seeds` at each of `sizes` with
@@ -501,7 +545,8 @@ impl FuelPlan {
     /// # Errors
     ///
     /// [`CheckFailure::Family`] if the family is defective; otherwise the
-    /// reference's first failure other than a timeout at the cap.
+    /// reference's first failure other than a timeout at the cap. The
+    /// reference is not run on the family's [`Gate`](crate::task::Gate).
     pub fn from_reference<F: TaskFamily + ?Sized>(
         family: &F,
         arena: &Arena,

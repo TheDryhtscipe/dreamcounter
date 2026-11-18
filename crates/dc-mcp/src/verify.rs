@@ -10,7 +10,9 @@
 //!    the library's type schemes.
 //! 3. **Run.** The entry, with the prelude and the library expanded, gives
 //!    the expected output on every example of the task, within the harness's
-//!    example fuel ([`dc_tasks::harness::check_examples`]).
+//!    example fuel ([`dc_tasks::harness::check_examples`]), and then on the
+//!    task's gate, if it has one, within the gate's fuel
+//!    ([`dc_tasks::harness::check_gate`], decision D25).
 //!
 //! A program that passes all three is kept as a core term with its prelude
 //! and library references in place, so the compressor sees `map` as a token,
@@ -23,7 +25,7 @@ use dc_core::types::{check, infer};
 use dc_core::{sexpr, Arena, ExpandError, Expander, LibDef, LibId, Scheme, TermId};
 use dc_surface::prelude::{Prelude, PreludeMode};
 use dc_surface::TopLevel;
-use dc_tasks::harness::{check_examples, CheckFailure, HarnessConfig, RunFailure};
+use dc_tasks::harness::{check_examples, check_gate, CheckFailure, HarnessConfig, RunFailure};
 use dc_tasks::task::TaskFamily;
 
 use crate::state::{Check, LibraryEntry, RunConfig};
@@ -293,13 +295,18 @@ impl Verifier {
                 }
             }
         };
-        match check_examples(family, &self.arena, expanded, &self.harness) {
+        let checked = check_examples(family, &self.arena, expanded, &self.harness)
+            .and_then(|passed| check_gate(family, &self.arena, &passed, &self.harness));
+        match checked {
             Ok(_) => Check::Passed { program: stored },
             Err(CheckFailure::Type(e)) => Check::Type {
                 error: e.to_string(),
             },
             Err(CheckFailure::Example { index, failure }) => Check::Run {
                 error: format!("example {index}: {}", describe(&failure)),
+            },
+            Err(CheckFailure::Gate { failure }) => Check::Run {
+                error: format!("the large example: {}", describe(&failure)),
             },
             Err(other) => Check::Run {
                 error: format!("{other:?}"),
@@ -528,5 +535,34 @@ mod tests {
     fn only_development_tasks_are_found() {
         assert!(task("collapse/merge").is_some());
         assert!(task("no/such").is_none());
+    }
+
+    #[test]
+    fn a_program_that_passes_the_examples_but_not_the_gate_does_not_pass() {
+        // Decision D25: the naive dominance references give every example's
+        // output, and run out of the gate's fuel.
+        let v = development()
+            .into_iter()
+            .find(|v| v.family.name() == "dominance/weighted-inversions")
+            .unwrap();
+        let naive = v.references.first().unwrap();
+        let good = v.references.last().unwrap();
+        assert!(!naive.passes_gate && good.passes_gate);
+        let mut verifier = Verifier::new(&[]).unwrap();
+        let text = |entry: &str| format!("{}\nlet {ENTRY} = {entry}\n", v.source);
+        match verifier.check(&*v.family, &text(naive.entry)) {
+            Check::Run { error } => assert_eq!(
+                error,
+                format!(
+                    "the large example: no result within {} steps",
+                    dc_tasks::families::dominance::GATE_FUEL
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            verifier.check(&*v.family, &text(good.entry)),
+            Check::Passed { .. }
+        ));
     }
 }

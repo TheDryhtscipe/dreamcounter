@@ -7,7 +7,9 @@
 //! its inputs have size `n`, and its inputs at the largest size differ for
 //! every seed. Every reference has the family's signature, passes its
 //! examples, and agrees with the oracle on every generated input it is run
-//! on, under the default fuel cap. By default
+//! on, under the default fuel cap. On a family with a gate (decision D25),
+//! a reference passes it if [`Reference::passes_gate`] says so, and
+//! otherwise runs out of the gate's fuel. By default
 //! (`good_references_at_every_size_others_at_the_lower_half`) the good
 //! reference runs at every size and the slower ones at the lower half of
 //! the sweep only, so a naive reference wrong only in the upper half passes
@@ -31,21 +33,22 @@ use common::{compile, list_len};
 use dc_core::{Arena, Scheme};
 use dc_eval::Value;
 use dc_tasks::families::{
-    self, collapse, sorted_order, subsequence_count, CorpusVariant, Reference,
+    self, collapse, dominance, sorted_order, subsequence_count, CorpusVariant, Reference,
 };
 use dc_tasks::growth::{ClassSelect, SizeObservation, Sweep};
 use dc_tasks::harness::{
-    check_examples, check_generated, check_input_sizes, run_on, validate_family, HarnessConfig,
-    DEFAULT_SEEDS,
+    check_examples, check_gate, check_generated, check_input_sizes, run_on, validate_family,
+    CheckFailure, HarnessConfig, RunFailure, DEFAULT_SEEDS,
 };
 use dc_tasks::rng::TaskRng;
-use dc_tasks::task::{generate_input, Example, Inputs, TaskFamily};
+use dc_tasks::task::{generate_input, Example, Gate, Inputs, TaskFamily};
 
 /// The seeds of the corpus run, `0..CORPUS_SEEDS`.
 const CORPUS_SEEDS: u64 = 32;
 
-/// The development families: collapse, sorted order, subsequence count.
-const FAMILIES: usize = 3;
+/// The development families: collapse, sorted order, subsequence count,
+/// dominance.
+const FAMILIES: usize = 4;
 
 /// The configuration of the corpus run: the harness defaults at
 /// [`CORPUS_SEEDS`] seeds.
@@ -112,7 +115,23 @@ fn check_variant(
     let good = v.references.len() - 1;
     for (i, r) in v.references.iter().enumerate() {
         let p = compile(&mut arena, v.source, r.entry);
-        check_examples(family, &arena, p, config).map_err(|f| format!("{}: {f:?}", r.entry))?;
+        let passed =
+            check_examples(family, &arena, p, config).map_err(|f| format!("{}: {f:?}", r.entry))?;
+        match (check_gate(family, &arena, &passed, config), family.gate()) {
+            (Ok(_), _) if r.passes_gate => {}
+            (
+                Err(CheckFailure::Gate {
+                    failure: RunFailure::Timeout { fuel },
+                }),
+                Some(g),
+            ) if !r.passes_gate && fuel == g.fuel.min(config.max_fuel) => {}
+            (other, _) => {
+                return Err(format!(
+                    "{}: on the gate {other:?}, passes_gate {}",
+                    r.entry, r.passes_gate
+                ))
+            }
+        }
         let sizes = sizes_for(family, r, i == good, coverage);
         if sizes.is_empty() {
             return Err(format!("{}: runs at no size of the sweep", r.entry));
@@ -167,7 +186,10 @@ fn the_corpus_holds_every_variant_once() {
     let corpus = families::development();
     let names: BTreeSet<&str> = corpus.iter().map(|v| v.family.name()).collect();
     assert_eq!(names.len(), corpus.len(), "variant names are unique");
-    let count = collapse::all().len() + sorted_order::all().len() + subsequence_count::all().len();
+    let count = collapse::all().len()
+        + sorted_order::all().len()
+        + subsequence_count::all().len()
+        + dominance::all().len();
     assert_eq!(corpus.len(), count);
     let families: BTreeSet<&str> = corpus.iter().map(|v| v.source).collect();
     assert_eq!(families.len(), FAMILIES);
@@ -188,6 +210,10 @@ fn the_corpus_holds_every_variant_once() {
         let name = subsequence_count::SubsequenceCount(v).name().into();
         expected.push((name, vec![v.naive(), v.quadratic(), v.good()]));
     }
+    for v in dominance::Variant::ALL {
+        let name = dominance::Dominance(v).name().into();
+        expected.push((name, vec![v.naive(), v.good()]));
+    }
     let actual: Vec<(String, Vec<&str>)> = corpus
         .iter()
         .map(|v| {
@@ -206,6 +232,16 @@ fn the_corpus_holds_every_variant_once() {
                 u64::MAX
             };
             assert_eq!(r.max_n, max_n, "{}", r.entry);
+            // Only the naive dominance references are too slow for a gate,
+            // and only the dominance family has one.
+            let gated = v.source == dominance::SOURCE;
+            assert_eq!(v.family.gate().is_some(), gated, "{}", v.family.name());
+            assert_eq!(
+                r.passes_gate,
+                !(gated && r.entry.ends_with("_naive")),
+                "{}",
+                r.entry
+            );
         }
     }
 }
@@ -269,6 +305,9 @@ impl TaskFamily for WrongOn {
         } else {
             right
         }
+    }
+    fn gate(&self) -> Option<Gate> {
+        self.inner.gate()
     }
     fn sizes(&self) -> Vec<u64> {
         self.inner.sizes()

@@ -183,14 +183,17 @@ fn shown(v: &dc_eval::Value) -> String {
     }
 }
 
-/// The task section: its description, type and examples.
+/// The task section: its description, type and examples. A task's gate
+/// (decision D25) is shown as its last example, cut to [`SHOWN_VALUES`]
+/// values like any other.
 fn task(family: &dyn TaskFamily) -> String {
     let mut out = format!(
         "## The task\n\n{}\n\n{ENTRY} : {}\n\nExamples:\n",
         family.description(),
         family.signature()
     );
-    for example in family.examples() {
+    let gate = family.gate().map(|g| g.example);
+    for example in family.examples().iter().chain(gate.iter()) {
         let args: Vec<String> = example.inputs.iter().map(shown).collect();
         out.push_str(&format!(
             "  {ENTRY} {} = {}\n",
@@ -481,6 +484,26 @@ mod tests {
         // No library and no solved tasks yet.
         assert!(!p.prompt.contains("## Library"));
         assert!(!p.prompt.contains("## Programs that solve"));
+    }
+
+    #[test]
+    fn a_gate_is_shown_as_the_last_example() {
+        let s = state(&["dominance/increasing-triples"]);
+        let v = Verifier::new(&[]).unwrap();
+        let family = crate::verify::task("dominance/increasing-triples").unwrap();
+        let p = payload(&s, &v, &*family, 0, "tok", 1);
+        let gate = family.gate().expect("a gate").example;
+        let line = format!(
+            "  {ENTRY} {} = {}\n",
+            shown(&gate.inputs[0]),
+            gate.output.display_within(SHOWN_VALUES)
+        );
+        assert!(p.prompt.contains(&line), "{}", p.prompt);
+        // The input is cut short.
+        assert!(line.len() < 20 * SHOWN_VALUES as usize, "{}", line.len());
+        let last_small = family.examples().last().unwrap().output.to_string();
+        let at = |needle: &str| p.prompt.find(needle).unwrap();
+        assert!(at(&format!("= {last_small}\n")) < at(&line));
     }
 
     #[test]

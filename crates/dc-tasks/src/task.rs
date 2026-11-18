@@ -8,8 +8,10 @@
 //! * example inputs and outputs for the prompt,
 //! * a generator `generate(n, seed)` of inputs of size `n`,
 //! * an oracle in Rust, independent of dc, that gives the expected output for
-//!   any input, and
-//! * the sweep of sizes over which cost growth is measured.
+//!   any input,
+//! * the sweep of sizes over which cost growth is measured, and
+//! * optionally a [`Gate`]: one large example with its own fuel, which only
+//!   a program of a low enough growth class finishes (decision D25).
 //!
 //! The generator receives a [`TaskRng`] seeded from `(n, seed)` rather than
 //! the seed itself, so a family cannot reach for another source of randomness
@@ -44,6 +46,20 @@ impl Example {
     }
 }
 
+/// A large example that a candidate must also pass, with its own fuel
+/// (decision D25). It is there to turn away programs of a growth class that
+/// cannot finish it within that fuel, such as every program that looks at
+/// each pair of positions. The family's description states its size and its
+/// fuel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gate {
+    /// The input and the expected result.
+    pub example: Example,
+    /// The fuel the candidate gets for it, capped by the harness's
+    /// [`max_fuel`](crate::harness::HarnessConfig::max_fuel).
+    pub fuel: u64,
+}
+
 /// A task family (spec §9).
 pub trait TaskFamily {
     /// A short, unique identifier, for logs and results tables.
@@ -65,6 +81,12 @@ pub trait TaskFamily {
 
     /// The expected output for `inputs`, computed in Rust without dc.
     fn oracle(&self, inputs: &[Value]) -> Value;
+
+    /// The gate, if the family has one. A candidate solves the family only
+    /// if it passes the examples and then the gate. The default is none.
+    fn gate(&self) -> Option<Gate> {
+        None
+    }
 
     /// The sizes of the growth sweep, strictly increasing and positive. The
     /// default is `16, 32, ..., 1024`; families whose reference solutions are

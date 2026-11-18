@@ -11,12 +11,16 @@
 //! * [`sorted_order`]: queries answered by sorting first.
 //! * [`subsequence_count`]: counting the subsets of positions that keep a
 //!   local rule.
+//! * [`dominance`]: counting pairs and chains of positions in order by both
+//!   position and value, with a gate that only a program better than `n²`
+//!   finishes within its fuel (decision D25).
 //!
 //! [`development`] lists every variant of these families with its reference
 //! solutions in one place, for checks that run over the whole corpus. A new
 //! family or reference must be added to it by hand.
 
 pub mod collapse;
+pub mod dominance;
 pub mod sorted_order;
 pub mod subsequence_count;
 
@@ -51,6 +55,12 @@ pub struct Reference {
     /// sweep, except for a reference too slow to finish at the larger
     /// sizes under the harness's fuel cap, such as a `2ⁿ` one.
     pub max_n: u64,
+    /// Whether it passes the variant's [`Gate`](crate::task::Gate). It is
+    /// `false` only for a reference of a growth class that the gate is
+    /// there to turn away, such as the naive references of [`dominance`].
+    /// Such a reference still passes the examples, and must run out of the
+    /// gate's fuel.
+    pub passes_gate: bool,
 }
 
 impl Reference {
@@ -59,6 +69,17 @@ impl Reference {
         Reference {
             entry,
             max_n: u64::MAX,
+            passes_gate: true,
+        }
+    }
+
+    /// A reference run over the whole sweep that runs out of the gate's
+    /// fuel.
+    pub const fn too_slow_for_gate(entry: &'static str) -> Reference {
+        Reference {
+            entry,
+            max_n: u64::MAX,
+            passes_gate: false,
         }
     }
 }
@@ -69,8 +90,8 @@ impl Reference {
 pub const EXPONENTIAL_MAX_N: u64 = 16;
 
 /// Every variant of every development family, with its references, in
-/// family order: collapse, sorted order, subsequence count. The held-out
-/// family is not here (decision D14).
+/// family order: collapse, sorted order, subsequence count, dominance. The
+/// held-out family is not here (decision D14).
 pub fn development() -> Vec<CorpusVariant> {
     let mut corpus = Vec::new();
     for v in collapse::Variant::ALL {
@@ -95,8 +116,19 @@ pub fn development() -> Vec<CorpusVariant> {
                 Reference {
                     entry: v.naive(),
                     max_n: EXPONENTIAL_MAX_N,
+                    passes_gate: true,
                 },
                 Reference::whole(v.quadratic()),
+                Reference::whole(v.good()),
+            ],
+        });
+    }
+    for v in dominance::Variant::ALL {
+        corpus.push(CorpusVariant {
+            family: Box::new(dominance::Dominance(v)),
+            source: dominance::SOURCE,
+            references: vec![
+                Reference::too_slow_for_gate(v.naive()),
                 Reference::whole(v.good()),
             ],
         });
