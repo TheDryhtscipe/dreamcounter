@@ -244,6 +244,7 @@ fn measure_unguarded(
                     seed: *seed,
                     kind: match failure {
                         RunFailure::Timeout { .. } => FailureKind::Timeout,
+                        RunFailure::MemoryLimit { .. } => FailureKind::MemoryLimit,
                         RunFailure::Error { .. } => FailureKind::Error,
                         RunFailure::WrongOutput { .. } => FailureKind::WrongOutput,
                     },
@@ -296,9 +297,9 @@ pub fn growth(cost: Option<&ProgramCost>) -> Growth {
             CostVerdict::NoiseUnknown { .. } => Growth::Refused(Refusal::NoiseUnknown),
             CostVerdict::NotFitted { .. } => {
                 let timed_out = sizes.iter().any(|s| {
-                    s.failed
-                        .as_ref()
-                        .is_some_and(|f| f.kind == FailureKind::Timeout)
+                    s.failed.as_ref().is_some_and(|f| {
+                        matches!(f.kind, FailureKind::Timeout | FailureKind::MemoryLimit)
+                    })
                 });
                 if timed_out {
                     Growth::TimedOut

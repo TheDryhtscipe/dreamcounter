@@ -151,7 +151,9 @@ fn pair_sums_sweep_rejects_wrong_exact_pair_counts() {
             .examples()
             .iter()
             .enumerate()
-            .filter(|(_, e)| run_on(&arena, p, &e.inputs, &e.output, c.example_fuel).is_err())
+            .filter(|(_, e)| {
+                run_on(&arena, p, &e.inputs, &e.output, c.limits(c.example_fuel)).is_err()
+            })
             .map(|(i, _)| i)
             .collect();
         assert!(
@@ -163,7 +165,7 @@ fn pair_sums_sweep_rejects_wrong_exact_pair_counts() {
             for seed in 0..c.seeds {
                 let inputs = generate_input(&family, n, seed);
                 let expected = family.oracle(&inputs);
-                match run_on(&arena, p, &inputs, &expected, c.max_fuel) {
+                match run_on(&arena, p, &inputs, &expected, c.limits(c.max_fuel)) {
                     Ok(_) => {}
                     Err(RunFailure::WrongOutput { expected, actual }) => {
                         wrong.push(format!("n = {n}, seed {seed}: {actual}, not {expected}"));

@@ -361,7 +361,7 @@ impl Kinds {
         match o {
             Outcome::Value(..) => self.values.set(self.values.get() + 1),
             Outcome::Error(..) => self.errors.set(self.errors.get() + 1),
-            Outcome::Timeout(_) => {}
+            Outcome::Timeout(_) | Outcome::MemoryLimit(_) => {}
         }
         if o.steps() >= 50 {
             self.long.set(self.long.get() + 1);
