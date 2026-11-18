@@ -28,6 +28,8 @@ use std::mem;
 use std::ptr;
 use std::rc::{Rc, Weak};
 
+use crate::budget::{Budget, OverMemory};
+
 use dc_core::{Prim, TermId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -173,17 +175,30 @@ pub struct MemoKey {
 impl MemoKey {
     /// Converts a value to a key. Returns `None` for a value that is not a valid key.
     pub fn from_value(v: &Value) -> Option<MemoKey> {
-        MemoKey::build(v, MemoKey::size_of(v)?)
+        let unlimited = Budget::UNLIMITED;
+        let size = MemoKey::size_of(v, &unlimited).ok()??;
+        MemoKey::build(v, size, &unlimited).ok()?
     }
 
     /// Converts a value of key size `size`, as measured by [`MemoKey::size_of`],
     /// to a key. The work is linear in the number of distinct pairs of `v`.
-    /// Returns `None` for a value that is not a valid key.
-    pub(crate) fn build(v: &Value, size: u64) -> Option<MemoKey> {
+    /// Returns `None` for a value that is not a valid key, and fails if the
+    /// key's scratch space would go over `budget`.
+    pub(crate) fn build(
+        v: &Value,
+        size: u64,
+        budget: &Budget,
+    ) -> Result<Option<MemoKey>, OverMemory> {
         let repr = if size <= FLAT_KEY_MAX {
-            KeyRepr::Flat(MemoKey::flat(v)?)
+            match MemoKey::flat(v) {
+                Some(atoms) => KeyRepr::Flat(atoms),
+                None => return Ok(None),
+            }
         } else {
-            KeyRepr::Dag(MemoKey::dag(v)?)
+            match MemoKey::dag(v, budget)? {
+                Some(nodes) => KeyRepr::Dag(nodes),
+                None => return Ok(None),
+            }
         };
         #[cfg(test)]
         KEY_ATOMS_BUILT.with(|n| {
@@ -193,7 +208,7 @@ impl MemoKey {
             };
             n.set(n.get() + built as u64)
         });
-        Some(MemoKey { repr, size })
+        Ok(Some(MemoKey { repr, size }))
     }
 
     /// The pre-order atoms of `v`, or `None` for an invalid key. Call it only on a
@@ -219,80 +234,92 @@ impl MemoKey {
 
     /// The distinct subvalues of `v` in canonical order (see [`KeyRepr::Dag`]), or
     /// `None` for an invalid key. Each pair in memory is visited once.
-    fn dag(v: &Value) -> Option<Vec<KeyNode>> {
+    fn dag(v: &Value, budget: &Budget) -> Result<Option<Vec<KeyNode>>, OverMemory> {
         let mut nodes: Vec<KeyNode> = Vec::new();
         let mut ids = KeyNodeIds::default();
         let mut by_ptr: FxHashMap<*const (Value, Value), usize> = FxHashMap::default();
-        let mut intern = |node: KeyNode, nodes: &mut Vec<KeyNode>| -> usize {
-            *ids.entry(node).or_insert_with(|| {
+        let mut intern = |node: KeyNode, nodes: &mut Vec<KeyNode>| -> Result<usize, OverMemory> {
+            if !ids.contains_key(&node) {
+                budget.ensure_map(&mut ids)?;
+                budget.ensure_vec(nodes, 1)?;
+            }
+            Ok(*ids.entry(node).or_insert_with(|| {
                 nodes.push(node);
                 nodes.len() - 1
-            })
+            }))
         };
         // `(value, components done)`; `results` holds the finished node ids.
         let mut work: Vec<(&Value, bool)> = vec![(v, false)];
         let mut results: Vec<usize> = Vec::new();
         while let Some((v, done)) = work.pop() {
             let id = match v {
-                Value::Int(n) => intern(KeyNode::Int(*n), &mut nodes),
-                Value::Bool(b) => intern(KeyNode::Bool(*b), &mut nodes),
-                Value::Unit => intern(KeyNode::Unit, &mut nodes),
+                Value::Int(n) => intern(KeyNode::Int(*n), &mut nodes)?,
+                Value::Bool(b) => intern(KeyNode::Bool(*b), &mut nodes)?,
+                Value::Unit => intern(KeyNode::Unit, &mut nodes)?,
                 Value::Pair(p) => {
                     let ptr = Rc::as_ptr(p);
                     if done {
-                        let b = results.pop()?;
-                        let a = results.pop()?;
-                        let id = intern(KeyNode::Pair(a, b), &mut nodes);
+                        let (Some(b), Some(a)) = (results.pop(), results.pop()) else {
+                            return Ok(None);
+                        };
+                        let id = intern(KeyNode::Pair(a, b), &mut nodes)?;
+                        budget.ensure_map(&mut by_ptr)?;
                         by_ptr.insert(ptr, id);
                         id
                     } else if let Some(&id) = by_ptr.get(&ptr) {
                         id
                     } else {
+                        budget.ensure_vec(&mut work, 3)?;
                         work.push((v, true));
                         work.push((&p.1, false));
                         work.push((&p.0, false));
                         continue;
                     }
                 }
-                _ => return None,
+                _ => return Ok(None),
             };
+            budget.ensure_vec(&mut results, 1)?;
             results.push(id);
         }
-        Some(nodes)
+        Ok(Some(nodes))
     }
 
     /// The key size of `v` in value nodes (saturating), or `None` if `v` is not a
     /// valid key. Each distinct pair is measured once, so the work is linear in the
     /// number of distinct pairs, not in the size, which sharing can make
     /// exponentially larger.
-    pub(crate) fn size_of(v: &Value) -> Option<u64> {
+    pub(crate) fn size_of(v: &Value, budget: &Budget) -> Result<Option<u64>, OverMemory> {
         let mut sizes: FxHashMap<*const (Value, Value), u64> = FxHashMap::default();
         // `(value, children measured)`; `results` holds the measured sizes.
         let mut work: Vec<(&Value, bool)> = vec![(v, false)];
         let mut results: Vec<u64> = Vec::new();
         while let Some((v, measured)) = work.pop() {
+            budget.ensure_vec(&mut results, 1)?;
             match v {
                 Value::Int(_) | Value::Bool(_) | Value::Unit => results.push(1),
                 Value::Pair(p) => {
                     let ptr = Rc::as_ptr(p);
                     if measured {
-                        let b = results.pop()?;
-                        let a = results.pop()?;
+                        let (Some(b), Some(a)) = (results.pop(), results.pop()) else {
+                            return Ok(None);
+                        };
                         let s = a.saturating_add(b).saturating_add(1);
+                        budget.ensure_map(&mut sizes)?;
                         sizes.insert(ptr, s);
                         results.push(s);
                     } else if let Some(&s) = sizes.get(&ptr) {
                         results.push(s);
                     } else {
+                        budget.ensure_vec(&mut work, 3)?;
                         work.push((v, true));
                         work.push((&p.1, false));
                         work.push((&p.0, false));
                     }
                 }
-                _ => return None,
+                _ => return Ok(None),
             }
         }
-        results.pop()
+        Ok(results.pop())
     }
 
     /// The key size in value nodes, as the cost model counts it.
@@ -515,81 +542,136 @@ impl Drop for Tree {
     }
 }
 
-/// Moves the uniquely owned children of `v` onto `out`, leaving `v` with nothing
-/// that a recursive drop would descend into. Shared children are left alone: dropping
-/// them only decrements a count.
-fn detach_children(v: &mut Value, out: &mut Vec<Value>) {
-    match v {
+/// A uniquely owned part of a value being dropped, waiting on the drop's work
+/// list. Each is one pointer (16 bytes with its tag), and is pushed only after
+/// the cell, node or box that held it has been freed, which is larger. So the
+/// work list never holds more bytes than the drop has already freed, whatever
+/// the nesting of the value: dropping never takes the heap above where it was
+/// when the drop started (bead dreamcounter-a3db93).
+enum Doomed {
+    Cons(Rc<Cons>),
+    Node(Rc<TreeNode>),
+    Some(Rc<Value>),
+    Pair(Rc<(Value, Value)>),
+    Fun(Rc<Fun>),
+    /// A pair or function taken while this thread's placeholders are gone,
+    /// during thread teardown.
+    Boxed(Box<Value>),
+}
+
+thread_local! {
+    /// Shared placeholders put in place of a pair or function moved onto a
+    /// drop's work list. They are never unique, so dropping one only
+    /// decrements a count.
+    static EMPTY_PAIR: Rc<(Value, Value)> = Rc::new((Value::Unit, Value::Unit));
+    static EMPTY_FUN: Rc<Fun> = Rc::new(Fun::Partial {
+        prim: Prim::ALL[0],
+        args: Vec::new(),
+    });
+}
+
+/// Moves `child` onto `out` if it owns something unique that a recursive drop
+/// would descend into, leaving a value whose drop does no work. Shared parts
+/// are left alone: dropping them only decrements a count.
+fn defer(child: &mut Value, out: &mut Vec<Doomed>) {
+    match child {
         Value::Int(_) | Value::Bool(_) | Value::Unit | Value::Option(None) => {}
         // `imbl` drops its elements itself, which would recurse once per level of
         // array nesting. Instead the vector is queued and dropped by the outermost
         // drop on this thread. Dropping a shared vector there only decrements a
         // count, so this costs O(1) per array, not O(size).
         Value::Array(a) => defer_array_drop(mem::take(a)),
-        Value::Pair(rc) => {
-            if let Some(p) = Rc::get_mut(rc) {
-                take_child(&mut p.0, out);
-                take_child(&mut p.1, out);
-            }
-        }
-        Value::Option(Some(rc)) => {
-            if let Some(x) = Rc::get_mut(rc) {
-                take_child(x, out);
-            }
-        }
         Value::List(l) => {
-            let mut next = l.0.take();
-            while let Some(rc) = next {
-                match Rc::try_unwrap(rc) {
-                    Ok(mut cell) => {
-                        out.push(mem::replace(&mut cell.head, Value::Unit));
-                        next = cell.tail.0.take();
-                    }
-                    Err(_) => break,
-                }
+            if l.0.as_ref().is_some_and(|c| Rc::strong_count(c) == 1) {
+                out.extend(l.0.take().map(Doomed::Cons));
             }
         }
         Value::Tree(t) => {
-            let mut stack: Vec<Rc<TreeNode>> = t.0.take().into_iter().collect();
-            while let Some(rc) = stack.pop() {
-                if let Ok(mut node) = Rc::try_unwrap(rc) {
-                    out.push(mem::replace(&mut node.value, Value::Unit));
-                    stack.extend(node.left.0.take());
-                    stack.extend(node.right.0.take());
+            if t.0.as_ref().is_some_and(|n| Rc::strong_count(n) == 1) {
+                out.extend(t.0.take().map(Doomed::Node));
+            }
+        }
+        Value::Option(o) => {
+            if o.as_ref().is_some_and(|x| Rc::strong_count(x) == 1) {
+                out.extend(o.take().map(Doomed::Some));
+            }
+        }
+        Value::Pair(rc) => {
+            if Rc::strong_count(rc) == 1 {
+                match EMPTY_PAIR.try_with(Rc::clone) {
+                    Ok(empty) => out.push(Doomed::Pair(mem::replace(rc, empty))),
+                    Err(_) => out.push(Doomed::Boxed(Box::new(mem::replace(child, Value::Unit)))),
                 }
             }
         }
         Value::Fun(rc) => {
-            if let Some(f) = Rc::get_mut(rc) {
-                match f {
-                    Fun::Closure { env, .. } => detach_env(env, out),
-                    Fun::Partial { args, .. } => out.append(args),
-                    Fun::BfixSelf { f, .. } => out.push(mem::replace(f, Value::Unit)),
-                    Fun::MemoSelf { f, .. } => out.push(mem::replace(f, Value::Unit)),
+            if Rc::strong_count(rc) == 1 {
+                match EMPTY_FUN.try_with(Rc::clone) {
+                    Ok(empty) => out.push(Doomed::Fun(mem::replace(rc, empty))),
+                    Err(_) => out.push(Doomed::Boxed(Box::new(mem::replace(child, Value::Unit)))),
                 }
             }
         }
     }
 }
 
-/// Moves `child` onto `out` unless it is a scalar, which drops without work. So a
-/// pair or option emptied by an earlier detach adds nothing to the work list.
-fn take_child(child: &mut Value, out: &mut Vec<Value>) {
-    if !matches!(
-        child,
-        Value::Int(_) | Value::Bool(_) | Value::Unit | Value::Option(None)
-    ) {
-        out.push(mem::replace(child, Value::Unit));
+/// Frees `part` if nothing else holds it, after moving the parts it owns onto
+/// `out`. `Rc::try_unwrap` frees the cell before anything is pushed.
+fn free(part: Doomed, out: &mut Vec<Doomed>) {
+    match part {
+        Doomed::Cons(rc) => {
+            if let Ok(mut cell) = Rc::try_unwrap(rc) {
+                out.extend(cell.tail.0.take().map(Doomed::Cons));
+                defer(&mut cell.head, out);
+            }
+        }
+        Doomed::Node(rc) => {
+            if let Ok(mut node) = Rc::try_unwrap(rc) {
+                out.extend(node.right.0.take().map(Doomed::Node));
+                out.extend(node.left.0.take().map(Doomed::Node));
+                defer(&mut node.value, out);
+            }
+        }
+        Doomed::Some(rc) => {
+            if let Ok(mut x) = Rc::try_unwrap(rc) {
+                defer(&mut x, out);
+            }
+        }
+        Doomed::Pair(rc) => {
+            if let Ok((mut a, mut b)) = Rc::try_unwrap(rc) {
+                defer(&mut b, out);
+                defer(&mut a, out);
+            }
+        }
+        Doomed::Fun(rc) => {
+            if let Ok(mut f) = Rc::try_unwrap(rc) {
+                match &mut f {
+                    Fun::Closure { env, .. } => defer_env(env, out),
+                    Fun::Partial { args, .. } => {
+                        for a in args.iter_mut() {
+                            defer(a, out);
+                        }
+                    }
+                    Fun::BfixSelf { f, .. } | Fun::MemoSelf { f, .. } => defer(f, out),
+                }
+            }
+        }
+        Doomed::Boxed(b) => {
+            let mut v = *b;
+            defer(&mut v, out);
+        }
     }
 }
 
-fn detach_env(env: &mut Env, out: &mut Vec<Value>) {
+/// Frees the uniquely owned nodes at the front of `env`, moving their values
+/// onto `out`.
+fn defer_env(env: &mut Env, out: &mut Vec<Doomed>) {
     let mut next = env.0.take();
     while let Some(rc) = next {
         match Rc::try_unwrap(rc) {
             Ok(mut node) => {
-                out.push(mem::replace(&mut node.value, Value::Unit));
                 next = node.next.0.take();
+                defer(&mut node.value, out);
             }
             Err(_) => break,
         }
@@ -668,10 +750,9 @@ impl Drop for Value {
             return;
         }
         let mut work = Vec::new();
-        detach_children(self, &mut work);
-        while let Some(mut v) = work.pop() {
-            detach_children(&mut v, &mut work);
-            // `v` now owns nothing unique, so its own drop does not recurse.
+        defer(self, &mut work);
+        while let Some(part) = work.pop() {
+            free(part, &mut work);
         }
         drain_array_drops();
     }
@@ -774,12 +855,17 @@ pub(crate) struct Reach {
     /// parts added with [`Reach::reserve`].
     work: u64,
     budget: u64,
+    /// The evaluation's memory budget: the walk gives up rather than grow its
+    /// sets and work list past it.
+    memory: Budget,
 }
 
 impl Reach {
-    /// A walk that may visit up to `budget` parts in all.
-    pub(crate) fn new(budget: u64) -> Reach {
+    /// A walk that may visit up to `budget` parts in all, and give up rather
+    /// than allocate past `memory`.
+    pub(crate) fn new(budget: u64, memory: Budget) -> Reach {
         Reach {
+            memory,
             seen: FxHashSet::default(),
             chunks: FxHashSet::default(),
             tables: FxHashSet::default(),
@@ -790,10 +876,17 @@ impl Reach {
     }
 
     /// Records the table at `table` as reached.
-    pub(crate) fn mark_table(&mut self, table: TableId) {
+    pub(crate) fn mark_table(&mut self, table: TableId) -> Result<(), OverBudget> {
+        self.memory
+            .ensure_set(&mut self.tables)
+            .map_err(|_| OverBudget)?;
+        self.memory
+            .ensure_vec(&mut self.pending, 1)
+            .map_err(|_| OverBudget)?;
         if self.tables.insert(table) {
             self.pending.push(table);
         }
+        Ok(())
     }
 
     /// A reached table whose entries are not yet walked.
@@ -809,6 +902,21 @@ impl Reach {
     /// The work so far.
     pub(crate) fn work(&self) -> u64 {
         self.work
+    }
+
+    /// Fails if `extra` more bytes would take the evaluation past its memory
+    /// budget.
+    pub(crate) fn check_memory(&self, extra: u64) -> Result<(), OverBudget> {
+        self.memory.check(extra).map_err(|_| OverBudget)
+    }
+
+    /// Makes room in `parts` for `n` more within the memory budget.
+    pub(crate) fn ensure_parts(
+        &self,
+        parts: &mut Vec<Part<'_>>,
+        n: usize,
+    ) -> Result<(), OverBudget> {
+        self.memory.ensure_vec(parts, n).map_err(|_| OverBudget)
     }
 
     /// Counts `n` parts about to be gathered for a walk as work, so gathering
@@ -828,12 +936,16 @@ impl Reach {
         values: impl ExactSizeIterator<Item = &'v Value>,
     ) -> Result<(), OverBudget> {
         self.reserve(values.len())?;
+        self.check_memory(crate::budget::bytes_of::<Part<'_>>(values.len()))?;
         self.walk(values.map(Part::Value).collect())
     }
 
     /// Whether this is the first visit of the part of kind `kind` at `addr`.
-    fn first(&mut self, kind: u8, addr: *const ()) -> bool {
-        self.seen.insert((kind, addr))
+    fn first(&mut self, kind: u8, addr: *const ()) -> Result<bool, OverBudget> {
+        self.memory
+            .ensure_set(&mut self.seen)
+            .map_err(|_| OverBudget)?;
+        Ok(self.seen.insert((kind, addr)))
     }
 
     /// Visits `parts` and everything they reach, except the entries of the
@@ -843,22 +955,27 @@ impl Reach {
         // first chunk, at most `ARRAYS_PER_KEY` for each.
         let mut arrays: FxHashMap<(usize, *const Value), Vec<&'v imbl::Vector<Value>>> =
             FxHashMap::default();
+        let memory = self.memory;
         while let Some(part) = parts.pop() {
             self.work += 1;
             if self.work > self.budget {
                 return Err(OverBudget);
             }
+            // A part pushes at most 3 parts, or a chunk's elements.
+            self.memory
+                .ensure_vec(&mut parts, 3)
+                .map_err(|_| OverBudget)?;
             match part {
                 Part::Value(v) => match v {
                     Value::Int(_) | Value::Bool(_) | Value::Unit | Value::Option(None) => {}
                     Value::Pair(p) => {
-                        if self.first(0, Rc::as_ptr(p).cast()) {
+                        if self.first(0, Rc::as_ptr(p).cast())? {
                             parts.push(Part::Value(&p.0));
                             parts.push(Part::Value(&p.1));
                         }
                     }
                     Value::Option(Some(x)) => {
-                        if self.first(1, Rc::as_ptr(x).cast()) {
+                        if self.first(1, Rc::as_ptr(x).cast())? {
                             parts.push(Part::Value(x));
                         }
                     }
@@ -871,6 +988,11 @@ impl Reach {
                     // first time it is seen.
                     Value::Array(a) => {
                         let first = a.leaves().next().map_or(ptr::null(), <[Value]>::as_ptr);
+                        if !arrays.contains_key(&(a.len(), first)) {
+                            self.memory
+                                .ensure_map(&mut arrays)
+                                .map_err(|_| OverBudget)?;
+                        }
                         let same = arrays.entry((a.len(), first)).or_default();
                         self.work += same.len() as u64;
                         if self.work > self.budget {
@@ -880,6 +1002,7 @@ impl Reach {
                             continue;
                         }
                         if same.len() < ARRAYS_PER_KEY {
+                            memory.ensure_vec(same, 1).map_err(|_| OverBudget)?;
                             same.push(a);
                         }
                         for chunk in a.leaves() {
@@ -887,7 +1010,13 @@ impl Reach {
                             if self.work > self.budget {
                                 return Err(OverBudget);
                             }
+                            self.memory
+                                .ensure_set(&mut self.chunks)
+                                .map_err(|_| OverBudget)?;
                             if self.chunks.insert((chunk.as_ptr(), chunk.len())) {
+                                self.memory
+                                    .ensure_vec(&mut parts, chunk.len())
+                                    .map_err(|_| OverBudget)?;
                                 if self.work.saturating_add(chunk.len() as u64) > self.budget {
                                     return Err(OverBudget);
                                 }
@@ -896,7 +1025,7 @@ impl Reach {
                         }
                     }
                     Value::Fun(f) => {
-                        if self.first(3, Rc::as_ptr(f).cast()) {
+                        if self.first(3, Rc::as_ptr(f).cast())? {
                             match &**f {
                                 Fun::Closure { env, .. } => parts.push(Part::Env(env)),
                                 Fun::Partial { args, .. } => {
@@ -904,7 +1033,7 @@ impl Reach {
                                 }
                                 Fun::BfixSelf { f, .. } => parts.push(Part::Value(f)),
                                 Fun::MemoSelf { table, f } => {
-                                    self.mark_table(Weak::as_ptr(table));
+                                    self.mark_table(Weak::as_ptr(table))?;
                                     parts.push(Part::Value(f));
                                 }
                             }
@@ -912,19 +1041,19 @@ impl Reach {
                     }
                 },
                 Part::Env(Env(Some(node))) => {
-                    if self.first(4, Rc::as_ptr(node).cast()) {
+                    if self.first(4, Rc::as_ptr(node).cast())? {
                         parts.push(Part::Value(&node.value));
                         parts.push(Part::Env(&node.next));
                     }
                 }
                 Part::List(List(Some(cell))) => {
-                    if self.first(5, Rc::as_ptr(cell).cast()) {
+                    if self.first(5, Rc::as_ptr(cell).cast())? {
                         parts.push(Part::Value(&cell.head));
                         parts.push(Part::List(&cell.tail));
                     }
                 }
                 Part::Tree(Tree(Some(node))) => {
-                    if self.first(6, Rc::as_ptr(node).cast()) {
+                    if self.first(6, Rc::as_ptr(node).cast())? {
                         parts.push(Part::Tree(&node.left));
                         parts.push(Part::Value(&node.value));
                         parts.push(Part::Tree(&node.right));
@@ -946,6 +1075,8 @@ pub(crate) enum EqResult {
     Function,
     /// More than the limit of node pairs were compared; the count is the limit + 1.
     OverLimit,
+    /// The comparison's work list would have gone over the memory budget.
+    OverMemory,
 }
 
 /// A pair of shared value parts that [`structural_eq`] has already compared: a
@@ -999,11 +1130,20 @@ pub(crate) fn structural_eq(
     b: &Value,
     limit: u64,
     mut seen: Option<&mut SeenPairs>,
+    budget: &Budget,
 ) -> (EqResult, u64) {
     use EqWork as Work;
     let mut work = vec![Work::Value(a, b)];
     let mut nodes = 0u64;
     while let Some(item) = work.pop() {
+        // A step pushes at most 3 items, or an array's elements.
+        let extra = match &item {
+            Work::Value(Value::Array(u), _) => u.len().max(3),
+            _ => 3,
+        };
+        if budget.ensure_vec(&mut work, extra).is_err() {
+            return (EqResult::OverMemory, nodes);
+        }
         if let (Some(seen), Some(id)) = (seen.as_deref_mut(), pair_id(&item)) {
             if !seen.insert(id) {
                 continue;
@@ -1292,14 +1432,17 @@ const PLAIN_EQ_NODES: u64 = 1 << 12;
 /// the values have the same sharing, as two runs of one program do.
 impl PartialEq for Value {
     fn eq(&self, other: &Value) -> bool {
-        match structural_eq(self, other, PLAIN_EQ_NODES, None).0 {
+        match structural_eq(self, other, PLAIN_EQ_NODES, None, &Budget::UNLIMITED).0 {
             EqResult::Data(same) => same,
             EqResult::Function => false,
             EqResult::OverLimit => {
                 let mut seen = SeenPairs::default();
-                let (result, _) = structural_eq(self, other, u64::MAX, Some(&mut seen));
+                let (result, _) =
+                    structural_eq(self, other, u64::MAX, Some(&mut seen), &Budget::UNLIMITED);
                 result == EqResult::Data(true)
             }
+            // Not reached: there is no memory budget.
+            EqResult::OverMemory => false,
         }
     }
 }
@@ -1435,5 +1578,22 @@ mod tests {
         })
         .join()
         .expect("test thread");
+    }
+
+    #[test]
+    fn a_walk_over_many_distinct_parts_stays_within_its_memory_budget() {
+        // A list of 100k distinct pairs: the walk remembers each cell and
+        // pair it has seen, about 4 MB, so a 1 MiB budget stops it.
+        let v =
+            Value::list((0..100_000).map(|i| Value::Pair(Rc::new((Value::Int(i), Value::Int(i))))));
+        let limit = 1 << 20;
+        let base = crate::memory::live_bytes();
+        crate::memory::reset_peak();
+        let mut reach = Reach::new(u64::MAX, Budget::new(limit));
+        let walked = reach.walk(vec![Part::Value(&v)]);
+        drop(reach);
+        let peak = u64::try_from(crate::memory::peak_bytes() - base).unwrap_or(0);
+        assert!(walked.is_err());
+        assert!(peak <= limit + (64 << 10), "peak {peak} B");
     }
 }

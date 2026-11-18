@@ -419,6 +419,16 @@ fn a_stored_cost_gives_the_growth_the_objective_scores() {
             ),
             Growth::TimedOut,
         ),
+        // A run over the memory limit ran out of a resource, as a timeout did.
+        (
+            measured(
+                vec![size(16, None), size(32, Some(FailureKind::MemoryLimit))],
+                CostVerdict::NotFitted {
+                    reason: "fit window has incomplete sizes".to_owned(),
+                },
+            ),
+            Growth::TimedOut,
+        ),
         (
             measured(
                 done(),

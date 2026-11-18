@@ -279,6 +279,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "dc-bench"
 version = "0.1.0"
 dependencies = [
@@ -326,6 +330,7 @@ dependencies = [
 name = "dc-eval"
 version = "0.1.0"
 dependencies = [
+ "dc-alloc",
  "dc-core",
  "dc-stitch",
  "imbl",

@@ -15,6 +15,7 @@ use std::rc::Rc;
 
 use dc_core::{Arena, LibId, Prim, Term, TermId};
 
+use crate::budget::{bytes_of, Budget, OverMemory};
 use crate::cost;
 use rustc_hash::FxHashMap;
 
@@ -33,13 +34,22 @@ pub enum Outcome {
     /// The global fuel ran out. The count is the first one above the fuel, or
     /// `u64::MAX` if that count does not fit in a `u64`.
     Timeout(u64),
+    /// The evaluation's heap went above its memory limit ([`Limits::memory`]).
+    /// The count is the steps taken before the machine stopped. Like a
+    /// timeout, this is a resource limit, not a fault of the program. Unlike a
+    /// step count, where it happens depends on the sizes of the host's data
+    /// structures, not only on the program and its inputs.
+    MemoryLimit(u64),
 }
 
 impl Outcome {
     /// The number of steps taken.
     pub fn steps(&self) -> u64 {
         match self {
-            Outcome::Value(_, s) | Outcome::Error(_, s) | Outcome::Timeout(s) => *s,
+            Outcome::Value(_, s)
+            | Outcome::Error(_, s)
+            | Outcome::Timeout(s)
+            | Outcome::MemoryLimit(s) => *s,
         }
     }
 
@@ -68,6 +78,7 @@ impl Outcome {
             Outcome::Value(v, s) => write!(f, "Value({}, {s})", v.display_within(limit)),
             Outcome::Error(k, s) => write!(f, "Error({k:?}, {s})"),
             Outcome::Timeout(s) => write!(f, "Timeout({s})"),
+            Outcome::MemoryLimit(s) => write!(f, "MemoryLimit({s})"),
         }
     }
 }
@@ -137,19 +148,54 @@ pub enum Stuck {
     UnexpandedLib(LibId),
 }
 
-/// No fuel limit in practice.
+/// No fuel limit, or no memory limit, in practice.
 pub const UNLIMITED: u64 = u64::MAX;
 
-/// Evaluates the closed term `term` with a global budget of `fuel` steps.
+/// The resource limits of one evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Limits {
+    /// The global budget of steps.
+    pub fuel: u64,
+    /// The most heap memory, in bytes, the evaluation may hold beyond what its
+    /// thread held when it started: its environments, continuations, memo
+    /// tables, scratch space and the values it builds. [`UNLIMITED`] turns
+    /// the check off. The evaluation stops with [`Outcome::MemoryLimit`]
+    /// before it would go over the limit; see [`crate::memory`] for how the
+    /// machine checks it and what it can still allocate unchecked.
+    pub memory: u64,
+}
+
+impl Limits {
+    /// `fuel` steps and no memory limit.
+    pub fn fuel(fuel: u64) -> Limits {
+        Limits {
+            fuel,
+            memory: UNLIMITED,
+        }
+    }
+}
+
+/// Evaluates the closed term `term` with a global budget of `fuel` steps and no
+/// memory limit.
 pub fn eval(arena: &Arena, term: TermId, fuel: u64) -> Outcome {
-    Machine::new(arena, fuel).run(Control::Eval(term, Env::empty()))
+    eval_within(arena, term, Limits::fuel(fuel))
+}
+
+/// Evaluates the closed term `term` within `limits`.
+pub fn eval_within(arena: &Arena, term: TermId, limits: Limits) -> Outcome {
+    Machine::new(arena, limits).run(Control::Eval(term, Env::empty()))
 }
 
 /// Evaluates the closed term `program`, then applies the result to each of
-/// `inputs` in turn, all within one budget of `fuel` steps. Applying a closure to
-/// an input is a β step like any other.
+/// `inputs` in turn, all within one budget of `fuel` steps and no memory limit.
+/// Applying a closure to an input is a β step like any other.
 pub fn apply(arena: &Arena, program: TermId, inputs: &[Value], fuel: u64) -> Outcome {
-    let mut m = Machine::new(arena, fuel);
+    apply_within(arena, program, inputs, Limits::fuel(fuel))
+}
+
+/// As [`apply`], within `limits`.
+pub fn apply_within(arena: &Arena, program: TermId, inputs: &[Value], limits: Limits) -> Outcome {
+    let mut m = Machine::new(arena, limits);
     for x in inputs.iter().rev() {
         m.stack.push(Frame::ApplyTo(x.clone()));
     }
@@ -174,6 +220,7 @@ fn call(f: &Value, x: Value) -> Step {
 enum Halt {
     Error(ErrorKind),
     Timeout,
+    MemoryLimit,
 }
 
 type Step = Result<Control, Halt>;
@@ -188,6 +235,12 @@ fn bad(p: Prim) -> Halt {
 
 fn error(k: ErrorKind) -> Halt {
     Halt::Error(k)
+}
+
+impl From<OverMemory> for Halt {
+    fn from(_: OverMemory) -> Halt {
+        Halt::MemoryLimit
+    }
 }
 
 /// A `tree_fold` work item.
@@ -266,6 +319,9 @@ struct Machine<'a> {
     stack: Vec<Frame>,
     steps: u64,
     fuel: u64,
+    /// [`Limits::memory`], from this thread's live heap when the machine was
+    /// made.
+    budget: Budget,
     /// Every memo table this evaluation created and the program may still reach.
     /// The machine owns them until the evaluation ends; a `memorec` `self` holds
     /// only a weak reference, so a `self` stored in its own table cannot keep the
@@ -280,6 +336,9 @@ struct Machine<'a> {
     last_walk_at: u64,
     /// The step count before which no reachability walk starts.
     next_walk_at: u64,
+    /// The step count of the last release of tables made because the
+    /// evaluation held more than half its memory limit.
+    last_low_memory_release: u64,
     /// The work of every reachability walk so far. Only tests read it.
     walk_work: u64,
     /// The partial applications of primitives built so far. Only tests read it.
@@ -313,18 +372,28 @@ const MAX_PRIM_ARITY: usize = 3;
 /// The work a reachability walk may always do, whatever the steps since the last.
 const MEMO_WALK_MIN: u64 = 1024;
 
+/// The most continuation frames one step pushes. [`Machine::before_step`]
+/// keeps this much room on the stack, so a step never grows it.
+const MAX_FRAMES_PER_STEP: usize = 4;
+
+/// A step that builds a whole collection checks the memory limit once per
+/// this many elements.
+const CHECK_EVERY: usize = 256;
+
 impl<'a> Machine<'a> {
-    fn new(arena: &'a Arena, fuel: u64) -> Machine<'a> {
+    fn new(arena: &'a Arena, limits: Limits) -> Machine<'a> {
         Machine {
             arena,
             stack: Vec::new(),
             steps: 0,
-            fuel,
+            fuel: limits.fuel,
+            budget: Budget::new(limits.memory),
             memo_tables: Vec::new(),
             memo_prune_at: MEMO_PRUNE_MIN,
             pruning: PRUNING,
             last_walk_at: 0,
             next_walk_at: 0,
+            last_low_memory_release: 0,
             walk_work: 0,
             partials_built: 0,
         }
@@ -333,6 +402,9 @@ impl<'a> Machine<'a> {
     fn run(&mut self, start: Control) -> Outcome {
         let mut control = start;
         loop {
+            if let Err(halt) = self.before_step() {
+                return self.halted(halt);
+            }
             let next = match control {
                 Control::Eval(t, env) => self.eval_term(t, env),
                 Control::Return(v) => match self.stack.pop() {
@@ -343,10 +415,73 @@ impl<'a> Machine<'a> {
             };
             control = match next {
                 Ok(c) => c,
-                Err(Halt::Error(k)) => return Outcome::Error(k, self.steps),
-                Err(Halt::Timeout) => return Outcome::Timeout(self.steps),
+                Err(halt) => return self.halted(halt),
             };
         }
+    }
+
+    fn halted(&self, halt: Halt) -> Outcome {
+        match halt {
+            Halt::Error(k) => Outcome::Error(k, self.steps),
+            Halt::Timeout => Outcome::Timeout(self.steps),
+            Halt::MemoryLimit => Outcome::MemoryLimit(self.steps),
+        }
+    }
+
+    /// Checks the memory limit before a step, and makes room on the
+    /// continuation stack for the frames the step can push, so that the
+    /// stack's growth is checked before it happens rather than after.
+    fn before_step(&mut self) -> Result<(), Halt> {
+        // A stack that deep recursion grew gives back what it no longer
+        // uses, so its spare room does not count against the limit for the
+        // rest of the evaluation. It halves when less than a quarter full, so each
+        // frame is copied O(1) times on average.
+        let cap = self.stack.capacity();
+        if cap > 1024 && self.stack.len() < cap / 4 {
+            self.stack.shrink_to(cap / 2);
+        }
+        self.budget
+            .ensure_vec(&mut self.stack, MAX_FRAMES_PER_STEP)?;
+        Ok(self.budget.check(0)?)
+    }
+
+    /// A vector of the `n` elements of `xs`, with the memory limit checked
+    /// for its buffer first.
+    fn vec_checked<'v>(
+        &self,
+        n: usize,
+        xs: impl Iterator<Item = &'v Value>,
+    ) -> Result<Vec<Value>, Halt> {
+        self.budget.check(bytes_of::<Value>(n))?;
+        let mut out = Vec::with_capacity(n);
+        out.extend(xs.cloned());
+        Ok(out)
+    }
+
+    /// The list of `items`, with the memory limit checked every
+    /// [`CHECK_EVERY`] cells.
+    fn list_checked(&self, items: Vec<Value>) -> Result<Value, Halt> {
+        let mut list = List::nil();
+        for (k, v) in items.into_iter().rev().enumerate() {
+            if k % CHECK_EVERY == 0 {
+                self.budget.check(0)?;
+            }
+            list = List::cons(v, list);
+        }
+        Ok(Value::List(list))
+    }
+
+    /// The array of the elements of `xs`, with the memory limit checked every
+    /// [`CHECK_EVERY`] elements.
+    fn array_checked<'v>(&self, xs: impl Iterator<Item = &'v Value>) -> Result<Value, Halt> {
+        let mut out = imbl::Vector::new();
+        for (k, v) in xs.enumerate() {
+            if k % CHECK_EVERY == 0 {
+                self.budget.check(0)?;
+            }
+            out.push_back(v.clone());
+        }
+        Ok(Value::Array(out))
     }
 
     /// Charges `n` steps. Stops with a timeout at the first charge that takes the
@@ -559,10 +694,11 @@ impl<'a> Machine<'a> {
             Frame::Foldr { f, elems } => self.foldr_next(f, elems, v),
             Frame::Loop { f, i, n } => self.loop_next(f, i, n, v),
             Frame::Unfold { g, mut out } => match &v {
-                Value::Option(None) => Ok(Control::Return(Value::list(out))),
+                Value::Option(None) => Ok(Control::Return(self.list_checked(out)?)),
                 Value::Option(Some(p)) => match &**p {
                     Value::Pair(p) => {
                         self.charge(cost::ITERATION)?;
+                        self.budget.ensure_vec(&mut out, 1)?;
                         out.push(p.0.clone());
                         let next = p.1.clone();
                         self.stack.push(Frame::Unfold { g: g.clone(), out });
@@ -586,7 +722,10 @@ impl<'a> Machine<'a> {
                 self.tree_fold_run(z, f, tasks, results)
             }
             Frame::MemoStore { table, key } => {
-                table.borrow_mut().entries.insert(key, v.clone());
+                let mut t = table.borrow_mut();
+                self.budget.ensure_map(&mut t.entries)?;
+                t.entries.insert(key, v.clone());
+                drop(t);
                 Ok(Control::Return(v))
             }
         }
@@ -653,12 +792,13 @@ impl<'a> Machine<'a> {
             (Prim::Eq, [a, b]) => {
                 // Comparing more pairs than the fuel left can only time out, so the
                 // comparison stops one pair above it.
-                let (result, nodes) = structural_eq(a, b, self.fuel_left(), None);
+                let (result, nodes) = structural_eq(a, b, self.fuel_left(), None, &self.budget);
                 self.charge(cost::eq(nodes))?;
                 match result {
                     EqResult::Data(same) => ret(V::Bool(same)),
                     EqResult::Function => Err(error(ErrorKind::EqOnFunction)),
                     EqResult::OverLimit => Err(Halt::Timeout),
+                    EqResult::OverMemory => Err(Halt::MemoryLimit),
                 }
             }
             (Prim::Pair, [a, b]) => self.constant(V::pair(a.clone(), b.clone())),
@@ -716,12 +856,12 @@ impl<'a> Machine<'a> {
             (Prim::ArraySize, [V::Array(a)]) => self.constant(V::Int(len_to_int(a.len() as u64))),
             (Prim::ArrayOfList, [V::List(xs)]) => {
                 self.charge(cost::array_convert(xs.len()))?;
-                ret(V::Array(xs.iter().cloned().collect()))
+                ret(self.array_checked(xs.iter())?)
             }
             (Prim::ArrayToList, [V::Array(a)]) => {
                 self.charge(cost::array_convert(a.len() as u64))?;
-                let items: Vec<Value> = a.iter().cloned().collect();
-                ret(V::list(items))
+                let items = self.vec_checked(a.len(), a.iter())?;
+                ret(self.list_checked(items)?)
             }
             (Prim::TreeFold, [z, f, V::Tree(t)]) => self.tree_fold_run(
                 z.clone(),
@@ -731,7 +871,8 @@ impl<'a> Machine<'a> {
             ),
             (Prim::Foldl, [f, z, V::List(xs)]) => self.foldl_next(f.clone(), xs.clone(), z.clone()),
             (Prim::Foldr, [f, z, V::List(xs)]) => {
-                let elems: Vec<Value> = xs.iter().cloned().collect();
+                let n = usize::try_from(xs.len()).unwrap_or(usize::MAX);
+                let elems = self.vec_checked(n, xs.iter())?;
                 self.foldr_next(f.clone(), elems, z.clone())
             }
             (Prim::Loop, [V::Int(n), z, f]) => self.loop_next(f.clone(), 0, *n, z.clone()),
@@ -748,7 +889,7 @@ impl<'a> Machine<'a> {
                     entries: Default::default(),
                     misses_left: *n,
                 }));
-                self.adopt_table(table.clone(), args);
+                self.adopt_table(table.clone(), args)?;
                 self.memo_call(&table, f, x.clone())
             }
             _ => Err(bad(p)),
@@ -839,8 +980,12 @@ impl<'a> Machine<'a> {
         while let Some(task) = tasks.pop() {
             match task {
                 TreeTask::Visit(t) => match &t.0 {
-                    None => results.push(z.clone()),
+                    None => {
+                        self.budget.ensure_vec(&mut results, 1)?;
+                        results.push(z.clone());
+                    }
                     Some(node) => {
+                        self.budget.ensure_vec(&mut tasks, 3)?;
                         tasks.push(TreeTask::Combine(node.value.clone()));
                         tasks.push(TreeTask::Visit(node.right.clone()));
                         tasks.push(TreeTask::Visit(node.left.clone()));
@@ -901,8 +1046,21 @@ impl<'a> Machine<'a> {
     /// least that walk's work, and it gives up after the steps since the last
     /// completed walk (or [`MEMO_WALK_MIN`], if more); after giving up, it waits
     /// twice that many steps. So its work is at most a constant times the steps.
-    fn adopt_table(&mut self, table: Rc<RefCell<MemoTable>>, args: &[Value]) {
-        if self.pruning.eager || self.memo_tables.len() >= self.memo_prune_at {
+    fn adopt_table(
+        &mut self,
+        table: Rc<RefCell<MemoTable>>,
+        args: &[Value],
+    ) -> Result<(), OverMemory> {
+        // Dead tables can hold most of the memory limit long before their
+        // count doubles. So once the evaluation holds more than half its
+        // limit, they are also released at each new table, at most once per
+        // as many steps as there are tables, so at amortised O(1) per step.
+        let low = self.budget.past_half()
+            && self.steps - self.last_low_memory_release >= self.memo_tables.len() as u64;
+        if low {
+            self.last_low_memory_release = self.steps;
+        }
+        if self.pruning.eager || low || self.memo_tables.len() >= self.memo_prune_at {
             // Strong references: this vector, plus any `MemoStore` frame. Weak
             // references: every `self` of this table that is still alive.
             self.memo_tables
@@ -912,7 +1070,9 @@ impl<'a> Machine<'a> {
             }
             self.memo_prune_at = (2 * self.memo_tables.len()).max(self.pruning.min_tables);
         }
+        self.budget.ensure_vec(&mut self.memo_tables, 1)?;
         self.memo_tables.push(table);
+        Ok(())
     }
 
     /// Releases the tables that a walk from the stack and `args` does not reach,
@@ -925,7 +1085,7 @@ impl<'a> Machine<'a> {
         } else {
             (self.steps - self.last_walk_at).max(MEMO_WALK_MIN)
         };
-        let mut reach = Reach::new(budget);
+        let mut reach = Reach::new(budget, self.budget);
         let walked = self.reachable_tables(args, &mut reach);
         self.walk_work = self.walk_work.saturating_add(reach.work());
         match walked {
@@ -950,6 +1110,10 @@ impl<'a> Machine<'a> {
             frame_parts(frame, &mut parts, reach)?;
         }
         reach.walk(parts)?;
+        reach.check_memory(crate::budget::table_bytes::<(
+            TableId,
+            &Rc<RefCell<MemoTable>>,
+        )>(self.memo_tables.len()))?;
         let tables: FxHashMap<TableId, &Rc<RefCell<MemoTable>>> = self
             .memo_tables
             .iter()
@@ -973,9 +1137,12 @@ impl<'a> Machine<'a> {
         // raises FuelExhausted without charging. Sizing and building take work and
         // memory in proportion to the key's distinct pairs, not to its size, which
         // sharing can make exponentially larger.
-        let size = MemoKey::size_of(&x).ok_or(error(ErrorKind::InvalidMemoKey))?;
+        let budget = self.budget;
+        let size = MemoKey::size_of(&x, &budget)?.ok_or(error(ErrorKind::InvalidMemoKey))?;
         // Not reached: `size_of` accepted the key.
-        let build = || MemoKey::build(&x, size).ok_or(error(ErrorKind::InvalidMemoKey));
+        let build = || -> Result<MemoKey, Halt> {
+            MemoKey::build(&x, size, &budget)?.ok_or(error(ErrorKind::InvalidMemoKey))
+        };
         if size > self.fuel_left() {
             let t = table.borrow();
             if t.misses_left <= 0 && !t.entries.contains_key(&build()?) {
@@ -1020,6 +1187,7 @@ fn gather<'f>(
     items: impl ExactSizeIterator<Item = Part<'f>>,
 ) -> Result<(), OverBudget> {
     reach.reserve(items.len())?;
+    reach.ensure_parts(parts, items.len())?;
     parts.extend(items);
     Ok(())
 }
@@ -1083,7 +1251,7 @@ fn frame_parts<'f>(
             gather(parts, reach, results.iter().map(Part::Value))
         }
         Frame::MemoStore { table, .. } => {
-            reach.mark_table(Rc::as_ptr(table));
+            reach.mark_table(Rc::as_ptr(table))?;
             Ok(())
         }
     }
@@ -1110,7 +1278,7 @@ mod tests {
     /// tables the machine still holds at the end.
     fn run_machine(arena: &mut Arena, src: &str, fuel: u64) -> (Outcome, usize) {
         let t = sexpr::parse(arena, src).expect("parse");
-        let mut m = Machine::new(arena, fuel);
+        let mut m = Machine::new(arena, Limits::fuel(fuel));
         let o = m.run(Control::Eval(t, Env::empty()));
         (o, m.memo_tables.len())
     }
@@ -1120,7 +1288,7 @@ mod tests {
     fn run_counting_partials(src: &str) -> (String, u64) {
         let mut arena = Arena::new();
         let t = sexpr::parse(&mut arena, src).expect("parse");
-        let mut m = Machine::new(&arena, UNLIMITED);
+        let mut m = Machine::new(&arena, Limits::fuel(UNLIMITED));
         let o = m.run(Control::Eval(t, Env::empty()));
         (format!("{o:?}"), m.partials_built)
     }
@@ -1159,7 +1327,7 @@ mod tests {
         let outcome = |src: &str, fuel: u64| -> (String, u64) {
             let mut arena = Arena::new();
             let t = sexpr::parse(&mut arena, src).expect("parse");
-            let mut m = Machine::new(&arena, fuel);
+            let mut m = Machine::new(&arena, Limits::fuel(fuel));
             let o = m.run(Control::Eval(t, Env::empty()));
             (format!("{o:?}"), m.partials_built)
         };
@@ -1192,7 +1360,7 @@ mod tests {
             let steps = {
                 let mut arena = Arena::new();
                 let t = sexpr::parse(&mut arena, &whole).expect("parse");
-                Machine::new(&arena, UNLIMITED)
+                Machine::new(&arena, Limits::fuel(UNLIMITED))
                     .run(Control::Eval(t, Env::empty()))
                     .steps()
             };
@@ -1301,7 +1469,7 @@ mod tests {
     #[test]
     fn a_charge_that_saturates_the_count_times_out_even_at_unlimited_fuel() {
         let arena = Arena::new();
-        let mut m = Machine::new(&arena, u64::MAX);
+        let mut m = Machine::new(&arena, Limits::fuel(u64::MAX));
         m.steps = u64::MAX - 1;
         assert!(matches!(m.charge(1), Ok(())));
         assert!(matches!(m.charge(1), Err(Halt::Timeout)));
@@ -1352,7 +1520,7 @@ mod tests {
     fn run_pruned(src: &str, pruning: Pruning) -> (Outcome, usize) {
         let mut arena = Arena::new();
         let t = sexpr::parse(&mut arena, src).expect("parse");
-        let mut m = Machine::new(&arena, UNLIMITED);
+        let mut m = Machine::new(&arena, Limits::fuel(UNLIMITED));
         m.pruning = pruning;
         m.memo_prune_at = pruning.min_tables;
         let o = m.run(Control::Eval(t, Env::empty()));
@@ -1546,7 +1714,7 @@ mod tests {
         );
         let t = sexpr::parse(&mut arena, &p).expect("parse");
         let xs: Vec<i64> = (0..100_000).collect();
-        let mut m = Machine::new(&arena, UNLIMITED);
+        let mut m = Machine::new(&arena, Limits::fuel(UNLIMITED));
         m.stack.push(Frame::ApplyTo(Value::int_list(&xs)));
         let o = m.run(Control::Eval(t, Env::empty()));
         assert!(matches!(o, Outcome::Value(Value::Int(0), _)), "{o}");
@@ -1570,7 +1738,7 @@ mod tests {
         );
         let mut arena = Arena::new();
         let t = sexpr::parse(&mut arena, &p).expect("parse");
-        let mut m = Machine::new(&arena, UNLIMITED);
+        let mut m = Machine::new(&arena, Limits::fuel(UNLIMITED));
         m.pruning = ALWAYS;
         let o = m.run(Control::Eval(t, Env::empty()));
         assert!(matches!(o, Outcome::Value(Value::Int(2), _)), "{o}");
