@@ -3,7 +3,10 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::state::{CostClass, CostVerdict, FrontierMember, LibraryEntry, ProgramCost};
+use crate::state::{
+    CostClass, CostVerdict, FailureKind, FrontierMember, LibraryEntry, ProgramCost, SizeCost,
+    SizeFailure,
+};
 use crate::verify::{shipped_prelude, Verifier};
 
 /// The fingerprint of the prelude the pilot run (bead dreamcounter-b1a2a8)
@@ -363,4 +366,162 @@ fn a_member_kept_from_the_previous_frontier_keeps_only_a_cost_that_measuring_giv
             "{m:?}"
         );
     }
+}
+
+fn measured(sizes: Vec<SizeCost>, verdict: CostVerdict) -> ProgramCost {
+    ProgramCost::Measured { sizes, verdict }
+}
+
+fn size(n: u64, failed: Option<FailureKind>) -> SizeCost {
+    SizeCost {
+        n,
+        fuel: 1000,
+        steps: if failed.is_some() {
+            Vec::new()
+        } else {
+            vec![10, 11, 12]
+        },
+        median: if failed.is_some() { None } else { Some(11) },
+        failed: failed.map(|kind| SizeFailure { seed: 0, kind }),
+    }
+}
+
+#[test]
+fn a_stored_cost_gives_the_growth_the_objective_scores() {
+    use dc_driver::objective::{Growth, Refusal};
+    use dc_tasks::growth::GrowthClass;
+
+    let done = || vec![size(16, None), size(32, None)];
+    let best = CostClass::Linear;
+    let cases = [
+        (
+            measured(done(), CostVerdict::Class(CostClass::Cubic)),
+            Growth::Fitted(GrowthClass::Cubic),
+        ),
+        (
+            measured(done(), CostVerdict::TooNoisy { best }),
+            Growth::Refused(Refusal::TooNoisy),
+        ),
+        (
+            measured(done(), CostVerdict::NoFit { best }),
+            Growth::Refused(Refusal::NoFit),
+        ),
+        (
+            measured(done(), CostVerdict::NoiseUnknown { best }),
+            Growth::Refused(Refusal::NoiseUnknown),
+        ),
+        (
+            measured(
+                vec![size(16, None), size(32, Some(FailureKind::Timeout))],
+                CostVerdict::NotFitted {
+                    reason: "fit window has incomplete sizes".to_owned(),
+                },
+            ),
+            Growth::TimedOut,
+        ),
+        (
+            measured(
+                done(),
+                CostVerdict::NotFitted {
+                    reason: "median step count at n = 16 is 0".to_owned(),
+                },
+            ),
+            Growth::Refused(Refusal::NotFitted),
+        ),
+        // A timeout below the window does not stop C naming a class.
+        (
+            measured(
+                vec![size(16, Some(FailureKind::Timeout)), size(32, None)],
+                CostVerdict::Class(CostClass::Linear),
+            ),
+            Growth::Fitted(GrowthClass::Linear),
+        ),
+        (
+            ProgramCost::Incorrect {
+                sizes: done(),
+                n: 16,
+                seed: 0,
+            },
+            Growth::Incorrect,
+        ),
+        (
+            ProgramCost::Refused {
+                reason: "no plan".to_owned(),
+            },
+            Growth::NotMeasured,
+        ),
+        (
+            ProgramCost::NotMeasured {
+                reason: OUT_OF_TIME.to_owned(),
+            },
+            Growth::NotMeasured,
+        ),
+    ];
+    for (cost, expected) in &cases {
+        assert_eq!(growth(Some(cost)), *expected, "{cost:?}");
+    }
+    assert_eq!(growth(None), Growth::NotMeasured);
+
+    // Every class maps to the class of the same name.
+    let classes = [
+        (CostClass::Constant, GrowthClass::Constant),
+        (CostClass::Log, GrowthClass::Log),
+        (CostClass::Linear, GrowthClass::Linear),
+        (CostClass::NLogN, GrowthClass::NLogN),
+        (CostClass::Quadratic, GrowthClass::Quadratic),
+        (CostClass::Cubic, GrowthClass::Cubic),
+        (CostClass::Exponential, GrowthClass::Exponential),
+    ];
+    for (stored, class) in classes {
+        assert_eq!(
+            growth(Some(&measured(done(), CostVerdict::Class(stored)))),
+            Growth::Fitted(class)
+        );
+    }
+}
+
+#[test]
+fn a_correct_program_slower_than_its_fuel_is_timed_out_for_the_objective() {
+    use dc_driver::objective::{member_costs, Growth, Member, TIMEOUT_COST};
+    use dc_tasks::growth::GrowthClass;
+
+    let v = Verifier::new(&pilot_library()).unwrap();
+    // The linear collapse/cancel program, after a cubic computation whose
+    // result it drops: the quadratic inversions count of the list, once for
+    // each element. The fuel is ten times the reference's steps, so the
+    // large sizes run out of it.
+    let good = PILOT[2].1;
+    let inversions = "(fst (foldr (lam (lib_1 $0 (lam (lt $0 $1)))) (pair 0 nil) $2))";
+    let slow = format!("(lam (let (foldl (lam (lam (add $1 {inversions}))) 0 $0) ({good} $1)))");
+    let cost = measure_program(&v, "collapse/cancel", &slow, &mut || false, "");
+    let ProgramCost::Measured { sizes, verdict } = &cost else {
+        panic!("{cost:?}");
+    };
+    assert!(
+        matches!(verdict, CostVerdict::NotFitted { .. }),
+        "{verdict:?}"
+    );
+    assert!(
+        sizes.iter().any(|s| s
+            .failed
+            .as_ref()
+            .is_some_and(|f| f.kind == FailureKind::Timeout)),
+        "{sizes:?}"
+    );
+    assert_eq!(growth(Some(&cost)), Growth::TimedOut);
+
+    let fast = measure_program(&v, "collapse/cancel", good, &mut || false, "");
+    assert_eq!(growth(Some(&fast)), Growth::Fitted(GrowthClass::Linear));
+    let costs = member_costs(&[
+        Member {
+            dl: 1,
+            growth: growth(Some(&cost)),
+        },
+        Member {
+            dl: 1,
+            growth: growth(Some(&fast)),
+        },
+    ]);
+    assert_eq!(costs[0].map(|c| c.c), Some(TIMEOUT_COST));
+    assert_eq!(costs[1].map(|c| c.c), Some(2));
 }

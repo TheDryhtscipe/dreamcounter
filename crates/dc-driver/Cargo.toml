@@ -13,6 +13,7 @@ dc-core.workspace = true
 dc-stitch.workspace = true
 dc-compress.workspace = true
 dc-surface.workspace = true
+dc-tasks.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
