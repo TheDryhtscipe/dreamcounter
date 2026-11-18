@@ -6,10 +6,12 @@
 //!
 //! The gate: the naive and good references pass every example. The good
 //! reference passes each gate input within a third of the gate's fuel, and
-//! the naive one runs out of fuel on the first input. A program that is
-//! `n²` only on sorted input (it inserts into an unbalanced search tree)
-//! passes the examples and the random input, and runs out of fuel on the
-//! sorted ones.
+//! the naive one runs out of fuel on the first input. Programs that are
+//! slow only on some inputs pass the examples and run out of fuel on the
+//! gate input meant for them: an unbalanced search tree on sorted input, a
+//! quicksort that puts ties on one side on few values, a quicksort with the
+//! middle element as pivot on the organ pipe, and arrays indexed by value
+//! on the wide range.
 
 mod common;
 

@@ -15,15 +15,17 @@
 //! [`Gate`]: seven inputs of [`GATE_N`] elements, each with [`GATE_FUEL`]
 //! steps ([`GATE_INPUTS`]). A program passes only if it answers all seven
 //! within that fuel. The gate checks only these inputs. They are chosen so
-//! that the slow programs this module's tests know of run out of fuel on
-//! at least one: the naive references, which look at every pair of
+//! that the slow programs in the tests of `tests/dominance.rs` run out of
+//! fuel on at least one: the naive references, which look at every pair of
 //! positions; an unbalanced search tree (sorted input); a quicksort that
-//! puts ties on one side (few values); a quicksort with the middle element
-//! as pivot (organ-pipe order); and an array indexed by value, which costs
+//! puts ties on one side (few values); a quicksort whose pivot is the
+//! middle, first, or last element, or the median of those three
+//! (organ-pipe order); and an array indexed by value, which costs
 //! at least a step for each value in the range (a wide range). A program
 //! that is slow only on some other input can pass. The good references
 //! take at most 29 % of the fuel on any gate input (November 2026). The
-//! description states the size and the step limit, not the inputs.
+//! description states the size, the value range, and the step limit, not
+//! the inputs.
 //!
 //! Each variant has a naive dc reference that looks at every pair of
 //! positions (`n²`), which times out on the gate, and a good one (`n log n`)
@@ -292,7 +294,9 @@ pub enum GateInput {
     WideRange,
     /// The values of [`GateInput::WideRange`] in organ-pipe order: up, then
     /// down, so the middle element is the largest. The worst case of a
-    /// quicksort that takes the middle element as its pivot.
+    /// quicksort whose pivot is the middle, first, or last element, or the
+    /// median of those three. A pivot at another fixed place, such as a
+    /// third of the way, is not slow on it.
     OrganPipe,
 }
 
@@ -307,10 +311,11 @@ pub const GATE_INPUTS: [GateInput; 7] = [
     GateInput::OrganPipe,
 ];
 
-/// The value range of [`GateInput::WideRange`]. A program that spends even
-/// a step on each value in the range runs out of fuel: the range is 40,000
-/// times [`GATE_FUEL`].
-pub const WIDE_GATE: i64 = 1_000_000_000_000;
+/// The bound on values that the description states, and the value range of
+/// [`GateInput::WideRange`]. A program that spends even a step on each value
+/// in the range runs out of fuel: the range is 40 times [`GATE_FUEL`]. The
+/// product of two values fits in an `Int`.
+pub const WIDE_GATE: i64 = 1_000_000_000;
 
 /// The seeds of the gate inputs that are not generated inputs. They are
 /// passed to [`TaskRng::new`] with [`GATE_N`], apart from the generator's.
@@ -369,8 +374,9 @@ fn gate_input(family: &Dominance, g: GateInput) -> Inputs {
 /// The text of the size and step limits, the same for every variant.
 macro_rules! limits {
     () => {
-        " Lists have at most 8192 elements. The program must finish within \
-         50000000 evaluation steps on a list of 8192 elements."
+        " Lists have at most 8192 elements, each between -1000000000 and \
+         1000000000. The program must finish within 50000000 evaluation steps \
+         on a list of 8192 elements."
     };
 }
 
@@ -659,10 +665,10 @@ mod tests {
             // The organ pipe goes up to its largest value, then down.
             for l in &at(GateInput::OrganPipe).inputs {
                 let xs = ints_of(l);
-                let top = xs.iter().enumerate().max_by_key(|&(_, x)| *x).unwrap().0;
+                let top = xs.len() / 2;
+                assert_eq!(xs[top], *xs.iter().max().unwrap(), "{}", f.name());
                 assert!(xs[..=top].windows(2).all(|w| w[0] <= w[1]), "{}", f.name());
                 assert!(xs[top..].windows(2).all(|w| w[0] >= w[1]), "{}", f.name());
-                assert!(top > xs.len() / 3 && top < 2 * xs.len() / 3, "{}", f.name());
             }
             for e in f.examples() {
                 assert!(ints_of(&e.inputs[0]).len() <= 8, "{}", f.name());
@@ -681,6 +687,10 @@ mod tests {
         assert!(text.contains(&format!("within {GATE_FUEL} ")), "{text}");
         assert!(
             text.contains(&format!("a list of {GATE_N} elements")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("between -{WIDE_GATE} and {WIDE_GATE}.")),
             "{text}"
         );
         for f in all() {
