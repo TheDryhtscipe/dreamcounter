@@ -447,12 +447,19 @@ fn the_gate_turns_away_a_program_that_is_quadratic_only_on_sorted_xs() {
         .iter()
         .position(|&g| g == GateInput::XsSorted)
         .expect("an input with xs sorted");
-    assert_eq!(
-        check_gate(&family, &arena, &passed, &c),
-        Err(CheckFailure::Gate {
-            index: sorted,
-            failure: RunFailure::Timeout { fuel: GATE_FUEL }
-        })
+    // On sorted xs its recursion is n deep, and with the default memory
+    // limit it fills that limit before it runs out of fuel. Either stops it
+    // on this input.
+    let result = check_gate(&family, &arena, &passed, &c);
+    assert!(
+        matches!(
+            result,
+            Err(CheckFailure::Gate {
+                index,
+                failure: RunFailure::Timeout { .. } | RunFailure::MemoryLimit { .. }
+            }) if index == sorted
+        ),
+        "{result:?}"
     );
 }
 
