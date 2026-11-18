@@ -283,6 +283,18 @@ fn a_run_over_the_memory_limit_in_a_sweep_counts_as_a_timeout() {
 }
 
 #[test]
+fn default_gate_cap_is_one_chosen_for_the_chain_gate() {
+    // A run on a gate input has its own cap, `max_gate_fuel`, chosen for the
+    // chain family's gate (decision D28). At 16 bytes per step it lets a
+    // runaway `unfold` take about 8 GB, and other programs take more per
+    // step (see `DEFAULT_MAX_GATE_FUEL`). This test only pins the value, so
+    // that a change to it is deliberate; it does not bound memory.
+    let c = HarnessConfig::default();
+    assert_eq!(c.max_gate_fuel, 500_000_000);
+    assert!(c.max_fuel <= c.max_gate_fuel);
+}
+
+#[test]
 fn generator_is_deterministic_in_size_and_seed() {
     for n in [16, 1024] {
         for seed in 0..5 {
@@ -1057,11 +1069,10 @@ fn the_gate_turns_away_a_program_that_passes_every_example() {
 }
 
 #[test]
-fn the_gate_fuel_is_capped_by_the_global_cap() {
+fn the_gate_fuel_is_capped_by_the_gate_cap() {
     let mut arena = Arena::new();
     let c = HarnessConfig {
-        max_fuel: 500,
-        example_fuel: 500,
+        max_gate_fuel: 500,
         ..config()
     };
     let gated = GatedReverse { right_output: true };
@@ -1073,6 +1084,28 @@ fn the_gate_fuel_is_capped_by_the_global_cap() {
             index: 1,
             failure: RunFailure::Timeout { fuel: 500 }
         })
+    );
+}
+
+#[test]
+fn the_gate_fuel_can_exceed_the_global_cap_up_to_the_gate_cap() {
+    // The linear reverse needs about 2 steps per element, so about 2,000 on
+    // the gate's long input: more than the global cap here, less than the
+    // gate cap.
+    let mut arena = Arena::new();
+    let c = HarnessConfig {
+        max_fuel: 500,
+        example_fuel: 500,
+        max_gate_fuel: 20 * GATE_LEN as u64,
+        ..config()
+    };
+    let gated = GatedReverse { right_output: true };
+    let rev = parse(&mut arena, REV);
+    let passed = check_examples(&gated, &arena, rev, &c).unwrap();
+    assert!(
+        matches!(check_gate(&gated, &arena, &passed, &c), Ok(Some(s)) if s > 500),
+        "{:?}",
+        check_gate(&gated, &arena, &passed, &c)
     );
 }
 

@@ -33,7 +33,7 @@ use common::{compile, list_len};
 use dc_core::{Arena, Scheme};
 use dc_eval::Value;
 use dc_tasks::families::{
-    self, collapse, dominance, sorted_order, subsequence_count, CorpusVariant, Reference,
+    self, chains, collapse, dominance, sorted_order, subsequence_count, CorpusVariant, Reference,
 };
 use dc_tasks::growth::{ClassSelect, SizeObservation, Sweep};
 use dc_tasks::harness::{
@@ -47,8 +47,8 @@ use dc_tasks::task::{generate_input, Example, Gate, Inputs, TaskFamily};
 const CORPUS_SEEDS: u64 = 32;
 
 /// The development families: collapse, sorted order, subsequence count,
-/// dominance.
-const FAMILIES: usize = 4;
+/// dominance, chains.
+const FAMILIES: usize = 5;
 
 /// The configuration of the corpus run: the harness defaults at
 /// [`CORPUS_SEEDS`] seeds.
@@ -125,7 +125,7 @@ fn check_variant(
                     failure: RunFailure::Timeout { fuel },
                 }),
                 Some(g),
-            ) if !r.passes_gate && fuel == g.fuel.min(config.max_fuel) => {}
+            ) if !r.passes_gate && fuel == g.fuel.min(config.max_gate_fuel) => {}
             (other, _) => {
                 return Err(format!(
                     "{}: on the gate {other:?}, passes_gate {}",
@@ -190,7 +190,8 @@ fn the_corpus_holds_every_variant_once() {
     let count = collapse::all().len()
         + sorted_order::all().len()
         + subsequence_count::all().len()
-        + dominance::all().len();
+        + dominance::all().len()
+        + chains::all().len();
     assert_eq!(corpus.len(), count);
     let families: BTreeSet<&str> = corpus.iter().map(|v| v.source).collect();
     assert_eq!(families.len(), FAMILIES);
@@ -215,6 +216,10 @@ fn the_corpus_holds_every_variant_once() {
         let name = dominance::Dominance(v).name().into();
         expected.push((name, vec![v.naive(), v.good()]));
     }
+    for v in chains::Variant::ALL {
+        let name = chains::Chains(v).name().into();
+        expected.push((name, vec![v.naive(), v.good()]));
+    }
     let actual: Vec<(String, Vec<&str>)> = corpus
         .iter()
         .map(|v| {
@@ -233,9 +238,9 @@ fn the_corpus_holds_every_variant_once() {
                 u64::MAX
             };
             assert_eq!(r.max_n, max_n, "{}", r.entry);
-            // Only the naive dominance references are too slow for a gate,
-            // and only the dominance family has one.
-            let gated = v.source == dominance::SOURCE;
+            // Only the dominance and chain families have a gate, and only
+            // their naive references are too slow for it.
+            let gated = v.source == dominance::SOURCE || v.source == chains::SOURCE;
             assert_eq!(v.family.gate().is_some(), gated, "{}", v.family.name());
             assert_eq!(
                 r.passes_gate,

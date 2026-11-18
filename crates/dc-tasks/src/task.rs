@@ -58,7 +58,7 @@ pub struct Gate {
     /// The inputs and their expected results.
     pub inputs: Vec<Example>,
     /// The fuel the candidate gets for each, capped by the harness's
-    /// [`max_fuel`](crate::harness::HarnessConfig::max_fuel).
+    /// [`max_gate_fuel`](crate::harness::HarnessConfig::max_gate_fuel).
     pub fuel: u64,
 }
 

@@ -1,0 +1,196 @@
+-- Reference solutions of the chain family (bead dreamcounter-4593ae), in dc
+-- surface syntax, compiled against the prelude. A chain is a set of
+-- positions i1 < i2 < ... < ik along which both lists strictly increase.
+-- Each variant is a dynamic programme over chains: the value of a chain
+-- that ends at position j is built from the values of the chains that end
+-- at the earlier positions below j in both lists. The variants differ only
+-- in how those values are combined. Each has two references:
+--
+-- * naive (n^2): each position looks at every earlier position.
+-- * good (n log^2 n): divide and conquer over positions, in order. The
+--   earlier half is finished first; then its values are passed to the
+--   later half with a merge by the first list and a merge sort by the
+--   second that combines while it merges; then the later half is solved.
+
+let addm a b = (a + b) mod 1000003
+
+-- Merges two lists that are sorted by le into one.
+let merge_by le a b =
+  bfix (length a + length b + 1)
+    (fun self (a, b) ->
+      match a with
+      | [] -> b
+      | x :: xs ->
+        match b with
+        | [] -> a
+        | y :: ys -> if le x y then x :: self (xs, b) else y :: self (a, ys))
+    (a, b)
+
+let msort_by le xs =
+  bfix (length xs + 1)
+    (fun self ys ->
+      if length ys <= 1 then ys
+      else
+        let (l, r) = split_at (length ys / 2) ys in
+        merge_by le (self l) (self r))
+    xs
+
+-- The step that passes values across the halves. An item here is
+-- (y, w, slot, t, u): a value y of the second list; w = 1 for an item of
+-- the earlier half, which passes its value t on, and 0 for one of the later
+-- half, which receives; its slot; and u, the combination under op of the
+-- values passed to it so far.
+--
+-- Merges a and b, each sorted by y, a before b in the order of the first
+-- list. On equal y the b item goes first, so an equal a item does not pass
+-- its value.
+let merge_passing op z a b =
+  bfix (length a + length b + 1)
+    (fun self (a, b, s) ->
+      match a with
+      | [] -> map (fun (y, w, slot, t, u) -> (y, w, slot, t, op u s)) b
+      | x :: xs ->
+        match b with
+        | [] -> a
+        | v :: vs ->
+          let (xy, xw, _, xt, _) = x in
+          let (vy, vw, vslot, vt, vu) = v in
+          if xy < vy then x :: self (xs, b, if xw = 1 then op s xt else s)
+          else (vy, vw, vslot, vt, op vu s) :: self (a, vs, s))
+    (a, b, z)
+
+let pass_sorted op z ps =
+  bfix (length ps + 1)
+    (fun self qs ->
+      if length qs <= 1 then qs
+      else
+        let (l, r) = split_at (length qs / 2) qs in
+        merge_passing op z (self l) (self r))
+    ps
+
+-- A point is (x, y, i, w, t, u): values x and y, position i, weight w, the
+-- value t of the chains that end at it once it is finished, and u, the
+-- combination of the values passed to it so far.
+--
+-- l and r are points sorted by x, every point of l at an earlier position
+-- than every point of r and finished. Combines into u of each point of r
+-- the values of the points of l with smaller x and smaller y. Returns the
+-- points of r, sorted by x. On equal x the r point goes first, so an equal
+-- l point does not pass its value.
+let pass_across op z l r =
+  let tag w ps = map (fun (x, y, i, v, t, u) -> (x, w, y, i, v, t, u)) ps in
+  let merged =
+    merge_by (fun (a, wa, _, _, _, _, _) (b, wb, _, _, _, _, _) -> a < b || (a = b && wa <= wb))
+      (tag 1 l) (tag 0 r) in
+  let k = length merged in
+  let slotted = zip merged (range 0 k) in
+  let passed =
+    pass_sorted op z
+      (map (fun (p, slot) -> let (_, w, y, _, _, t, _) = p in (y, w, slot, t, z)) slotted) in
+  let gains =
+    foldl
+      (fun a (_, w, slot, _, u) -> if w = 0 then array_set a slot u else a)
+      (array_tabulate k (fun _ -> z)) passed in
+  foldr
+    (fun (p, slot) acc ->
+      let (x, w, y, i, v, t, u) = p in
+      if w = 0 then (x, y, i, v, t, op u (array_get gains slot)) :: acc else acc)
+    [] slotted
+
+-- The points of xs, ys and ws, each finished: t = fin u w, where u is the
+-- combination under op, from z, of the values of the earlier points of
+-- smaller x and smaller y. Returns them sorted by x.
+let chain_dp op z fin xs ys ws =
+  let n = length xs in
+  let points =
+    map (fun (p, q) -> let (x, y) = p in let (i, w) = q in (x, y, i, w, z, z))
+      (zip (zip xs ys) (zip (range 0 n) ws)) in
+  let by_x = fun (a, _, _, _, _, _) (b, _, _, _, _, _) -> a <= b in
+  bfix (n + 1)
+    (fun self ps ->
+      match ps with
+      | [] -> []
+      | p :: rest ->
+        match rest with
+        | [] -> let (x, y, i, w, _, u) = p in [(x, y, i, w, fin u w, u)]
+        | _ :: _ ->
+          let (l, r) = split_at (length ps / 2) ps in
+          let ls = self l in
+          let rs = pass_across op z ls (msort_by by_x r) in
+          let by_pos = msort_by (fun (_, _, i, _, _, _) (_, _, j, _, _, _) -> i <= j) rs in
+          merge_by by_x ls (self by_pos))
+    points
+
+-- The same, by looking at every earlier point. Returns the finished
+-- values, latest first. Each earlier point costs about the same steps
+-- whether it is below or not: both comparisons are made, and op combines z
+-- when it is not, so that the steps depend on the size more than on the
+-- values.
+let chain_dp_naive op z fin xs ys ws =
+  foldl
+    (fun seen (p, w) ->
+      let (x, y) = p in
+      let u =
+        foldl
+          (fun acc (a, b, t) ->
+            let c = (if a < x then 1 else 0) + (if b < y then 1 else 0) in
+            op acc (if c = 2 then t else z))
+          z seen in
+      (x, y, fin u w) :: seen)
+    [] (zip (zip xs ys) ws)
+
+let values_naive op z fin xs ys ws =
+  map (fun (_, _, t) -> t) (chain_dp_naive op z fin xs ys ws)
+
+let values_good op z fin xs ys ws =
+  map (fun (_, _, _, _, t, _) -> t) (chain_dp op z fin xs ys ws)
+
+let zeros xs = map (fun _ -> 0) xs
+
+-- (a) Chains: the number of non-empty chains, mod 1000003. Those that end
+-- at j are j alone and those that end at an earlier point below j,
+-- extended by j.
+
+let chains_naive xs ys =
+  foldl addm 0 (values_naive addm 0 (fun u _ -> addm 1 u) xs ys (zeros xs))
+
+let chains_good xs ys =
+  foldl addm 0 (values_good addm 0 (fun u _ -> addm 1 u) xs ys (zeros xs))
+
+-- (b) Longest chain: the most positions in a chain, 0 for empty lists.
+
+let longest_chain_naive xs ys =
+  foldl max 0 (values_naive max 0 (fun u _ -> u + 1) xs ys (zeros xs))
+
+let longest_chain_good xs ys =
+  foldl max 0 (values_good max 0 (fun u _ -> u + 1) xs ys (zeros xs))
+
+-- (c) Heaviest chain: the largest sum of ws over the positions of a chain,
+-- 0 for empty lists.
+
+let heaviest_chain_naive xs ys ws =
+  foldl max 0 (values_naive max 0 (fun u w -> u + w) xs ys ws)
+
+let heaviest_chain_good xs ys ws =
+  foldl max 0 (values_good max 0 (fun u w -> u + w) xs ys ws)
+
+-- (d) Longest chains: the number of chains of the most positions, mod
+-- 1000003, 0 for empty lists. A value is (length, count); combining keeps
+-- the longer, and adds the counts of equal lengths. It makes both
+-- comparisons and the sum whichever is longer, so that its steps do not
+-- depend on the values.
+
+let longer a b =
+  let (la, ca) = a in
+  let (lb, cb) = b in
+  let s = addm ca cb in
+  let c = (if la < lb then 1 else 0) + (if lb < la then 2 else 0) in
+  if c = 1 then b else if c = 2 then a else (la, s)
+
+let extend u _ = let (l, c) = u in if l = 0 then (1, 1) else (l + 1, c)
+
+let longest_chains_naive xs ys =
+  snd (foldl longer (0, 0) (values_naive longer (0, 0) extend xs ys (zeros xs)))
+
+let longest_chains_good xs ys =
+  snd (foldl longer (0, 0) (values_good longer (0, 0) extend xs ys (zeros xs)))
