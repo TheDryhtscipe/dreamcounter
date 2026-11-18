@@ -8,8 +8,10 @@
 //! * example inputs and outputs for the prompt,
 //! * a generator `generate(n, seed)` of inputs of size `n`,
 //! * an oracle in Rust, independent of dc, that gives the expected output for
-//!   any input, and
-//! * the sweep of sizes over which cost growth is measured.
+//!   any input,
+//! * the sweep of sizes over which cost growth is measured, and
+//! * optionally a [`Gate`]: a few large inputs with their own fuel, which a
+//!   program must also answer within that fuel (decision D25).
 //!
 //! The generator receives a [`TaskRng`] seeded from `(n, seed)` rather than
 //! the seed itself, so a family cannot reach for another source of randomness
@@ -44,6 +46,22 @@ impl Example {
     }
 }
 
+/// Large inputs that a candidate must also answer, each within the gate's
+/// fuel (decision D25). A gate checks only these inputs and this fuel. A
+/// family chooses them so that programs of a growth class it means to turn
+/// away run out of fuel on at least one of them, and so that inputs which
+/// are a worst case for common algorithms are among them. The family's
+/// description states their size and the fuel. The prompt does not show
+/// them, so a program cannot be fitted to their answers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gate {
+    /// The inputs and their expected results.
+    pub inputs: Vec<Example>,
+    /// The fuel the candidate gets for each, capped by the harness's
+    /// [`max_fuel`](crate::harness::HarnessConfig::max_fuel).
+    pub fuel: u64,
+}
+
 /// A task family (spec §9).
 pub trait TaskFamily {
     /// A short, unique identifier, for logs and results tables.
@@ -65,6 +83,12 @@ pub trait TaskFamily {
 
     /// The expected output for `inputs`, computed in Rust without dc.
     fn oracle(&self, inputs: &[Value]) -> Value;
+
+    /// The gate, if the family has one. A candidate solves the family only
+    /// if it passes the examples and then the gate. The default is none.
+    fn gate(&self) -> Option<Gate> {
+        None
+    }
 
     /// The sizes of the growth sweep, strictly increasing and positive. The
     /// default is `16, 32, ..., 1024`; families whose reference solutions are

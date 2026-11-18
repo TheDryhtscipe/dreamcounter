@@ -10,7 +10,9 @@
 //!    the library's type schemes.
 //! 3. **Run.** The entry, with the prelude and the library expanded, gives
 //!    the expected output on every example of the task, within the harness's
-//!    example fuel ([`dc_tasks::harness::check_examples`]).
+//!    example fuel ([`dc_tasks::harness::check_examples`]), and then on the
+//!    task's gate, if it has one, within the gate's fuel
+//!    ([`dc_tasks::harness::check_gate`], decision D25).
 //!
 //! A program that passes all three is kept as a core term with its prelude
 //! and library references in place, so the compressor sees `map` as a token,
@@ -23,7 +25,7 @@ use dc_core::types::{check, infer};
 use dc_core::{sexpr, Arena, ExpandError, Expander, LibDef, LibId, Scheme, TermId};
 use dc_surface::prelude::{Prelude, PreludeMode};
 use dc_surface::TopLevel;
-use dc_tasks::harness::{check_examples, CheckFailure, HarnessConfig, RunFailure};
+use dc_tasks::harness::{check_examples, check_gate, CheckFailure, HarnessConfig, RunFailure};
 use dc_tasks::task::TaskFamily;
 
 use crate::state::{Check, LibraryEntry, RunConfig};
@@ -313,13 +315,18 @@ impl Verifier {
                 }
             }
         };
-        match check_examples(family, &self.arena, expanded, &self.harness) {
+        let checked = check_examples(family, &self.arena, expanded, &self.harness)
+            .and_then(|passed| check_gate(family, &self.arena, &passed, &self.harness));
+        match checked {
             Ok(_) => Check::Passed { program: stored },
             Err(CheckFailure::Type(e)) => Check::Type {
                 error: e.to_string(),
             },
             Err(CheckFailure::Example { index, failure }) => Check::Run {
                 error: format!("example {index}: {}", describe(&failure)),
+            },
+            Err(CheckFailure::Gate { index, failure }) => Check::Run {
+                error: format!("large input {index}: {}", describe_hidden(&failure)),
             },
             Err(other) => Check::Run {
                 error: format!("{other:?}"),
@@ -391,6 +398,19 @@ fn describe(failure: &RunFailure) -> String {
         ),
         RunFailure::Error { kind, steps } => format!("runtime error {kind:?} after {steps} steps"),
         RunFailure::Timeout { fuel } => format!("no result within {fuel} steps"),
+    }
+}
+
+/// A failure on a gate input, without the expected or the actual value or
+/// the steps before an error. The gate is hidden from the prompt (decision
+/// D25), and a program's output or step count could carry any feature of
+/// the hidden input. Which input failed, and the kind of failure, still
+/// tell a little about it.
+fn describe_hidden(failure: &RunFailure) -> String {
+    match failure {
+        RunFailure::WrongOutput { .. } => "wrong output".to_owned(),
+        RunFailure::Error { kind, .. } => format!("runtime error {kind:?}"),
+        RunFailure::Timeout { .. } => describe(failure),
     }
 }
 
@@ -548,5 +568,58 @@ mod tests {
     fn only_development_tasks_are_found() {
         assert!(task("collapse/merge").is_some());
         assert!(task("no/such").is_none());
+    }
+
+    #[test]
+    fn a_program_that_passes_the_examples_but_not_the_gate_does_not_pass() {
+        // Decision D25: the naive dominance references give every example's
+        // output, and run out of the gate's fuel.
+        let v = development()
+            .into_iter()
+            .find(|v| v.family.name() == "dominance/weighted-inversions")
+            .unwrap();
+        let naive = v.references.first().unwrap();
+        let good = v.references.last().unwrap();
+        assert!(!naive.passes_gate && good.passes_gate);
+        let mut verifier = Verifier::new(&[]).unwrap();
+        let text = |entry: &str| format!("{}\nlet {ENTRY} = {entry}\n", v.source);
+        match verifier.check(&*v.family, &text(naive.entry)) {
+            Check::Run { error } => assert_eq!(
+                error,
+                format!(
+                    "large input 0: no result within {} steps",
+                    dc_tasks::families::dominance::GATE_FUEL
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            verifier.check(&*v.family, &text(good.entry)),
+            Check::Passed { .. }
+        ));
+        // A wrong output on a gate input names neither the expected value
+        // nor the program's: the program returns the input's length.
+        let wrong = format!(
+            "fun xs -> if length xs > 100 then length xs else {} xs",
+            good.entry
+        );
+        match verifier.check(&*v.family, &text(&wrong)) {
+            Check::Run { error } => assert_eq!(error, "large input 0: wrong output"),
+            other => panic!("{other:?}"),
+        }
+        // Nor does a runtime error give the steps before it: here they
+        // would depend on the first element.
+        let error = format!(
+            "fun xs -> if length xs > 100 then \
+             1 / loop (match xs with | [] -> 0 | x :: _ -> x + 2000) 0 (fun i acc -> acc) \
+             else {} xs",
+            good.entry
+        );
+        match verifier.check(&*v.family, &text(&error)) {
+            Check::Run { error } => {
+                assert_eq!(error, "large input 0: runtime error DivisionByZero")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

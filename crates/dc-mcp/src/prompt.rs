@@ -183,7 +183,9 @@ fn shown(v: &dc_eval::Value) -> String {
     }
 }
 
-/// The task section: its description, type and examples.
+/// The task section: its description, type and examples. A task's gate
+/// (decision D25) is not shown: its answers would let a program pass it
+/// without computing them. The description states its size and fuel.
 fn task(family: &dyn TaskFamily) -> String {
     let mut out = format!(
         "## The task\n\n{}\n\n{ENTRY} : {}\n\nExamples:\n",
@@ -481,6 +483,44 @@ mod tests {
         // No library and no solved tasks yet.
         assert!(!p.prompt.contains("## Library"));
         assert!(!p.prompt.contains("## Programs that solve"));
+    }
+
+    #[test]
+    fn a_gate_is_not_shown() {
+        let s = state(&["dominance/increasing-triples"]);
+        let v = Verifier::new(&[]).unwrap();
+        let family = crate::verify::task("dominance/increasing-triples").unwrap();
+        let p = payload(&s, &v, &*family, 0, "tok", 1);
+        // Every small example is shown, and nothing else in its form.
+        let examples = family.examples();
+        for e in &examples {
+            let line = format!(
+                "  {ENTRY} {} = {}\n",
+                shown(&e.inputs[0]),
+                e.output.display_within(SHOWN_VALUES)
+            );
+            assert!(p.prompt.contains(&line), "{}", p.prompt);
+        }
+        assert_eq!(
+            p.prompt.matches(&format!("  {ENTRY} ")).count(),
+            examples.len(),
+            "{}",
+            p.prompt
+        );
+        // No gate input is shown, nor an answer no small example has (the
+        // input sorted down has no increasing triple, like a small example).
+        for e in family.gate().expect("a gate").inputs {
+            assert!(!p.prompt.contains(&shown(&e.inputs[0])));
+            if examples.iter().all(|x| x.output != e.output) {
+                assert!(!p.prompt.contains(&format!("= {}\n", e.output)));
+            }
+        }
+        // A shown gate input would add at least SHOWN_VALUES values.
+        assert!(
+            p.prompt.len() < 3 * SHOWN_VALUES as usize,
+            "{}",
+            p.prompt.len()
+        );
     }
 
     #[test]
