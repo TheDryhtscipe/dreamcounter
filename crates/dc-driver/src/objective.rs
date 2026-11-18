@@ -202,6 +202,11 @@ fn check_lambda(lambda: f64) -> Result<(), ObjectiveError> {
 /// The member of `members` with the smallest `DL(p | L) + λ · C(p)`, the
 /// earliest on a tie. `None` if every member is incorrect or there are none.
 ///
+/// Two members are compared by `DL(a) − DL(b)` against `λ · (C(b) − C(a))`,
+/// not by their rounded scores. So at equal description length the smaller
+/// `C` wins at every λ > 0, however small: `λ · ΔC` is never 0 when λ > 0
+/// and `ΔC ≥ 1`. Scores alone could round to the same value.
+///
 /// # Errors
 ///
 /// [`ObjectiveError::BadLambda`] if λ is not finite or is negative.
@@ -211,7 +216,12 @@ pub fn select(members: &[Member], lambda: f64) -> Result<Option<Selection>, Obje
     for (index, (member, cost)) in members.iter().zip(member_costs(members)).enumerate() {
         let Some(cost) = cost else { continue };
         let score = member.dl as f64 + lambda * f64::from(cost.c);
-        if best.is_none_or(|b| score < b.score) {
+        let better = |b: Selection| {
+            let dl_gap = (i128::from(member.dl) - i128::from(b.dl)) as f64;
+            let cost_gap = lambda * (f64::from(b.cost.c) - f64::from(cost.c));
+            dl_gap < cost_gap
+        };
+        if best.is_none_or(better) {
             best = Some(Selection {
                 index,
                 dl: member.dl,

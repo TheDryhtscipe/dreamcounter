@@ -428,7 +428,8 @@ fn a_stored_cost_gives_the_growth_the_objective_scores() {
             ),
             Growth::Refused(Refusal::NotFitted),
         ),
-        // A timeout below the window does not stop C naming a class.
+        // A named class is trusted. Under the default window every size is
+        // in it, so measuring cannot store this; a narrower window could.
         (
             measured(
                 vec![size(16, Some(FailureKind::Timeout)), size(32, None)],

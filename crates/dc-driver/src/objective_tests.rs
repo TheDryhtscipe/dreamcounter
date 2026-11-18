@@ -261,3 +261,38 @@ fn each_cause_has_a_log_line() {
     distinct.dedup();
     assert_eq!(distinct.len(), lines.len());
 }
+
+#[test]
+fn a_cost_difference_decides_a_tie_in_description_length_even_when_lambda_is_tiny() {
+    // λ · ΔC is far below the spacing of f64 values near these lengths, so
+    // the rounded scores are equal.
+    for (dl, lambda) in [(40, 1e-15), (1_000_000, 1e-12), (u64::MAX / 2, 1e-3)] {
+        let refused_first = [too_noisy(dl), fitted(dl, GrowthClass::Exponential)];
+        assert_eq!(
+            selected(&refused_first, lambda).index,
+            1,
+            "dl {dl}, lambda {lambda}"
+        );
+        let timeout_first = [member(dl, Growth::TimedOut), too_noisy(dl)];
+        assert_eq!(
+            selected(&timeout_first, lambda).index,
+            1,
+            "dl {dl}, lambda {lambda}"
+        );
+    }
+}
+
+#[test]
+fn the_timeout_penalty_is_fixed_whatever_the_task_holds() {
+    for others in [
+        vec![],
+        vec![fitted(10, GrowthClass::Constant)],
+        vec![fitted(10, GrowthClass::Linear), too_noisy(10)],
+        vec![member(10, Growth::Incorrect)],
+    ] {
+        let mut members = vec![member(10, Growth::TimedOut)];
+        members.extend(others);
+        let costs = member_costs(&members);
+        assert_eq!(costs[0].expect("correct").c, TIMEOUT_COST, "{members:?}");
+    }
+}
