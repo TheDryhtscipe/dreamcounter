@@ -619,8 +619,15 @@ fn a_worker_stopped_at_the_runs_time_limit_ends_the_iteration_without_abstractio
     };
     let tasks = TASKS.iter().map(|t| (*t).to_owned()).collect();
     store.create_run(&run, settings, tasks).unwrap();
-    fill(&store, &run, 0);
+    // Reference 1 of each collapse task, the good one: cheap to measure, so
+    // that measuring the kept programs adds little to the time below.
+    fill_with(&store, &run, 0, |task, _| solution(task, 1));
     let cancel = AtomicBool::new(false);
+    // The fuel plans that measuring the frontiers needs are made once per
+    // process. Made here, they are not part of the time below.
+    for task in TASKS {
+        crate::cost::fuel_plan(task).unwrap();
+    }
     // The run's limit, not the worker's default of ten minutes, stops it.
     let started = std::time::Instant::now();
     let done = finish_iteration_in_worker(&store, &run, &sleeper(), &cancel).unwrap();
