@@ -982,14 +982,25 @@ proptest! {
         let prog = build_in(&mut a, &prog, u32::try_from(libs.len()).unwrap());
         let want = naive_expand(&mut a, &libs, prog);
         let got = expand(&mut a, &libs, prog).expect("expand");
-        prop_assert_eq!(
-            sexpr::print(&a, got).unwrap(),
-            sexpr::print(&a, want).unwrap(),
-            "{}",
-            sexpr::print(&a, prog).unwrap()
+        // The arena is hash-consed, so equal terms have equal ids. Expansions
+        // can be far too large to print whole, so the message shows prefixes.
+        prop_assert!(
+            got == want,
+            "got {}\nwant {}\nprogram {}",
+            shown(&a, got),
+            shown(&a, want),
+            shown(&a, prog)
         );
-        prop_assert_eq!(got, want);
     }
+}
+
+/// The first few kilobytes of `id` in core syntax, for a failure message.
+fn shown(a: &Arena, id: TermId) -> String {
+    let mut out = String::new();
+    if !sexpr::print_bounded(a, id, 4096, &mut out) {
+        out.push_str(" ...");
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

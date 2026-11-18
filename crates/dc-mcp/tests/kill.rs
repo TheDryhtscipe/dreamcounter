@@ -5,11 +5,17 @@
 //! in a loop and prints a line after each commit returns. The parent kills it
 //! with SIGKILL and reads the run.
 //!
+//! A kill can tear a write: Linux checks for a fatal signal between the folios
+//! of a write, and a record here is longer than a page, so on a file system
+//! that writes it in more than one folio a kill can tear it. The next child
+//! then sets the torn tail aside and logs a [`LogKind::Recovery`]. So that
+//! this is tested on every run, not only when a kill happens to land in a
+//! write, the test leaves a torn tail of its own before one round.
+//!
 //! What this does not show: that a commit survives a power cut, which needs
-//! the `fsync` (see `store_tests.rs` for the order of the write and the sync),
-//! or what a torn tail does (SIGKILL does not tear a write in practice; see
-//! the torn-tail tests in `store_tests.rs`).
+//! the `fsync` (see `store_tests.rs` for the order of the write and the sync).
 
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -21,6 +27,10 @@ const ROOT_ENV: &str = "DC_MCP_KILL_TEST_ROOT";
 const RUN: &str = "killed";
 /// The child ends an iteration with every fifth commit.
 const COMMITS_PER_ITERATION: u64 = 5;
+/// Before this round the test leaves a torn tail in the journal.
+const TORN_ROUND: usize = 3;
+/// The torn tail the test leaves: the start of a record.
+const TORN_TAIL: &[u8] = b"9999 00000000 half a rec";
 
 fn config() -> RunConfig {
     RunConfig {
@@ -65,11 +75,26 @@ fn batch(i: u64) -> Vec<Event> {
     events
 }
 
-/// The state after the child's first `commits` commits.
-fn expected(commits: u64) -> RunState {
+/// The state the run should have, given its log: the child's commits in order,
+/// with each [`LogKind::Recovery`] record where the store wrote it, first in
+/// the commit after a torn tail. Each note in the log must be the next
+/// commit's. The recovery records are taken as the store wrote them.
+fn expected(log: &[LogRecord]) -> RunState {
     let mut state = RunState::create(config(), tasks()).unwrap();
-    for event in (0..commits).flat_map(batch) {
-        state.apply(&event).unwrap();
+    let mut commits = 0;
+    for record in log {
+        match record.kind {
+            LogKind::Recovery => state.apply(&Event::Logged(record.clone())).unwrap(),
+            LogKind::Note => {
+                let events = batch(commits);
+                assert_eq!(events[0], Event::Logged(record.clone()), "note {commits}");
+                for event in &events {
+                    state.apply(event).unwrap();
+                }
+                commits += 1;
+            }
+            other => panic!("the child logs no {other:?}"),
+        }
     }
     state
 }
@@ -107,7 +132,13 @@ fn a_killed_writer_loses_no_acknowledged_commit() {
     let mut total_acked = 0;
     // Each round kills the child after a different number of commits, so the
     // kills fall at different points of an iteration.
-    for acks_before_kill in [1, 3, 7, 12, 2, 9] {
+    for (round, acks_before_kill) in [1, 3, 7, 12, 2, 9].into_iter().enumerate() {
+        if round == TORN_ROUND {
+            // What a kill in the middle of a write leaves: part of a record.
+            let journal = dir.path().join(RUN).join("journal");
+            let mut file = OpenOptions::new().append(true).open(journal).unwrap();
+            file.write_all(TORN_TAIL).unwrap();
+        }
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "writer_child", "--nocapture", "--test-threads=1"])
             .env(ROOT_ENV, dir.path())
@@ -139,8 +170,42 @@ fn a_killed_writer_loses_no_acknowledged_commit() {
             commits >= total_acked,
             "{total_acked} commits were acknowledged and {commits} are in the run"
         );
-        assert_eq!(state, expected(commits));
-        assert_eq!(store.log(&run).unwrap().len() as u64, commits);
+        let log = store.log(&run).unwrap();
+        assert_eq!(state, expected(&log));
+        // Each recovery set aside a torn tail in a file of its own. A kill in
+        // the middle of a write can tear one, so there may be more than the
+        // one the test made, but each child recovers at most one, first.
+        let recoveries: Vec<&LogRecord> = log
+            .iter()
+            .filter(|record| record.kind == LogKind::Recovery)
+            .collect();
+        let torn_files = std::fs::read_dir(dir.path().join(RUN))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("torn-")
+            })
+            .count();
+        assert_eq!(recoveries.len(), torn_files, "{recoveries:?}");
+        if round >= TORN_ROUND {
+            // A natural tear just before merges with the test's tail, so the
+            // set-aside tail can be longer, but it ends with it.
+            let made = recoveries.iter().any(|record| {
+                let aside = record.text.rsplit(' ').next().unwrap();
+                std::fs::read(dir.path().join(RUN).join(aside))
+                    .unwrap()
+                    .ends_with(TORN_TAIL)
+            });
+            assert!(
+                made,
+                "the test's torn tail was not recovered: {recoveries:?}"
+            );
+        }
+        assert!(recoveries.len() <= round, "{recoveries:?}");
     }
     assert!(total_acked >= 34);
     assert!(
