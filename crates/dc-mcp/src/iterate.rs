@@ -19,8 +19,8 @@
 //!    changes nothing the step chose.
 //! 4. **Commit.** In one record, so that a restart finds all of it or none:
 //!    a `FrontierSet` for each task, its members with their costs, a
-//!    `LibraryExtended` if abstractions join the library, a log record of kind [`LogKind::Compression`] whose
-//!    text is the step's [`IterationReport`] as JSON, and an
+//!    `LibraryExtended` if abstractions join the library, a log record of
+//!    kind [`LogKind::Compression`] whose text is the step's [`IterationReport`] as JSON, and an
 //!    `IterationFinished` that takes the verified programs the step read.
 //!    Programs verified during the step stay for the next one.
 //!

@@ -10,14 +10,16 @@
 //!
 //! # The sweep
 //!
-//! Each task's fuel plan is made once per process from its variant's first
+//! Each task's fuel plan is made from its variant's first
 //! reference solution that runs over the whole sweep
 //! ([`dc_tasks::families::Reference::max_n`]): the naive reference for the
 //! collapse and sorted-order families, the quadratic one for subsequence
 //! count, whose naive reference is `2ⁿ`. Each size's fuel is ten times that
 //! reference's steps there, within the harness's cap
 //! ([`HarnessConfig::default`]). These are the plans the corpus tests
-//! measure natural solutions with.
+//! measure natural solutions with. A process makes each plan once and keeps
+//! it. A plan that cannot be made is tried once in each call of
+//! [`measure_frontiers`], and the task's programs are refused.
 //!
 //! # What it does not change
 //!
@@ -36,8 +38,8 @@
 //! * one run, bounded by its fuel, at most the harness's cap of 50 million
 //!   steps;
 //! * one program's examples, each run bounded by the harness's example fuel;
-//! * making a task's fuel plan, the first time a process measures the task:
-//!   it runs the reference over the sweep, up to about ten seconds for a
+//! * making a task's fuel plan, when the process has none for the task: it
+//!   runs the reference over the sweep, up to about ten seconds for a
 //!   development task.
 //!
 //! A cancel during measuring stops it, and the call then ends as
@@ -77,6 +79,14 @@ use crate::verify::{task, Verifier};
 thread_local! {
     /// How many programs this thread has started to measure, for tests.
     static STARTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// How many fuel plans this thread has tried to make, for tests.
+    static PLANS_TRIED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many fuel plans this thread has tried to make.
+#[cfg(test)]
+pub(crate) fn plans_tried() -> u64 {
+    PLANS_TRIED.with(std::cell::Cell::get)
 }
 
 /// How many programs this thread has started to measure. Tests use it to
@@ -98,7 +108,8 @@ pub const OUT_OF_TIME: &str = "the time for measuring this iteration's frontiers
 pub const CANCELLED: &str = "the call was cancelled while frontiers were measured";
 
 /// The fuel plan of `name`'s sweep, made the first time it is asked for in
-/// this process. See the module docs.
+/// this process and kept. A plan that cannot be made is not kept, so a
+/// later call makes it again. See the module docs.
 ///
 /// # Errors
 ///
@@ -120,6 +131,8 @@ pub fn fuel_plan(name: &str) -> Result<Arc<FuelPlan>, String> {
 }
 
 fn make_plan(name: &str) -> Result<FuelPlan, String> {
+    #[cfg(test)]
+    PLANS_TRIED.with(|p| p.set(p.get() + 1));
     let variant = development()
         .into_iter()
         .find(|v| v.family.name() == name)
@@ -318,6 +331,9 @@ pub fn measure_frontiers(
     let mut out = BTreeMap::new();
     for (name, programs) in kept {
         let before = previous.get(name).map(Vec::as_slice).unwrap_or_default();
+        // Made at most once in this call, when a program of the task is
+        // first measured.
+        let mut plan: Option<Result<(), String>> = None;
         let mut members = Vec::with_capacity(programs.len());
         for program in programs {
             let known = before
@@ -338,6 +354,11 @@ pub fn measure_frontiers(
                 (None, Ok(v)) => {
                     let cost = if stopper.stop() {
                         None
+                    } else if let Err(e) = plan
+                        .get_or_insert_with(|| fuel_plan(name).map(|_| ()))
+                        .as_ref()
+                    {
+                        Some(ProgramCost::Refused { reason: e.clone() })
                     } else {
                         Some(measure_program(
                             v,

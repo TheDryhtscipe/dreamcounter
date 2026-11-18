@@ -239,21 +239,71 @@ fn a_deadline_inside_a_sweep_stops_it() {
             reason: "stopped".to_owned()
         }
     );
+    // Asked before the examples, then before each of the sweep's runs: the
+    // examples and six runs, and none after it says stop.
+    assert_eq!(runs, 8);
+
+    // Asked before the examples first: stopped there, nothing runs. This
+    // program fails its examples, so it would be refused had they run.
+    let mut asked = 0;
+    let cost = measure_program(
+        &v,
+        "collapse/cancel",
+        "(lam $0)",
+        &mut || {
+            asked += 1;
+            true
+        },
+        "stopped",
+    );
     assert_eq!(
-        runs, 8,
-        "stop is asked before each run, and no run after it says stop"
+        cost,
+        ProgramCost::NotMeasured {
+            reason: "stopped".to_owned()
+        }
+    );
+    assert_eq!(asked, 1);
+}
+
+#[test]
+fn a_task_with_no_fuel_plan_refuses_its_programs_without_measuring_them() {
+    let before = started();
+    let tried = plans_tried();
+    let out = measure_frontiers(
+        &[],
+        &kept("no/such", &[PILOT[2].1, PILOT[3].1]),
+        &BTreeMap::new(),
+        never(),
+    );
+    for m in &out["no/such"] {
+        assert!(
+            matches!(&m.cost, Some(ProgramCost::Refused { reason }) if reason.contains("no development task")),
+            "{m:?}"
+        );
+    }
+    assert_eq!(started(), before, "no program was measured");
+    assert_eq!(
+        plans_tried(),
+        tried + 1,
+        "the plan was tried once in the call"
     );
 }
 
 #[test]
 fn a_member_kept_from_the_previous_frontier_keeps_only_a_cost_that_measuring_gives_again() {
     let task = "collapse/cancel";
-    // A cost no measuring gives, so that keeping it is seen.
+    // Costs no measuring gives, so that keeping them is seen: no sizes.
     let marked = ProgramCost::Incorrect {
         sizes: Vec::new(),
         n: 0,
         seed: 99,
     };
+    let measured = ProgramCost::Measured {
+        sizes: Vec::new(),
+        verdict: CostVerdict::Class(CostClass::Cubic),
+    };
+    // Reversing twice: right on no input of cancel, but kept by its cost.
+    let twice = "(lam (lib_4294901767 (lib_4294901767 $0)))";
     let previous = BTreeMap::from([(
         task.to_owned(),
         vec![
@@ -268,6 +318,10 @@ fn a_member_kept_from_the_previous_frontier_keeps_only_a_cost_that_measuring_giv
                 }),
             },
             FrontierMember {
+                program: twice.to_owned(),
+                cost: Some(measured.clone()),
+            },
+            FrontierMember {
                 program: "(lam (lib_4294901767 $0))".to_owned(),
                 cost: Some(ProgramCost::Refused {
                     reason: "a failure that need not recur".to_owned(),
@@ -277,15 +331,17 @@ fn a_member_kept_from_the_previous_frontier_keeps_only_a_cost_that_measuring_giv
     )]);
     let programs = [
         PILOT[2].1,
+        twice,
         "(lam (lib_4294901767 (lib_4294901767 (lib_4294901767 $0))))",
         "(lam (lib_4294901767 $0))",
     ];
     let out = measure_frontiers(&[], &kept(task, &programs), &previous, never());
     let members = &out[task];
     assert_eq!(members[0].cost, Some(marked));
+    assert_eq!(members[1].cost, Some(measured));
     // Measured again: they were not measured, or were refused, before.
     // Reversing is not cancel's collapse, so they fail the examples.
-    for m in &members[1..] {
+    for m in &members[2..] {
         assert!(
             matches!(&m.cost, Some(ProgramCost::Refused { reason }) if reason.contains("checks")),
             "{m:?}"
