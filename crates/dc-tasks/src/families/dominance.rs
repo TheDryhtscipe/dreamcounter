@@ -12,17 +12,18 @@
 //! The family is the harder part of the development corpus. The pilot run
 //! (results log, 2026-11-18) showed a strong proposer solving every other
 //! development task with every program. Here each variant has a
-//! [`Gate`]: six inputs of [`GATE_N`] elements, each with [`GATE_FUEL`]
-//! steps ([`GATE_INPUTS`]). A program passes only if it answers all six
+//! [`Gate`]: seven inputs of [`GATE_N`] elements, each with [`GATE_FUEL`]
+//! steps ([`GATE_INPUTS`]). A program passes only if it answers all seven
 //! within that fuel. The gate checks only these inputs. They are chosen so
-//! that the `n²` programs this module's tests know of run out of fuel on at
-//! least one: the naive references, which look at every pair of positions;
-//! an unbalanced search tree (sorted input); a quicksort that puts ties on
-//! one side (few values); and an array with a slot for each value (a wide
-//! range). A program that is slow only on some other input can pass. The
-//! good references take at most 29 % of the fuel on any input (November
-//! 2026). The description states the size and the step limit, not the
-//! inputs.
+//! that the slow programs this module's tests know of run out of fuel on
+//! at least one: the naive references, which look at every pair of
+//! positions; an unbalanced search tree (sorted input); a quicksort that
+//! puts ties on one side (few values); a quicksort with the middle element
+//! as pivot (organ-pipe order); and an array indexed by value, which costs
+//! at least a step for each value in the range (a wide range). A program
+//! that is slow only on some other input can pass. The good references
+//! take at most 29 % of the fuel on any gate input (November 2026). The
+//! description states the size and the step limit, not the inputs.
 //!
 //! Each variant has a naive dc reference that looks at every pair of
 //! positions (`n²`), which times out on the gate, and a good one (`n log n`)
@@ -287,22 +288,29 @@ pub enum GateInput {
     FewValues,
     /// Values from `-WIDE_GATE..=WIDE_GATE`, nearly all distinct: the worst
     /// case of a program that keeps a slot or a step for each value in the
-    /// range.
+    /// range, such as an array indexed by value.
     WideRange,
+    /// The values of [`GateInput::WideRange`] in organ-pipe order: up, then
+    /// down, so the middle element is the largest. The worst case of a
+    /// quicksort that takes the middle element as its pivot.
+    OrganPipe,
 }
 
 /// The order of the gate's inputs.
-pub const GATE_INPUTS: [GateInput; 6] = [
+pub const GATE_INPUTS: [GateInput; 7] = [
     GateInput::Random,
     GateInput::SortedUp,
     GateInput::SortedDown,
     GateInput::Walk,
     GateInput::FewValues,
     GateInput::WideRange,
+    GateInput::OrganPipe,
 ];
 
-/// The value range of [`GateInput::WideRange`].
-pub const WIDE_GATE: i64 = 1_000_000;
+/// The value range of [`GateInput::WideRange`]. A program that spends even
+/// a step on each value in the range runs out of fuel: the range is 40,000
+/// times [`GATE_FUEL`].
+pub const WIDE_GATE: i64 = 1_000_000_000_000;
 
 /// The seeds of the gate inputs that are not generated inputs. They are
 /// passed to [`TaskRng::new`] with [`GATE_N`], apart from the generator's.
@@ -345,6 +353,16 @@ fn gate_input(family: &Dominance, g: GateInput) -> Inputs {
         GateInput::Walk => generate_input(family, GATE_N, 2),
         GateInput::FewValues => drawn(FEW_VALUES_SEED, 0, 1),
         GateInput::WideRange => drawn(WIDE_RANGE_SEED, -WIDE_GATE, WIDE_GATE),
+        GateInput::OrganPipe => drawn(WIDE_RANGE_SEED, -WIDE_GATE, WIDE_GATE)
+            .iter()
+            .map(|l| {
+                let mut xs = ints_of(l);
+                xs.sort_unstable();
+                let up = xs.iter().step_by(2);
+                let down = xs.iter().skip(1).step_by(2).rev();
+                list(&up.chain(down).copied().collect::<Vec<i64>>())
+            })
+            .collect(),
     }
 }
 
@@ -637,6 +655,14 @@ mod tests {
             for (d, range) in distinct(at(GateInput::WideRange)) {
                 assert!(d as u64 > GATE_N * 99 / 100, "{}: {d}", f.name());
                 assert!(range as u64 > 100 * GATE_N, "{}: {range}", f.name());
+            }
+            // The organ pipe goes up to its largest value, then down.
+            for l in &at(GateInput::OrganPipe).inputs {
+                let xs = ints_of(l);
+                let top = xs.iter().enumerate().max_by_key(|&(_, x)| *x).unwrap().0;
+                assert!(xs[..=top].windows(2).all(|w| w[0] <= w[1]), "{}", f.name());
+                assert!(xs[top..].windows(2).all(|w| w[0] >= w[1]), "{}", f.name());
+                assert!(top > xs.len() / 3 && top < 2 * xs.len() / 3, "{}", f.name());
             }
             for e in f.examples() {
                 assert!(ints_of(&e.inputs[0]).len() <= 8, "{}", f.name());

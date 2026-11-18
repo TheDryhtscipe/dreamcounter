@@ -381,13 +381,16 @@ fn describe(failure: &RunFailure) -> String {
     }
 }
 
-/// A failure on a gate input, without the expected or the actual value.
-/// The gate is hidden from the prompt (decision D25), and a program's
-/// output could carry any feature of the hidden input.
+/// A failure on a gate input, without the expected or the actual value or
+/// the steps before an error. The gate is hidden from the prompt (decision
+/// D25), and a program's output or step count could carry any feature of
+/// the hidden input. Which input failed, and the kind of failure, still
+/// tell a little about it.
 fn describe_hidden(failure: &RunFailure) -> String {
     match failure {
         RunFailure::WrongOutput { .. } => "wrong output".to_owned(),
-        other => describe(other),
+        RunFailure::Error { kind, .. } => format!("runtime error {kind:?}"),
+        RunFailure::Timeout { .. } => describe(failure),
     }
 }
 
@@ -582,6 +585,20 @@ mod tests {
         );
         match verifier.check(&*v.family, &text(&wrong)) {
             Check::Run { error } => assert_eq!(error, "large input 0: wrong output"),
+            other => panic!("{other:?}"),
+        }
+        // Nor does a runtime error give the steps before it: here they
+        // would depend on the first element.
+        let error = format!(
+            "fun xs -> if length xs > 100 then \
+             1 / loop (match xs with | [] -> 0 | x :: _ -> x + 2000) 0 (fun i acc -> acc) \
+             else {} xs",
+            good.entry
+        );
+        match verifier.check(&*v.family, &text(&error)) {
+            Check::Run { error } => {
+                assert_eq!(error, "large input 0: runtime error DivisionByZero")
+            }
             other => panic!("{other:?}"),
         }
     }

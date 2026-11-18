@@ -220,10 +220,12 @@ fn the_gate_turns_away_a_program_that_is_quadratic_only_on_sorted_input() {
     );
 }
 
-/// Two increasing-subsequences programs that are fast on most inputs:
-/// the good reference with its value sort replaced by a quicksort that puts
-/// ties on one side (`n²` when there are few values), and a program with an
-/// array slot for each value in the range (`n · range`).
+/// Increasing-subsequences programs that are fast on most inputs: the good
+/// reference with its value sort replaced by a quicksort that puts ties on
+/// one side (`n²` when there are few values) or by a quicksort with the
+/// middle element as pivot (`n²` in organ-pipe order), and programs with an
+/// array slot for each value in the range (`n · range`, and a Fenwick tree
+/// at `range + n log range`).
 const RANGE_AND_TIES: &str = r#"
 let qsort_by_value ps =
   bfix (length ps + 1)
@@ -261,6 +263,62 @@ let qs_increasing_subsequences xs =
       (zeros_tree n, 0) by_pos in
   total
 
+-- A quicksort with three parts and the middle element as pivot.
+let qsort3 ps =
+  bfix (length ps + 1)
+    (fun self ys ->
+      let n = length ys in
+      if n <= 1 then ys
+      else
+        let (pv, _) = nth ys (n / 2) in
+        append (self (filter (fun (v, _) -> v < pv) ys))
+          (append (filter (fun (v, _) -> v = pv) ys)
+            (self (filter (fun (v, _) -> pv < v) ys))))
+    ps
+
+let qs3_increasing_subsequences xs =
+  let sorted = qsort3 (zip xs (range 0 (length xs))) in
+  let ranked =
+    match sorted with
+    | [] -> []
+    | first :: _ ->
+      let (_, _, acc) =
+        foldl
+          (fun (prev, r, acc) (v, i) ->
+            let r2 = r + (if v = prev then 0 else 1) in
+            (v, r2, (i, r2) :: acc))
+          (fst first, 0, []) sorted in
+      acc in
+  let by_pos = msort_by (fun (i, _) (j, _) -> i <= j) ranked in
+  let n = length xs in
+  let (_, total) =
+    foldl
+      (fun (t, total) (_, r) ->
+        let ending = addm 1 (tree_below t n r) in
+        (tree_add t n r ending, addm total ending))
+      (zeros_tree n, 0) by_pos in
+  total
+
+-- A Fenwick tree indexed by the value minus the least value.
+let fenwick_increasing_subsequences xs =
+  match xs with
+  | [] -> 0
+  | _ :: _ ->
+    let lo = foldl min max_int xs in
+    let hi = foldl max min_int xs in
+    let size = hi - lo + 2 in
+    let lowb i = bfix 70 (fun self (p, q) -> if q mod 2 = 1 then p else self (p * 2, q / 2)) (1, i) in
+    let query a k = bfix 70 (fun self (i, acc) -> if i <= 0 then acc else self (i - lowb i, addm acc (array_get a i))) (k, 0) in
+    let update a k c = bfix 70 (fun self (a, i) -> if i >= size then a else self (array_set a i (addm (array_get a i) c), i + lowb i)) (a, k) in
+    let (_, total) =
+      foldl
+        (fun (a, total) x ->
+          let k = x - lo + 1 in
+          let ending = addm 1 (query a (k - 1)) in
+          (update a k ending, addm total ending))
+        (array_tabulate size (fun _ -> 0), 0) xs in
+    total
+
 let arr_increasing_subsequences xs =
   match xs with
   | [] -> 0
@@ -282,7 +340,7 @@ let arr_increasing_subsequences xs =
 "#;
 
 #[test]
-fn the_gate_turns_away_programs_slow_only_on_ties_or_a_wide_range() {
+fn the_gate_turns_away_programs_slow_only_on_ties_a_wide_range_or_organ_pipes() {
     let family = Dominance(Variant::IncreasingSubsequences);
     let c = HarnessConfig::default();
     let mut arena = Arena::new();
@@ -291,6 +349,8 @@ fn the_gate_turns_away_programs_slow_only_on_ties_or_a_wide_range() {
     for (entry, slow_on) in [
         ("qs_increasing_subsequences", GateInput::FewValues),
         ("arr_increasing_subsequences", GateInput::WideRange),
+        ("fenwick_increasing_subsequences", GateInput::WideRange),
+        ("qs3_increasing_subsequences", GateInput::OrganPipe),
     ] {
         let p = compile(&mut arena, &src, entry);
         let passed = check_examples(&family, &arena, p, &c).expect("it passes the examples");
