@@ -185,6 +185,15 @@ fn default_global_cap_keeps_a_runaway_run_under_a_gigabyte() {
         c.max_fuel
     );
     assert!(c.example_fuel <= c.max_fuel);
+    // A run on a gate input has its own cap, which holds such a candidate
+    // to about 2.4 GB. These checks hold the caps to the assumed bytes per
+    // step; they do not measure memory, and other programs take more per
+    // step (see `DEFAULT_MAX_GATE_FUEL`).
+    assert!(
+        c.max_gate_fuel * BYTES_PER_RUNAWAY_STEP <= 5 << 29,
+        "max_gate_fuel = {}",
+        c.max_gate_fuel
+    );
 }
 
 #[test]
@@ -962,11 +971,10 @@ fn the_gate_turns_away_a_program_that_passes_every_example() {
 }
 
 #[test]
-fn the_gate_fuel_is_capped_by_the_global_cap() {
+fn the_gate_fuel_is_capped_by_the_gate_cap() {
     let mut arena = Arena::new();
     let c = HarnessConfig {
-        max_fuel: 500,
-        example_fuel: 500,
+        max_gate_fuel: 500,
         ..config()
     };
     let gated = GatedReverse { right_output: true };
@@ -978,6 +986,28 @@ fn the_gate_fuel_is_capped_by_the_global_cap() {
             index: 1,
             failure: RunFailure::Timeout { fuel: 500 }
         })
+    );
+}
+
+#[test]
+fn the_gate_fuel_can_exceed_the_global_cap_up_to_the_gate_cap() {
+    // The linear reverse needs about 2 steps per element, so about 2,000 on
+    // the gate's long input: more than the global cap here, less than the
+    // gate cap.
+    let mut arena = Arena::new();
+    let c = HarnessConfig {
+        max_fuel: 500,
+        example_fuel: 500,
+        max_gate_fuel: 20 * GATE_LEN as u64,
+        ..config()
+    };
+    let gated = GatedReverse { right_output: true };
+    let rev = parse(&mut arena, REV);
+    let passed = check_examples(&gated, &arena, rev, &c).unwrap();
+    assert!(
+        matches!(check_gate(&gated, &arena, &passed, &c), Ok(Some(s)) if s > 500),
+        "{:?}",
+        check_gate(&gated, &arena, &passed, &c)
     );
 }
 

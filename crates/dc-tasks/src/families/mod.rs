@@ -14,11 +14,15 @@
 //! * [`dominance`]: counting pairs and chains of positions in order by both
 //!   position and value, with a gate of large inputs and a step limit that
 //!   pairwise programs exceed (decision D25).
+//! * [`chains`]: values over the chains of positions along which two lists
+//!   both increase, each built from the values at earlier positions, with a
+//!   gate whose fuel is above the global cap.
 //!
 //! [`development`] lists every variant of these families with its reference
 //! solutions in one place, for checks that run over the whole corpus. A new
 //! family or reference must be added to it by hand.
 
+pub mod chains;
 pub mod collapse;
 pub mod dominance;
 pub mod sorted_order;
@@ -90,8 +94,8 @@ impl Reference {
 pub const EXPONENTIAL_MAX_N: u64 = 16;
 
 /// Every variant of every development family, with its references, in
-/// family order: collapse, sorted order, subsequence count, dominance. The
-/// held-out family is not here (decision D14).
+/// family order: collapse, sorted order, subsequence count, dominance,
+/// chains. The held-out family is not here (decision D14).
 pub fn development() -> Vec<CorpusVariant> {
     let mut corpus = Vec::new();
     for v in collapse::Variant::ALL {
@@ -127,6 +131,16 @@ pub fn development() -> Vec<CorpusVariant> {
         corpus.push(CorpusVariant {
             family: Box::new(dominance::Dominance(v)),
             source: dominance::SOURCE,
+            references: vec![
+                Reference::too_slow_for_gate(v.naive()),
+                Reference::whole(v.good()),
+            ],
+        });
+    }
+    for v in chains::Variant::ALL {
+        corpus.push(CorpusVariant {
+            family: Box::new(chains::Chains(v)),
+            source: chains::SOURCE,
             references: vec![
                 Reference::too_slow_for_gate(v.naive()),
                 Reference::whole(v.good()),

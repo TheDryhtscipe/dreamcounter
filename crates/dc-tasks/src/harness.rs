@@ -75,6 +75,17 @@ pub const DEFAULT_MAX_FUEL: u64 = 50_000_000;
 /// The default fuel for one example run. Examples are small; this stops a
 /// non-terminating candidate (`unfold` can loop) early.
 pub const DEFAULT_EXAMPLE_FUEL: u64 = 10_000_000;
+/// The default cap on the fuel of one run on a gate input.
+///
+/// It is above [`DEFAULT_MAX_FUEL`] because a gate must let an `n log² n`
+/// program finish at a size where an `n²` one cannot: the chain family's
+/// gate needs 150,000,000 steps (bead dreamcounter-4593ae). Memory grows
+/// with the cap: at about 16 bytes per step a runaway `unfold` on a gate
+/// input takes up to about 2.4 GB, an `array_tabulate` about 32 bytes per
+/// step (4.8 GB), and a loop that keeps every version of an array it
+/// updates with `array_set` about 300 bytes per step, which no cap here
+/// bounds to the memory of this machine (bead dreamcounter-a3db93).
+pub const DEFAULT_MAX_GATE_FUEL: u64 = 150_000_000;
 
 /// Harness settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +98,9 @@ pub struct HarnessConfig {
     pub max_fuel: u64,
     /// Fuel for one example run, also capped by `max_fuel`.
     pub example_fuel: u64,
+    /// The cap on fuel for one run on a gate input, in place of
+    /// `max_fuel`.
+    pub max_gate_fuel: u64,
 }
 
 impl Default for HarnessConfig {
@@ -96,6 +110,7 @@ impl Default for HarnessConfig {
             fuel_multiplier: DEFAULT_FUEL_MULTIPLIER,
             max_fuel: DEFAULT_MAX_FUEL,
             example_fuel: DEFAULT_EXAMPLE_FUEL,
+            max_gate_fuel: DEFAULT_MAX_GATE_FUEL,
         }
     }
 }
@@ -448,7 +463,7 @@ pub fn check_examples<F: TaskFamily + ?Sized>(
 
 /// Runs a program that passed its examples on each input of the family's
 /// [`Gate`](crate::task::Gate), in order, with the gate's fuel capped by
-/// [`HarnessConfig::max_fuel`]. A candidate solves the family only if this
+/// [`HarnessConfig::max_gate_fuel`]. A candidate solves the family only if this
 /// passes as well. Returns the most steps it took on one input, or `None`
 /// if the family has no gate.
 ///
@@ -465,7 +480,7 @@ pub fn check_gate<F: TaskFamily + ?Sized>(
     let Some(gate) = family.gate() else {
         return Ok(None);
     };
-    let fuel = gate.fuel.min(config.max_fuel);
+    let fuel = gate.fuel.min(config.max_gate_fuel);
     let mut most = 0;
     for (index, e) in gate.inputs.iter().enumerate() {
         let steps = run_on(arena, passed.program(), &e.inputs, &e.output, fuel)
