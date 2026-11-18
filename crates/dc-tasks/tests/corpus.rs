@@ -10,11 +10,11 @@
 //! on, under the default fuel cap. On a family with a gate (decision D25),
 //! a reference passes it if [`Reference::passes_gate`] says so, and
 //! otherwise runs out of the gate's fuel. By default
-//! (`good_references_at_every_size_others_at_the_lower_half` for the
-//! families without a gate, and a test of the same shape for each gated
-//! family) the good reference runs at every size and the slower ones at the lower half of
-//! the sweep only, so a naive reference wrong only in the upper half passes
-//! it; `every_reference_at_every_size`, ignored by default, runs all of
+//! (`good_references_at_every_size_others_at_the_lower_half` for every
+//! family but the chain and dominance families, which have a test each of
+//! the same shape) the good reference runs at every size and the slower
+//! ones at the lower half of the sweep only, so a naive reference wrong
+//! only in the upper half passes it; `every_reference_at_every_size`, ignored by default, runs all of
 //! them at every size. An oracle wrong on the last seed only fails the run (see
 //! [`a_wrong_answer_on_the_last_seed_fails_the_run`]).
 //!
@@ -267,9 +267,11 @@ fn lower_half_sweep(keep: fn(&CorpusVariant) -> bool) {
     assert!(errors.is_empty(), "{errors:#?}");
 }
 
-/// The lower-half sweep of every family without a gate. The gated families
-/// have tests of their own below, as their gates take minutes of CPU, so
-/// that each can run in its own CI job (scripts/test-shard.sh).
+/// The lower-half sweep of every family but the chain and dominance
+/// families. Those two have tests of their own below, as their gates take
+/// minutes of CPU, so that CI can run them in other jobs
+/// (scripts/test-shard.sh). A family added later, with a gate or without,
+/// runs here until it is given a test of its own.
 #[test]
 fn good_references_at_every_size_others_at_the_lower_half() {
     lower_half_sweep(|v| v.source != chains::SOURCE && v.source != dominance::SOURCE);
