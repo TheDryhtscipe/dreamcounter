@@ -62,6 +62,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use dc_core::Arena;
+use dc_driver::objective::{Growth, Refusal};
 use dc_surface::prelude::{Prelude, PreludeMode};
 use dc_tasks::families::development;
 use dc_tasks::growth::{median_steps, ClassSelect, ClassVerdict, GrowthClass};
@@ -268,6 +269,57 @@ fn measure_unguarded(
         }
     };
     ProgramCost::Measured { sizes, verdict }
+}
+
+/// What `cost`, a frontier member's stored cost, says about its growth, for
+/// the cost-aware objective (`dc_driver::objective`, decision D27). `None`
+/// is a member of a run made before costs were measured.
+///
+/// * A measured member whose verdict names a class is fitted.
+/// * A measured member whose verdict is `not_fitted` and that has a size
+///   that timed out is timed out. Estimator C fits the whole sweep
+///   ([`ClassSelect::default`]), so every timeout is inside its window, and
+///   a timeout is why such a fit fails.
+/// * Any other measured member was refused by estimator C.
+/// * An incorrect member is incorrect.
+/// * A refused or unmeasured member, or one with no cost, is not measured.
+pub fn growth(cost: Option<&ProgramCost>) -> Growth {
+    match cost {
+        None | Some(ProgramCost::Refused { .. } | ProgramCost::NotMeasured { .. }) => {
+            Growth::NotMeasured
+        }
+        Some(ProgramCost::Incorrect { .. }) => Growth::Incorrect,
+        Some(ProgramCost::Measured { sizes, verdict }) => match verdict {
+            CostVerdict::Class(c) => Growth::Fitted(growth_class(*c)),
+            CostVerdict::TooNoisy { .. } => Growth::Refused(Refusal::TooNoisy),
+            CostVerdict::NoFit { .. } => Growth::Refused(Refusal::NoFit),
+            CostVerdict::NoiseUnknown { .. } => Growth::Refused(Refusal::NoiseUnknown),
+            CostVerdict::NotFitted { .. } => {
+                let timed_out = sizes.iter().any(|s| {
+                    s.failed
+                        .as_ref()
+                        .is_some_and(|f| f.kind == FailureKind::Timeout)
+                });
+                if timed_out {
+                    Growth::TimedOut
+                } else {
+                    Growth::Refused(Refusal::NotFitted)
+                }
+            }
+        },
+    }
+}
+
+fn growth_class(c: CostClass) -> GrowthClass {
+    match c {
+        CostClass::Constant => GrowthClass::Constant,
+        CostClass::Log => GrowthClass::Log,
+        CostClass::Linear => GrowthClass::Linear,
+        CostClass::NLogN => GrowthClass::NLogN,
+        CostClass::Quadratic => GrowthClass::Quadratic,
+        CostClass::Cubic => GrowthClass::Cubic,
+        CostClass::Exponential => GrowthClass::Exponential,
+    }
 }
 
 fn class(c: GrowthClass) -> CostClass {
