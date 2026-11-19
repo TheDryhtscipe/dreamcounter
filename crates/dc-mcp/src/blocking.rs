@@ -40,8 +40,9 @@ where
 
 /// Runs `work` on this thread. When it ends, or unwinds, after the thread's
 /// heap rose more than [`RELEASE_ABOVE`] bytes, the free memory of every
-/// arena goes back to the system. A job that runs many checks calls it for
-/// each, so that it does not keep one check's memory while it waits.
+/// arena goes back to the system. The proposer's check drain calls it for
+/// each pass over the pending submissions, so that it does not keep a pass's
+/// memory while it waits for the next.
 pub(crate) fn releasing<T>(work: impl FnOnce() -> T) -> T {
     let _release = Release::from_now();
     work()
@@ -81,7 +82,7 @@ mod tests {
     use dc_tasks::rng::TaskRng;
     use dc_tasks::task::{Example, Inputs, TaskFamily};
 
-    use super::spawn;
+    use super::{releasing, spawn};
 
     /// The memory limit of each runaway run.
     const LIMIT: u64 = 64 << 20;
@@ -165,55 +166,92 @@ mod tests {
             << 10
     }
 
-    /// Runs [`JOBS`] runaway checks at once through [`spawn`], and prints
-    /// the resident memory before, at the peak, and after. Run only as the
-    /// child of the test below, so that nothing else runs in its process.
-    fn child() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
+    /// Runs [`JOBS`] runaway checks at once, each on a thread of its own,
+    /// and prints the resident memory before, at the peak, and after, while
+    /// every thread is still alive, as the threads of a busy server are. With
+    /// `mode` "spawn" each check is a job of [`spawn`]; with "releasing" each
+    /// runs in [`releasing`] on a thread that lives on after it. Run only as
+    /// the child of the tests below, so that nothing else runs in its process.
+    fn child(mode: &str) {
         std::fs::write("/proc/self/clear_refs", "5").unwrap();
         let before = status_bytes("VmRSS:");
-        let reached = runtime.block_on(async {
-            // Each job waits for the others before it ends, so the jobs are
-            // on different threads and every thread is alive at the end, as
-            // the threads of a busy server are.
-            let barrier = Arc::new(Barrier::new(JOBS));
-            let jobs: Vec<_> = (0..JOBS)
-                .map(|_| {
-                    let barrier = Arc::clone(&barrier);
-                    spawn(move || {
-                        let reached = runaway_check();
-                        barrier.wait();
-                        reached
-                    })
-                })
-                .collect();
-            let mut reached = 0;
-            for job in jobs {
-                reached += usize::from(job.await.unwrap());
+        let (reached, after) = match mode {
+            "spawn" => {
+                // Each job waits at `done` for the others, so the jobs are
+                // on different threads of the pool.
+                let done = Arc::new(Barrier::new(JOBS));
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let reached = runtime.block_on(async {
+                    let jobs: Vec<_> = (0..JOBS)
+                        .map(|_| {
+                            let done = Arc::clone(&done);
+                            spawn(move || {
+                                let reached = runaway_check();
+                                done.wait();
+                                reached
+                            })
+                        })
+                        .collect();
+                    let mut reached = 0;
+                    for job in jobs {
+                        reached += usize::from(job.await.unwrap());
+                    }
+                    reached
+                });
+                // The pool's threads are idle, not gone, while the runtime
+                // lives.
+                (reached, status_bytes("VmRSS:"))
             }
-            reached
-        });
+            "releasing" => {
+                // Each thread passes `done` once its check and the release
+                // after it are over, then waits at `measured` until the
+                // memory is read.
+                let done = Arc::new(Barrier::new(JOBS + 1));
+                let measured = Arc::new(Barrier::new(JOBS + 1));
+                let threads: Vec<_> = (0..JOBS)
+                    .map(|_| {
+                        let done = Arc::clone(&done);
+                        let measured = Arc::clone(&measured);
+                        std::thread::spawn(move || {
+                            let reached = releasing(runaway_check);
+                            done.wait();
+                            measured.wait();
+                            reached
+                        })
+                    })
+                    .collect();
+                done.wait();
+                let after = status_bytes("VmRSS:");
+                measured.wait();
+                let reached = threads
+                    .into_iter()
+                    .map(|t| usize::from(t.join().unwrap()))
+                    .sum();
+                (reached, after)
+            }
+            other => panic!("unknown mode {other}"),
+        };
         let peak = status_bytes("VmHWM:");
-        let after = status_bytes("VmRSS:");
         println!("\nresult {reached} {before} {peak} {after}");
     }
 
-    #[test]
-    fn runaway_jobs_on_many_threads_leave_little_resident_memory() {
-        if std::env::var_os(CHILD).is_some() {
-            child();
+    /// Runs the test `name` again as a child in `mode`, and checks what it
+    /// measured.
+    fn check_child(name: &str, mode: &str) {
+        if let Some(mode) = std::env::var_os(CHILD) {
+            child(mode.to_str().unwrap());
             return;
         }
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "blocking::tests::runaway_jobs_on_many_threads_leave_little_resident_memory",
+                &format!("blocking::tests::{name}"),
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env(CHILD, "1")
+            .env(CHILD, mode)
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -230,15 +268,15 @@ mod tests {
         let (reached, before, peak, after) = (f[0], f[1], f[2], f[3]);
         let mib = |b: u64| b >> 20;
         println!(
-            "{reached} of {JOBS} reached the limit; resident {} MiB before, peak {} MiB, {} MiB \
-             after",
+            "{mode}: {reached} of {JOBS} reached the limit; resident {} MiB before, peak {} MiB, \
+             {} MiB after",
             mib(before),
             mib(peak),
             mib(after)
         );
-        assert_eq!(reached, JOBS as u64, "every job must reach the limit");
-        // The jobs held their memory at once: without that, the test could
-        // pass with nothing to give back.
+        assert_eq!(reached, JOBS as u64, "every check must reach the limit");
+        // The checks held their memory at once: without that, the test
+        // could pass with nothing to give back.
         assert!(
             peak.saturating_sub(before) >= JOBS as u64 * LIMIT * 9 / 10,
             "the peak was only {} MiB above the start",
@@ -246,9 +284,25 @@ mod tests {
         );
         assert!(
             after.saturating_sub(before) <= BOUND,
-            "{JOBS} runaway jobs left {} MiB resident; the bound is {} MiB",
+            "{JOBS} runaway checks left {} MiB resident; the bound is {} MiB",
             mib(after.saturating_sub(before)),
             mib(BOUND)
+        );
+    }
+
+    #[test]
+    fn runaway_jobs_on_many_threads_leave_little_resident_memory() {
+        check_child(
+            "runaway_jobs_on_many_threads_leave_little_resident_memory",
+            "spawn",
+        );
+    }
+
+    #[test]
+    fn runaway_checks_in_releasing_leave_little_resident_memory() {
+        check_child(
+            "runaway_checks_in_releasing_leave_little_resident_memory",
+            "releasing",
         );
     }
 }
