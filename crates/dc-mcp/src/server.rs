@@ -830,11 +830,12 @@ pub struct DcServer {
     store: Arc<Store>,
     /// How `dc_finish_iteration` starts its Stitch worker.
     worker: Arc<WorkerStart>,
-    /// What stops the Stitch runs of this server's calls.
+    /// What stops the long calls of this server: Stitch runs and measuring.
     stops: Arc<Stops>,
 }
 
-/// The cancel flags of the `dc_finish_iteration` calls that are running.
+/// The cancel flags of the `dc_finish_iteration` and `dc_diversity` calls
+/// that are running.
 #[derive(Debug, Default)]
 struct Stops {
     /// Whether the server shut down, and the flag of each running call.
@@ -919,7 +920,7 @@ impl DcServer {
 
 #[cfg(test)]
 impl DcServer {
-    /// How many `dc_finish_iteration` calls are running.
+    /// How many `dc_finish_iteration` and `dc_diversity` calls are running.
     pub(crate) fn finish_calls_running(&self) -> usize {
         self.stops.calls().1.len()
     }

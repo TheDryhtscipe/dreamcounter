@@ -10,11 +10,15 @@
 //!   Bruijn indices, so programs that differ only in the names of their
 //!   variables, or in surface sugar, count once.
 //! * **distinct expanded programs:** distinct terms once prelude and learned
-//!   library references are written out. A program that calls a library
-//!   function counts as the same as one that writes the function out.
+//!   library references are written out, each call reduced with its
+//!   arguments put in. A program that calls a library function counts as
+//!   the same as one that writes out what the call reduces to. A
+//!   proposer's own redex, such as a lambda applied where it is written,
+//!   is not reduced.
 //! * **mean distance:** the mean over pairs of passed programs of the
 //!   Jaccard distance between the sets of their compound subterms (every
-//!   subterm that has a subterm of its own), as stored. Terms are
+//!   subterm that has a subterm of its own, and the whole program however
+//!   small), as stored. Terms are
 //!   hash-consed, so two programs share a subterm exactly when they contain
 //!   the same piece of code. 0 means the two are the same term; 1 means they
 //!   share no compound piece. Library and prelude references are atoms
@@ -26,7 +30,8 @@
 //!   report says how many distinct classes estimator C names. A program
 //!   whose expansion is that of a member of the iteration's kept frontier
 //!   with a measured or incorrect cost keeps that cost, since the expansion
-//!   is what runs.
+//!   is what runs. A program is measured at most once in a call, however
+//!   many iterations it passed in.
 //!
 //! Programs that did not pass are left out. Programs come from the run's
 //! journal: the checks of the batches issued in each iteration
@@ -160,6 +165,10 @@ pub struct TaskDiversity {
     /// How many distinct growth classes C names among the groups. None if
     /// growth was not asked for.
     pub distinct_classes: Option<u64>,
+    /// How many groups have no class: C named none (too noisy, no fit, not
+    /// fitted), or the program was incorrect, refused or not measured. None
+    /// if growth was not asked for.
+    pub groups_without_class: Option<u64>,
     /// The distinct expanded programs, most common first, then in the order
     /// they first passed.
     pub groups: Vec<ProgramGroup>,
@@ -247,6 +256,9 @@ pub fn report(
     let base = Verifier::new(state.library(), state.config().max_memory)
         .map_err(|e| format!("the run's library does not load: {e}"))?;
     let mut expanding = base.clone();
+    // Costs measured in this call, by task and expanded term, so a program
+    // that passed in several iterations is measured once.
+    let mut measured: HashMap<(String, TermId), ProgramCost> = HashMap::new();
     let empty = BTreeMap::new();
     let mut iterations = Vec::with_capacity(wanted.len());
     for i in wanted {
@@ -277,19 +289,33 @@ pub fn report(
             let measure = growth.map(|limits| {
                 let base = &base;
                 let known = &known;
+                let measured = &mut measured;
                 move |program: &str, term: Option<TermId>| -> ProgramCost {
                     if let Some((_, cost)) = known.iter().find(|(t, _)| Some(*t) == term) {
+                        return cost.clone();
+                    }
+                    let key = term.map(|t| (task.clone(), t));
+                    if let Some(cost) = key.as_ref().and_then(|k| measured.get(k)) {
                         return cost.clone();
                     }
                     let mut stop = || {
                         limits.cancel.load(Ordering::SeqCst) || Instant::now() >= limits.deadline
                     };
-                    let why = if limits.cancel.load(Ordering::SeqCst) {
-                        CANCELLED
-                    } else {
-                        OUT_OF_TIME
+                    let cost = match measure_program(base, task, program, &mut stop, OUT_OF_TIME) {
+                        // The flag is only ever set, so if it is set now it
+                        // may be why measuring stopped.
+                        ProgramCost::NotMeasured { .. } if limits.cancel.load(Ordering::SeqCst) => {
+                            ProgramCost::NotMeasured {
+                                reason: CANCELLED.to_owned(),
+                            }
+                        }
+                        cost => cost,
                     };
-                    measure_program(base, task, program, &mut stop, why)
+                    if let (Some(k), false) = (key, matches!(cost, ProgramCost::NotMeasured { .. }))
+                    {
+                        measured.insert(k, cost.clone());
+                    }
+                    cost
                 }
             });
             tasks.push(task_diversity(task, programs, &mut expanding, measure));
@@ -341,16 +367,19 @@ fn task_diversity(
         }
     }
     groups.sort_by(|(a, ai, _), (b, bi, _)| b.count.cmp(&a.count).then(ai.cmp(bi)));
-    let distinct_classes = measure.as_mut().map(|measure| {
+    let classes = measure.as_mut().map(|measure| {
         let mut classes: Vec<CostClass> = Vec::new();
+        let mut without = 0u64;
         for (g, _, term) in &mut groups {
             let result = GrowthResult::of(&measure(&g.program, *term));
-            if let Some(c) = result.class().filter(|c| !classes.contains(c)) {
-                classes.push(c);
+            match result.class() {
+                Some(c) if !classes.contains(&c) => classes.push(c),
+                Some(_) => {}
+                None => without += 1,
             }
             g.growth = Some(result);
         }
-        classes.len() as u64
+        (classes.len() as u64, without)
     });
     let groups: Vec<ProgramGroup> = groups.into_iter().map(|(g, _, _)| g).collect();
     TaskDiversity {
@@ -359,16 +388,17 @@ fn task_diversity(
         distinct_programs,
         distinct_expanded: groups.len() as u64,
         mean_distance: mean_distance(programs),
-        distinct_classes,
+        distinct_classes: classes.map(|(c, _)| c),
+        groups_without_class: classes.map(|(_, w)| w),
         groups,
     }
 }
 
-/// The compound subterms of `term`: every subterm, `term` included, that
-/// has a subterm.
+/// The compound subterms of `term`: every subterm that has a subterm, and
+/// `term` itself, so that two different atoms are not the same.
 fn compound_subterms(arena: &Arena, term: TermId) -> HashSet<TermId> {
-    let mut seen = HashSet::new();
-    let mut stack = vec![term];
+    let mut seen = HashSet::from([term]);
+    let mut stack = children(&arena.get(term));
     while let Some(t) = stack.pop() {
         let kids = children(&arena.get(t));
         if kids.is_empty() || !seen.insert(t) {

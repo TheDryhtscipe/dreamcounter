@@ -169,6 +169,7 @@ fn programs_that_differ_only_in_names_count_once_and_two_algorithms_twice() {
     assert_eq!(merge.groups[1].count, 1);
     assert!(merge.groups.iter().all(|g| g.growth.is_none()));
     assert_eq!(merge.distinct_classes, None);
+    assert_eq!(merge.groups_without_class, None);
     // Two of the three pairs are the same term, the third is not.
     let d = merge.mean_distance.unwrap();
     assert!(d > 0.0 && d < 2.0 / 3.0, "{d}");
@@ -211,6 +212,16 @@ fn a_call_of_a_library_function_and_the_function_written_out_expand_alike() {
     assert_eq!(t.groups[0].program, programs[0]);
     assert_eq!(t.groups[0].count, 2);
     assert_eq!(t.groups[1].program, programs[2]);
+
+    // Groups of the same count are in the order they first passed.
+    let tied = [programs[2].clone(), programs[0].clone()];
+    let t = task_diversity("t", &tied, &mut verifier, none);
+    let order: Vec<&str> = t.groups.iter().map(|g| g.program.as_str()).collect();
+    assert_eq!(order, [tied[0].as_str(), tied[1].as_str()]);
+    let tied = [programs[0].clone(), programs[2].clone()];
+    let t = task_diversity("t", &tied, &mut verifier, none);
+    let order: Vec<&str> = t.groups.iter().map(|g| g.program.as_str()).collect();
+    assert_eq!(order, [tied[0].as_str(), tied[1].as_str()]);
 }
 
 #[test]
@@ -220,6 +231,15 @@ fn the_distance_is_zero_for_one_term_one_for_nothing_shared_and_a_mean_over_pair
     let c = "(lam (add $0 2))".to_owned();
     assert_eq!(mean_distance(std::slice::from_ref(&a)), None);
     assert_eq!(mean_distance(&[a.clone(), a.clone()]), Some(0.0));
+    // Two different atoms are not the same program.
+    assert_eq!(
+        mean_distance(&["lib_0".to_owned(), "lib_1".to_owned()]),
+        Some(1.0)
+    );
+    assert_eq!(
+        mean_distance(&["lib_0".to_owned(), "lib_0".to_owned()]),
+        Some(0.0)
+    );
     // a and b share no compound subterm.
     assert_eq!(mean_distance(&[a.clone(), b.clone()]), Some(1.0));
     // a and c share `(add $0)`, as applications are curried.
@@ -250,6 +270,7 @@ fn growth_names_the_classes_of_two_algorithms() {
     assert!(classes.contains(&Some(CostClass::Quadratic)), "{merge:?}");
     assert!(classes.contains(&Some(CostClass::Linear)), "{merge:?}");
     assert_eq!(merge.distinct_classes, Some(2));
+    assert_eq!(merge.groups_without_class, Some(0));
     assert_eq!(r.iterations[0].summary.tasks_with_two_classes, Some(2));
 }
 
@@ -273,6 +294,7 @@ fn past_the_deadline_a_program_is_not_measured_unless_the_frontier_measured_it()
         );
     }
     assert_eq!(line(&before, 0, MERGE).distinct_classes, Some(0));
+    assert_eq!(line(&before, 0, MERGE).groups_without_class, Some(2));
 
     // Ending it keeps both programs of each task and measures them. Stitch
     // may rewrite them to call new entries; their costs still count.
@@ -298,6 +320,39 @@ fn a_cancelled_call_records_why_it_stopped() {
             reason: CANCELLED.to_owned()
         })
     );
+}
+
+#[test]
+fn each_program_counts_in_the_iteration_of_its_batch() {
+    let (_dir, store, run) = setup(1);
+    fill(&store, &run, 0, |task, _| reference(task, 0));
+    finish_iteration(&store, &run, &mut InProcess).unwrap();
+    // Iteration 0 gets the naive reference, iteration 1 the good one.
+    fill(&store, &run, 1, |task, _| reference(task, 1));
+    let r = report_of(&store, &run, None, None);
+    assert_eq!(r.iterations.len(), 2);
+    for (i, which) in [(0, 0), (1, 1)] {
+        let merge = line(&r, i, MERGE);
+        assert_eq!(merge.passed, 1, "iteration {i}");
+        assert_eq!(merge.distinct_expanded, 1);
+        let expected = store
+            .read(&run, |s| {
+                let mut v = Verifier::new(s.library(), s.config().max_memory).unwrap();
+                let a = v.expand_stored(&merge.groups[0].program).unwrap();
+                (a, v)
+            })
+            .unwrap();
+        let (got, mut v) = expected;
+        // The program is the reference given in that iteration, compiled.
+        let mut check = v.clone();
+        let family = crate::verify::task(MERGE).unwrap();
+        let Check::Passed { program } = check.check(&*family, &reference(MERGE, which)) else {
+            panic!("the reference passes");
+        };
+        assert_eq!(v.expand_stored(&program).unwrap(), got, "iteration {i}");
+        // One program is not "all the same".
+        assert_eq!(r.iterations[i as usize].summary.tasks_all_same, 0);
+    }
 }
 
 #[test]
