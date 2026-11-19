@@ -746,6 +746,8 @@ mod tests {
                     stitch: crate::state::StitchSettings::default(),
                     prelude: crate::verify::shipped_prelude(),
                     compared_with: None,
+                    approach_hints: false,
+                    show_received: false,
                 },
                 vec![MERGE.into(), CANCEL.into()],
             )
@@ -927,6 +929,8 @@ mod tests {
             stitch: crate::state::StitchSettings::default(),
             prelude: crate::verify::shipped_prelude(),
             compared_with: None,
+            approach_hints: false,
+            show_received: false,
         };
         let tasks = vec![MERGE.to_owned(), CANCEL.to_owned()];
         let created = Event::Created {
@@ -1475,6 +1479,8 @@ mod tests {
             stitch: crate::state::StitchSettings::default(),
             prelude: crate::verify::shipped_prelude(),
             compared_with: None,
+            approach_hints: false,
+            show_received: false,
         }
     }
 

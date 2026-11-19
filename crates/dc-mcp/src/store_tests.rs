@@ -22,6 +22,8 @@ fn config() -> RunConfig {
         stitch: crate::state::StitchSettings::default(),
         prelude: 0,
         compared_with: None,
+        approach_hints: false,
+        show_received: false,
     }
 }
 

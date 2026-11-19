@@ -33,6 +33,8 @@ fn setup(quota: u32) -> (TempDir, Store, RunId) {
         stitch: StitchSettings::default(),
         prelude: shipped_prelude(),
         compared_with: None,
+        approach_hints: false,
+        show_received: false,
     };
     store
         .create_run(&run, config, vec![MERGE.to_owned(), CANCEL.to_owned()])

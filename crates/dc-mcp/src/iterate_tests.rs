@@ -37,6 +37,8 @@ fn config(quota: u32, prelude: u64) -> RunConfig {
         stitch: StitchSettings::default(),
         prelude,
         compared_with: None,
+        approach_hints: false,
+        show_received: false,
     }
 }
 

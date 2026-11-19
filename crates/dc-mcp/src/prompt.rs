@@ -8,9 +8,15 @@
 //! they cannot drift from what the type checker accepts.
 //!
 //! The payload does not show the task's name, any cost, or any frontier
-//! size, and it says nothing about the proposer's own submissions. The
-//! programs that solve other tasks are frontier members, so they come from
-//! earlier submissions that passed: that is how LILO shows solved tasks.
+//! size, and it gives no result of any submission. The programs that solve
+//! other tasks are frontier members, so they come from earlier submissions
+//! that passed: that is how LILO shows solved tasks.
+//!
+//! Two run settings add to the payload (decision D32). With
+//! `approach_hints` on, it names an approach to try, drawn by the seed from
+//! [`APPROACH_HINTS`]. With `show_received` on, it shows the programs
+//! already received for its task in this iteration, passed or not, which
+//! can include the proposer's own.
 
 use dc_core::{prim::Prim, sexpr, types::prim_scheme, Arena, LibId};
 use dc_surface::pretty;
@@ -250,6 +256,116 @@ fn solved(state: &RunState, verifier: &Verifier, this: &str, batch: u64) -> Stri
     out
 }
 
+/// The approaches a payload can name when its run has
+/// [`RunConfig::approach_hints`](crate::state::RunConfig::approach_hints) on
+/// (decision D32). Each is a technique the dc language supports, and none
+/// depends on the task.
+pub const APPROACH_HINTS: [&str; 9] = [
+    "one pass with foldl that carries what it needs in an accumulator (a tuple if it \
+     needs several values)",
+    "foldr, building the answer from the end of the list back to the start",
+    "for each element, a second fold over the list (a nested loop)",
+    "put the elements in order first (write the sort yourself, for example a merge sort \
+     with bfix), then work on the ordered list",
+    "an Array: build one with array_of_list or array_tabulate, then read it by index \
+     inside loop",
+    "a Tree: insert the elements into a binary search tree, then walk it with tree_fold \
+     or tree_case",
+    "memorec: a recursive function of a key whose results are cached",
+    "divide and conquer with bfix: split the input into two halves, solve each half, \
+     and combine the results",
+    "loop or unfold over an index or a counter instead of over the list itself",
+];
+
+/// The most received programs a payload shows (decision D32).
+pub const MAX_RECEIVED_SHOWN: usize = 4;
+
+/// The most bytes of one received program a payload shows.
+pub const MAX_RECEIVED_BYTES: usize = 4000;
+
+/// The approach named to the `k`-th batch (from 0) that `task` is given in
+/// `iteration` of a run with `seed`.
+///
+/// Each task and iteration has its own order of [`APPROACH_HINTS`], a
+/// shuffle drawn from the seed, the iteration and the task's name, and the
+/// `k`-th batch takes item `k` of it, starting again past the end. The batch
+/// number plays no part, so two runs compared with each other name the same
+/// approach to a task's `k`-th batch however their batches interleave.
+pub fn approach_hint(seed: u64, iteration: u64, task: &str, k: u64) -> &'static str {
+    // FNV-1a: a hash of the name that is the same on every platform.
+    let name = task.bytes().fold(0xCBF2_9CE4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+    });
+    let mut r = mix(seed ^ mix(iteration ^ mix(name)));
+    let mut order: Vec<usize> = (0..APPROACH_HINTS.len()).collect();
+    // A Fisher-Yates shuffle.
+    for i in (1..order.len()).rev() {
+        r = mix(r);
+        let j = (r % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    let at = (k % APPROACH_HINTS.len() as u64) as usize;
+    APPROACH_HINTS[order[at]]
+}
+
+/// The section that names an approach to try, for a batch of `task` in a
+/// run with [`RunConfig::approach_hints`](crate::state::RunConfig::approach_hints)
+/// on; empty with it off. The batch is the task's first in the iteration
+/// that has not been issued yet.
+fn hint(state: &RunState, task: &str) -> String {
+    if !state.config().approach_hints {
+        return String::new();
+    }
+    let iteration = state.iteration();
+    let k = state.task_counts(iteration, task).batches;
+    format!(
+        "## An approach to try\n\nTry to solve the task with this approach: {}. If it does \
+         not fit the task, use another approach that does.\n",
+        approach_hint(state.config().seed, iteration, task, k)
+    )
+}
+
+/// `text` cut to at most [`MAX_RECEIVED_BYTES`] bytes, at a character
+/// boundary, with a note if it was cut.
+fn cut(text: &str) -> String {
+    if text.len() <= MAX_RECEIVED_BYTES {
+        return text.to_owned();
+    }
+    let mut end = MAX_RECEIVED_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n-- (the rest of this program is not shown)",
+        &text[..end]
+    )
+}
+
+/// The section that shows the programs received for `task` in this
+/// iteration, without results, for a run with
+/// [`RunConfig::show_received`](crate::state::RunConfig::show_received) on;
+/// empty with it off or with none received. Each program is in a fenced
+/// block whose fence is longer than any run of backticks in it.
+fn received(state: &RunState, task: &str) -> String {
+    let programs = state.received(task);
+    if !state.config().show_received || programs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "## Programs already written for this task\n\nThese programs were sent for this \
+         task in this round, before your batch. They are shown as they were sent, with no \
+         results: any of them may be wrong. Write programs that take a different approach \
+         from each of them.\n\n",
+    );
+    for program in programs {
+        let text = cut(program);
+        let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+        let fence = "`".repeat(longest.max(2) + 1);
+        out.push_str(&format!("{fence}\n{text}\n{fence}\n\n"));
+    }
+    out
+}
+
 /// A piece of a prompt as it is built. A shared piece is the same for many
 /// batches (the guide, the types, the library, a task), so the run stores it
 /// once and payloads name it; the others are written out in each batch's
@@ -293,6 +409,8 @@ pub fn payload_in_pieces(
         (library(state, verifier), true),
         (solved(state, verifier, family.name(), batch), false),
         (task(family), true),
+        (hint(state, family.name()), true),
+        (received(state, family.name()), false),
     ];
     let mut pieces = Vec::new();
     for (i, (text, shared)) in sections.into_iter().enumerate() {
@@ -456,6 +574,8 @@ mod tests {
                 stitch: crate::state::StitchSettings::default(),
                 prelude: crate::verify::shipped_prelude(),
                 compared_with: None,
+                approach_hints: false,
+                show_received: false,
             },
             tasks.iter().map(|t| (*t).to_owned()).collect(),
         )
@@ -688,6 +808,10 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "variety_tests.rs"]
+mod variety_tests;
 
 #[cfg(test)]
 #[path = "prompt_guide_tests.rs"]

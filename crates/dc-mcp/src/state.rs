@@ -137,6 +137,17 @@ pub struct RunConfig {
     /// out. A run made before the setting has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compared_with: Option<String>,
+    /// Whether each payload names an approach to try, drawn by the run's
+    /// seed from a fixed list that does not depend on the task (decision
+    /// D32). A run made before the setting has it off.
+    #[serde(default)]
+    pub approach_hints: bool,
+    /// Whether each payload shows the programs already received for its
+    /// task in the current iteration, without results, and asks for a
+    /// different approach (decision D32). A run made before the setting
+    /// has it off.
+    #[serde(default)]
+    pub show_received: bool,
 }
 
 /// The [`RunConfig::library_learning`] of a run made before the setting.
@@ -1169,6 +1180,10 @@ pub struct RunState {
     /// The iteration whose end added each library entry, by index.
     added: Vec<u64>,
     uptake: ByIteration<LibraryUptake>,
+    /// The programs received for each task in the current iteration, kept
+    /// only when [`RunConfig::show_received`] is on (see
+    /// [`RunState::received`]).
+    received: BTreeMap<String, Vec<String>>,
 }
 
 /// Changes the counts of `task` in `iteration` by `change`. The task's name
@@ -1252,6 +1267,7 @@ impl RunState {
             named: Vec::new(),
             added: Vec::new(),
             uptake: ByIteration::default(),
+            received: BTreeMap::new(),
         })
     }
 
@@ -1354,6 +1370,7 @@ impl RunState {
                 self.verified.drain(..taken);
                 // No batch of the ended iteration holds a live lease now.
                 self.live.clear();
+                self.received.clear();
             }
         }
         Ok(())
@@ -1527,6 +1544,12 @@ impl RunState {
             change_task_counts(&mut self.task_counts, batch.iteration, &batch.task, |c| {
                 c.received += received;
             });
+            if self.config.show_received && batch.iteration == self.iteration {
+                let kept = self.received.entry(batch.task.clone()).or_default();
+                kept.extend(s.programs.iter().take(received as usize).cloned());
+                let over = kept.len().saturating_sub(crate::prompt::MAX_RECEIVED_SHOWN);
+                kept.drain(..over);
+            }
         }
         let by_model = self
             .model_counts
@@ -1813,6 +1836,15 @@ impl RunState {
         self.kept.get(iteration)
     }
 
+    /// The programs received for `task` in the current iteration, oldest
+    /// first: at most [`MAX_RECEIVED_SHOWN`](crate::prompt::MAX_RECEIVED_SHOWN)
+    /// of them, the most recent. They are the programs that count for the
+    /// task (see [`Standing::evaluated`]), checked or not. The state keeps
+    /// them only when [`RunConfig::show_received`] is on.
+    pub fn received(&self, task: &str) -> &[String] {
+        self.received.get(task).map_or(&[], Vec::as_slice)
+    }
+
     /// The current iteration. The first is 0.
     pub fn iteration(&self) -> u64 {
         self.iteration
@@ -1950,6 +1982,8 @@ mod tests {
             stitch: crate::state::StitchSettings::default(),
             prelude: 0,
             compared_with: None,
+            approach_hints: false,
+            show_received: false,
         }
     }
 
