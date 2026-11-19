@@ -10,6 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use dc_core::sexpr;
+use dc_core::term::{children, Arena, LibId, Term};
 use serde::{Deserialize, Serialize};
 
 /// The longest run id, in bytes.
@@ -1029,6 +1031,60 @@ pub struct ModelCounts {
     pub programs: u64,
 }
 
+/// Which learned library entries the programs that passed in one iteration
+/// refer to. A program counts an entry once however often it refers to it.
+/// Every reference in the compiled program counts, one in a binding that is
+/// never used too. Only a direct reference counts: one inside another
+/// entry's body does not. Prelude functions are not learned entries and are
+/// not counted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LibraryUptake {
+    /// Programs that passed every example.
+    pub passed: u64,
+    /// Of those, the programs that refer to at least one learned entry.
+    pub using_library: u64,
+    /// For each entry referred to, by its index, the programs that refer to it.
+    pub entries: BTreeMap<u64, EntryUptake>,
+}
+
+/// The passed programs of one iteration that refer to one library entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntryUptake {
+    /// How many programs refer to it.
+    pub programs: u64,
+    /// The tasks of those programs.
+    pub tasks: BTreeSet<String>,
+}
+
+/// The learned library entries that `program`, a core term as an
+/// s-expression, refers to directly: its references below `library_len`. The
+/// prelude's references are far above any learned index, so they are left
+/// out. A program that does not parse refers to none; a passed program is
+/// printed by the server, so it always parses.
+fn learned_refs(program: &str, library_len: u64) -> BTreeSet<u64> {
+    let mut arena = Arena::new();
+    let Ok(root) = sexpr::parse(&mut arena, program) else {
+        return BTreeSet::new();
+    };
+    // The arena shares equal subterms, so each node is visited once.
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![root];
+    let mut refs = BTreeSet::new();
+    while let Some(t) = stack.pop() {
+        if !seen.insert(t) {
+            continue;
+        }
+        let term = arena.get(t);
+        if let Term::Lib(LibId(l)) = term {
+            if u64::from(l) < library_len {
+                refs.insert(u64::from(l));
+            }
+        }
+        stack.extend(children(&term));
+    }
+    refs
+}
+
 /// A program that passed its task's examples and that no iteration step has
 /// taken yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1087,6 +1143,9 @@ pub struct RunState {
     verified: Vec<Verified>,
     naming_jobs: Vec<NamingJob>,
     named: Vec<bool>,
+    /// The iteration whose end added each library entry, by index.
+    added: Vec<u64>,
+    uptake: ByIteration<LibraryUptake>,
 }
 
 /// Changes the counts of `task` in `iteration` by `change`. The task's name
@@ -1164,6 +1223,8 @@ impl RunState {
             verified: Vec::new(),
             naming_jobs: Vec::new(),
             named: Vec::new(),
+            added: Vec::new(),
+            uptake: ByIteration::default(),
         })
     }
 
@@ -1239,6 +1300,7 @@ impl RunState {
                 }
                 self.library.extend(entries.iter().cloned());
                 self.named.resize(self.library.len(), false);
+                self.added.resize(self.library.len(), self.iteration);
             }
             Event::NamingIssued(issued) => self.issue_naming(issued)?,
             Event::NamingDone(done) => self.finish_naming(done)?,
@@ -1504,8 +1566,19 @@ impl RunState {
         });
         // An iteration cannot end with a check pending, so the batch is of
         // the current iteration.
+        let uptake = self.uptake.entry(batch.iteration);
         for check in &c.checks {
             if let Check::Passed { program } = check {
+                uptake.passed += 1;
+                let refs = learned_refs(program, library);
+                if !refs.is_empty() {
+                    uptake.using_library += 1;
+                }
+                for entry in refs {
+                    let used = uptake.entries.entry(entry).or_default();
+                    used.programs += 1;
+                    used.tasks.insert(batch.task.clone());
+                }
                 self.verified.push(Verified {
                     task: batch.task.clone(),
                     program: program.clone(),
@@ -1683,6 +1756,22 @@ impl RunState {
     /// The library. Entry `i` is library definition `i`.
     pub fn library(&self) -> &[LibraryEntry] {
         &self.library
+    }
+
+    /// The iteration whose end added library entry `entry`, or `None` if
+    /// the library has no such entry. Programs can call it from the next
+    /// iteration on.
+    pub fn added_in(&self, entry: u64) -> Option<u64> {
+        usize::try_from(entry)
+            .ok()
+            .and_then(|i| self.added.get(i))
+            .copied()
+    }
+
+    /// Which learned library entries the programs that passed in
+    /// `iteration` refer to.
+    pub fn library_uptake(&self, iteration: u64) -> LibraryUptake {
+        self.uptake.get(iteration).cloned().unwrap_or_default()
     }
 
     /// The frontier of `task`, or `None` if the run has no such task.
@@ -2128,6 +2217,89 @@ mod tests {
             assert_eq!(t.apply(&event), Err(why), "{event:?}");
             assert_eq!(t, s, "{event:?}");
         }
+    }
+
+    /// Each library entry keeps the iteration whose end added it, and each
+    /// iteration counts the learned entries its passed programs refer to.
+    #[test]
+    fn the_library_records_when_each_entry_came_and_which_programs_use_it() {
+        let mut s = new_state();
+        let entry = |term: &str| LibraryEntry {
+            name: None,
+            doc: None,
+            arity: 1,
+            term: term.into(),
+        };
+        s.apply(&Event::LibraryExtended {
+            entries: vec![entry("(lam $0)"), entry("(lam (lib_0 $0))")],
+        })
+        .unwrap();
+        s.apply(&Event::IterationFinished {
+            iteration: 0,
+            used: 0,
+        })
+        .unwrap();
+        s.apply(&Event::LibraryExtended {
+            entries: vec![entry("(lam (lib_1 $0))")],
+        })
+        .unwrap();
+        assert_eq!(s.added_in(0), Some(0));
+        assert_eq!(s.added_in(1), Some(0));
+        assert_eq!(s.added_in(2), Some(1));
+        assert_eq!(s.added_in(3), None);
+
+        for (batch, task) in [(0, "a"), (1, "b")] {
+            s.apply(&Event::BatchIssued(BatchIssued {
+                batch,
+                iteration: 1,
+                task: task.into(),
+                wanted: 2,
+                worker: "w".into(),
+                token: format!("t{batch}"),
+                issued_ms: 0,
+                deadline_ms: 1000,
+                payload: IssuedPayload::Whole("pay".into()),
+            }))
+            .unwrap();
+            s.apply(&sub(batch, "w", 1, 0, Standing::OnTime, 2))
+                .unwrap();
+        }
+        let prelude = dc_surface::prelude::PRELUDE_LIB_BASE;
+        // Entry 0 twice in one program counts once; a prelude function is
+        // not a learned entry; a failed program uses nothing.
+        s.apply(&Event::Checked(Checked {
+            batch: 0,
+            library_len: 3,
+            checks: vec![
+                passed(&format!(
+                    "(lam (lib_0 (lib_0 (lib_1 $0)) (lib_{prelude} $0)))"
+                )),
+                passed(&format!("(lam (lib_{prelude} $0))")),
+            ],
+        }))
+        .unwrap();
+        s.apply(&Event::Checked(Checked {
+            batch: 1,
+            library_len: 3,
+            checks: vec![
+                passed("(lam (lib_1 $0))"),
+                Check::Run {
+                    error: "lib_2".into(),
+                },
+            ],
+        }))
+        .unwrap();
+
+        assert_eq!(s.library_uptake(0), LibraryUptake::default());
+        let uptake = s.library_uptake(1);
+        assert_eq!(uptake.passed, 3);
+        assert_eq!(uptake.using_library, 2);
+        let used: Vec<(u64, u64, Vec<&str>)> = uptake
+            .entries
+            .iter()
+            .map(|(e, u)| (*e, u.programs, u.tasks.iter().map(String::as_str).collect()))
+            .collect();
+        assert_eq!(used, vec![(0, 1, vec!["a"]), (1, 2, vec!["a", "b"])]);
     }
 
     #[test]

@@ -175,6 +175,7 @@ fn the_server_lists_its_tools() {
             "dc_create_run",
             "dc_finish_iteration",
             "dc_frontiers",
+            "dc_library",
             "dc_list_runs",
             "dc_proposal_stats",
             "dc_run_status"
@@ -806,6 +807,7 @@ fn a_proposer_sees_only_its_tools_and_gets_no_results() {
         ("dc_list_runs", json!({})),
         ("dc_proposal_stats", json!({ "run": "r1" })),
         ("dc_frontiers", json!({ "run": "r1" })),
+        ("dc_library", json!({ "run": "r1" })),
         (
             "dc_create_run",
             json!({ "run": "r2", "seed": 1, "tasks": ["collapse/merge"] }),
@@ -1472,6 +1474,38 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
         .unwrap();
     assert_eq!(status["unnamed"], 0, "{status}");
 
+    // The library, with each entry's name, doc and the iteration that
+    // added it, is what the journal holds.
+    let library = operator.call("dc_library", json!({ "run": "r1" })).unwrap();
+    assert_eq!(library["iteration"], 1, "{library}");
+    let entries = library["entries"].as_array().unwrap();
+    let stored = Store::open(dir.path())
+        .unwrap()
+        .read(&run, |s| s.library().to_vec())
+        .unwrap();
+    assert_eq!(entries.len() as u64, found, "{library}");
+    for (k, (entry, kept)) in entries.iter().zip(&stored).enumerate() {
+        assert_eq!(entry["index"], k, "{entry}");
+        assert_eq!(entry["arity"], kept.arity, "{entry}");
+        assert_eq!(entry["term"], kept.term.as_str(), "{entry}");
+        assert_eq!(entry["name"], format!("abs_{k}"), "{entry}");
+        assert_eq!(entry["doc"], format!("Abstraction {k}."), "{entry}");
+        assert_eq!(entry["iteration_added"], 0, "{entry}");
+    }
+    let given = operator
+        .call("dc_library", json!({ "run": "r1", "iteration": 1 }))
+        .unwrap();
+    assert_eq!(given, library);
+    // Iteration 0's programs had no library.
+    let first = operator
+        .call("dc_library", json!({ "run": "r1", "iteration": 0 }))
+        .unwrap();
+    assert_eq!(first["entries"], json!([]), "{first}");
+    let later = operator
+        .call("dc_library", json!({ "run": "r1", "iteration": 2 }))
+        .unwrap_err();
+    assert!(later.contains("has not started"), "{later}");
+
     // The proposer's server, which was running all along, hands out work
     // for iteration 1 with the new library, and checks a program that uses
     // it.
@@ -1490,23 +1524,53 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
             "dc_submit",
             json!({
                 "worker": "agent-9", "batch": batch, "token": got["batch"]["token"],
-                "programs": [format!("{}\nlet unused = abs_0\n", solves(&task))]
+                "programs": [uses_abs_0(&task)]
             }),
         )
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let passed = loop {
+    let stats = loop {
         let stats = operator
             .call("dc_proposal_stats", json!({ "run": "r1" }))
             .unwrap();
         let now = &stats["iterations"][1];
         if now["pending_checks"] == 0 && now["submissions"] == 1 {
-            break now["tasks_solved"].clone();
+            break stats;
         }
         assert!(std::time::Instant::now() < deadline, "{stats}");
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    assert_eq!(passed, 1);
+    assert_eq!(stats["iterations"][1]["tasks_solved"], 1, "{stats}");
+    // The program that passed refers to entry 0; iteration 0's programs had no
+    // library to call.
+    assert_eq!(
+        stats["iterations"][1]["library_uptake"],
+        json!({
+            "passed": 1, "using_library": 1,
+            "entries": [{ "entry": 0, "name": "abs_0", "programs": 1, "tasks": [task] }]
+        }),
+        "{stats}"
+    );
+    assert_eq!(
+        stats["iterations"][0]["library_uptake"],
+        json!({ "passed": 3, "using_library": 0, "entries": [] }),
+        "{stats}"
+    );
+}
+
+/// A program that solves `task` and whose `solve` refers to `abs_0` in a
+/// binding it does not use. The compiler keeps the binding, so the
+/// reference is in the compiled program, and uptake counts references.
+fn uses_abs_0(task: &str) -> String {
+    let v = dc_tasks::families::development()
+        .into_iter()
+        .find(|v| v.family.name() == task)
+        .unwrap();
+    format!(
+        "{}\nlet solve xs = let u = abs_0 in {} xs\n",
+        v.source,
+        v.references.last().unwrap().entry
+    )
 }
 
 /// Makes the run `r1` of three tasks and gives each task one program that

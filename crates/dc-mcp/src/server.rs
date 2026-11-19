@@ -33,8 +33,8 @@ use crate::iterate::{finish_iteration_in_worker, WorkerStart};
 use crate::naming::{next_naming_job, submit_naming, NamingReceipt, NextNamingJob};
 use crate::proposer::{check_pending, next_batch, submit, Clock, NextBatch, Receipt, Refused};
 use crate::state::{
-    Arm, Event, FrontierMember, LogKind, LogRecord, RunConfig, RunId, RunState, StitchSettings,
-    DEFAULT_MAX_UNCHECKED_PER_BATCH, MIN_STITCH_MEMORY_BYTES,
+    Arm, Event, FrontierMember, LibraryUptake, LogKind, LogRecord, RunConfig, RunId, RunState,
+    StitchSettings, DEFAULT_MAX_UNCHECKED_PER_BATCH, MIN_STITCH_MEMORY_BYTES,
 };
 use crate::store::{Refusals, Store, StoreError};
 use crate::verify::{shipped_prelude, VerifierCache};
@@ -420,8 +420,64 @@ pub struct IterationStats {
     /// What came in from each model the proposers named, in the models'
     /// order, with those that named none first (decision D24).
     pub models: Vec<ModelStats>,
+    /// Which learned library entries the programs that passed refer to.
+    pub library_uptake: UptakeStats,
     /// Each task, in the run's order.
     pub tasks: Vec<TaskStats>,
+}
+
+/// Which learned library entries the programs that passed in one iteration
+/// refer to. Only programs that passed every example are counted, as only
+/// they are kept compiled. A program counts an entry once however often it
+/// refers to it. Every reference in the compiled program counts, one in a
+/// binding that is never used too, so this counts uptake, not calls made
+/// when the program runs. Only a direct reference counts: one inside
+/// another entry's body does not. Prelude functions are not learned
+/// entries.
+#[derive(Debug, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct UptakeStats {
+    /// Programs that passed every example.
+    pub passed: u64,
+    /// Of those, the programs that refer to at least one learned entry.
+    pub using_library: u64,
+    /// Each entry referred to, by index, in order.
+    pub entries: Vec<EntryUse>,
+}
+
+/// The passed programs of one iteration that refer to one library entry.
+#[derive(Debug, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct EntryUse {
+    /// The entry's index in the library.
+    pub entry: u64,
+    /// The entry's name now, if it has one; programs that call it by no
+    /// name call it `fn_<entry>`.
+    pub name: Option<String>,
+    /// How many programs refer to it.
+    pub programs: u64,
+    /// The tasks of those programs, in order of name.
+    pub tasks: Vec<String>,
+}
+
+impl UptakeStats {
+    fn of(state: &RunState, uptake: LibraryUptake) -> UptakeStats {
+        UptakeStats {
+            passed: uptake.passed,
+            using_library: uptake.using_library,
+            entries: uptake
+                .entries
+                .into_iter()
+                .map(|(entry, used)| EntryUse {
+                    entry,
+                    name: usize::try_from(entry)
+                        .ok()
+                        .and_then(|i| state.library().get(i))
+                        .and_then(|e| e.name.clone()),
+                    programs: used.programs,
+                    tasks: used.tasks.into_iter().collect(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// What came in during one iteration from proposers that named one model.
@@ -487,6 +543,7 @@ impl IterationStats {
                     programs: c.programs,
                 })
                 .collect(),
+            library_uptake: UptakeStats::of(state, state.library_uptake(iteration)),
             tasks,
         }
     }
@@ -602,6 +659,86 @@ impl FrontiersReport {
         Ok(FrontiersReport {
             run: run.as_str().to_owned(),
             iterations,
+        })
+    }
+}
+
+/// The arguments of `dc_library`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LibraryArg {
+    /// The run's id.
+    pub run: String,
+    /// The iteration whose library to report: the entries its programs
+    /// could call, added by the iterations before it. The current
+    /// iteration if it is left out, which is the whole library.
+    pub iteration: Option<u64>,
+}
+
+/// The result of `dc_library`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct LibraryReport {
+    /// The run's id.
+    pub run: String,
+    /// The iteration whose library this is.
+    pub iteration: u64,
+    /// Each entry, by index.
+    pub entries: Vec<LibraryItem>,
+}
+
+/// One library entry.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct LibraryItem {
+    /// The entry's index. A program calls it by its name, or by
+    /// `fn_<index>` if it has none.
+    pub index: u64,
+    /// The number of parameters.
+    pub arity: u32,
+    /// The closed term, as an s-expression of core syntax. `lib_<i>` in it
+    /// is entry `i`, or a prelude function if `i` is 4294901760 or more.
+    pub term: String,
+    /// The name a proposer gave it, if any.
+    pub name: Option<String>,
+    /// What it does, in one line, as a proposer wrote it, if any.
+    pub doc: Option<String>,
+    /// The iteration whose end added it. Programs can call it from the next
+    /// iteration on.
+    pub iteration_added: u64,
+}
+
+impl LibraryReport {
+    /// The library of `iteration`, or of the current iteration.
+    fn of(run: &RunId, state: &RunState, iteration: Option<u64>) -> Result<Self, String> {
+        let current = state.iteration();
+        let iteration = match iteration {
+            Some(i) if i > current => {
+                return Err(format!(
+                    "iteration {i} has not started; the run is in iteration {current}"
+                ))
+            }
+            Some(i) => i,
+            None => current,
+        };
+        let entries = state
+            .library()
+            .iter()
+            .zip(0u64..)
+            .filter_map(|(entry, index)| {
+                let added = state.added_in(index)?;
+                (added < iteration).then(|| LibraryItem {
+                    index,
+                    arity: entry.arity,
+                    term: entry.term.clone(),
+                    name: entry.name.clone(),
+                    doc: entry.doc.clone(),
+                    iteration_added: added,
+                })
+            })
+            .collect();
+        Ok(LibraryReport {
+            run: run.as_str().to_owned(),
+            iteration,
+            entries,
         })
     }
 }
@@ -1016,7 +1153,9 @@ impl DcServer {
                        for each task the batches issued, the programs checked, how many \
                        compiled, typed and passed their examples, and whether the task was \
                        solved; the bytes of payload and program text; and the submissions \
-                       and programs from each model the proposers named."
+                       and programs from each model the proposers named; and which learned \
+                       library entries the programs that passed refer to, so the library's uptake \
+                       can be counted."
     )]
     async fn proposal_stats(
         &self,
@@ -1057,6 +1196,29 @@ impl DcServer {
                 .read(&run, |state| {
                     FrontiersReport::of(&run, state, arg.iteration)
                 })
+                .map_err(|e| e.to_string())?
+        })
+        .await
+    }
+
+    /// Reports a run's library.
+    #[tool(
+        name = "dc_library",
+        description = "Report the library of a DreamCounter run: for the current iteration, or \
+                       the one given, each abstraction its programs could call, with its \
+                       index, arity, term as core text, the name and one-line doc a proposer \
+                       gave it (if any), and the iteration whose end added it. \
+                       dc_proposal_stats says which entries each iteration's passed programs \
+                       call. Read only."
+    )]
+    async fn library(
+        &self,
+        Parameters(arg): Parameters<LibraryArg>,
+    ) -> Result<Json<LibraryReport>, String> {
+        let run = run_id(&arg.run)?;
+        self.blocking(move |store| {
+            store
+                .read(&run, |state| LibraryReport::of(&run, state, arg.iteration))
                 .map_err(|e| e.to_string())?
         })
         .await
