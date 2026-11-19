@@ -622,6 +622,127 @@ fn bad_requests_are_tool_errors_and_change_nothing() {
     client.kill();
 }
 
+/// A baseline run made with `compared_with` takes the settings it does not
+/// give from the run it is compared with, is refused if a setting it gives
+/// differs, and reports the pairing with that run's iteration (D24).
+#[test]
+fn a_run_compared_with_another_shares_its_settings_or_is_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut client = Client::start(dir.path());
+    let names: Vec<String> = dc_tasks::families::development()
+        .iter()
+        .take(2)
+        .map(|v| v.family.name().to_owned())
+        .collect();
+    let main = client
+        .call(
+            "dc_create_run",
+            json!({
+                "run": "main", "seed": 7, "proposals_per_task": 2, "frontier_size": 3,
+                "tasks": names, "programs_per_batch": 4, "lease_seconds": 60,
+                "max_unchecked_per_batch": 2
+            }),
+        )
+        .unwrap();
+    assert_eq!(main["compared_with"], Value::Null);
+    assert_eq!(main["programs_per_batch"], 4);
+    assert_eq!(main["lease_seconds"], 60);
+    let base = json!({
+        "run": "base", "seed": 7, "proposals_per_task": 2, "frontier_size": 3,
+        "library_learning": false, "compared_with": "main"
+    });
+
+    // A setting given that differs refuses the run, and the error names
+    // every such setting.
+    for (setting, value) in [
+        ("seed", json!(8)),
+        ("proposals_per_task", json!(1)),
+        ("frontier_size", json!(4)),
+        ("programs_per_batch", json!(1)),
+        ("lease_seconds", json!(1800)),
+        ("tasks", json!([names[1], names[0]])),
+        ("max_unchecked_per_batch", json!(5)),
+    ] {
+        let mut arguments = base.clone();
+        arguments[setting] = value;
+        let error = client.call("dc_create_run", arguments).unwrap_err();
+        assert!(
+            error.contains(setting) && error.contains("main"),
+            "{setting}: {error}"
+        );
+    }
+    let mut two = base.clone();
+    two["seed"] = json!(8);
+    two["programs_per_batch"] = json!(1);
+    let error = client.call("dc_create_run", two).unwrap_err();
+    assert!(
+        error.contains("seed") && error.contains("programs_per_batch"),
+        "{error}"
+    );
+    let error = client
+        .call("dc_run_status", json!({ "run": "base" }))
+        .unwrap_err();
+    assert!(error.contains("no run"), "{error}");
+
+    // The run compared with must exist and be another run.
+    let mut missing = base.clone();
+    missing["compared_with"] = json!("none");
+    let error = client.call("dc_create_run", missing).unwrap_err();
+    assert!(error.contains("no run"), "{error}");
+    let mut itself = base.clone();
+    itself["compared_with"] = json!("base");
+    let error = client.call("dc_create_run", itself).unwrap_err();
+    assert!(error.contains("itself"), "{error}");
+    let mut bad = base.clone();
+    bad["compared_with"] = json!("../main");
+    let error = client.call("dc_create_run", bad).unwrap_err();
+    assert!(
+        error.starts_with("compared_with: ") && error.contains("run id"),
+        "{error}"
+    );
+
+    // A run that runs no Stitch takes no Stitch setting, and reports none.
+    let mut stitched = base.clone();
+    stitched["stitch_iterations"] = json!(3);
+    let error = client.call("dc_create_run", stitched).unwrap_err();
+    assert!(error.contains("stitch_iterations"), "{error}");
+
+    // Settings not given are the compared run's, not the defaults.
+    let made = client.call("dc_create_run", base.clone()).unwrap();
+    assert_eq!(made["programs_per_batch"], 4);
+    assert_eq!(made["lease_seconds"], 60);
+    assert_eq!(made["max_unchecked_per_batch"], 2);
+    let tasks: Vec<&str> = made["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(tasks, names);
+    assert_eq!(made["stitch"], Value::Null);
+    assert_eq!(made["library_learning"], false);
+    assert_eq!(
+        made["compared_with"],
+        json!({ "run": "main", "iteration": 0 })
+    );
+
+    // The pairing is part of the run: another server reads it back.
+    drop(client);
+    let mut again = Client::start(dir.path());
+    let status = again
+        .call("dc_run_status", json!({ "run": "base" }))
+        .unwrap();
+    assert_eq!(
+        status["compared_with"],
+        json!({ "run": "main", "iteration": 0 })
+    );
+    let status = again
+        .call("dc_run_status", json!({ "run": "main" }))
+        .unwrap();
+    assert_eq!(status["compared_with"], Value::Null);
+    assert_ne!(status["stitch"], Value::Null);
+}
+
 #[test]
 fn the_binary_refuses_to_start_without_a_state_directory() {
     let output = Command::new(env!("CARGO_BIN_EXE_dc-mcp")).output().unwrap();
@@ -1570,4 +1691,55 @@ fn the_binary_is_its_own_stitch_worker() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("usage"));
+}
+
+/// A run's status reports the iteration of the run it is compared with,
+/// not its own.
+#[test]
+fn a_compared_run_reports_the_other_runs_iteration() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut operator = Client::start(dir.path());
+    let tasks = ["collapse/merge"];
+    operator
+        .call(
+            "dc_create_run",
+            json!({
+                "run": "main", "seed": 5, "proposals_per_task": 1, "frontier_size": 2,
+                "library_learning": false, "tasks": tasks
+            }),
+        )
+        .unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("main").unwrap();
+    let mut proposer = Client::start_proposer(dir.path(), "main");
+    let got = proposer
+        .call("dc_next_batch", json!({ "worker": "w" }))
+        .unwrap();
+    let batch = got["batch"]["batch"].as_u64().unwrap();
+    let task = store
+        .read(&run, |s| s.batch(batch).unwrap().task.clone())
+        .unwrap();
+    proposer
+        .call(
+            "dc_submit",
+            json!({ "worker": "w", "batch": batch, "token": got["batch"]["token"],
+                    "programs": [solves(&task)] }),
+        )
+        .unwrap();
+    wait_for_checks(&mut operator, &mut proposer, "main");
+    operator
+        .call("dc_finish_iteration", json!({ "run": "main" }))
+        .unwrap();
+    let base = operator
+        .call(
+            "dc_create_run",
+            json!({ "run": "base", "seed": 5, "proposals_per_task": 1, "frontier_size": 2,
+                    "library_learning": false, "compared_with": "main" }),
+        )
+        .unwrap();
+    assert_eq!(base["iteration"], 0);
+    assert_eq!(
+        base["compared_with"],
+        json!({ "run": "main", "iteration": 1 })
+    );
 }

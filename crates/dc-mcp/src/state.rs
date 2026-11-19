@@ -123,6 +123,12 @@ pub struct RunConfig {
     /// it on.
     #[serde(default = "learns_library")]
     pub library_learning: bool,
+    /// The id of the run this one is compared with, such as the main run
+    /// of an LLM-only baseline (decision D24). `dc_create_run` checks that
+    /// the two runs share every setting that fixes the proposals they hand
+    /// out. A run made before the setting has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compared_with: Option<String>,
 }
 
 /// The [`RunConfig::library_learning`] of a run made before the setting.
@@ -1915,6 +1921,7 @@ mod tests {
             frontier_size: 5,
             stitch: crate::state::StitchSettings::default(),
             prelude: 0,
+            compared_with: None,
         }
     }
 
@@ -1971,6 +1978,24 @@ mod tests {
         assert!(read.library_learning);
     }
 
+    /// A run written before the setting is compared with no run, and a run
+    /// compared with none writes no field, so its journal reads as before.
+    #[test]
+    fn settings_written_before_compared_with_read_back_with_none() {
+        let paired = RunConfig {
+            compared_with: Some("main".into()),
+            ..config()
+        };
+        let json = serde_json::to_value(&paired).unwrap();
+        assert_eq!(json["compared_with"], "main");
+        let read: RunConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(read, paired);
+        let json = serde_json::to_value(config()).unwrap();
+        assert!(json.get("compared_with").is_none(), "{json}");
+        let read: RunConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(read.compared_with, None);
+    }
+
     fn new_state() -> RunState {
         RunState::create(config(), vec!["a".into(), "b".into()]).unwrap()
     }
@@ -2016,6 +2041,7 @@ mod tests {
             frontier_size: 5,
             stitch: crate::state::StitchSettings::default(),
             prelude: 0,
+            compared_with: None,
             ..config()
         };
         assert_eq!(

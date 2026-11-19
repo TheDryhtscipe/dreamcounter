@@ -89,6 +89,7 @@ impl Fixture {
             frontier_size: 5,
             stitch: StitchSettings::default(),
             prelude: dc_mcp::verify::shipped_prelude(),
+            compared_with: None,
         };
         store
             .create_run(&run, config, vec!["collapse/merge".into()])

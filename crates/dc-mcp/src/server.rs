@@ -88,13 +88,22 @@ pub struct CreateRun {
     /// Whether the run learns a library. If false, the run is the LLM-only
     /// baseline (decision D24): each iteration selects frontiers as usual,
     /// but no Stitch run ends it and the library stays empty, so autodoc
-    /// must be off. To match it with the run it is compared with on
-    /// proposals, give it the same tasks, proposals_per_task,
-    /// programs_per_batch, lease_seconds, frontier_size, seed and number of
-    /// iterations, then compare the batches and payload bytes that
-    /// `dc_proposal_stats` reports for the two runs. Nothing checks that
-    /// the settings match, and tokens are not matched. If absent, true.
+    /// must be off, and it takes no Stitch setting. To match it with the
+    /// run it is compared with on proposals, name that run in
+    /// compared_with, end as many iterations in both, then compare the
+    /// batches and payload bytes that `dc_proposal_stats` reports for the
+    /// two runs. Tokens are not matched. If absent, true.
     pub library_learning: Option<bool>,
+    /// The id of an existing run that this run is compared with, such as
+    /// the main run of an LLM-only baseline. Either run may learn a
+    /// library. If given, tasks, programs_per_batch, lease_seconds and
+    /// max_unchecked_per_batch, when absent, are that run's, and the run is
+    /// not made unless its seed, proposals_per_task, frontier_size, tasks
+    /// (in order), programs_per_batch, lease_seconds and
+    /// max_unchecked_per_batch are that run's too, and that run uses this
+    /// server's prelude. The error names each setting that differs.
+    /// `dc_run_status` reports the pairing.
+    pub compared_with: Option<String>,
 }
 
 /// The most programs one batch asks for when `dc_create_run` does not say.
@@ -159,10 +168,19 @@ pub struct RunStatus {
     pub seed: u64,
     /// How many proposals each task gets in one iteration.
     pub proposals_per_task: u32,
+    /// The most programs one batch asks for.
+    pub programs_per_batch: u32,
+    /// How long a proposer has to submit a batch, in seconds, rounded up.
+    pub lease_seconds: u64,
+    /// The most submissions kept for one batch that are not checked, of
+    /// each kind.
+    pub max_unchecked_per_batch: u32,
     /// The most programs a task's frontier keeps when an iteration ends.
     pub frontier_size: u32,
-    /// The settings of the Stitch run that ends an iteration.
-    pub stitch: StitchStatus,
+    /// The settings of the Stitch run that ends an iteration. Null if the
+    /// run does not learn a library, since no Stitch run ends its
+    /// iterations.
+    pub stitch: Option<StitchStatus>,
     /// The current iteration. The first is 0.
     pub iteration: u64,
     /// The run's tasks, in the order given at creation.
@@ -174,6 +192,8 @@ pub struct RunStatus {
     /// Whether the run learns a library. False for the LLM-only baseline
     /// (decision D24), whose library stays empty.
     pub library_learning: bool,
+    /// The run this one is compared with, if it was made with one.
+    pub compared_with: Option<Comparison>,
     /// How many definitions wait for a naming result. While any does, no
     /// batch is issued.
     pub unnamed: u64,
@@ -183,6 +203,16 @@ pub struct RunStatus {
     pub batches_issued: usize,
     /// What came in during the current iteration.
     pub current: IterationStats,
+}
+
+/// The run that a run is compared with.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct Comparison {
+    /// That run's id.
+    pub run: String,
+    /// That run's current iteration, to set beside this run's. Null if
+    /// that run cannot be read.
+    pub iteration: Option<u64>,
 }
 
 /// The settings of the Stitch run that ends an iteration.
@@ -208,16 +238,23 @@ impl RunStatus {
             },
             seed: config.seed,
             proposals_per_task: config.proposals_per_task,
+            programs_per_batch: config.programs_per_batch,
+            lease_seconds: config.lease_ms.div_ceil(1000),
+            max_unchecked_per_batch: config.max_unchecked_per_batch,
             frontier_size: config.frontier_size,
-            stitch: StitchStatus {
+            stitch: config.library_learning.then(|| StitchStatus {
                 iterations: config.stitch.iterations,
                 max_arity: config.stitch.max_arity,
                 wall_seconds: config.stitch.wall_ms.div_ceil(1000),
                 memory_mib: config.stitch.memory_bytes >> 20,
-            },
+            }),
             iteration: state.iteration(),
             autodoc: config.autodoc,
             library_learning: config.library_learning,
+            compared_with: config.compared_with.as_ref().map(|other| Comparison {
+                run: other.clone(),
+                iteration: None,
+            }),
             unnamed: state.names_pending(),
             tasks: state
                 .tasks()
@@ -237,6 +274,92 @@ impl RunStatus {
             current: IterationStats::of(state, refusals, state.iteration()),
         }
     }
+
+    /// Fills in the iteration of the run this one is compared with. It
+    /// reads that run after this one, so the two runs are never locked at
+    /// once.
+    fn compared(mut self, store: &Store) -> RunStatus {
+        if let Some(comparison) = &mut self.compared_with {
+            comparison.iteration = RunId::new(&comparison.run)
+                .ok()
+                .and_then(|other| store.read(&other, RunState::iteration).ok());
+        }
+        self
+    }
+}
+
+/// The settings of a run that fix the proposals it hands out (decision
+/// D24), as `dc_create_run` names them, where `config` and `tasks` differ
+/// from `other` and `other_tasks`. Each is said with both values.
+fn differences(
+    config: &RunConfig,
+    tasks: &[String],
+    other: &RunConfig,
+    other_tasks: &[String],
+) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut check = |name: &str, mine: String, theirs: String| {
+        if mine != theirs {
+            found.push(format!("{name} is {mine}, not {theirs}"));
+        }
+    };
+    check("seed", config.seed.to_string(), other.seed.to_string());
+    check(
+        "proposals_per_task",
+        config.proposals_per_task.to_string(),
+        other.proposals_per_task.to_string(),
+    );
+    check(
+        "frontier_size",
+        config.frontier_size.to_string(),
+        other.frontier_size.to_string(),
+    );
+    check(
+        "programs_per_batch",
+        config.programs_per_batch.to_string(),
+        other.programs_per_batch.to_string(),
+    );
+    // Both in ms, so a lease that differs by less than a second is found
+    // and said exactly.
+    let seconds = |ms: u64| match ms % 1000 {
+        0 => (ms / 1000).to_string(),
+        part => format!("{}.{part:03}", ms / 1000),
+    };
+    check(
+        "lease_seconds",
+        seconds(config.lease_ms),
+        seconds(other.lease_ms),
+    );
+    // It decides which late or repeat submissions are kept.
+    check(
+        "max_unchecked_per_batch",
+        config.max_unchecked_per_batch.to_string(),
+        other.max_unchecked_per_batch.to_string(),
+    );
+    if tasks != other_tasks {
+        let shown = |t: &[String]| {
+            let all = t.join(", ");
+            let cut: String = all.chars().take(MAX_ECHO).collect();
+            if cut.len() < all.len() {
+                format!("[{cut}...]")
+            } else {
+                format!("[{cut}]")
+            }
+        };
+        found.push(format!(
+            "tasks are {}, not {}",
+            shown(tasks),
+            shown(other_tasks)
+        ));
+    }
+    if config.prelude != other.prelude {
+        found.push(
+            "prelude differs: the run compared with was made with another prelude than \
+             this server's"
+                .to_owned(),
+        );
+    }
+    found
 }
 
 /// What came in for one task in one iteration.
@@ -806,6 +929,7 @@ impl DcServer {
             // the step failed.
             let status = store
                 .read_with_refusals(&run, |state, refusals| RunStatus::of(&run, state, refusals))
+                .map(|status| status.compared(store))
                 .map_err(|e| {
                     format!(
                         "iteration {} ended, but the run's status could not be read: {e}",
@@ -840,29 +964,42 @@ impl DcServer {
     #[tool(
         name = "dc_create_run",
         description = "Create a DreamCounter run at iteration 0, with an empty library and an \
-                       empty frontier for each task. Fails if a run of that id exists. Returns \
-                       the new run's status."
+                       empty frontier for each task. Fails if a run of that id exists, or if \
+                       the run named in compared_with has other settings that fix proposals. \
+                       Returns the new run's status."
     )]
     async fn create_run(
         &self,
         Parameters(arg): Parameters<CreateRun>,
     ) -> Result<Json<RunStatus>, String> {
         let run = run_id(&arg.run)?;
-        let known = known_tasks();
-        let tasks = match arg.tasks {
-            None => known,
-            Some(tasks) => {
-                if let Some(unknown) = tasks.iter().find(|t| !known.contains(t)) {
-                    let shown: String = unknown.chars().take(MAX_ECHO).collect();
-                    return Err(format!(
-                        "there is no task {shown:?}. The tasks are: {}",
-                        known.join(", ")
-                    ));
+        let compared_with = match &arg.compared_with {
+            None => None,
+            Some(text) => {
+                let other = run_id(text).map_err(|e| format!("compared_with: {e}"))?;
+                if other == run {
+                    return Err("a run cannot be compared with itself".to_owned());
                 }
-                tasks
+                Some(other)
             }
         };
+        let library_learning = arg.library_learning.unwrap_or(true);
         // Refused here, in the tool's own names and units.
+        if !library_learning {
+            for (name, given) in [
+                ("stitch_iterations", arg.stitch_iterations.is_some()),
+                ("stitch_max_arity", arg.stitch_max_arity.is_some()),
+                ("stitch_wall_seconds", arg.stitch_wall_seconds.is_some()),
+                ("stitch_memory_mib", arg.stitch_memory_mib.is_some()),
+            ] {
+                if given {
+                    return Err(format!(
+                        "{name} is a Stitch setting, and a run with library_learning off \
+                         runs no Stitch"
+                    ));
+                }
+            }
+        }
         if arg.stitch_iterations == Some(0) {
             return Err("stitch_iterations must be at least 1".to_owned());
         }
@@ -873,39 +1010,85 @@ impl DcServer {
         if arg.stitch_memory_mib.is_some_and(|m| m < least_mib) {
             return Err(format!("stitch_memory_mib must be at least {least_mib}"));
         }
-        let defaults = StitchSettings::default();
-        let config = RunConfig {
-            autodoc: arg.autodoc.unwrap_or(false),
-            library_learning: arg.library_learning.unwrap_or(true),
-            arm: Arm::Blind,
-            seed: arg.seed,
-            proposals_per_task: arg.proposals_per_task,
-            programs_per_batch: arg.programs_per_batch.unwrap_or(DEFAULT_PROGRAMS_PER_BATCH),
-            lease_ms: arg
-                .lease_seconds
-                .unwrap_or(DEFAULT_LEASE_SECONDS)
-                .saturating_mul(1000),
-            max_unchecked_per_batch: arg
-                .max_unchecked_per_batch
-                .unwrap_or(DEFAULT_MAX_UNCHECKED_PER_BATCH),
-            frontier_size: arg.frontier_size,
-            stitch: StitchSettings {
-                iterations: arg.stitch_iterations.unwrap_or(defaults.iterations),
-                max_arity: arg.stitch_max_arity.unwrap_or(defaults.max_arity),
-                wall_ms: arg
-                    .stitch_wall_seconds
-                    .map_or(defaults.wall_ms, |s| s.saturating_mul(1000)),
-                memory_bytes: arg
-                    .stitch_memory_mib
-                    .map_or(defaults.memory_bytes, |m| m.saturating_mul(1 << 20)),
-            },
-            prelude: shipped_prelude(),
-        };
         self.blocking(move |store| {
+            let other = match &compared_with {
+                None => None,
+                Some(other) => Some(
+                    store
+                        .read(other, |s| (s.config().clone(), s.tasks().to_vec()))
+                        .map_err(|e| format!("compared_with: {e}"))?,
+                ),
+            };
+            let known = known_tasks();
+            let tasks = match arg.tasks {
+                None => other
+                    .as_ref()
+                    .map_or(known, |(_, other_tasks)| other_tasks.clone()),
+                Some(tasks) => {
+                    if let Some(unknown) = tasks.iter().find(|t| !known.contains(t)) {
+                        let shown: String = unknown.chars().take(MAX_ECHO).collect();
+                        return Err(format!(
+                            "there is no task {shown:?}. The tasks are: {}",
+                            known.join(", ")
+                        ));
+                    }
+                    tasks
+                }
+            };
+            let defaults = StitchSettings::default();
+            let config = RunConfig {
+                autodoc: arg.autodoc.unwrap_or(false),
+                library_learning,
+                arm: Arm::Blind,
+                seed: arg.seed,
+                proposals_per_task: arg.proposals_per_task,
+                programs_per_batch: arg
+                    .programs_per_batch
+                    .or(other.as_ref().map(|(c, _)| c.programs_per_batch))
+                    .unwrap_or(DEFAULT_PROGRAMS_PER_BATCH),
+                lease_ms: arg.lease_seconds.map_or_else(
+                    || {
+                        other
+                            .as_ref()
+                            .map_or(DEFAULT_LEASE_SECONDS.saturating_mul(1000), |(c, _)| {
+                                c.lease_ms
+                            })
+                    },
+                    |s| s.saturating_mul(1000),
+                ),
+                max_unchecked_per_batch: arg
+                    .max_unchecked_per_batch
+                    .or(other.as_ref().map(|(c, _)| c.max_unchecked_per_batch))
+                    .unwrap_or(DEFAULT_MAX_UNCHECKED_PER_BATCH),
+                frontier_size: arg.frontier_size,
+                stitch: StitchSettings {
+                    iterations: arg.stitch_iterations.unwrap_or(defaults.iterations),
+                    max_arity: arg.stitch_max_arity.unwrap_or(defaults.max_arity),
+                    wall_ms: arg
+                        .stitch_wall_seconds
+                        .map_or(defaults.wall_ms, |s| s.saturating_mul(1000)),
+                    memory_bytes: arg
+                        .stitch_memory_mib
+                        .map_or(defaults.memory_bytes, |m| m.saturating_mul(1 << 20)),
+                },
+                prelude: shipped_prelude(),
+                compared_with: compared_with.as_ref().map(|r| r.as_str().to_owned()),
+            };
+            if let (Some(name), Some((other_config, other_tasks))) = (&compared_with, &other) {
+                let found = differences(&config, &tasks, other_config, other_tasks);
+                if !found.is_empty() {
+                    return Err(format!(
+                        "the run must share these settings with run {:?}, which it is \
+                         compared with: {}",
+                        name.as_str(),
+                        found.join("; ")
+                    ));
+                }
+            }
             let state = store
                 .create_run(&run, config, tasks)
                 .map_err(|e| e.to_string())?;
-            Ok(RunStatus::of(&run, &state, &Refusals::default()))
+            Ok(RunStatus::of(&run, &state, &Refusals::default()).compared(store))
         })
         .await
     }
@@ -925,6 +1108,7 @@ impl DcServer {
         self.blocking(move |store| {
             store
                 .read_with_refusals(&run, |state, refusals| RunStatus::of(&run, state, refusals))
+                .map(|status| status.compared(store))
                 .map_err(|e| e.to_string())
         })
         .await
@@ -955,7 +1139,9 @@ impl DcServer {
                 },
                 |(), state, refusals| RunStatus::of(&run, state, &refusals.read()),
             );
-            noted.map_err(|e| e.to_string())
+            noted
+                .map(|status| status.compared(store))
+                .map_err(|e| e.to_string())
         })
         .await
     }
@@ -1693,6 +1879,102 @@ mod tests {
         signalled.join().unwrap();
     }
 
+    /// Every setting that fixes the proposals is compared, including the
+    /// two that `dc_create_run` cannot make differ by itself: the prelude,
+    /// and a lease that differs by less than a second.
+    #[test]
+    fn differences_name_every_setting_that_fixes_proposals() {
+        let base = RunConfig {
+            autodoc: false,
+            arm: Arm::Blind,
+            library_learning: true,
+            seed: 3,
+            proposals_per_task: 2,
+            programs_per_batch: 2,
+            lease_ms: 60_000,
+            max_unchecked_per_batch: 3,
+            frontier_size: 5,
+            stitch: crate::state::StitchSettings::default(),
+            prelude: 9,
+            compared_with: None,
+        };
+        let tasks = vec!["a".to_owned(), "b".to_owned()];
+        // What does not fix the proposals may differ.
+        let free = RunConfig {
+            library_learning: false,
+            stitch: crate::state::StitchSettings {
+                iterations: 9,
+                ..crate::state::StitchSettings::default()
+            },
+            compared_with: Some("main".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            differences(&free, &tasks, &base, &tasks),
+            Vec::<String>::new()
+        );
+        for (changed, said) in [
+            (
+                RunConfig {
+                    seed: 4,
+                    ..base.clone()
+                },
+                "seed is 4, not 3",
+            ),
+            (
+                RunConfig {
+                    proposals_per_task: 1,
+                    ..base.clone()
+                },
+                "proposals_per_task is 1, not 2",
+            ),
+            (
+                RunConfig {
+                    frontier_size: 6,
+                    ..base.clone()
+                },
+                "frontier_size is 6, not 5",
+            ),
+            (
+                RunConfig {
+                    programs_per_batch: 1,
+                    ..base.clone()
+                },
+                "programs_per_batch is 1, not 2",
+            ),
+            (
+                RunConfig {
+                    lease_ms: 59_500,
+                    ..base.clone()
+                },
+                "lease_seconds is 59.500, not 60",
+            ),
+            (
+                RunConfig {
+                    prelude: 8,
+                    ..base.clone()
+                },
+                "prelude differs: the run compared with was made with another prelude than \
+                 this server's",
+            ),
+        ] {
+            assert_eq!(differences(&changed, &tasks, &base, &tasks), vec![said]);
+        }
+        let kept = RunConfig {
+            max_unchecked_per_batch: 7,
+            ..base.clone()
+        };
+        assert_eq!(
+            differences(&kept, &tasks, &base, &tasks),
+            vec!["max_unchecked_per_batch is 7, not 3"]
+        );
+        let reversed = vec!["b".to_owned(), "a".to_owned()];
+        assert_eq!(
+            differences(&base, &reversed, &base, &tasks),
+            vec!["tasks are [b, a], not [a, b]"]
+        );
+    }
+
     /// `dc_proposal_stats` reports, for each iteration, what came in from
     /// each model the proposers named (D24 accounting).
     #[test]
@@ -1715,6 +1997,7 @@ mod tests {
                     frontier_size: 5,
                     stitch: crate::state::StitchSettings::default(),
                     prelude: crate::verify::shipped_prelude(),
+                    compared_with: None,
                 },
                 vec!["collapse/merge".into()],
             )
@@ -1799,6 +2082,7 @@ mod tests {
                         frontier_size: 5,
                         stitch: crate::state::StitchSettings::default(),
                         prelude: crate::verify::shipped_prelude(),
+                        compared_with: None,
                     },
                     vec!["collapse/merge".into()],
                 )

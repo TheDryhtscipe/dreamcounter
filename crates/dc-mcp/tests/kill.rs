@@ -45,6 +45,7 @@ fn config() -> RunConfig {
         frontier_size: 5,
         stitch: dc_mcp::state::StitchSettings::default(),
         prelude: 0,
+        compared_with: None,
     }
 }
 
