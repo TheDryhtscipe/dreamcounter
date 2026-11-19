@@ -137,6 +137,17 @@ pub struct RunConfig {
     /// out. A run made before the setting has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compared_with: Option<String>,
+    /// Whether each payload names an approach to try, drawn by the run's
+    /// seed from a fixed list that does not depend on the task (decision
+    /// D32). A run made before the setting has it off.
+    #[serde(default)]
+    pub approach_hints: bool,
+    /// Whether each payload shows the programs already received for its
+    /// task in the current iteration, without results, and asks for a
+    /// different approach (decision D32). A run made before the setting
+    /// has it off.
+    #[serde(default)]
+    pub show_received: bool,
 }
 
 /// The [`RunConfig::library_learning`] of a run made before the setting.
@@ -1006,6 +1017,10 @@ pub struct Batch {
     pub foreign_kept: u32,
     /// How many late or repeat submissions from its worker are kept.
     pub unchecked_kept: u32,
+    /// Its slot among its task's batches in its iteration: the approach it
+    /// was named under [`RunConfig::approach_hints`] (see
+    /// [`RunState::hint_slot`]).
+    pub slot: u64,
 }
 
 /// What came in for one task in one iteration. Only evaluated submissions
@@ -1169,6 +1184,14 @@ pub struct RunState {
     /// The iteration whose end added each library entry, by index.
     added: Vec<u64>,
     uptake: ByIteration<LibraryUptake>,
+    /// The programs received for each task in the current iteration, kept
+    /// only when [`RunConfig::show_received`] is on (see
+    /// [`RunState::received`]).
+    received: BTreeMap<String, Vec<String>>,
+    /// The batches issued for each task in the current iteration, by
+    /// number. It is derived, like the indexes, and empties when the
+    /// iteration ends.
+    issued_now: BTreeMap<String, Vec<u64>>,
 }
 
 /// Changes the counts of `task` in `iteration` by `change`. The task's name
@@ -1252,6 +1275,8 @@ impl RunState {
             named: Vec::new(),
             added: Vec::new(),
             uptake: ByIteration::default(),
+            received: BTreeMap::new(),
+            issued_now: BTreeMap::new(),
         })
     }
 
@@ -1354,6 +1379,8 @@ impl RunState {
                 self.verified.drain(..taken);
                 // No batch of the ended iteration holds a live lease now.
                 self.live.clear();
+                self.received.clear();
+                self.issued_now.clear();
             }
         }
         Ok(())
@@ -1373,6 +1400,7 @@ impl RunState {
             return Err(Rejected::BadBatch);
         }
         let payload_bytes = self.payload_len(issued)?;
+        let slot = self.hint_slot(&issued.task, issued.issued_ms);
         self.batches.push(Batch {
             iteration: issued.iteration,
             task: issued.task.clone(),
@@ -1384,8 +1412,13 @@ impl RunState {
             awaiting_check: None,
             foreign_kept: 0,
             unchecked_kept: 0,
+            slot,
         });
         self.live.insert(issued.batch);
+        self.issued_now
+            .entry(issued.task.clone())
+            .or_default()
+            .push(issued.batch);
         change_task_counts(&mut self.task_counts, issued.iteration, &issued.task, |c| {
             c.batches += 1
         });
@@ -1527,6 +1560,12 @@ impl RunState {
             change_task_counts(&mut self.task_counts, batch.iteration, &batch.task, |c| {
                 c.received += received;
             });
+            if self.config.show_received && batch.iteration == self.iteration {
+                let kept = self.received.entry(batch.task.clone()).or_default();
+                kept.extend(s.programs.iter().take(received as usize).cloned());
+                let over = kept.len().saturating_sub(crate::prompt::MAX_RECEIVED_SHOWN);
+                kept.drain(..over);
+            }
         }
         let by_model = self
             .model_counts
@@ -1813,6 +1852,37 @@ impl RunState {
         self.kept.get(iteration)
     }
 
+    /// The programs received for `task` in the current iteration, oldest
+    /// first: at most [`MAX_RECEIVED_SHOWN`](crate::prompt::MAX_RECEIVED_SHOWN)
+    /// of them, the most recent. They are the programs that count for the
+    /// task (see [`Standing::evaluated`]), checked or not. The state keeps
+    /// them only when [`RunConfig::show_received`] is on.
+    pub fn received(&self, task: &str) -> &[String] {
+        self.received.get(task).map_or(&[], Vec::as_slice)
+    }
+
+    /// The slot of a batch for `task` issued now, at `now_ms`: the least
+    /// slot that no batch of the task in the current iteration holds. A
+    /// batch holds its slot while its lease is live (up to and including
+    /// its deadline, as in [`RunState::leased`]) and once its worker has
+    /// submitted for it. So a batch whose lease ended without a submission
+    /// gives its slot, and with it its approach, to the next (decision
+    /// D32). A submission that comes after its lease ended makes its batch
+    /// hold the slot again, so it can share the slot with the batch that
+    /// took it meanwhile.
+    pub fn hint_slot(&self, task: &str, now_ms: u64) -> u64 {
+        let held: BTreeSet<u64> = self
+            .issued_now
+            .get(task)
+            .into_iter()
+            .flatten()
+            .filter_map(|&n| self.batches.get(n))
+            .filter(|b| b.submitted || now_ms <= b.deadline_ms)
+            .map(|b| b.slot)
+            .collect();
+        (0..).find(|k| !held.contains(k)).unwrap_or(0)
+    }
+
     /// The current iteration. The first is 0.
     pub fn iteration(&self) -> u64 {
         self.iteration
@@ -1950,6 +2020,8 @@ mod tests {
             stitch: crate::state::StitchSettings::default(),
             prelude: 0,
             compared_with: None,
+            approach_hints: false,
+            show_received: false,
         }
     }
 

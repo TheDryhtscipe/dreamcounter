@@ -91,6 +91,8 @@ impl Fixture {
             stitch: StitchSettings::default(),
             prelude: dc_mcp::verify::shipped_prelude(),
             compared_with: None,
+            approach_hints: false,
+            show_received: false,
         };
         store
             .create_run(&run, config, vec!["collapse/merge".into()])

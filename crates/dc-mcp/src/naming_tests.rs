@@ -24,6 +24,8 @@ fn config(autodoc: bool) -> RunConfig {
         stitch: StitchSettings::default(),
         prelude: shipped_prelude(),
         compared_with: None,
+        approach_hints: false,
+        show_received: false,
     }
 }
 

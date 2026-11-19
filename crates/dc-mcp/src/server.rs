@@ -110,13 +110,26 @@ pub struct CreateRun {
     /// The id of an existing run that this run is compared with, such as
     /// the main run of an LLM-only baseline. Either run may learn a
     /// library. If given, tasks, programs_per_batch, lease_seconds,
-    /// max_unchecked_per_batch and max_memory_mib, when absent, are that
-    /// run's, and the run is not made unless its seed, proposals_per_task,
-    /// frontier_size, tasks (in order), programs_per_batch, lease_seconds,
-    /// max_unchecked_per_batch and max_memory_mib are that run's too, and that run uses this
-    /// server's prelude. The error names each setting that differs.
+    /// max_unchecked_per_batch, max_memory_mib, approach_hints and
+    /// show_received, when absent, are that run's, and the run is not made
+    /// unless its seed, proposals_per_task, frontier_size, tasks (in order),
+    /// programs_per_batch, lease_seconds, max_unchecked_per_batch,
+    /// max_memory_mib, approach_hints and show_received are that run's too,
+    /// and that run uses this server's prelude. The error names each
+    /// setting that differs.
     /// `dc_run_status` reports the pairing.
     pub compared_with: Option<String>,
+    /// Whether each payload names an approach to try, drawn by the run's
+    /// seed from a fixed list that does not depend on the task (decision
+    /// D32). A task's batches in one iteration that hold a live lease or
+    /// were submitted get different approaches until the list runs out; a
+    /// batch whose lease ended unsubmitted gives its approach to the next.
+    /// If absent, the compared run's, or false.
+    pub approach_hints: Option<bool>,
+    /// Whether each payload shows the programs already received for its
+    /// task in this iteration, without results, and asks for a different
+    /// approach (decision D32). If absent, the compared run's, or false.
+    pub show_received: Option<bool>,
 }
 
 /// The most programs one batch asks for when `dc_create_run` does not say.
@@ -209,6 +222,11 @@ pub struct RunStatus {
     pub max_memory_mib: u64,
     /// The run this one is compared with, if it was made with one.
     pub compared_with: Option<Comparison>,
+    /// Whether each payload names an approach to try (decision D32).
+    pub approach_hints: bool,
+    /// Whether each payload shows the programs already received for its
+    /// task in this iteration (decision D32).
+    pub show_received: bool,
     /// How many definitions wait for a naming result. While any does, no
     /// batch is issued.
     pub unnamed: u64,
@@ -271,6 +289,8 @@ impl RunStatus {
                 run: other.clone(),
                 iteration: None,
             }),
+            approach_hints: config.approach_hints,
+            show_received: config.show_received,
             unnamed: state.names_pending(),
             tasks: state
                 .tasks()
@@ -316,7 +336,7 @@ fn mib(bytes: u64) -> String {
 /// The settings that two runs compared with each other must share, as
 /// `dc_create_run` names them, where `config` and `tasks` differ from
 /// `other` and `other_tasks`. Each is said with both values. They are the
-/// settings that fix the proposals a run hands out (decision D24), and the
+/// settings that fix the proposals a run hands out (decisions D24 and D32), and the
 /// memory limit, which decides which programs pass their checks and what
 /// they cost.
 fn differences(
@@ -363,6 +383,17 @@ fn differences(
         "max_unchecked_per_batch",
         config.max_unchecked_per_batch.to_string(),
         other.max_unchecked_per_batch.to_string(),
+    );
+    // They change the payload (decision D32).
+    check(
+        "approach_hints",
+        config.approach_hints.to_string(),
+        other.approach_hints.to_string(),
+    );
+    check(
+        "show_received",
+        config.show_received.to_string(),
+        other.show_received.to_string(),
     );
     // It decides which programs pass their checks, and what they cost.
     check(
@@ -1145,6 +1176,14 @@ impl DcServer {
                 },
                 prelude: shipped_prelude(),
                 compared_with: compared_with.as_ref().map(|r| r.as_str().to_owned()),
+                approach_hints: arg
+                    .approach_hints
+                    .or(other.as_ref().map(|(c, _)| c.approach_hints))
+                    .unwrap_or(false),
+                show_received: arg
+                    .show_received
+                    .or(other.as_ref().map(|(c, _)| c.show_received))
+                    .unwrap_or(false),
             };
             if let (Some(name), Some((other_config, other_tasks))) = (&compared_with, &other) {
                 let found = differences(&config, &tasks, other_config, other_tasks);
@@ -2024,6 +2063,8 @@ mod tests {
             stitch: crate::state::StitchSettings::default(),
             prelude: 9,
             compared_with: None,
+            approach_hints: false,
+            show_received: false,
         };
         let tasks = vec!["a".to_owned(), "b".to_owned()];
         // What does not fix the proposals may differ.
@@ -2078,6 +2119,20 @@ mod tests {
             ),
             (
                 RunConfig {
+                    approach_hints: true,
+                    ..base.clone()
+                },
+                "approach_hints is true, not false",
+            ),
+            (
+                RunConfig {
+                    show_received: true,
+                    ..base.clone()
+                },
+                "show_received is true, not false",
+            ),
+            (
+                RunConfig {
                     prelude: 8,
                     ..base.clone()
                 },
@@ -2126,6 +2181,8 @@ mod tests {
                     stitch: crate::state::StitchSettings::default(),
                     prelude: crate::verify::shipped_prelude(),
                     compared_with: None,
+                    approach_hints: false,
+                    show_received: false,
                 },
                 vec!["collapse/merge".into()],
             )
@@ -2212,6 +2269,8 @@ mod tests {
                         stitch: crate::state::StitchSettings::default(),
                         prelude: crate::verify::shipped_prelude(),
                         compared_with: None,
+                        approach_hints: false,
+                        show_received: false,
                     },
                     vec!["collapse/merge".into()],
                 )

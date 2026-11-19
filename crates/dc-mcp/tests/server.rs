@@ -653,7 +653,8 @@ fn a_run_compared_with_another_shares_its_settings_or_is_refused() {
             json!({
                 "run": "main", "seed": 7, "proposals_per_task": 2, "frontier_size": 3,
                 "tasks": names, "programs_per_batch": 4, "lease_seconds": 60,
-                "max_unchecked_per_batch": 2, "max_memory_mib": 64
+                "max_unchecked_per_batch": 2, "max_memory_mib": 64,
+                "approach_hints": true, "show_received": true
             }),
         )
         .unwrap();
@@ -672,6 +673,15 @@ fn a_run_compared_with_another_shares_its_settings_or_is_refused() {
     );
     assert_eq!(main["programs_per_batch"], 4);
     assert_eq!(main["lease_seconds"], 60);
+    // The payload settings are reported, and are off unless asked for (D32).
+    assert_eq!(
+        (&main["approach_hints"], &main["show_received"]),
+        (&json!(true), &json!(true))
+    );
+    assert_eq!(
+        (&plain["approach_hints"], &plain["show_received"]),
+        (&json!(false), &json!(false))
+    );
     let base = json!({
         "run": "base", "seed": 7, "proposals_per_task": 2, "frontier_size": 3,
         "library_learning": false, "compared_with": "main"
@@ -688,6 +698,8 @@ fn a_run_compared_with_another_shares_its_settings_or_is_refused() {
         ("tasks", json!([names[1], names[0]])),
         ("max_unchecked_per_batch", json!(5)),
         ("max_memory_mib", json!(65)),
+        ("approach_hints", json!(false)),
+        ("show_received", json!(false)),
     ] {
         let mut arguments = base.clone();
         arguments[setting] = value;
@@ -739,6 +751,8 @@ fn a_run_compared_with_another_shares_its_settings_or_is_refused() {
     assert_eq!(made["lease_seconds"], 60);
     assert_eq!(made["max_unchecked_per_batch"], 2);
     assert_eq!(made["max_memory_mib"], 64);
+    assert_eq!(made["approach_hints"], true);
+    assert_eq!(made["show_received"], true);
     let tasks: Vec<&str> = made["tasks"]
         .as_array()
         .unwrap()

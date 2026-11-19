@@ -124,6 +124,8 @@ fn check_cold_reads(notes: u64, note_bytes: usize) {
         stitch: dc_mcp::state::StitchSettings::default(),
         prelude: dc_mcp::verify::shipped_prelude(),
         compared_with: None,
+        approach_hints: false,
+        show_received: false,
     };
     store.create_run(&run, config, vec!["t".into()]).unwrap();
     for i in 0..notes {
