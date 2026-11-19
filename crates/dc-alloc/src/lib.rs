@@ -126,6 +126,38 @@ pub fn reset_peak() {
     PEAK.with(|p| p.set(now));
 }
 
+/// Gives back to the system the memory the system allocator holds free, in
+/// every thread's arena, and says whether it gave any back (bead
+/// dreamcounter-c8e05a).
+///
+/// glibc keeps the memory a thread frees in that thread's arena, for the
+/// thread to use again. So a thread that ran a large evaluation keeps its
+/// resident memory near that evaluation's peak after the evaluation has
+/// freed it, and k such threads keep k peaks. This calls glibc's
+/// `malloc_trim(0)`, which returns the free pages of every arena. Its cost
+/// grows with the free memory it walks, so call it after work that grew the
+/// heap, not after every allocation.
+///
+/// Elsewhere than Linux with glibc it does nothing and returns `false`.
+pub fn release_free_memory() -> bool {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: `malloc_trim` takes a byte count and touches only the
+        // allocator's free memory, under the allocator's own locks. It is
+        // safe to call from any thread outside a signal handler.
+        #[allow(unsafe_code)]
+        let released = unsafe { malloc_trim(0) };
+        released != 0
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
