@@ -20,6 +20,7 @@ fn config() -> RunConfig {
         frontier_size: 5,
         stitch: crate::state::StitchSettings::default(),
         prelude: 0,
+        compared_with: None,
     }
 }
 
@@ -1402,6 +1403,7 @@ fn two_stores_agree_with_the_journal(seed: u64, steps: u32) -> Outcomes {
         frontier_size: 5,
         stitch: crate::state::StitchSettings::default(),
         prelude: 0,
+        compared_with: None,
         ..config()
     };
     a.create_run(&run, capped, tasks()).unwrap();

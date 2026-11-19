@@ -57,6 +57,7 @@ fn a_claim_held_by_a_killed_process_does_not_strand_its_submission() {
                 frontier_size: 5,
                 stitch: dc_mcp::state::StitchSettings::default(),
                 prelude: dc_mcp::verify::shipped_prelude(),
+                compared_with: None,
             },
             vec!["collapse/merge".into()],
         )

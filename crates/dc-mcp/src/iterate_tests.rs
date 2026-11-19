@@ -35,6 +35,7 @@ fn config(quota: u32, prelude: u64) -> RunConfig {
         frontier_size: K,
         stitch: StitchSettings::default(),
         prelude,
+        compared_with: None,
     }
 }
 

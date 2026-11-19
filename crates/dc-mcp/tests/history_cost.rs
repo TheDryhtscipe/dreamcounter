@@ -112,6 +112,7 @@ fn build(past: u64) -> (TempDir, Store, RunId) {
                 frontier_size: 5,
                 stitch: dc_mcp::state::StitchSettings::default(),
                 prelude: dc_mcp::verify::shipped_prelude(),
+                compared_with: None,
             },
             vec![MERGE.to_owned(), CANCEL.to_owned()],
         )

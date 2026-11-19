@@ -454,6 +454,7 @@ mod tests {
                 frontier_size: 5,
                 stitch: crate::state::StitchSettings::default(),
                 prelude: crate::verify::shipped_prelude(),
+                compared_with: None,
             },
             tasks.iter().map(|t| (*t).to_owned()).collect(),
         )
