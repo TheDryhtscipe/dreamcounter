@@ -174,7 +174,7 @@ fn the_hint_does_not_depend_on_the_batch_number() {
     let family = crate::verify::task(MERGE).unwrap();
     let hint = approach_hint(3, 0, MERGE, 0);
     for batch in [0, 1, 7, 1000] {
-        let p = payload(&state, &verifier, &*family, batch, "tok", 1);
+        let p = payload(&state, &verifier, &*family, batch, "tok", 1, 0);
         assert_eq!(hints_in(&p.prompt), [hint], "batch {batch}");
     }
     // Each of the four inputs changes the order of the list somewhere.
@@ -225,11 +225,11 @@ fn received_programs_are_shown_to_the_task_s_later_batches_without_results() {
     let verifier = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
     let family = crate::verify::task(MERGE).unwrap();
     let before = r.store.state(&r.run).unwrap();
-    let unchecked = payload(&before, &verifier, &*family, 9, "tok", 1);
+    let unchecked = payload(&before, &verifier, &*family, 9, "tok", 1, 0);
     r.check();
     let after = r.store.state(&r.run).unwrap();
     assert_eq!(after.task_counts(0, MERGE).passed, 1);
-    let checked = payload(&after, &verifier, &*family, 9, "tok", 1);
+    let checked = payload(&after, &verifier, &*family, 9, "tok", 1, 0);
     assert_eq!(unchecked, checked);
 
     let (_, t2, p2) = r.next("c");
@@ -350,4 +350,72 @@ fn a_config_from_before_the_settings_has_them_off() {
     assert!(object.remove("show_received").is_some());
     let old: RunConfig = serde_json::from_value(value).unwrap();
     assert!(!old.approach_hints && !old.show_received);
+}
+
+/// A batch whose lease ended without a submission gives its approach back:
+/// the batch that takes its slot names the same one. A batch that is live
+/// or submitted keeps its approach. So the hints of a task's slots do not
+/// depend on how long proposers took.
+#[test]
+fn a_batch_whose_lease_ended_gives_its_approach_to_the_next() {
+    let r = Run::new(config(2, true, false));
+    let next_at = |worker: &str, now_ms: u64| -> (String, &'static str) {
+        let got = next_batch(&r.store, &r.run, worker, now_ms, &r.verifiers).unwrap();
+        let payload = got
+            .batch
+            .unwrap_or_else(|| panic!("no batch: {:?}", got.wait));
+        let state = r.store.state(&r.run).unwrap();
+        let task = state.batch(payload.batch).unwrap().task.clone();
+        let named = hints_in(&payload.prompt);
+        assert_eq!(named.len(), 1, "{}", payload.prompt);
+        (task, named[0])
+    };
+    // Two slots for each task, all issued at once.
+    let mut first: std::collections::BTreeMap<String, Vec<&'static str>> =
+        std::collections::BTreeMap::new();
+    for i in 0..4 {
+        let (task, hint) = next_at(&format!("w{i}"), 0);
+        first.entry(task).or_default().push(hint);
+    }
+    // MERGE's second batch (batch 2) is submitted; its first (batch 0) and
+    // both CANCEL batches let their leases end.
+    let state = r.store.state(&r.run).unwrap();
+    assert_eq!(state.batch(2).unwrap().task, MERGE);
+    let token = state.batch(2).unwrap().token.clone();
+    submit(
+        &r.store,
+        &r.run,
+        2,
+        "w2",
+        &token,
+        vec!["let solve xs = xs".into()],
+        None,
+        1,
+    )
+    .unwrap();
+    let (task, hint) = next_at("x0", 5000);
+    let (task2, hint2) = next_at("x1", 5000);
+    let (task3, hint3) = next_at("x2", 5000);
+    let mut again: std::collections::BTreeMap<String, Vec<&'static str>> =
+        std::collections::BTreeMap::new();
+    for (t, h) in [(task, hint), (task2, hint2), (task3, hint3)] {
+        again.entry(t).or_default().push(h);
+    }
+    // MERGE's free slot is its first, so it gets the first hint again.
+    assert_eq!(again[MERGE], [first[MERGE][0]]);
+    // CANCEL's two slots come back in order.
+    assert_eq!(again[CANCEL], first[CANCEL]);
+}
+
+/// A repeat submission from the batch's worker is not shown again.
+#[test]
+fn a_repeat_submission_is_not_shown() {
+    let r = Run::new(config(3, false, true));
+    let (b0, _, _) = r.next("a");
+    r.submit(b0, "a", &["let solve xs = xs -- first"]);
+    r.submit(b0, "a", &["let solve xs = xs -- repeat"]);
+    assert_eq!(
+        r.store.state(&r.run).unwrap().received(MERGE),
+        ["let solve xs = xs -- first"]
+    );
 }

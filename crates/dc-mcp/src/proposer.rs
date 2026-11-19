@@ -298,7 +298,8 @@ fn issue(
     };
     let batch = state.batch_count();
     let token = new_token()?;
-    let (sent, pieces) = payload_in_pieces(state, &verifier, &*family, batch, &token, wanted);
+    let (sent, pieces) =
+        payload_in_pieces(state, &verifier, &*family, batch, &token, wanted, now_ms);
     let mut events = Vec::new();
     let prompt = prompt_parts(state, pieces, &mut events);
     events.push(Event::BatchIssued(BatchIssued {
@@ -940,7 +941,7 @@ mod tests {
         let state = RunState::create(config, tasks).unwrap();
         let family = task(MERGE).unwrap();
         let verifier = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
-        let old = crate::prompt::payload(&state, &verifier, &*family, 0, "t0", 1);
+        let old = crate::prompt::payload(&state, &verifier, &*family, 0, "t0", 1, 0);
         let old_text = serde_json::to_string(&old).unwrap();
         // The event as the server wrote it before: the payload as a string.
         let old_event = format!(
