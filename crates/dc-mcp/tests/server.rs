@@ -521,6 +521,17 @@ fn bad_requests_are_tool_errors_and_change_nothing() {
             "stitch_memory_mib must be at least 512",
         ),
         ("max_memory_mib", 0, "max_memory_mib must be at least 1"),
+        (
+            "max_memory_mib",
+            1_048_577,
+            "max_memory_mib must be at most 1048576",
+        ),
+        // 2^44 MiB is more bytes than a u64 holds.
+        (
+            "max_memory_mib",
+            1_u64 << 44,
+            "max_memory_mib must be at most 1048576",
+        ),
     ] {
         let mut arguments = create("s1", json!([first]));
         arguments[setting] = json!(value);
