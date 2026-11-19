@@ -111,6 +111,7 @@ fn check_cold_reads(notes: u64, note_bytes: usize) {
     let run = RunId::new(RUN).unwrap();
     let store = Store::open(dir.path()).unwrap();
     let config = RunConfig {
+        max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
         autodoc: false,
         arm: Arm::Blind,
         library_learning: true,

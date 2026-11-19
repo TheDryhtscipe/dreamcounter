@@ -11,6 +11,7 @@ const CANCEL: &str = "collapse/cancel";
 
 fn config(autodoc: bool) -> RunConfig {
     RunConfig {
+        max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
         autodoc,
         arm: Arm::Blind,
         library_learning: true,
@@ -288,7 +289,11 @@ fn a_named_function_is_in_scope_by_its_name_and_by_fn_i() {
     };
     let family = task(MERGE).unwrap();
     for wrap in ["ident", "fn_0"] {
-        let mut verifier = Verifier::new(std::slice::from_ref(&named)).unwrap();
+        let mut verifier = Verifier::new(
+            std::slice::from_ref(&named),
+            dc_tasks::harness::DEFAULT_MAX_MEMORY,
+        )
+        .unwrap();
         let check = verifier.check(&*family, &solves_merge_through(wrap));
         assert!(matches!(check, Check::Passed { .. }), "{wrap}: {check:?}");
     }
@@ -297,7 +302,11 @@ fn a_named_function_is_in_scope_by_its_name_and_by_fn_i() {
         name: None,
         ..named
     };
-    let mut verifier = Verifier::new(std::slice::from_ref(&unnamed)).unwrap();
+    let mut verifier = Verifier::new(
+        std::slice::from_ref(&unnamed),
+        dc_tasks::harness::DEFAULT_MAX_MEMORY,
+    )
+    .unwrap();
     let check = verifier.check(&*family, &solves_merge_through("ident"));
     assert!(matches!(check, Check::Compile { .. }), "{check:?}");
 }

@@ -443,6 +443,7 @@ mod tests {
     fn state(tasks: &[&str]) -> RunState {
         RunState::create(
             RunConfig {
+                max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
                 autodoc: false,
                 arm: Arm::Blind,
                 library_learning: true,
@@ -464,7 +465,7 @@ mod tests {
     #[test]
     fn a_payload_has_the_task_its_examples_and_the_language() {
         let s = state(&["collapse/merge", "collapse/cancel"]);
-        let v = Verifier::new(&[]).unwrap();
+        let v = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         let family = crate::verify::task("collapse/merge").unwrap();
         let p = payload(&s, &v, &*family, 4, "tok", 1);
         assert_eq!((p.batch, p.programs_wanted, p.lease_seconds), (4, 1, 90));
@@ -489,7 +490,7 @@ mod tests {
     #[test]
     fn a_gate_is_not_shown() {
         let s = state(&["dominance/increasing-triples"]);
-        let v = Verifier::new(&[]).unwrap();
+        let v = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         let family = crate::verify::task("dominance/increasing-triples").unwrap();
         let p = payload(&s, &v, &*family, 0, "tok", 1);
         // Every small example is shown, and nothing else in its form.
@@ -527,7 +528,7 @@ mod tests {
     #[test]
     fn the_library_and_solved_tasks_are_shown_in_surface_syntax() {
         let mut s = state(&["collapse/merge", "collapse/cancel", "collapse/absorb"]);
-        let v0 = Verifier::new(&[]).unwrap();
+        let v0 = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         let reverse = v0.prelude().get("reverse").unwrap().lib().0;
         let entry = LibraryEntry {
             name: None,
@@ -547,7 +548,7 @@ mod tests {
             }],
         })
         .unwrap();
-        let v = Verifier::new(&[entry]).unwrap();
+        let v = Verifier::new(&[entry], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         let family = crate::verify::task("collapse/merge").unwrap();
         let p = payload(&s, &v, &*family, 0, "tok", 2);
         assert!(p
@@ -583,7 +584,7 @@ mod tests {
             })
             .unwrap();
         }
-        let v = Verifier::new(&[]).unwrap();
+        let v = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         let family = crate::verify::task(names[0]).unwrap();
         let a = payload(&s, &v, &*family, 3, "tok", 1);
         assert_eq!(a, payload(&s, &v, &*family, 3, "tok", 1));
@@ -605,7 +606,7 @@ mod tests {
     #[test]
     fn a_whole_payload_reads_back_from_its_event() {
         let s = state(&["collapse/merge"]);
-        let v = Verifier::new(&[]).unwrap();
+        let v = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         let family = crate::verify::task("collapse/merge").unwrap();
         let p = payload(&s, &v, &*family, 0, "tok", 1);
         assert!(p.prompt.contains("batch 0, token tok,"), "{}", p.prompt);
@@ -666,7 +667,7 @@ mod tests {
             }],
         })
         .unwrap();
-        let v = Verifier::new(&[]).unwrap();
+        let v = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         let family = crate::verify::task(names[0]).unwrap();
         for (batch, wanted) in [(0, 1), (7, 3)] {
             let (p, pieces) = payload_in_pieces(&s, &v, &*family, batch, "tok", wanted);

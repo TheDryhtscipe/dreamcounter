@@ -171,9 +171,9 @@ enum Attempt {
     /// The reply. The events committed with it are the commit's.
     Done(NextBatch),
     /// A batch is due, but the cache has no verifier for the run's library,
-    /// which is this copy. It is built without the lock and the attempt made
-    /// again.
-    Build(Vec<LibraryEntry>),
+    /// which is this copy, and its memory limit. It is built without the
+    /// lock and the attempt made again.
+    Build(Vec<LibraryEntry>, u64),
 }
 
 /// Hands `worker` the next batch of `run` at `now_ms`, or says why there is
@@ -212,9 +212,9 @@ fn next_batch_with(
         })?;
         match attempt {
             Attempt::Done(reply) => return Ok(reply),
-            Attempt::Build(library) => {
+            Attempt::Build(library, max_memory) => {
                 verifiers
-                    .get_or_build(&library)
+                    .get_or_build(&library, max_memory)
                     .map_err(|e| Refused::State(e.to_string()))?;
                 built_outside = true;
                 built();
@@ -283,12 +283,18 @@ fn issue(
     };
     let family = task(name).ok_or_else(|| Refused::State(format!("there is no task {name:?}")))?;
     // Only a verifier built for exactly the library under the lock is used.
-    let verifier: Arc<Verifier> = match verifiers.get(state.library()) {
+    let max_memory = state.config().max_memory;
+    let verifier: Arc<Verifier> = match verifiers.get(state.library(), max_memory) {
         Some(kept) => kept,
         None if build_here => verifiers
-            .get_or_build(state.library())
+            .get_or_build(state.library(), max_memory)
             .map_err(|e| Refused::State(e.to_string()))?,
-        None => return Ok((Attempt::Build(state.library().to_vec()), Vec::new())),
+        None => {
+            return Ok((
+                Attempt::Build(state.library().to_vec(), max_memory),
+                Vec::new(),
+            ))
+        }
     };
     let batch = state.batch_count();
     let token = new_token()?;
@@ -480,6 +486,8 @@ struct Pending {
     programs: Vec<String>,
     library_len: usize,
     library: Library,
+    /// The run's [`RunConfig::max_memory`](crate::state::RunConfig::max_memory).
+    max_memory: u64,
 }
 
 /// The submission of `batch` if it waits to be checked, and the library to
@@ -488,7 +496,8 @@ fn pending(state: &RunState, batch: u64, verifiers: &VerifierCache) -> Option<Pe
     let b = state.batch(batch)?;
     let programs = b.awaiting_check.clone()?;
     // The library is copied only when the cache has no verifier for it.
-    let library = match verifiers.get(state.library()) {
+    let max_memory = state.config().max_memory;
+    let library = match verifiers.get(state.library(), max_memory) {
         Some(kept) => Library::Kept(kept),
         None => Library::Copied(state.library().to_vec()),
     };
@@ -499,6 +508,7 @@ fn pending(state: &RunState, batch: u64, verifiers: &VerifierCache) -> Option<Pe
         programs,
         library_len: state.library().len(),
         library,
+        max_memory,
     })
 }
 
@@ -645,7 +655,7 @@ fn check_pending_with(
         let verifier = match &p.library {
             Library::Kept(kept) => Arc::clone(kept),
             Library::Copied(library) => verifiers
-                .get_or_build(library)
+                .get_or_build(library, p.max_memory)
                 .map_err(|e| Refused::State(e.to_string()))?,
         };
         let checks = check(&verifier, &p)?;
@@ -723,6 +733,7 @@ mod tests {
             .create_run(
                 &run,
                 RunConfig {
+                    max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
                     autodoc: false,
                     arm: Arm::Blind,
                     library_learning: true,
@@ -903,6 +914,7 @@ mod tests {
     #[test]
     fn a_journal_with_whole_payloads_reads_back_and_goes_on() {
         let config = RunConfig {
+            max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
             autodoc: false,
             arm: Arm::Blind,
             library_learning: true,
@@ -923,7 +935,7 @@ mod tests {
         };
         let state = RunState::create(config, tasks).unwrap();
         let family = task(MERGE).unwrap();
-        let verifier = Verifier::new(&[]).unwrap();
+        let verifier = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         let old = crate::prompt::payload(&state, &verifier, &*family, 0, "t0", 1);
         let old_text = serde_json::to_string(&old).unwrap();
         // The event as the server wrote it before: the payload as a string.
@@ -1450,6 +1462,7 @@ mod tests {
     /// The config of `setup(1, 1)`, for a run made again.
     fn config() -> RunConfig {
         RunConfig {
+            max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
             autodoc: false,
             arm: Arm::Blind,
             library_learning: true,
@@ -1663,8 +1676,12 @@ mod tests {
         // The verifier kept is the one for the grown library.
         let library = store.read(&run, |s| s.library().to_vec()).unwrap();
         assert_eq!(library.len(), 1);
-        assert!(verifiers.get(&library).is_some());
-        assert!(verifiers.get(&[]).is_none());
+        assert!(verifiers
+            .get(&library, dc_tasks::harness::DEFAULT_MAX_MEMORY)
+            .is_some());
+        assert!(verifiers
+            .get(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY)
+            .is_none());
     }
 
     /// The length of the run's journal in bytes.

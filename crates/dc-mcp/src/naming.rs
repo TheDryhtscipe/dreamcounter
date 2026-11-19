@@ -299,7 +299,7 @@ pub fn next_naming_job(
             ));
         };
         let verifier = verifiers
-            .get_or_build(state.library())
+            .get_or_build(state.library(), state.config().max_memory)
             .map_err(|e| Refused::State(e.to_string()))?;
         let job = state.naming_job_count();
         let token = new_token()?;

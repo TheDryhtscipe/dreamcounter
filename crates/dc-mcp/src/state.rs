@@ -123,6 +123,14 @@ pub struct RunConfig {
     /// it on.
     #[serde(default = "learns_library")]
     pub library_learning: bool,
+    /// The most memory one evaluation may hold, in bytes
+    /// (`dc_tasks::harness::HarnessConfig::max_memory`): each run of a
+    /// program on an example, a gate input or a size of its sweep. A run
+    /// that would hold more stops with a memory limit failure. It is
+    /// positive. A run made before the setting has
+    /// `dc_tasks::harness::DEFAULT_MAX_MEMORY`.
+    #[serde(default = "default_max_memory")]
+    pub max_memory: u64,
     /// The id of the run this one is compared with, such as the main run
     /// of an LLM-only baseline (decision D24). `dc_create_run` checks that
     /// the two runs share every setting that fixes the proposals they hand
@@ -134,6 +142,11 @@ pub struct RunConfig {
 /// The [`RunConfig::library_learning`] of a run made before the setting.
 fn learns_library() -> bool {
     true
+}
+
+/// The [`RunConfig::max_memory`] of a run made before the setting.
+fn default_max_memory() -> u64 {
+    dc_tasks::harness::DEFAULT_MAX_MEMORY
 }
 
 /// The settings of the Stitch run that ends each iteration: what Stitch
@@ -160,6 +173,10 @@ pub struct StitchSettings {
 /// 260 MiB Stitch's thread cannot start, and a little above it Stitch runs
 /// many times slower (`dc_compress::worker::Limits::memory_bytes`).
 pub const MIN_STITCH_MEMORY_BYTES: u64 = 512 << 20;
+
+/// The largest [`RunConfig::max_memory`]: 1 TiB. It keeps the limit a
+/// limit: the evaluator reads `u64::MAX` as no limit at all.
+pub const MAX_EVALUATION_MEMORY: u64 = 1 << 40;
 
 impl Default for StitchSettings {
     /// Stitch's own defaults, 3 abstractions of arity at most 2, and the
@@ -801,6 +818,8 @@ pub enum Rejected {
     ZeroSetting(&'static str),
     /// The Stitch worker's memory is under [`MIN_STITCH_MEMORY_BYTES`].
     TooLittleStitchMemory(u64),
+    /// [`RunConfig::max_memory`] is over [`MAX_EVALUATION_MEMORY`].
+    TooMuchEvaluationMemory(u64),
     /// `programs_per_batch` is over [`MAX_PROGRAMS_PER_BATCH`].
     TooManyPerBatch(u32),
     /// The first event of a run is not `Created`.
@@ -886,6 +905,10 @@ impl fmt::Display for Rejected {
             Rejected::TooManyPerBatch(n) => write!(
                 f,
                 "programs_per_batch is {n}; it must be at most {MAX_PROGRAMS_PER_BATCH}"
+            ),
+            Rejected::TooMuchEvaluationMemory(bytes) => write!(
+                f,
+                "max_memory is {bytes} bytes; it must be at most {MAX_EVALUATION_MEMORY}"
             ),
             Rejected::TooLittleStitchMemory(bytes) => write!(
                 f,
@@ -1188,6 +1211,7 @@ impl RunState {
             ("frontier_size", u64::from(config.frontier_size)),
             ("stitch.iterations", u64::from(config.stitch.iterations)),
             ("stitch.wall_ms", config.stitch.wall_ms),
+            ("max_memory", config.max_memory),
         ] {
             if value == 0 {
                 return Err(Rejected::ZeroSetting(name));
@@ -1195,6 +1219,9 @@ impl RunState {
         }
         if config.stitch.memory_bytes < MIN_STITCH_MEMORY_BYTES {
             return Err(Rejected::TooLittleStitchMemory(config.stitch.memory_bytes));
+        }
+        if config.max_memory > MAX_EVALUATION_MEMORY {
+            return Err(Rejected::TooMuchEvaluationMemory(config.max_memory));
         }
         if config.autodoc && !config.library_learning {
             return Err(Rejected::AutodocWithoutLearning);
@@ -1910,6 +1937,7 @@ mod tests {
 
     fn config() -> RunConfig {
         RunConfig {
+            max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
             autodoc: false,
             arm: Arm::Blind,
             library_learning: true,
@@ -1976,6 +2004,43 @@ mod tests {
         json.as_object_mut().unwrap().remove("library_learning");
         let read: RunConfig = serde_json::from_value(json).unwrap();
         assert!(read.library_learning);
+    }
+
+    /// A memory limit over the most is refused; the most is kept.
+    #[test]
+    fn a_memory_limit_over_the_most_is_refused() {
+        for (bytes, ok) in [
+            (MAX_EVALUATION_MEMORY, true),
+            (MAX_EVALUATION_MEMORY + 1, false),
+            (u64::MAX, false),
+        ] {
+            let made = RunState::create(
+                RunConfig {
+                    max_memory: bytes,
+                    ..config()
+                },
+                vec!["a".into()],
+            );
+            if ok {
+                assert!(made.is_ok(), "{bytes}");
+            } else {
+                assert_eq!(made, Err(Rejected::TooMuchEvaluationMemory(bytes)));
+            }
+        }
+    }
+
+    /// A run written before the setting has the default memory limit.
+    #[test]
+    fn settings_written_before_max_memory_read_back_with_the_default() {
+        let mut json = serde_json::to_value(RunConfig {
+            max_memory: 1 << 20,
+            ..config()
+        })
+        .unwrap();
+        assert_eq!(json["max_memory"], 1 << 20);
+        json.as_object_mut().unwrap().remove("max_memory");
+        let read: RunConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(read.max_memory, dc_tasks::harness::DEFAULT_MAX_MEMORY);
     }
 
     /// A run written before the setting is compared with no run, and a run
@@ -2076,6 +2141,13 @@ mod tests {
                         wall_ms: 0,
                         ..StitchSettings::default()
                     },
+                    ..config()
+                },
+            ),
+            (
+                "max_memory",
+                RunConfig {
+                    max_memory: 0,
                     ..config()
                 },
             ),

@@ -9,6 +9,7 @@ use crate::state::{Arm, FrontierMember, LibraryEntry, LogKind, Rejected};
 
 fn config() -> RunConfig {
     RunConfig {
+        max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
         autodoc: false,
         arm: Arm::Blind,
         library_learning: true,

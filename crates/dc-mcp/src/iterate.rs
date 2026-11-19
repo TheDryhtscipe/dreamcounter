@@ -221,6 +221,8 @@ struct Snapshot {
     candidates: Vec<Candidate>,
     config: DriverConfig,
     stitch: StitchSettings,
+    /// The run's [`RunConfig::max_memory`], for measuring.
+    max_memory: u64,
 }
 
 /// The step's input, or why the iteration cannot end now.
@@ -276,6 +278,7 @@ fn snapshot(state: &RunState) -> Result<Snapshot, FinishError> {
             .collect(),
         config: driver_config(state.config()),
         stitch: state.config().stitch,
+        max_memory: state.config().max_memory,
     })
 }
 
@@ -450,6 +453,7 @@ fn finish(
         &library,
         &kept,
         &snap.members,
+        snap.max_memory,
         cost::Limits {
             deadline: Instant::now() + budget,
             cancel: cancelled,

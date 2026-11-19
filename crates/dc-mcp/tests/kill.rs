@@ -34,6 +34,7 @@ const TORN_TAIL: &[u8] = b"9999 00000000 half a rec";
 
 fn config() -> RunConfig {
     RunConfig {
+        max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
         autodoc: false,
         arm: Arm::Blind,
         library_learning: true,

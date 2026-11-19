@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::proposer::{next_batch, submit, Refused};
-use crate::state::{Arm, CostVerdict, ProgramCost, RunConfig, Standing};
+use crate::state::{Arm, Check, CostVerdict, ProgramCost, RunConfig, Standing};
 
 const MERGE: &str = "collapse/merge";
 const CANCEL: &str = "collapse/cancel";
@@ -24,6 +24,7 @@ const K: u32 = 2;
 
 fn config(quota: u32, prelude: u64) -> RunConfig {
     RunConfig {
+        max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
         autodoc: false,
         arm: Arm::Blind,
         library_learning: true,
@@ -555,6 +556,100 @@ fn a_run_without_library_learning_ends_its_iterations_without_stitch() {
         for task in TASKS {
             let members = state.frontier(task).unwrap();
             assert!(!members.is_empty() && members.len() <= K as usize, "{task}");
+        }
+    }
+}
+
+/// A run's memory limit (`RunConfig::max_memory`) reaches the checks of
+/// its submissions and the measuring of its frontiers. The run has a limit
+/// of 1 MiB. A program that makes an array of a billion elements on every
+/// input stops at that limit on its first example; under the default limit
+/// it would run out of fuel first. The kept programs make an array of
+/// 50,000 elements, about 1.6 MB, from 512 elements: they pass their
+/// examples, and their sweeps stop at the limit from 512.
+#[test]
+fn a_runs_memory_limit_reaches_its_checks_and_its_costs() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("r").unwrap();
+    let config = RunConfig {
+        library_learning: false,
+        max_memory: 1 << 20,
+        ..config(2, shipped_prelude())
+    };
+    store
+        .create_run(&run, config, vec![CANCEL.to_owned()])
+        .unwrap();
+    let v = dc_tasks::families::development()
+        .into_iter()
+        .find(|v| v.family.name() == CANCEL)
+        .unwrap();
+    let with_array = |which: usize, from: u64, length: u64| {
+        let e = v.references[which % v.references.len()].entry;
+        format!(
+            "{}\nlet solve = fun xs -> if length xs < {from} then {e} xs \
+             else (if 0 < array_size (array_tabulate {length} (fun i -> i)) then {e} xs \
+             else {e} xs)\n",
+            v.source
+        )
+    };
+
+    let verifiers = VerifierCache::default();
+    let payload = next_batch(&store, &run, "w", 0, &verifiers)
+        .unwrap()
+        .batch
+        .unwrap();
+    let runaway = with_array(0, 0, 1_000_000_000);
+    submit(
+        &store,
+        &run,
+        payload.batch,
+        "w",
+        &payload.token,
+        vec![runaway],
+        None,
+        0,
+    )
+    .unwrap();
+    check(&store, &run);
+    let checks: Vec<Check> = events(&store, &run)
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Checked(c) if c.batch == payload.batch => Some(c.checks),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    match checks.as_slice() {
+        [Check::Run { error }] => assert!(
+            error.ends_with("no result within the memory limit of 1048576 bytes"),
+            "{error}"
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    fill_with(&store, &run, 10_000, |_, n| with_array(n, 512, 50_000));
+    let missing = WorkerStart {
+        program: dir.path().join("no-such-worker"),
+        args: Vec::new(),
+    };
+    finish_iteration_in_worker(&store, &run, &missing, &AtomicBool::new(false)).unwrap();
+    let members = kept(&store, &run, 0).remove(CANCEL).unwrap();
+    assert!(!members.is_empty());
+    for m in &members {
+        let Some(ProgramCost::Measured { sizes, .. }) = &m.cost else {
+            panic!("{:?}", m.cost);
+        };
+        for size in sizes {
+            if size.n < 512 {
+                assert!(size.median.is_some(), "{size:?}");
+            } else {
+                assert_eq!(
+                    size.failed.as_ref().map(|f| f.kind),
+                    Some(crate::state::FailureKind::MemoryLimit),
+                    "{size:?}"
+                );
+            }
         }
     }
 }

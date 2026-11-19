@@ -520,6 +520,18 @@ fn bad_requests_are_tool_errors_and_change_nothing() {
             511,
             "stitch_memory_mib must be at least 512",
         ),
+        ("max_memory_mib", 0, "max_memory_mib must be at least 1"),
+        (
+            "max_memory_mib",
+            1_048_577,
+            "max_memory_mib must be at most 1048576",
+        ),
+        // 2^44 MiB is more bytes than a u64 holds.
+        (
+            "max_memory_mib",
+            1_u64 << 44,
+            "max_memory_mib must be at most 1048576",
+        ),
     ] {
         let mut arguments = create("s1", json!([first]));
         arguments[setting] = json!(value);
@@ -640,11 +652,23 @@ fn a_run_compared_with_another_shares_its_settings_or_is_refused() {
             json!({
                 "run": "main", "seed": 7, "proposals_per_task": 2, "frontier_size": 3,
                 "tasks": names, "programs_per_batch": 4, "lease_seconds": 60,
-                "max_unchecked_per_batch": 2
+                "max_unchecked_per_batch": 2, "max_memory_mib": 64
             }),
         )
         .unwrap();
     assert_eq!(main["compared_with"], Value::Null);
+    assert_eq!(main["max_memory_mib"], 64);
+    // A run made without the setting has the harness's default.
+    let plain = client
+        .call(
+            "dc_create_run",
+            json!({ "run": "plain", "seed": 7, "proposals_per_task": 2, "frontier_size": 3 }),
+        )
+        .unwrap();
+    assert_eq!(
+        plain["max_memory_mib"],
+        dc_tasks::harness::DEFAULT_MAX_MEMORY >> 20
+    );
     assert_eq!(main["programs_per_batch"], 4);
     assert_eq!(main["lease_seconds"], 60);
     let base = json!({
@@ -662,6 +686,7 @@ fn a_run_compared_with_another_shares_its_settings_or_is_refused() {
         ("lease_seconds", json!(1800)),
         ("tasks", json!([names[1], names[0]])),
         ("max_unchecked_per_batch", json!(5)),
+        ("max_memory_mib", json!(65)),
     ] {
         let mut arguments = base.clone();
         arguments[setting] = value;
@@ -712,6 +737,7 @@ fn a_run_compared_with_another_shares_its_settings_or_is_refused() {
     assert_eq!(made["programs_per_batch"], 4);
     assert_eq!(made["lease_seconds"], 60);
     assert_eq!(made["max_unchecked_per_batch"], 2);
+    assert_eq!(made["max_memory_mib"], 64);
     let tasks: Vec<&str> = made["tasks"]
         .as_array()
         .unwrap()
