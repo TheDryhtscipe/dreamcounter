@@ -121,8 +121,10 @@ pub struct CreateRun {
     pub compared_with: Option<String>,
     /// Whether each payload names an approach to try, drawn by the run's
     /// seed from a fixed list that does not depend on the task (decision
-    /// D32). A task's batches in one iteration get different approaches
-    /// until the list runs out. If absent, the compared run's, or false.
+    /// D32). A task's batches in one iteration that hold a live lease or
+    /// were submitted get different approaches until the list runs out; a
+    /// batch whose lease ended unsubmitted gives its approach to the next.
+    /// If absent, the compared run's, or false.
     pub approach_hints: Option<bool>,
     /// Whether each payload shows the programs already received for its
     /// task in this iteration, without results, and asks for a different

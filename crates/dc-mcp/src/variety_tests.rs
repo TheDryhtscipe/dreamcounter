@@ -138,8 +138,8 @@ fn with_both_settings_off_a_payload_has_no_hint_and_no_received_programs() {
     assert!(r.store.state(&r.run).unwrap().received(MERGE).is_empty());
 }
 
-/// Each of a task's batches in one iteration names a different approach,
-/// until the list runs out.
+/// Each of a task's batches in one iteration names a different approach
+/// while their leases are live, until the list runs out.
 #[test]
 fn a_task_s_batches_in_an_iteration_name_different_approaches() {
     let n = APPROACH_HINTS.len();
@@ -418,4 +418,56 @@ fn a_repeat_submission_is_not_shown() {
         r.store.state(&r.run).unwrap().received(MERGE),
         ["let solve xs = xs -- first"]
     );
+}
+
+/// A lease is live up to and including its deadline, so a batch issued at
+/// that moment does not take the slot of one still live. The slot the
+/// state records is the one whose approach the payload named.
+#[test]
+fn a_batch_issued_at_another_s_deadline_takes_a_free_slot() {
+    let r = Run::new(config(3, true, false));
+    let at = |worker: &str, now_ms: u64| -> (u64, String) {
+        let got = next_batch(&r.store, &r.run, worker, now_ms, &r.verifiers).unwrap();
+        let payload = got
+            .batch
+            .unwrap_or_else(|| panic!("no batch: {:?}", got.wait));
+        (payload.batch, payload.prompt)
+    };
+    for i in 0..4 {
+        at(&format!("w{i}"), 0);
+    }
+    // Batches 0 and 2 are MERGE's, in slots 0 and 1; their leases end at
+    // 1000, and are still live then.
+    let (b, prompt) = at("late", 1000);
+    let state = r.store.state(&r.run).unwrap();
+    let batch = state.batch(b).unwrap();
+    assert_eq!(batch.task, MERGE);
+    assert_eq!(batch.slot, 2);
+    assert_eq!(hints_in(&prompt), [approach_hint(3, 0, MERGE, 2)]);
+    for n in 0..b {
+        let earlier = state.batch(n).unwrap();
+        assert_eq!(earlier.slot, approach_hint_slot_of(&r, n));
+    }
+}
+
+/// The slot whose approach batch `n`'s payload named, read from its prompt.
+fn approach_hint_slot_of(r: &Run, n: u64) -> u64 {
+    let mut table = PromptTable::default();
+    let mut found = None;
+    r.store
+        .for_each_event(&r.run, |e| {
+            table.see(&e);
+            if let Event::BatchIssued(b) = &e {
+                if b.batch == n {
+                    found = Some((b.task.clone(), table.read_payload(b).unwrap().prompt));
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+    let (task, prompt) = found.unwrap();
+    let named = hints_in(&prompt);
+    (0..APPROACH_HINTS.len() as u64)
+        .find(|&k| named == [approach_hint(3, 0, &task, k)])
+        .unwrap()
 }

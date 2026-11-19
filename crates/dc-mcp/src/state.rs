@@ -1189,7 +1189,8 @@ pub struct RunState {
     /// [`RunState::received`]).
     received: BTreeMap<String, Vec<String>>,
     /// The batches issued for each task in the current iteration, by
-    /// number.
+    /// number. It is derived, like the indexes, and empties when the
+    /// iteration ends.
     issued_now: BTreeMap<String, Vec<u64>>,
 }
 
@@ -1862,10 +1863,13 @@ impl RunState {
 
     /// The slot of a batch for `task` issued now, at `now_ms`: the least
     /// slot that no batch of the task in the current iteration holds. A
-    /// batch holds its slot while its lease is live and once its worker
-    /// has submitted for it. So a batch whose lease ended without a
-    /// submission gives its slot, and with it its approach, to the next
-    /// (decision D32).
+    /// batch holds its slot while its lease is live (up to and including
+    /// its deadline, as in [`RunState::leased`]) and once its worker has
+    /// submitted for it. So a batch whose lease ended without a submission
+    /// gives its slot, and with it its approach, to the next (decision
+    /// D32). A submission that comes after its lease ended makes its batch
+    /// hold the slot again, so it can share the slot with the batch that
+    /// took it meanwhile.
     pub fn hint_slot(&self, task: &str, now_ms: u64) -> u64 {
         let held: BTreeSet<u64> = self
             .issued_now
@@ -1873,7 +1877,7 @@ impl RunState {
             .into_iter()
             .flatten()
             .filter_map(|&n| self.batches.get(n))
-            .filter(|b| b.submitted || b.deadline_ms > now_ms)
+            .filter(|b| b.submitted || now_ms <= b.deadline_ms)
             .map(|b| b.slot)
             .collect();
         (0..).find(|k| !held.contains(k)).unwrap_or(0)
