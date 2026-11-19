@@ -20,7 +20,7 @@ use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, TryLockError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dc_driver::CompressionReport;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -29,6 +29,9 @@ use rmcp::service::RequestContext;
 use rmcp::{schemars, tool, tool_handler, tool_router, RoleServer, ServerHandler};
 use serde::{Deserialize, Serialize};
 
+use crate::diversity::{
+    passed_programs, report as diversity_report, DiversityReport, GrowthLimits,
+};
 use crate::iterate::{finish_iteration_in_worker, WorkerStart};
 use crate::naming::{next_naming_job, submit_naming, NamingReceipt, NextNamingJob};
 use crate::proposer::{check_pending, next_batch, submit, Clock, NextBatch, Receipt, Refused};
@@ -706,6 +709,28 @@ pub struct LibraryArg {
     pub iteration: Option<u64>,
 }
 
+/// The arguments of `dc_diversity`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DiversityArg {
+    /// The run's id.
+    pub run: String,
+    /// The iteration to report. Every iteration up to the current one if it
+    /// is left out.
+    pub iteration: Option<u64>,
+    /// Whether to run each distinct program on its task's growth sweep and
+    /// name its growth class. Off if it is left out.
+    pub growth: Option<bool>,
+    /// With growth on, no program's run starts after this many seconds.
+    /// 600 if it is left out; at most 3600.
+    pub deadline_seconds: Option<u64>,
+}
+
+/// The default and the most time `dc_diversity` gives to measuring growth,
+/// in seconds.
+const DIVERSITY_DEADLINE_SECONDS: u64 = 600;
+const MAX_DIVERSITY_DEADLINE_SECONDS: u64 = 3600;
+
 /// The result of `dc_library`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct LibraryReport {
@@ -805,11 +830,12 @@ pub struct DcServer {
     store: Arc<Store>,
     /// How `dc_finish_iteration` starts its Stitch worker.
     worker: Arc<WorkerStart>,
-    /// What stops the Stitch runs of this server's calls.
+    /// What stops the long calls of this server: Stitch runs and measuring.
     stops: Arc<Stops>,
 }
 
-/// The cancel flags of the `dc_finish_iteration` calls that are running.
+/// The cancel flags of the `dc_finish_iteration` and `dc_diversity` calls
+/// that are running.
 #[derive(Debug, Default)]
 struct Stops {
     /// Whether the server shut down, and the flag of each running call.
@@ -894,7 +920,7 @@ impl DcServer {
 
 #[cfg(test)]
 impl DcServer {
-    /// How many `dc_finish_iteration` calls are running.
+    /// How many `dc_finish_iteration` and `dc_diversity` calls are running.
     pub(crate) fn finish_calls_running(&self) -> usize {
         self.stops.calls().1.len()
     }
@@ -1268,6 +1294,60 @@ impl DcServer {
                 .map_err(|e| e.to_string())?
         })
         .await
+    }
+
+    /// Reports how varied each task's passed programs are.
+    #[tool(
+        name = "dc_diversity",
+        description = "Report how varied the programs that passed each task of a DreamCounter \
+                       run are, for each iteration up to the current one, or the one given: \
+                       programs passed, distinct core terms (names of variables do not \
+                       count), distinct terms once library and prelude calls are written out, \
+                       the mean Jaccard distance between the compound subterms of each pair, \
+                       and each distinct program with how many passed programs it stands for. \
+                       With growth true it also runs each distinct program on its task's growth \
+                       sweep and gives estimator C's verdict and the number of distinct \
+                       classes, reusing the cost of a kept frontier program with the same \
+                       expansion; no program's run starts after deadline_seconds (default 600, \
+                       at most 3600). Read only."
+    )]
+    async fn diversity(
+        &self,
+        Parameters(arg): Parameters<DiversityArg>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<DiversityReport>, String> {
+        let run = run_id(&arg.run)?;
+        let seconds = arg.deadline_seconds.unwrap_or(DIVERSITY_DEADLINE_SECONDS);
+        if seconds > MAX_DIVERSITY_DEADLINE_SECONDS {
+            return Err(format!(
+                "deadline_seconds is {seconds}; it must be at most {MAX_DIVERSITY_DEADLINE_SECONDS}"
+            ));
+        }
+        let growth = arg.growth.unwrap_or(false);
+        let stop = self.stops.call();
+        let stopping = Arc::clone(&stop.flag);
+        let work = self.blocking(move |store| {
+            // The state first, then the journal: the journal holds at least
+            // what the state does. Measuring runs on the copy, without the
+            // run's lock.
+            let state = store.state(&run).map_err(|e| e.to_string())?;
+            let passed = passed_programs(store, &run).map_err(|e| e.to_string())?;
+            let limits = growth.then(|| GrowthLimits {
+                deadline: Instant::now() + Duration::from_secs(seconds),
+                cancel: &stopping,
+            });
+            diversity_report(&run, &state, &passed, arg.iteration, limits)
+        });
+        let cancelled = context.ct.cancelled_owned();
+        tokio::pin!(work);
+        tokio::pin!(cancelled);
+        tokio::select! {
+            done = &mut work => done,
+            () = &mut cancelled => {
+                stop.stop();
+                work.await
+            }
+        }
     }
 
     /// Checks the submissions of a run that wait to be checked.

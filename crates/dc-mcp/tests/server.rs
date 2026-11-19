@@ -173,6 +173,7 @@ fn the_server_lists_its_tools() {
             "dc_add_note",
             "dc_check_pending",
             "dc_create_run",
+            "dc_diversity",
             "dc_finish_iteration",
             "dc_frontiers",
             "dc_library",
@@ -834,6 +835,7 @@ fn a_proposer_sees_only_its_tools_and_gets_no_results() {
         ("dc_proposal_stats", json!({ "run": "r1" })),
         ("dc_frontiers", json!({ "run": "r1" })),
         ("dc_library", json!({ "run": "r1" })),
+        ("dc_diversity", json!({ "run": "r1" })),
         (
             "dc_create_run",
             json!({ "run": "r2", "seed": 1, "tasks": ["collapse/merge"] }),
@@ -1415,6 +1417,36 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
     }
     assert_eq!(status["current"]["quota_in"], false);
     assert_eq!(status["unnamed"].as_u64().unwrap(), found);
+
+    // Each task had one program, the good reference. With no time to
+    // measure, its class still comes from the kept frontier's cost.
+    let diversity = operator
+        .call(
+            "dc_diversity",
+            json!({ "run": "r1", "iteration": 0, "growth": true, "deadline_seconds": 0 }),
+        )
+        .unwrap();
+    let iteration = &diversity["iterations"][0];
+    assert_eq!(iteration["iteration"], 0, "{diversity}");
+    for task in iteration["tasks"].as_array().unwrap() {
+        assert_eq!(task["passed"], 1, "{task}");
+        assert_eq!(task["distinct_expanded"], 1, "{task}");
+        assert_eq!(task["mean_distance"], Value::Null, "{task}");
+        assert_eq!(task["distinct_classes"], 1, "{task}");
+        assert_eq!(
+            task["groups"][0]["growth"],
+            json!({ "verdict": { "class": "n" } }),
+            "{task}"
+        );
+    }
+    assert_eq!(iteration["summary"]["passed"], 3, "{diversity}");
+    let too_long = operator
+        .call(
+            "dc_diversity",
+            json!({ "run": "r1", "deadline_seconds": 3601 }),
+        )
+        .unwrap_err();
+    assert!(too_long.contains("at most 3600"), "{too_long}");
 
     // Each kept program was measured on its task's sweep, and the cost is
     // in the journal: a new store reads it back from the file.
