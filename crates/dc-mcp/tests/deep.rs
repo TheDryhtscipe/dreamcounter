@@ -42,7 +42,7 @@ fn checker_child() {
         .stack_size(stack)
         .spawn(move || {
             let family = task("collapse/merge").unwrap();
-            let mut verifier = Verifier::new(&[]).unwrap();
+            let mut verifier = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
             texts
                 .iter()
                 .map(|t| verifier.check(&*family, t))

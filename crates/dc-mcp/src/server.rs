@@ -38,6 +38,7 @@ use crate::state::{
 };
 use crate::store::{Refusals, Store, StoreError};
 use crate::verify::{shipped_prelude, VerifierCache};
+use dc_tasks::harness::DEFAULT_MAX_MEMORY;
 
 /// The arguments of `dc_create_run`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -94,13 +95,18 @@ pub struct CreateRun {
     /// batches and payload bytes that `dc_proposal_stats` reports for the
     /// two runs. Tokens are not matched. If absent, true.
     pub library_learning: Option<bool>,
+    /// The most memory one evaluation of a program may hold, in MiB: each
+    /// run on an example, a large input or a size of the cost sweep. A run
+    /// that would hold more fails with a memory limit, like a run out of
+    /// fuel. At least 1. If absent, the compared run's, or 512.
+    pub max_memory_mib: Option<u64>,
     /// The id of an existing run that this run is compared with, such as
     /// the main run of an LLM-only baseline. Either run may learn a
-    /// library. If given, tasks, programs_per_batch, lease_seconds and
-    /// max_unchecked_per_batch, when absent, are that run's, and the run is
-    /// not made unless its seed, proposals_per_task, frontier_size, tasks
-    /// (in order), programs_per_batch, lease_seconds and
-    /// max_unchecked_per_batch are that run's too, and that run uses this
+    /// library. If given, tasks, programs_per_batch, lease_seconds,
+    /// max_unchecked_per_batch and max_memory_mib, when absent, are that
+    /// run's, and the run is not made unless its seed, proposals_per_task,
+    /// frontier_size, tasks (in order), programs_per_batch, lease_seconds,
+    /// max_unchecked_per_batch and max_memory_mib are that run's too, and that run uses this
     /// server's prelude. The error names each setting that differs.
     /// `dc_run_status` reports the pairing.
     pub compared_with: Option<String>,
@@ -192,6 +198,8 @@ pub struct RunStatus {
     /// Whether the run learns a library. False for the LLM-only baseline
     /// (decision D24), whose library stays empty.
     pub library_learning: bool,
+    /// The most memory one evaluation may hold, in MiB, rounded down.
+    pub max_memory_mib: u64,
     /// The run this one is compared with, if it was made with one.
     pub compared_with: Option<Comparison>,
     /// How many definitions wait for a naming result. While any does, no
@@ -251,6 +259,7 @@ impl RunStatus {
             iteration: state.iteration(),
             autodoc: config.autodoc,
             library_learning: config.library_learning,
+            max_memory_mib: config.max_memory >> 20,
             compared_with: config.compared_with.as_ref().map(|other| Comparison {
                 run: other.clone(),
                 iteration: None,
@@ -291,6 +300,15 @@ impl RunStatus {
 /// The settings of a run that fix the proposals it hands out (decision
 /// D24), as `dc_create_run` names them, where `config` and `tasks` differ
 /// from `other` and `other_tasks`. Each is said with both values.
+/// `bytes` in MiB, with any part of a MiB in bytes, so that limits that
+/// differ by less than a MiB are told apart.
+fn mib(bytes: u64) -> String {
+    match bytes % (1 << 20) {
+        0 => (bytes >> 20).to_string(),
+        part => format!("{} MiB and {part} bytes", bytes >> 20),
+    }
+}
+
 fn differences(
     config: &RunConfig,
     tasks: &[String],
@@ -335,6 +353,12 @@ fn differences(
         "max_unchecked_per_batch",
         config.max_unchecked_per_batch.to_string(),
         other.max_unchecked_per_batch.to_string(),
+    );
+    // It decides which programs pass their checks, and what they cost.
+    check(
+        "max_memory_mib",
+        mib(config.max_memory),
+        mib(other.max_memory),
     );
     if tasks != other_tasks {
         let shown = |t: &[String]| {
@@ -1000,6 +1024,9 @@ impl DcServer {
                 }
             }
         }
+        if arg.max_memory_mib == Some(0) {
+            return Err("max_memory_mib must be at least 1".to_owned());
+        }
         if arg.stitch_iterations == Some(0) {
             return Err("stitch_iterations must be at least 1".to_owned());
         }
@@ -1039,6 +1066,14 @@ impl DcServer {
             let config = RunConfig {
                 autodoc: arg.autodoc.unwrap_or(false),
                 library_learning,
+                max_memory: arg.max_memory_mib.map_or_else(
+                    || {
+                        other
+                            .as_ref()
+                            .map_or(DEFAULT_MAX_MEMORY, |(c, _)| c.max_memory)
+                    },
+                    |m| m.saturating_mul(1 << 20),
+                ),
                 arm: Arm::Blind,
                 seed: arg.seed,
                 proposals_per_task: arg.proposals_per_task,
@@ -1885,6 +1920,7 @@ mod tests {
     #[test]
     fn differences_name_every_setting_that_fixes_proposals() {
         let base = RunConfig {
+            max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
             autodoc: false,
             arm: Arm::Blind,
             library_learning: true,
@@ -1986,6 +2022,7 @@ mod tests {
             .create_run(
                 &run,
                 RunConfig {
+                    max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
                     autodoc: false,
                     arm: Arm::Blind,
                     library_learning: true,
@@ -2071,6 +2108,7 @@ mod tests {
                 .create_run(
                     &run,
                     RunConfig {
+                        max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
                         autodoc: false,
                         arm: Arm::Blind,
                         library_learning: true,

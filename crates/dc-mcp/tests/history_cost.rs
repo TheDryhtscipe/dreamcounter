@@ -101,6 +101,7 @@ fn build(past: u64) -> (TempDir, Store, RunId) {
         .create_run(
             &run,
             RunConfig {
+                max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
                 autodoc: false,
                 arm: Arm::Blind,
                 library_learning: true,

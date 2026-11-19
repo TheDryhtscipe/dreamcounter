@@ -46,6 +46,7 @@ fn a_claim_held_by_a_killed_process_does_not_strand_its_submission() {
         .create_run(
             &run,
             RunConfig {
+                max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
                 autodoc: false,
                 arm: Arm::Blind,
                 library_learning: true,

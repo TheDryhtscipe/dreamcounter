@@ -123,6 +123,14 @@ pub struct RunConfig {
     /// it on.
     #[serde(default = "learns_library")]
     pub library_learning: bool,
+    /// The most memory one evaluation may hold, in bytes
+    /// (`dc_tasks::harness::HarnessConfig::max_memory`): each run of a
+    /// program on an example, a gate input or a size of its sweep. A run
+    /// that would hold more stops with a memory limit failure. It is
+    /// positive. A run made before the setting has
+    /// `dc_tasks::harness::DEFAULT_MAX_MEMORY`.
+    #[serde(default = "default_max_memory")]
+    pub max_memory: u64,
     /// The id of the run this one is compared with, such as the main run
     /// of an LLM-only baseline (decision D24). `dc_create_run` checks that
     /// the two runs share every setting that fixes the proposals they hand
@@ -134,6 +142,11 @@ pub struct RunConfig {
 /// The [`RunConfig::library_learning`] of a run made before the setting.
 fn learns_library() -> bool {
     true
+}
+
+/// The [`RunConfig::max_memory`] of a run made before the setting.
+fn default_max_memory() -> u64 {
+    dc_tasks::harness::DEFAULT_MAX_MEMORY
 }
 
 /// The settings of the Stitch run that ends each iteration: what Stitch
@@ -1188,6 +1201,7 @@ impl RunState {
             ("frontier_size", u64::from(config.frontier_size)),
             ("stitch.iterations", u64::from(config.stitch.iterations)),
             ("stitch.wall_ms", config.stitch.wall_ms),
+            ("max_memory", config.max_memory),
         ] {
             if value == 0 {
                 return Err(Rejected::ZeroSetting(name));
@@ -1910,6 +1924,7 @@ mod tests {
 
     fn config() -> RunConfig {
         RunConfig {
+            max_memory: dc_tasks::harness::DEFAULT_MAX_MEMORY,
             autodoc: false,
             arm: Arm::Blind,
             library_learning: true,
@@ -1976,6 +1991,20 @@ mod tests {
         json.as_object_mut().unwrap().remove("library_learning");
         let read: RunConfig = serde_json::from_value(json).unwrap();
         assert!(read.library_learning);
+    }
+
+    /// A run written before the setting has the default memory limit.
+    #[test]
+    fn settings_written_before_max_memory_read_back_with_the_default() {
+        let mut json = serde_json::to_value(RunConfig {
+            max_memory: 1 << 20,
+            ..config()
+        })
+        .unwrap();
+        assert_eq!(json["max_memory"], 1 << 20);
+        json.as_object_mut().unwrap().remove("max_memory");
+        let read: RunConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(read.max_memory, dc_tasks::harness::DEFAULT_MAX_MEMORY);
     }
 
     /// A run written before the setting is compared with no run, and a run
@@ -2076,6 +2105,13 @@ mod tests {
                         wall_ms: 0,
                         ..StitchSettings::default()
                     },
+                    ..config()
+                },
+            ),
+            (
+                "max_memory",
+                RunConfig {
+                    max_memory: 0,
                     ..config()
                 },
             ),

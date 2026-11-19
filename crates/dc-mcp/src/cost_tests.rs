@@ -107,7 +107,7 @@ fn the_pilot_runs_frontier_programs_get_the_expected_classes() {
         PILOT_PRELUDE,
         "the prelude changed, so the pilot's programs name other functions"
     );
-    let v = Verifier::new(&pilot_library()).unwrap();
+    let v = Verifier::new(&pilot_library(), dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
     for (task, program, expected) in PILOT {
         let cost = measure_program(&v, task, program, &mut || false, "");
         assert_eq!(
@@ -141,7 +141,7 @@ fn the_pilot_runs_frontier_programs_get_the_expected_classes() {
 fn a_program_that_is_wrong_on_the_sweep_is_incorrect_not_measured() {
     // A wrong program that fails its examples is refused, so this one is
     // right below 64 elements, where the examples are, and wrong from 64.
-    let v = Verifier::new(&[]).unwrap();
+    let v = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
     let good = PILOT[2].1;
     let wrong = format!("(lam (if (lt (length $0) 64) ({good} $0) nil))");
     let cost = measure_program(&v, "collapse/cancel", &wrong, &mut || false, "");
@@ -152,9 +152,48 @@ fn a_program_that_is_wrong_on_the_sweep_is_incorrect_not_measured() {
     assert!(sizes[0].median.is_some());
 }
 
+/// The verifier's memory limit reaches the sweep. From 512 elements this
+/// program also makes an array of 50,000 elements, about 1.6 MB: under the
+/// default limit every size is measured, and under a limit of 1 MiB the
+/// sizes from 512 stop at the memory limit.
+#[test]
+fn the_memory_limit_reaches_the_sweep() {
+    let good = PILOT[2].1;
+    let program = format!(
+        "(lam (if (lt (length $0) 512) ({good} $0) \
+         (if (lt 0 (array_size (array_tabulate 50000 (lam $0)))) ({good} $0) nil)))"
+    );
+    let roomy = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
+    let cost = measure_program(&roomy, "collapse/cancel", &program, &mut || false, "");
+    let ProgramCost::Measured { sizes, .. } = &cost else {
+        panic!("{cost:?}");
+    };
+    assert!(sizes.iter().all(|s| s.median.is_some()), "{sizes:?}");
+
+    let tight = Verifier::new(&[], 1 << 20).unwrap();
+    let cost = measure_program(&tight, "collapse/cancel", &program, &mut || false, "");
+    let ProgramCost::Measured { sizes, .. } = &cost else {
+        panic!("{cost:?}");
+    };
+    for size in sizes {
+        if size.n < 512 {
+            assert!(size.median.is_some(), "{size:?}");
+        } else {
+            assert_eq!(
+                size.failed,
+                Some(SizeFailure {
+                    seed: 0,
+                    kind: FailureKind::MemoryLimit
+                }),
+                "{size:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_program_that_fails_its_examples_or_does_not_expand_is_refused() {
-    let v = Verifier::new(&[]).unwrap();
+    let v = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
     for program in ["(lam $0)", "(lam (lib_7 $0))", "(lam"] {
         let cost = measure_program(&v, "collapse/cancel", program, &mut || false, "");
         assert!(
@@ -187,6 +226,7 @@ fn measuring_stops_at_the_deadline_and_on_cancel_and_keeps_every_program() {
         &[],
         &kept("collapse/cancel", &programs),
         &BTreeMap::new(),
+        dc_tasks::harness::DEFAULT_MAX_MEMORY,
         past,
     );
     let members = &out["collapse/cancel"];
@@ -214,6 +254,7 @@ fn measuring_stops_at_the_deadline_and_on_cancel_and_keeps_every_program() {
         &[],
         &kept("collapse/cancel", &programs),
         &BTreeMap::new(),
+        dc_tasks::harness::DEFAULT_MAX_MEMORY,
         cancelled,
     );
     assert!(out["collapse/cancel"].iter().all(|m| m.cost
@@ -224,7 +265,7 @@ fn measuring_stops_at_the_deadline_and_on_cancel_and_keeps_every_program() {
 
 #[test]
 fn a_deadline_inside_a_sweep_stops_it() {
-    let v = Verifier::new(&[]).unwrap();
+    let v = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
     let mut runs = 0;
     let cost = measure_program(
         &v,
@@ -276,6 +317,7 @@ fn a_task_with_no_fuel_plan_refuses_its_programs_without_measuring_them() {
         &[],
         &kept("no/such", &[PILOT[2].1, PILOT[3].1]),
         &BTreeMap::new(),
+        dc_tasks::harness::DEFAULT_MAX_MEMORY,
         never(),
     );
     for m in &out["no/such"] {
@@ -297,7 +339,13 @@ fn a_task_with_no_fuel_plan_refuses_its_programs_without_measuring_them() {
         deadline: Instant::now(),
         cancel: None,
     };
-    let out = measure_frontiers(&[], &kept("no/such", &[PILOT[2].1]), &BTreeMap::new(), past);
+    let out = measure_frontiers(
+        &[],
+        &kept("no/such", &[PILOT[2].1]),
+        &BTreeMap::new(),
+        dc_tasks::harness::DEFAULT_MAX_MEMORY,
+        past,
+    );
     assert_eq!(
         out["no/such"][0].cost,
         Some(ProgramCost::NotMeasured {
@@ -354,7 +402,13 @@ fn a_member_kept_from_the_previous_frontier_keeps_only_a_cost_that_measuring_giv
         "(lam (lib_4294901767 (lib_4294901767 (lib_4294901767 $0))))",
         "(lam (lib_4294901767 $0))",
     ];
-    let out = measure_frontiers(&[], &kept(task, &programs), &previous, never());
+    let out = measure_frontiers(
+        &[],
+        &kept(task, &programs),
+        &previous,
+        dc_tasks::harness::DEFAULT_MAX_MEMORY,
+        never(),
+    );
     let members = &out[task];
     assert_eq!(members[0].cost, Some(marked));
     assert_eq!(members[1].cost, Some(measured));
@@ -496,7 +550,7 @@ fn a_correct_program_slower_than_its_fuel_is_timed_out_for_the_objective() {
     use dc_driver::objective::{member_costs, Growth, Member, TIMEOUT_COST};
     use dc_tasks::growth::GrowthClass;
 
-    let v = Verifier::new(&pilot_library()).unwrap();
+    let v = Verifier::new(&pilot_library(), dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
     // The linear collapse/cancel program, after a cubic computation whose
     // result it drops: the quadratic inversions count of the list, once for
     // each element. The fuel is ten times the reference's steps, so the

@@ -17,7 +17,11 @@
 //! count, whose naive reference is `2ⁿ`. Each size's fuel is ten times that
 //! reference's steps there, within the harness's cap
 //! ([`HarnessConfig::default`]). These are the plans the corpus tests
-//! measure natural solutions with. A process makes each plan once and keeps
+//! measure natural solutions with. A plan is made under the default
+//! harness, memory limit included, whatever the run's memory limit
+//! ([`RunConfig::max_memory`](crate::state::RunConfig::max_memory)), so every
+//! run gives a task's programs the same fuel. The programs themselves run
+//! under the run's memory limit. A process makes each plan once and keeps
 //! it. A plan that cannot be made is tried once in each call of
 //! [`measure_frontiers`], and the task's programs are refused.
 //!
@@ -203,7 +207,7 @@ fn measure_unguarded(
         Ok(term) => term,
         Err(e) => return refused(format!("the program does not expand: {e}")),
     };
-    let config = HarnessConfig::default();
+    let config = *v.harness();
     if stop() {
         return ProgramCost::NotMeasured {
             reason: stopped.to_owned(),
@@ -367,6 +371,8 @@ impl Stopper<'_> {
 /// The members of each task's new frontier, `kept` (program texts, in the
 /// step's order), with their costs. `library` is the library the programs
 /// were written against: the run's, with the step's new abstractions.
+/// Each run of a program may hold `max_memory` bytes
+/// ([`RunConfig::max_memory`](crate::state::RunConfig::max_memory)).
 /// `previous` is each task's frontier before the step; a member whose text
 /// was there keeps its cost if it was measured or incorrect. See the
 /// module docs.
@@ -374,9 +380,10 @@ pub fn measure_frontiers(
     library: &[LibraryEntry],
     kept: &BTreeMap<String, Vec<String>>,
     previous: &BTreeMap<String, Vec<FrontierMember>>,
+    max_memory: u64,
     limits: Limits<'_>,
 ) -> BTreeMap<String, Vec<FrontierMember>> {
-    let verifier = Verifier::new(library);
+    let verifier = Verifier::new(library, max_memory);
     let mut stopper = Stopper {
         limits,
         stopped: None,

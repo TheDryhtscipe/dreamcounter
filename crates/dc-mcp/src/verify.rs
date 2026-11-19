@@ -163,8 +163,9 @@ pub struct Verifier {
 
 impl Verifier {
     /// A verifier for programs written against `library`, with the prelude
-    /// on.
-    pub fn new(library: &[LibraryEntry]) -> Result<Verifier, BadLibrary> {
+    /// on. Each run of a program may hold `max_memory` bytes
+    /// ([`RunConfig::max_memory`]).
+    pub fn new(library: &[LibraryEntry], max_memory: u64) -> Result<Verifier, BadLibrary> {
         #[cfg(test)]
         BUILDS.with(|b| b.set(b.get() + 1));
         let prelude = Prelude::load().map_err(|e| BadLibrary {
@@ -215,7 +216,10 @@ impl Verifier {
             top,
             expander,
             schemes,
-            harness: HarnessConfig::default(),
+            harness: HarnessConfig {
+                max_memory,
+                ..HarnessConfig::default()
+            },
             library: library.to_vec(),
             poisoned: false,
         })
@@ -224,6 +228,11 @@ impl Verifier {
     /// The library the verifier was built for.
     pub fn library(&self) -> &[LibraryEntry] {
         &self.library
+    }
+
+    /// The harness settings programs are checked with.
+    pub fn harness(&self) -> &HarnessConfig {
+        &self.harness
     }
 
     /// The prelude the programs are compiled with.
@@ -260,7 +269,7 @@ impl Verifier {
     /// failure of the run stage, so the submission is still kept.
     pub fn check(&mut self, family: &dyn TaskFamily, text: &str) -> Check {
         if self.poisoned {
-            match Verifier::new(&self.library) {
+            match Verifier::new(&self.library, self.harness.max_memory) {
                 Ok(fresh) => *self = fresh,
                 Err(e) => {
                     return Check::Run {
@@ -353,30 +362,36 @@ impl Verifier {
 /// serves one run; it keeps one verifier, for the longest library it has
 /// been given. A verifier is handed out only for a library equal to the one
 /// it was built for, entry by entry, so a cache shared by mistake between
-/// runs costs builds, not wrong checks.
+/// runs costs builds, not wrong checks. So does a verifier asked for with
+/// another memory limit.
 #[derive(Debug, Default)]
 pub struct VerifierCache {
     latest: Mutex<Option<Arc<Verifier>>>,
 }
 
 impl VerifierCache {
-    /// The kept verifier, if it was built for exactly `library`.
-    pub fn get(&self, library: &[LibraryEntry]) -> Option<Arc<Verifier>> {
+    /// The kept verifier, if it was built for exactly `library` and
+    /// `max_memory`.
+    pub fn get(&self, library: &[LibraryEntry], max_memory: u64) -> Option<Arc<Verifier>> {
         let latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
         latest
             .as_ref()
-            .filter(|v| v.library.as_slice() == library)
+            .filter(|v| v.library.as_slice() == library && v.harness.max_memory == max_memory)
             .cloned()
     }
 
-    /// A verifier for `library`: the kept one if it was built for exactly
-    /// `library`, or a new one. A new one is kept unless the kept one is for
-    /// a longer library.
-    pub fn get_or_build(&self, library: &[LibraryEntry]) -> Result<Arc<Verifier>, BadLibrary> {
-        if let Some(kept) = self.get(library) {
+    /// A verifier for `library` and `max_memory`: the kept one if it was
+    /// built for exactly those, or a new one. A new one is kept unless the
+    /// kept one is for a longer library.
+    pub fn get_or_build(
+        &self,
+        library: &[LibraryEntry],
+        max_memory: u64,
+    ) -> Result<Arc<Verifier>, BadLibrary> {
+        if let Some(kept) = self.get(library, max_memory) {
             return Ok(kept);
         }
-        let built = Arc::new(Verifier::new(library)?);
+        let built = Arc::new(Verifier::new(library, max_memory)?);
         let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
         if latest
             .as_ref()
@@ -470,7 +485,7 @@ mod tests {
     #[test]
     fn a_reference_solution_passes_and_keeps_its_prelude_references() {
         let (family, source, good) = merge();
-        let mut v = Verifier::new(&[]).unwrap();
+        let mut v = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         let text = format!("{source}\nlet {ENTRY} = {good}\n");
         let Check::Passed { program } = v.check(&*family, &text) else {
             panic!("{:?}", v.check(&*family, &text));
@@ -489,7 +504,7 @@ mod tests {
     #[test]
     fn each_stage_reports_its_own_failure() {
         let (family, _, _) = merge();
-        let mut v = Verifier::new(&[]).unwrap();
+        let mut v = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         type Expect = fn(&Check) -> bool;
         let cases: [(&str, Expect); 5] = [
             ("let solve xs = (", |c| matches!(c, Check::Compile { .. })),
@@ -515,7 +530,7 @@ mod tests {
     #[test]
     fn a_program_that_runs_out_of_fuel_is_a_run_failure() {
         let (family, _, _) = merge();
-        let mut v = Verifier::new(&[]).unwrap();
+        let mut v = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         let text = "let solve xs = loop 1000000000 xs (fun i acc -> acc)";
         let c = v.check(&*family, text);
         assert!(
@@ -527,8 +542,8 @@ mod tests {
     #[test]
     fn a_program_over_the_memory_limit_is_a_run_failure() {
         let (family, _, _) = merge();
-        let mut v = Verifier::new(&[]).unwrap();
-        v.harness.max_memory = 1 << 20;
+        let mut v = Verifier::new(&[], 1 << 20).unwrap();
+        assert_eq!(v.harness().max_memory, 1 << 20);
         let text = "let solve xs = loop 1000000000 xs (fun i acc -> i :: acc)";
         let c = v.check(&*family, text);
         assert!(
@@ -536,6 +551,52 @@ mod tests {
                 if error.ends_with("no result within the memory limit of 1048576 bytes")),
             "{c:?}"
         );
+    }
+
+    /// The verifier's memory limit reaches the examples and the gate: a
+    /// program that holds about 3 MB on the gate's inputs only passes under
+    /// the default limit, and fails on the gate, not on its examples, under
+    /// a limit of 1 MiB.
+    #[test]
+    fn the_memory_limit_reaches_the_gate() {
+        let v = development()
+            .into_iter()
+            .find(|v| v.family.name() == "dominance/weighted-inversions")
+            .unwrap();
+        let good = v.references.last().unwrap();
+        let text = format!(
+            "{}\nlet {ENTRY} = fun xs -> if length xs > 100 \
+             then (if array_size (array_tabulate 100000 (fun i -> i)) > 0 then {} xs else 0) \
+             else {} xs\n",
+            v.source, good.entry, good.entry
+        );
+        let mut roomy = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
+        assert!(
+            matches!(roomy.check(&*v.family, &text), Check::Passed { .. }),
+            "{:?}",
+            roomy.check(&*v.family, &text)
+        );
+        let mut tight = Verifier::new(&[], 1 << 20).unwrap();
+        match tight.check(&*v.family, &text) {
+            Check::Run { error } => assert_eq!(
+                error,
+                "large input 0: no result within the memory limit of 1048576 bytes"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A cache hands out a verifier only for the memory limit it was built
+    /// with.
+    #[test]
+    fn a_cached_verifier_is_for_one_memory_limit() {
+        let cache = VerifierCache::default();
+        let big = cache.get_or_build(&[], 2 << 20).unwrap();
+        assert_eq!(big.harness().max_memory, 2 << 20);
+        assert!(cache.get(&[], 1 << 20).is_none());
+        let small = cache.get_or_build(&[], 1 << 20).unwrap();
+        assert_eq!(small.harness().max_memory, 1 << 20);
+        assert!(cache.get(&[], 1 << 20).is_some());
     }
 
     #[test]
@@ -551,7 +612,7 @@ mod tests {
             arity: 1,
             term: format!("(lam (lib_{r} (lib_{r} $0)))", r = reverse.0),
         };
-        let mut v = Verifier::new(&[entry]).unwrap();
+        let mut v = Verifier::new(&[entry], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         assert_eq!(v.schemes().len(), 1);
         // fn_0 is the identity on lists, so this has the right type and the
         // wrong output; without fn_0 in scope it would not compile.
@@ -569,7 +630,12 @@ mod tests {
             arity: 1,
             term: "(lam (add $0 true))".into(),
         };
-        assert_eq!(Verifier::new(&[entry]).unwrap_err().index, 0);
+        assert_eq!(
+            Verifier::new(&[entry], dc_tasks::harness::DEFAULT_MAX_MEMORY)
+                .unwrap_err()
+                .index,
+            0
+        );
     }
 
     #[test]
@@ -598,7 +664,7 @@ mod tests {
         let naive = v.references.first().unwrap();
         let good = v.references.last().unwrap();
         assert!(!naive.passes_gate && good.passes_gate);
-        let mut verifier = Verifier::new(&[]).unwrap();
+        let mut verifier = Verifier::new(&[], dc_tasks::harness::DEFAULT_MAX_MEMORY).unwrap();
         let text = |entry: &str| format!("{}\nlet {ENTRY} = {entry}\n", v.source);
         match verifier.check(&*v.family, &text(naive.entry)) {
             Check::Run { error } => assert_eq!(
