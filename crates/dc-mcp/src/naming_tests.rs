@@ -22,6 +22,7 @@ fn config(autodoc: bool) -> RunConfig {
         frontier_size: 5,
         stitch: StitchSettings::default(),
         prelude: shipped_prelude(),
+        compared_with: None,
     }
 }
 

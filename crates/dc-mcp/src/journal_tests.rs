@@ -15,6 +15,7 @@ fn created() -> Event {
             frontier_size: 5,
             stitch: crate::state::StitchSettings::default(),
             prelude: 0,
+            compared_with: None,
         },
         tasks: vec!["a".into()],
     }

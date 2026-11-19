@@ -734,6 +734,7 @@ mod tests {
                     frontier_size: 5,
                     stitch: crate::state::StitchSettings::default(),
                     prelude: crate::verify::shipped_prelude(),
+                    compared_with: None,
                 },
                 vec![MERGE.into(), CANCEL.into()],
             )
@@ -913,6 +914,7 @@ mod tests {
             frontier_size: 5,
             stitch: crate::state::StitchSettings::default(),
             prelude: crate::verify::shipped_prelude(),
+            compared_with: None,
         };
         let tasks = vec![MERGE.to_owned(), CANCEL.to_owned()];
         let created = Event::Created {
@@ -1459,6 +1461,7 @@ mod tests {
             frontier_size: 5,
             stitch: crate::state::StitchSettings::default(),
             prelude: crate::verify::shipped_prelude(),
+            compared_with: None,
         }
     }
 
