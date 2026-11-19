@@ -16,6 +16,8 @@
 //! * [`proposer`]: handing out batches and taking in submissions.
 //! * [`iterate`]: ending an iteration with the step of `dc_driver`.
 //! * [`cost`]: measuring what frontier programs cost on their task's sweep.
+//! * `blocking`: the threads that run checks and tool calls, which give
+//!   back the memory a large evaluation freed.
 //!
 //! # Tools
 //!
@@ -33,6 +35,7 @@
 //! Started as `dc-mcp --stitch-worker`, the binary is the Stitch worker
 //! process of `dc_finish_iteration` and serves nothing (see [`iterate`]).
 
+mod blocking;
 pub mod cost;
 pub mod iterate;
 pub mod journal;

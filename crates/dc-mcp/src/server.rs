@@ -897,7 +897,7 @@ impl DcServer {
         F: FnOnce(&Store) -> Result<T, String> + Send + 'static,
     {
         let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || work(&store))
+        crate::blocking::spawn(move || work(&store))
             .await
             .map_err(|e| format!("the tool call did not finish: {e}"))?
             .map(Json)
@@ -1530,7 +1530,7 @@ impl ProposerServer {
         let run = self.run.clone();
         let checker = Arc::clone(&self.checker);
         let verifiers = Arc::clone(&self.verifiers);
-        tokio::task::spawn_blocking(move || {
+        crate::blocking::spawn(move || {
             let mut retry = CHECK_RETRY_FIRST;
             checker.drain(
                 || match catch_check(|| {
@@ -1571,7 +1571,7 @@ impl ProposerServer {
         let store = Arc::clone(&self.store);
         let run = self.run.clone();
         let clock = Arc::clone(&self.clock);
-        let done = tokio::task::spawn_blocking(move || work(&store, &run, clock.now_ms()))
+        let done = crate::blocking::spawn(move || work(&store, &run, clock.now_ms()))
             .await
             .map_err(|e| {
                 let _ = writeln!(

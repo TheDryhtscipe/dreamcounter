@@ -342,6 +342,7 @@ dependencies = [
 name = "dc-mcp"
 version = "0.1.0"
 dependencies = [
+ "dc-alloc",
  "dc-compress",
  "dc-core",
  "dc-driver",
