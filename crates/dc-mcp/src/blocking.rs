@@ -6,15 +6,21 @@
 //! frees in that thread's arena. A check whose program runs to the memory
 //! limit leaves its thread holding about the limit, resident, after the
 //! program's values are freed, so k such threads held about k times the
-//! limit. [`spawn`] gives that memory back when the job ends.
+//! limit. [`spawn`] gives that memory back when the job ends, and
+//! [`releasing`] when one part of a long job ends.
+//!
+//! Whether to give back is decided from the count `dc_alloc` keeps for the
+//! job's thread. Memory a job allocates and another thread frees after the
+//! job ended is not seen: it goes back to the job thread's arena, and stays
+//! there until a later job gives back, since giving back covers every arena.
 
 use tokio::task::JoinHandle;
 
 /// A job whose thread's heap rose more than this above where it started
-/// gives back the memory the system allocator then holds free. Below it the
-/// job leaves its thread at most a few times this, and glibc trims an
-/// arena's top on its own; above it, giving back costs far less than the
-/// work that grew the heap.
+/// gives back the memory the system allocator then holds free. It keeps
+/// calls that read a little, such as polling tools, from walking every
+/// arena; above it, giving back costs far less than the work that grew the
+/// heap.
 pub(crate) const RELEASE_ABOVE: i64 = 16 << 20;
 
 /// Runs `work` on Tokio's blocking pool. When it ends, or unwinds, after
@@ -30,6 +36,15 @@ where
         let _release = Release::from_now();
         work()
     })
+}
+
+/// Runs `work` on this thread. When it ends, or unwinds, after the thread's
+/// heap rose more than [`RELEASE_ABOVE`] bytes, the free memory of every
+/// arena goes back to the system. A job that runs many checks calls it for
+/// each, so that it does not keep one check's memory while it waits.
+pub(crate) fn releasing<T>(work: impl FnOnce() -> T) -> T {
+    let _release = Release::from_now();
+    work()
 }
 
 /// Gives back free memory when dropped, if the thread's heap rose more than
@@ -56,7 +71,7 @@ impl Drop for Release {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
 mod tests {
     use std::sync::{Arc, Barrier};
 
@@ -186,7 +201,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn runaway_jobs_on_many_threads_leave_little_resident_memory() {
         if std::env::var_os(CHILD).is_some() {
             child();

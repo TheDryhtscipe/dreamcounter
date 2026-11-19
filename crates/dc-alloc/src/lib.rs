@@ -147,7 +147,7 @@ pub fn release_free_memory() -> bool {
         }
         // SAFETY: `malloc_trim` takes a byte count and touches only the
         // allocator's free memory, under the allocator's own locks. It is
-        // safe to call from any thread at any time.
+        // safe to call from any thread outside a signal handler.
         #[allow(unsafe_code)]
         let released = unsafe { malloc_trim(0) };
         released != 0

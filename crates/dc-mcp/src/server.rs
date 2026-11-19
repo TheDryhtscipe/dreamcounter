@@ -1534,7 +1534,7 @@ impl ProposerServer {
             let mut retry = CHECK_RETRY_FIRST;
             checker.drain(
                 || match catch_check(|| {
-                    check_pending(&store, &run, &verifiers)
+                    crate::blocking::releasing(|| check_pending(&store, &run, &verifiers))
                         .map(|_| ())
                         .map_err(|e| e.to_string())
                 }) {
