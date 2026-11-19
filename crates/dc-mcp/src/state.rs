@@ -1026,34 +1026,36 @@ pub struct ModelCounts {
 }
 
 /// Which learned library entries the programs that passed in one iteration
-/// call. A program counts an entry once however often it calls it. Only a
-/// direct call counts: a call made inside another entry's body does not.
-/// Prelude functions are not learned entries and are not counted.
+/// refer to. A program counts an entry once however often it refers to it.
+/// Every reference in the compiled program counts, one in a binding that is
+/// never used too. Only a direct reference counts: one inside another
+/// entry's body does not. Prelude functions are not learned entries and are
+/// not counted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LibraryUptake {
     /// Programs that passed every example.
     pub passed: u64,
-    /// Of those, the programs that call at least one learned entry.
+    /// Of those, the programs that refer to at least one learned entry.
     pub using_library: u64,
-    /// For each entry called, by its index, the programs that call it.
+    /// For each entry referred to, by its index, the programs that refer to it.
     pub entries: BTreeMap<u64, EntryUptake>,
 }
 
-/// The passed programs of one iteration that call one library entry.
+/// The passed programs of one iteration that refer to one library entry.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EntryUptake {
-    /// How many programs call it.
+    /// How many programs refer to it.
     pub programs: u64,
     /// The tasks of those programs.
     pub tasks: BTreeSet<String>,
 }
 
 /// The learned library entries that `program`, a core term as an
-/// s-expression, calls directly: its references below `library_len`. The
+/// s-expression, refers to directly: its references below `library_len`. The
 /// prelude's references are far above any learned index, so they are left
-/// out. A program that does not parse calls none; a passed program is
+/// out. A program that does not parse refers to none; a passed program is
 /// printed by the server, so it always parses.
-fn learned_calls(program: &str, library_len: u64) -> BTreeSet<u64> {
+fn learned_refs(program: &str, library_len: u64) -> BTreeSet<u64> {
     let mut arena = Arena::new();
     let Ok(root) = sexpr::parse(&mut arena, program) else {
         return BTreeSet::new();
@@ -1061,7 +1063,7 @@ fn learned_calls(program: &str, library_len: u64) -> BTreeSet<u64> {
     // The arena shares equal subterms, so each node is visited once.
     let mut seen = BTreeSet::new();
     let mut stack = vec![root];
-    let mut calls = BTreeSet::new();
+    let mut refs = BTreeSet::new();
     while let Some(t) = stack.pop() {
         if !seen.insert(t) {
             continue;
@@ -1069,12 +1071,12 @@ fn learned_calls(program: &str, library_len: u64) -> BTreeSet<u64> {
         let term = arena.get(t);
         if let Term::Lib(LibId(l)) = term {
             if u64::from(l) < library_len {
-                calls.insert(u64::from(l));
+                refs.insert(u64::from(l));
             }
         }
         stack.extend(children(&term));
     }
-    calls
+    refs
 }
 
 /// A program that passed its task's examples and that no iteration step has
@@ -1562,16 +1564,14 @@ impl RunState {
         for check in &c.checks {
             if let Check::Passed { program } = check {
                 uptake.passed += 1;
-                let calls = learned_calls(program, library);
-                if !calls.is_empty() {
+                let refs = learned_refs(program, library);
+                if !refs.is_empty() {
                     uptake.using_library += 1;
                 }
-                for entry in calls {
+                for entry in refs {
                     let used = uptake.entries.entry(entry).or_default();
                     used.programs += 1;
-                    if !used.tasks.contains(&batch.task) {
-                        used.tasks.insert(batch.task.clone());
-                    }
+                    used.tasks.insert(batch.task.clone());
                 }
                 self.verified.push(Verified {
                     task: batch.task.clone(),
@@ -1763,7 +1763,7 @@ impl RunState {
     }
 
     /// Which learned library entries the programs that passed in
-    /// `iteration` call.
+    /// `iteration` refer to.
     pub fn library_uptake(&self, iteration: u64) -> LibraryUptake {
         self.uptake.get(iteration).cloned().unwrap_or_default()
     }
@@ -2194,7 +2194,7 @@ mod tests {
     }
 
     /// Each library entry keeps the iteration whose end added it, and each
-    /// iteration counts the learned entries its passed programs call.
+    /// iteration counts the learned entries its passed programs refer to.
     #[test]
     fn the_library_records_when_each_entry_came_and_which_programs_use_it() {
         let mut s = new_state();

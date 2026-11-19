@@ -34,8 +34,7 @@ use crate::naming::{next_naming_job, submit_naming, NamingReceipt, NextNamingJob
 use crate::proposer::{check_pending, next_batch, submit, Clock, NextBatch, Receipt, Refused};
 use crate::state::{
     Arm, Event, FrontierMember, LibraryUptake, LogKind, LogRecord, RunConfig, RunId, RunState,
-    StitchSettings,
-    DEFAULT_MAX_UNCHECKED_PER_BATCH, MIN_STITCH_MEMORY_BYTES,
+    StitchSettings, DEFAULT_MAX_UNCHECKED_PER_BATCH, MIN_STITCH_MEMORY_BYTES,
 };
 use crate::store::{Refusals, Store, StoreError};
 use crate::verify::{shipped_prelude, VerifierCache};
@@ -298,28 +297,31 @@ pub struct IterationStats {
     /// What came in from each model the proposers named, in the models'
     /// order, with those that named none first (decision D24).
     pub models: Vec<ModelStats>,
-    /// Which learned library entries the programs that passed call.
+    /// Which learned library entries the programs that passed refer to.
     pub library_uptake: UptakeStats,
     /// Each task, in the run's order.
     pub tasks: Vec<TaskStats>,
 }
 
 /// Which learned library entries the programs that passed in one iteration
-/// call. Only programs that passed every example are counted, as only they
-/// are kept compiled. A program counts an entry once however often it
-/// calls it, and only a direct call counts: a call inside another entry's
-/// body does not. Prelude functions are not learned entries.
+/// refer to. Only programs that passed every example are counted, as only
+/// they are kept compiled. A program counts an entry once however often it
+/// refers to it. Every reference in the compiled program counts, one in a
+/// binding that is never used too, so this counts uptake, not calls made
+/// when the program runs. Only a direct reference counts: one inside
+/// another entry's body does not. Prelude functions are not learned
+/// entries.
 #[derive(Debug, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct UptakeStats {
     /// Programs that passed every example.
     pub passed: u64,
-    /// Of those, the programs that call at least one learned entry.
+    /// Of those, the programs that refer to at least one learned entry.
     pub using_library: u64,
-    /// Each entry called, by index, in order.
+    /// Each entry referred to, by index, in order.
     pub entries: Vec<EntryUse>,
 }
 
-/// The passed programs of one iteration that call one library entry.
+/// The passed programs of one iteration that refer to one library entry.
 #[derive(Debug, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct EntryUse {
     /// The entry's index in the library.
@@ -327,7 +329,7 @@ pub struct EntryUse {
     /// The entry's name now, if it has one; programs that call it by no
     /// name call it `fn_<entry>`.
     pub name: Option<String>,
-    /// How many programs call it.
+    /// How many programs refer to it.
     pub programs: u64,
     /// The tasks of those programs, in order of name.
     pub tasks: Vec<String>,
@@ -966,7 +968,7 @@ impl DcServer {
                        compiled, typed and passed their examples, and whether the task was \
                        solved; the bytes of payload and program text; and the submissions \
                        and programs from each model the proposers named; and which learned \
-                       library entries the programs that passed call, so the library's uptake \
+                       library entries the programs that passed refer to, so the library's uptake \
                        can be counted."
     )]
     async fn proposal_stats(

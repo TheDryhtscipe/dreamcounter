@@ -1355,9 +1355,7 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
 
     // The library, with each entry's name, doc and the iteration that
     // added it, is what the journal holds.
-    let library = operator
-        .call("dc_library", json!({ "run": "r1" }))
-        .unwrap();
+    let library = operator.call("dc_library", json!({ "run": "r1" })).unwrap();
     assert_eq!(library["iteration"], 1, "{library}");
     let entries = library["entries"].as_array().unwrap();
     let stored = Store::open(dir.path())
@@ -1422,7 +1420,7 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     assert_eq!(stats["iterations"][1]["tasks_solved"], 1, "{stats}");
-    // The program that passed calls entry 0; iteration 0's programs had no
+    // The program that passed refers to entry 0; iteration 0's programs had no
     // library to call.
     assert_eq!(
         stats["iterations"][1]["library_uptake"],
@@ -1439,8 +1437,9 @@ fn the_operator_ends_an_iteration_and_proposers_get_the_new_library() {
     );
 }
 
-/// A program that solves `task` and whose `solve` calls `abs_0`, so the
-/// call is in the compiled program.
+/// A program that solves `task` and whose `solve` refers to `abs_0` in a
+/// binding it does not use. The compiler keeps the binding, so the
+/// reference is in the compiled program, and uptake counts references.
 fn uses_abs_0(task: &str) -> String {
     let v = dc_tasks::families::development()
         .into_iter()
