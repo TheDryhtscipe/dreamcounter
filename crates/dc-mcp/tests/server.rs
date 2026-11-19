@@ -638,7 +638,8 @@ fn a_run_compared_with_another_shares_its_settings_or_is_refused() {
             "dc_create_run",
             json!({
                 "run": "main", "seed": 7, "proposals_per_task": 2, "frontier_size": 3,
-                "tasks": names, "programs_per_batch": 4, "lease_seconds": 60
+                "tasks": names, "programs_per_batch": 4, "lease_seconds": 60,
+                "max_unchecked_per_batch": 2
             }),
         )
         .unwrap();
@@ -659,6 +660,7 @@ fn a_run_compared_with_another_shares_its_settings_or_is_refused() {
         ("programs_per_batch", json!(1)),
         ("lease_seconds", json!(1800)),
         ("tasks", json!([names[1], names[0]])),
+        ("max_unchecked_per_batch", json!(5)),
     ] {
         let mut arguments = base.clone();
         arguments[setting] = value;
@@ -693,7 +695,10 @@ fn a_run_compared_with_another_shares_its_settings_or_is_refused() {
     let mut bad = base.clone();
     bad["compared_with"] = json!("../main");
     let error = client.call("dc_create_run", bad).unwrap_err();
-    assert!(error.contains("run id"), "{error}");
+    assert!(
+        error.starts_with("compared_with: ") && error.contains("run id"),
+        "{error}"
+    );
 
     // A run that runs no Stitch takes no Stitch setting, and reports none.
     let mut stitched = base.clone();
@@ -705,6 +710,7 @@ fn a_run_compared_with_another_shares_its_settings_or_is_refused() {
     let made = client.call("dc_create_run", base.clone()).unwrap();
     assert_eq!(made["programs_per_batch"], 4);
     assert_eq!(made["lease_seconds"], 60);
+    assert_eq!(made["max_unchecked_per_batch"], 2);
     let tasks: Vec<&str> = made["tasks"]
         .as_array()
         .unwrap()
@@ -1621,4 +1627,55 @@ fn the_binary_is_its_own_stitch_worker() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("usage"));
+}
+
+/// A run's status reports the iteration of the run it is compared with,
+/// not its own.
+#[test]
+fn a_compared_run_reports_the_other_runs_iteration() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut operator = Client::start(dir.path());
+    let tasks = ["collapse/merge"];
+    operator
+        .call(
+            "dc_create_run",
+            json!({
+                "run": "main", "seed": 5, "proposals_per_task": 1, "frontier_size": 2,
+                "library_learning": false, "tasks": tasks
+            }),
+        )
+        .unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("main").unwrap();
+    let mut proposer = Client::start_proposer(dir.path(), "main");
+    let got = proposer
+        .call("dc_next_batch", json!({ "worker": "w" }))
+        .unwrap();
+    let batch = got["batch"]["batch"].as_u64().unwrap();
+    let task = store
+        .read(&run, |s| s.batch(batch).unwrap().task.clone())
+        .unwrap();
+    proposer
+        .call(
+            "dc_submit",
+            json!({ "worker": "w", "batch": batch, "token": got["batch"]["token"],
+                    "programs": [solves(&task)] }),
+        )
+        .unwrap();
+    wait_for_checks(&mut operator, &mut proposer, "main");
+    operator
+        .call("dc_finish_iteration", json!({ "run": "main" }))
+        .unwrap();
+    let base = operator
+        .call(
+            "dc_create_run",
+            json!({ "run": "base", "seed": 5, "proposals_per_task": 1, "frontier_size": 2,
+                    "library_learning": false, "compared_with": "main" }),
+        )
+        .unwrap();
+    assert_eq!(base["iteration"], 0);
+    assert_eq!(
+        base["compared_with"],
+        json!({ "run": "main", "iteration": 1 })
+    );
 }

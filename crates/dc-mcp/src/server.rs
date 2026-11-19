@@ -95,12 +95,14 @@ pub struct CreateRun {
     /// two runs. Tokens are not matched. If absent, true.
     pub library_learning: Option<bool>,
     /// The id of an existing run that this run is compared with, such as
-    /// the main run of an LLM-only baseline. If given, tasks,
-    /// programs_per_batch and lease_seconds, when absent, are that run's,
-    /// and the run is not made unless its seed, proposals_per_task,
-    /// frontier_size, tasks (in order), programs_per_batch, lease_seconds
-    /// and prelude are that run's too. The error names each setting that
-    /// differs. `dc_run_status` reports the pairing.
+    /// the main run of an LLM-only baseline. Either run may learn a
+    /// library. If given, tasks, programs_per_batch, lease_seconds and
+    /// max_unchecked_per_batch, when absent, are that run's, and the run is
+    /// not made unless its seed, proposals_per_task, frontier_size, tasks
+    /// (in order), programs_per_batch, lease_seconds and
+    /// max_unchecked_per_batch are that run's too, and that run uses this
+    /// server's prelude. The error names each setting that differs.
+    /// `dc_run_status` reports the pairing.
     pub compared_with: Option<String>,
 }
 
@@ -170,6 +172,9 @@ pub struct RunStatus {
     pub programs_per_batch: u32,
     /// How long a proposer has to submit a batch, in seconds, rounded up.
     pub lease_seconds: u64,
+    /// The most submissions kept for one batch that are not checked, of
+    /// each kind.
+    pub max_unchecked_per_batch: u32,
     /// The most programs a task's frontier keeps when an iteration ends.
     pub frontier_size: u32,
     /// The settings of the Stitch run that ends an iteration. Null if the
@@ -235,6 +240,7 @@ impl RunStatus {
             proposals_per_task: config.proposals_per_task,
             programs_per_batch: config.programs_per_batch,
             lease_seconds: config.lease_ms.div_ceil(1000),
+            max_unchecked_per_batch: config.max_unchecked_per_batch,
             frontier_size: config.frontier_size,
             stitch: config.library_learning.then(|| StitchStatus {
                 iterations: config.stitch.iterations,
@@ -324,6 +330,12 @@ fn differences(
         seconds(config.lease_ms),
         seconds(other.lease_ms),
     );
+    // It decides which late or repeat submissions are kept.
+    check(
+        "max_unchecked_per_batch",
+        config.max_unchecked_per_batch.to_string(),
+        other.max_unchecked_per_batch.to_string(),
+    );
     if tasks != other_tasks {
         let shown = |t: &[String]| {
             let all = t.join(", ");
@@ -341,7 +353,11 @@ fn differences(
         ));
     }
     if config.prelude != other.prelude {
-        found.push("prelude differs: the runs were made with different preludes".to_owned());
+        found.push(
+            "prelude differs: the run compared with was made with another prelude than \
+             this server's"
+                .to_owned(),
+        );
     }
     found
 }
@@ -823,7 +839,7 @@ impl DcServer {
         let compared_with = match &arg.compared_with {
             None => None,
             Some(text) => {
-                let other = run_id(text)?;
+                let other = run_id(text).map_err(|e| format!("compared_with: {e}"))?;
                 if other == run {
                     return Err("a run cannot be compared with itself".to_owned());
                 }
@@ -905,6 +921,7 @@ impl DcServer {
                 ),
                 max_unchecked_per_batch: arg
                     .max_unchecked_per_batch
+                    .or(other.as_ref().map(|(c, _)| c.max_unchecked_per_batch))
                     .unwrap_or(DEFAULT_MAX_UNCHECKED_PER_BATCH),
                 frontier_size: arg.frontier_size,
                 stitch: StitchSettings {
@@ -1723,7 +1740,6 @@ mod tests {
         // What does not fix the proposals may differ.
         let free = RunConfig {
             library_learning: false,
-            max_unchecked_per_batch: 7,
             stitch: crate::state::StitchSettings {
                 iterations: 9,
                 ..crate::state::StitchSettings::default()
@@ -1776,11 +1792,20 @@ mod tests {
                     prelude: 8,
                     ..base.clone()
                 },
-                "prelude differs: the runs were made with different preludes",
+                "prelude differs: the run compared with was made with another prelude than \
+                 this server's",
             ),
         ] {
             assert_eq!(differences(&changed, &tasks, &base, &tasks), vec![said]);
         }
+        let kept = RunConfig {
+            max_unchecked_per_batch: 7,
+            ..base.clone()
+        };
+        assert_eq!(
+            differences(&kept, &tasks, &base, &tasks),
+            vec!["max_unchecked_per_batch is 7, not 3"]
+        );
         let reversed = vec!["b".to_owned(), "a".to_owned()];
         assert_eq!(
             differences(&base, &reversed, &base, &tasks),
