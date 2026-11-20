@@ -1208,17 +1208,35 @@ fn the_operator_can_check_what_a_stopped_proposer_left() {
     assert_eq!(stats["iterations"][0]["quota_in"], false);
 
     let report = operator
-        .call("dc_check_pending", json!({ "run": "r1" }))
+        .call("dc_check_pending", json!({ "run": "r1", "workers": 3 }))
         .unwrap();
     assert_eq!(
         report,
-        json!({ "run": "r1", "checked": 1, "pending_checks": 0, "claimed_elsewhere": [] })
+        json!({
+            "run": "r1", "checked": 1, "pending_checks": 0, "claimed_elsewhere": [], "workers": 3
+        })
     );
     let stats = operator
         .call("dc_proposal_stats", json!({ "run": "r1" }))
         .unwrap();
     assert_eq!(stats["iterations"][0]["quota_in"], true);
     assert_eq!(stats["iterations"][0]["tasks"][0]["passed"], 1);
+
+    // Without workers, the call picks a number of them itself.
+    let report = operator
+        .call("dc_check_pending", json!({ "run": "r1" }))
+        .unwrap();
+    let workers = report["workers"].as_u64().unwrap();
+    assert!((1..=64).contains(&workers), "{report}");
+    for workers in [0, 65] {
+        let refused = operator
+            .call(
+                "dc_check_pending",
+                json!({ "run": "r1", "workers": workers }),
+            )
+            .unwrap_err();
+        assert!(refused.contains("workers"), "{refused}");
+    }
 }
 
 /// A check whose claimant stopped is taken up when a proposer waits for it,
@@ -1278,11 +1296,13 @@ fn a_proposer_that_waits_for_an_abandoned_check_gets_it_done() {
     assert_eq!(pending(&mut operator), 1);
     // The operator sees which batch another checker holds.
     let report = operator
-        .call("dc_check_pending", json!({ "run": "r1" }))
+        .call("dc_check_pending", json!({ "run": "r1", "workers": 1 }))
         .unwrap();
     assert_eq!(
         report,
-        json!({ "run": "r1", "checked": 0, "pending_checks": 1, "claimed_elsewhere": [0] })
+        json!({
+            "run": "r1", "checked": 0, "pending_checks": 1, "claimed_elsewhere": [0], "workers": 1
+        })
     );
 
     // The claimant stops without checking.

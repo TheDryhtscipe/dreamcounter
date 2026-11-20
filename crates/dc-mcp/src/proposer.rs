@@ -592,6 +592,118 @@ pub fn check_pending(
     })
 }
 
+/// [`check_pending`], with up to `workers` submissions checked at once,
+/// each on a thread of its own (bead dreamcounter-c9df9a). A chain task's
+/// gate takes minutes for each program, so one call that checks a backlog
+/// one at a time leaves the other cores idle.
+///
+/// The workers share nothing but the store and `verifiers`: each claims
+/// and checks as [`check_pending`] does, so the claims keep two of them, or
+/// a worker and another server, from checking one submission. No more
+/// workers start than submissions wait when the call begins. Each check
+/// uses up to the run's memory limit, so the caller sets `workers` with the
+/// machine's memory in mind. After each check, a worker's thread gives back
+/// the memory it freed (see [`crate::blocking`]).
+///
+/// `claimed_elsewhere` names the batches that still waited, claimed by
+/// another checker, once every worker was done; a batch one worker held
+/// while another finished is not among them. The first error a worker met
+/// is returned, after the others are done. A panic in a worker is resumed
+/// on the calling thread.
+pub fn check_pending_parallel(
+    store: &Store,
+    run: &RunId,
+    verifiers: &VerifierCache,
+    workers: usize,
+) -> Result<Checks, Refused> {
+    check_pending_parallel_with(store, run, verifiers, workers, &|verifier, p| {
+        checks(verifier, &p.task, p.wanted, &p.programs)
+    })
+}
+
+/// The most workers [`check_pending_parallel`] is asked for through
+/// `dc_check_pending`.
+pub const MAX_CHECK_WORKERS: usize = 64;
+
+/// How many workers `dc_check_pending` uses when the caller does not say:
+/// one for each core, but no more than `available_memory` holds at
+/// `max_memory` each, at least 1 and at most [`MAX_CHECK_WORKERS`]. If the
+/// available memory is not known, the cores alone.
+pub fn default_check_workers(
+    cores: usize,
+    available_memory: Option<u64>,
+    max_memory: u64,
+) -> usize {
+    let by_memory = available_memory.map_or(usize::MAX, |m| {
+        usize::try_from(m / max_memory.max(1)).unwrap_or(usize::MAX)
+    });
+    cores.min(by_memory).clamp(1, MAX_CHECK_WORKERS)
+}
+
+/// The memory the system says it can give without swapping, in bytes:
+/// `MemAvailable` in `/proc/meminfo`. `None` where there is no such file.
+pub fn available_memory() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    kib.checked_mul(1024)
+}
+
+/// How [`check_pending_parallel_with`] checks a pending submission's
+/// programs. Several threads call it at once.
+type CheckShared<'a> = dyn Fn(&Verifier, &Pending) -> Result<Vec<Check>, Refused> + Sync + 'a;
+
+/// [`check_pending_parallel`], with the programs of each pending submission
+/// checked by `check`. Tests use it to see and slow the checks.
+fn check_pending_parallel_with(
+    store: &Store,
+    run: &RunId,
+    verifiers: &VerifierCache,
+    workers: usize,
+    check: &CheckShared<'_>,
+) -> Result<Checks, Refused> {
+    let waiting = store.read(run, |state| state.pending_checks().len())?;
+    let workers = workers.min(waiting);
+    if workers <= 1 {
+        return check_pending_with(store, run, verifiers, &mut |v, p| check(v, p));
+    }
+    let results: Vec<Result<Checks, Refused>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    check_pending_with(store, run, verifiers, &mut |v, p| {
+                        crate::blocking::releasing(|| check(v, p))
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    let mut checked = 0;
+    for result in results {
+        checked += result?.checked;
+    }
+    // Every worker is done, so a claim still held is another checker's. A
+    // submission that came in as the workers stopped is checked here.
+    let last = check_pending_with(store, run, verifiers, &mut |v, p| check(v, p))?;
+    Ok(Checks {
+        checked: checked + last.checked,
+        claimed_elsewhere: last.claimed_elsewhere,
+    })
+}
+
 /// How [`check_pending_with`] checks a pending submission's programs.
 type CheckWith<'a> = dyn FnMut(&Verifier, &Pending) -> Result<Vec<Check>, Refused> + 'a;
 
@@ -1825,5 +1937,136 @@ mod tests {
             ));
         }
         assert_eq!(events(&store, &run), before);
+    }
+
+    /// Three pending submissions and three workers: the three checks run at
+    /// the same time, and each submission is checked once.
+    #[test]
+    fn parallel_checks_run_at_once() {
+        use std::sync::{Condvar, Mutex};
+
+        let (_dir, store, run) = setup(2, 1);
+        for (batch, worker) in ["a", "b", "c"].into_iter().enumerate() {
+            next_batch(&store, &run, worker, 0).unwrap();
+            sub(
+                &store,
+                &run,
+                batch as u64,
+                worker,
+                vec!["let solve xs = xs".into()],
+                None,
+                1,
+            )
+            .unwrap();
+        }
+        // (checks running now, most running at once, batches checked)
+        let inside = Mutex::new((0usize, 0usize, Vec::<u64>::new()));
+        let all_in = Condvar::new();
+        let verifiers = VerifierCache::default();
+        let done = check_pending_parallel_with(&store, &run, &verifiers, 3, &|v, p| {
+            let mut g = inside.lock().unwrap();
+            g.0 += 1;
+            g.1 = g.1.max(g.0);
+            g.2.push(p.batch);
+            all_in.notify_all();
+            // Wait until all three are in, or give up: one at a time never
+            // gets there.
+            let (mut g, _) = all_in
+                .wait_timeout_while(g, Duration::from_secs(5), |g| g.1 < 3)
+                .unwrap();
+            g.0 -= 1;
+            drop(g);
+            checks(v, &p.task, p.wanted, &p.programs)
+        })
+        .unwrap();
+        let (_, most, mut batches) = inside.into_inner().unwrap();
+        assert_eq!(most, 3, "the checks did not run at once");
+        batches.sort_unstable();
+        assert_eq!(batches, [0, 1, 2], "each submission is checked once");
+        assert_eq!(
+            done,
+            Checks {
+                checked: 3,
+                claimed_elsewhere: vec![]
+            }
+        );
+        assert!(store.state(&run).unwrap().pending_checks().is_empty());
+        assert_eq!(checked(&store, &run).len(), 3);
+    }
+
+    /// A batch one worker of the call holds while another worker runs out of
+    /// submissions is not reported as claimed elsewhere; one that another
+    /// checker holds is.
+    #[test]
+    fn parallel_checks_report_only_claims_held_outside_the_call() {
+        use std::sync::mpsc;
+        use std::sync::Mutex;
+
+        let (_dir, store, run) = setup(2, 1);
+        for (batch, worker) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            next_batch(&store, &run, worker, 0).unwrap();
+            sub(
+                &store,
+                &run,
+                batch as u64,
+                worker,
+                vec!["let solve xs = xs".into()],
+                None,
+                1,
+            )
+            .unwrap();
+        }
+        // Another checker holds batch 3 throughout.
+        let held = store.try_claim_check(&run, 3).unwrap().unwrap();
+        let (last_done, on_last_done) = mpsc::channel::<()>();
+        let last_done = Mutex::new(last_done);
+        let on_last_done = Mutex::new(on_last_done);
+        let verifiers = VerifierCache::default();
+        let done = check_pending_parallel_with(&store, &run, &verifiers, 2, &|v, p| {
+            let checks = checks(v, &p.task, p.wanted, &p.programs);
+            match p.batch {
+                // Slow, until the other worker has checked batches 1 and 2,
+                // found batch 0 held by this worker, and stopped.
+                0 => {
+                    let got = on_last_done
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(30));
+                    assert!(got.is_ok(), "batch 2 was not checked while 0 was");
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                2 => last_done.lock().unwrap().send(()).unwrap(),
+                _ => {}
+            }
+            checks
+        })
+        .unwrap();
+        assert_eq!(
+            done,
+            Checks {
+                checked: 3,
+                claimed_elsewhere: vec![3]
+            }
+        );
+        held.release();
+    }
+
+    #[test]
+    fn default_check_workers_fit_the_cores_and_the_memory() {
+        const MIB: u64 = 1 << 20;
+        // Memory for 35 checks at 512 MiB, 16 cores: the cores bound it.
+        assert_eq!(default_check_workers(16, Some(18_000 * MIB), 512 * MIB), 16);
+        // Memory for 5 checks: the memory bounds it.
+        assert_eq!(default_check_workers(16, Some(2_600 * MIB), 512 * MIB), 5);
+        // Memory for none still checks one at a time.
+        assert_eq!(default_check_workers(16, Some(100 * MIB), 512 * MIB), 1);
+        // Unknown memory: the cores.
+        assert_eq!(default_check_workers(16, None, 512 * MIB), 16);
+        // Never more than the most.
+        assert_eq!(
+            default_check_workers(1000, None, 512 * MIB),
+            MAX_CHECK_WORKERS
+        );
+        assert_eq!(default_check_workers(0, None, 512 * MIB), 1);
     }
 }
