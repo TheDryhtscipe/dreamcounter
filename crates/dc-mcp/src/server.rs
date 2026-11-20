@@ -157,7 +157,9 @@ pub struct CheckPendingArg {
     /// How many submissions to check at once, each on a thread of its own,
     /// from 1 to 64. Each check may hold up to the run's max_memory_mib. If
     /// absent, one for each core, but no more than the memory the system
-    /// has available holds at the run's max_memory_mib each.
+    /// has available when the call starts holds at the run's
+    /// max_memory_mib each. Other calls running at once, and memory
+    /// limits of a cgroup, are not counted.
     pub workers: Option<usize>,
 }
 
@@ -646,8 +648,9 @@ pub struct CheckReport {
     /// by a process that hangs: stop that process, and its claim goes with
     /// it.
     pub claimed_elsewhere: Vec<u64>,
-    /// The most submissions this call would check at once. It starts no
-    /// more than wait when it begins.
+    /// The most submissions this call would check at once: the workers
+    /// asked for, or the default. It starts no more workers than
+    /// submissions wait when it begins.
     pub workers: usize,
 }
 
@@ -1419,7 +1422,9 @@ impl DcServer {
                        servers check in the background, one at a time; use this when one \
                        stopped before it finished, or to see why checks fail. Returns how \
                        many it checked, how many still wait, the batches another server is \
-                       checking, and the workers it used."
+                       checking, and the most it would check at once. The default counts \
+                       only the memory free when the call starts: a caller that runs \
+                       several calls at once should pass workers."
     )]
     async fn check_pending(
         &self,

@@ -37,7 +37,8 @@
 //! was not sent, whatever worker id it gives.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmcp::schemars;
@@ -607,9 +608,13 @@ pub fn check_pending(
 ///
 /// `claimed_elsewhere` names the batches that still waited, claimed by
 /// another checker, once every worker was done; a batch one worker held
-/// while another finished is not among them. The first error a worker met
-/// is returned, after the others are done. A panic in a worker is resumed
-/// on the calling thread.
+/// while another finished is not among them. When a worker meets an error,
+/// the others finish the checks they hold and take up no more; the first
+/// error, in time, is returned, and checks the workers committed stay
+/// committed though the call does not count them. A panic in a worker is
+/// resumed on the calling thread, once the other workers are done. Each
+/// worker builds its own verifier if `verifiers` keeps none for the run's
+/// library.
 pub fn check_pending_parallel(
     store: &Store,
     run: &RunId,
@@ -640,10 +645,8 @@ pub fn default_check_workers(
     cores.min(by_memory).clamp(1, MAX_CHECK_WORKERS)
 }
 
-/// The memory the system says it can give without swapping, in bytes:
-/// `MemAvailable` in `/proc/meminfo`. `None` where there is no such file.
-pub fn available_memory() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+/// `MemAvailable` in the text of `/proc/meminfo`, in bytes.
+fn mem_available(meminfo: &str) -> Option<u64> {
     let kib = meminfo
         .lines()
         .find_map(|line| line.strip_prefix("MemAvailable:"))?
@@ -653,6 +656,12 @@ pub fn available_memory() -> Option<u64> {
         .parse::<u64>()
         .ok()?;
     kib.checked_mul(1024)
+}
+
+/// The memory the system says it can give without swapping, in bytes:
+/// `MemAvailable` in `/proc/meminfo`. `None` where there is no such file.
+pub fn available_memory() -> Option<u64> {
+    mem_available(&std::fs::read_to_string("/proc/meminfo").ok()?)
 }
 
 /// How [`check_pending_parallel_with`] checks a pending submission's
@@ -673,13 +682,34 @@ fn check_pending_parallel_with(
     if workers <= 1 {
         return check_pending_with(store, run, verifiers, &mut |v, p| check(v, p));
     }
-    let results: Vec<Result<Checks, Refused>> = std::thread::scope(|scope| {
+    // The first error a worker meets, in time. Once there is one, the
+    // other workers take up no more checks.
+    let failed: Mutex<Option<Refused>> = Mutex::new(None);
+    let stopping = AtomicBool::new(false);
+    let checked: usize = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
-                    check_pending_with(store, run, verifiers, &mut |v, p| {
+                    let mut stopped = false;
+                    let done = check_pending_with(store, run, verifiers, &mut |v, p| {
+                        if stopping.load(Ordering::SeqCst) {
+                            stopped = true;
+                            return Err(Refused::State("another worker failed".into()));
+                        }
                         crate::blocking::releasing(|| check(v, p))
-                    })
+                    });
+                    match done {
+                        Ok(done) => done.checked,
+                        Err(e) => {
+                            if !stopped {
+                                let mut first =
+                                    failed.lock().unwrap_or_else(PoisonError::into_inner);
+                                first.get_or_insert(e);
+                                stopping.store(true, Ordering::SeqCst);
+                            }
+                            0
+                        }
+                    }
                 })
             })
             .collect();
@@ -689,11 +719,10 @@ fn check_pending_parallel_with(
                 h.join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             })
-            .collect()
+            .sum()
     });
-    let mut checked = 0;
-    for result in results {
-        checked += result?.checked;
+    if let Some(e) = failed.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        return Err(e);
     }
     // Every worker is done, so a claim still held is another checker's. A
     // submission that came in as the workers stopped is checked here.
@@ -2068,5 +2097,80 @@ mod tests {
             MAX_CHECK_WORKERS
         );
         assert_eq!(default_check_workers(0, None, 512 * MIB), 1);
+    }
+
+    /// A worker whose check fails stops the others taking up more checks:
+    /// the failing submission is not tried again by another worker, and the
+    /// call returns that error.
+    #[test]
+    fn a_failed_worker_stops_the_others() {
+        use std::sync::mpsc;
+        use std::sync::Mutex;
+
+        let (_dir, store, run) = setup(2, 1);
+        for (batch, worker) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            next_batch(&store, &run, worker, 0).unwrap();
+            sub(
+                &store,
+                &run,
+                batch as u64,
+                worker,
+                vec!["let solve xs = xs".into()],
+                None,
+                1,
+            )
+            .unwrap();
+        }
+        let calls: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let (b_in, on_b_in) = mpsc::channel::<()>();
+        let (a_failed, on_a_failed) = mpsc::channel::<()>();
+        let (b_in, on_b_in) = (Mutex::new(b_in), Mutex::new(on_b_in));
+        let (a_failed, on_a_failed) = (Mutex::new(a_failed), Mutex::new(on_a_failed));
+        let verifiers = VerifierCache::default();
+        let done = check_pending_parallel_with(&store, &run, &verifiers, 2, &|v, p| {
+            calls.lock().unwrap().push(p.batch);
+            match p.batch {
+                0 => {
+                    // Fails once the other worker is checking batch 1.
+                    let _ = on_b_in
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(30));
+                    a_failed.lock().unwrap().send(()).unwrap();
+                    Err(Refused::State("boom".into()))
+                }
+                1 => {
+                    b_in.lock().unwrap().send(()).unwrap();
+                    let _ = on_a_failed
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(30));
+                    // Time for the failed worker to stop.
+                    std::thread::sleep(Duration::from_millis(500));
+                    Ok(checks(v, &p.task, p.wanted, &p.programs))
+                }
+                _ => Ok(checks(v, &p.task, p.wanted, &p.programs)),
+            }
+            .and_then(|c| c)
+        });
+        let refused = done.unwrap_err();
+        assert!(refused.to_string().contains("boom"), "{refused}");
+        let mut calls = calls.into_inner().unwrap();
+        calls.sort_unstable();
+        assert_eq!(
+            calls,
+            [0, 1],
+            "a worker went on checking after another failed"
+        );
+    }
+
+    #[test]
+    fn mem_available_is_read_from_meminfo_in_bytes() {
+        let meminfo =
+            "MemTotal:       32000000 kB\nMemFree:  100 kB\nMemAvailable:   18484588 kB\n";
+        assert_eq!(mem_available(meminfo), Some(18_484_588 * 1024));
+        assert_eq!(mem_available("MemTotal: 1 kB\n"), None);
+        assert_eq!(mem_available("MemAvailable: lots kB\n"), None);
+        assert_eq!(mem_available("MemAvailable: 12\n"), None);
     }
 }
