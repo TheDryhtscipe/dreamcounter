@@ -377,6 +377,9 @@ fn load(
                 let mut cheap = 0;
                 let mut classed = 0;
                 let mut worse = 0;
+                // Programs without a class, by kind: count and reasons.
+                let mut unmeasured: (u64, BTreeSet<String>) = (0, BTreeSet::new());
+                let mut refused: (u64, BTreeSet<String>) = (0, BTreeSet::new());
                 for g in groups {
                     let Some(growth) = &g.growth else {
                         return Err(CompareError(format!(
@@ -396,13 +399,13 @@ fn load(
                             if strict {
                                 return Err(CompareError(msg));
                             }
-                            warnings.push(format!("{msg}. They count as not cheap"));
+                            unmeasured.0 += g.count;
+                            unmeasured.1.insert(reason.clone());
                         }
-                        GrowthResult::Refused { reason } => warnings.push(format!(
-                            "run {id} iteration {i} {}: {} passed programs could not be run \
-                             on the growth sweep ({reason}); they count as not cheap",
-                            t.name, g.count
-                        )),
+                        GrowthResult::Refused { reason } => {
+                            refused.0 += g.count;
+                            refused.1.insert(reason.clone());
+                        }
                         _ => {}
                     }
                     if let Some(class) = growth.class() {
@@ -414,6 +417,20 @@ fn load(
                         if rank > class_rank(CostClass::Linear) {
                             worse += g.count;
                         }
+                    }
+                }
+                for (kind, found) in [
+                    ("were not measured", &unmeasured),
+                    ("could not be run on the growth sweep", &refused),
+                ] {
+                    let (n, reasons) = found;
+                    if *n > 0 {
+                        warnings.push(format!(
+                            "run {id} iteration {i} {}: {n} passed programs {kind} ({}); \
+                             they count as neither cheap nor worse than n",
+                            t.name,
+                            reasons.iter().cloned().collect::<Vec<_>>().join("; ")
+                        ));
                     }
                 }
                 c.cheap = Some(cheap);
@@ -808,11 +825,39 @@ pub struct Report {
     pub not_computed: Vec<String>,
 }
 
-/// Whether two setting values are equal, numbers by value: `6` and `6.0`
-/// are the same.
+/// Whether two setting values are equal, numbers by value at any depth:
+/// `6` and `6.0` are the same. Two integers are compared exactly, so
+/// integers above 2^53 that round to one float stay apart.
 fn same_value(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-    match (a.as_f64(), b.as_f64()) {
-        (Some(x), Some(y)) => x == y,
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            let int = |n: &serde_json::Number| {
+                n.as_i64()
+                    .map(i128::from)
+                    .or_else(|| n.as_u64().map(i128::from))
+            };
+            // An integer equals a float only if the float is that integer
+            // exactly.
+            let float_is = |n: &serde_json::Number, i: i128| {
+                n.as_f64()
+                    .is_some_and(|v| v.fract() == 0.0 && v.abs() < 1e38 && v as i128 == i)
+            };
+            match (int(x), int(y)) {
+                (Some(i), Some(j)) => i == j,
+                (Some(i), None) => float_is(y, i),
+                (None, Some(j)) => float_is(x, j),
+                (None, None) => x.as_f64() == y.as_f64(),
+            }
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_value(p, q))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, p)| y.get(k).is_some_and(|q| same_value(p, q)))
+        }
         _ => a == b,
     }
 }
@@ -979,13 +1024,14 @@ pub fn analyse(spec: &Spec, base: &Path) -> Result<Report, CompareError> {
             "allow_unfinished is set: iterations that have not finished are counted".to_owned(),
         );
     }
+    // Without each arm's value, a pair with its arms swapped would flip
+    // the sign of its difference unseen.
     if !spec.arm_settings.is_empty()
-        && spec.arm_values.test.is_empty()
-        && spec.arm_values.control.is_empty()
+        && (spec.arm_values.test.is_empty() || spec.arm_values.control.is_empty())
     {
-        warnings.push(
-            "the spec names no arm_values, so a pair with its arms swapped is not found".to_owned(),
-        );
+        return Err(CompareError(
+            "the spec names arm_settings, so it needs arm_values for both arms".to_owned(),
+        ));
     }
     let mut loaded: Vec<(u64, Run, Run)> = Vec::with_capacity(spec.pairs.len());
     let mut wrong_arm = Vec::new();

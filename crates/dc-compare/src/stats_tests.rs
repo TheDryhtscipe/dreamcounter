@@ -321,3 +321,10 @@ fn the_interval_scales_with_the_differences() {
         );
     }
 }
+
+#[test]
+fn sums_that_overflow_are_refused() {
+    let d = [1e308; 6];
+    assert_eq!(sign_flip_p(&d), Err(TestError::NotFinite));
+    assert_eq!(interval(&d, 0.05), Err(TestError::NotFinite));
+}

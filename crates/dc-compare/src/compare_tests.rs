@@ -130,7 +130,10 @@ fn spec(metric: Metric, pairs: &[(u64, &str, &str)]) -> Spec {
             control: "baseline".to_owned(),
         },
         arm_settings: vec!["library_learning".to_owned(), "stitch".to_owned()],
-        arm_values: ArmValues::default(),
+        arm_values: ArmValues {
+            test: [("library_learning".to_owned(), json!(true))].into(),
+            control: [("library_learning".to_owned(), json!(false))].into(),
+        },
         planned_pairs: None,
         allow_unfinished: false,
         worse_than_n_tasks: Vec::new(),
@@ -395,6 +398,7 @@ fn the_cheap_rate_counts_only_fitted_classes_up_to_n_log_n() {
         .collect();
     let mut s = spec(Metric::CheapRate, &refs);
     s.arm_settings = Vec::new();
+    s.arm_values = ArmValues::default();
     s.smallest_effect = 0.05;
     s.worse_than_n_tasks = vec!["chains/count".to_owned()];
     let report = analyse(&s, dir.path()).unwrap();
@@ -484,7 +488,14 @@ fn settings_seeds_and_arm_settings_are_checked_within_each_pair() {
     let b = run("b", 2, true, its);
     write(&dir.path().join("a"), &a);
     write(&dir.path().join("b"), &b);
-    let report = analyse(&spec(Metric::PassRate, &[(1, "a", "b")]), dir.path()).unwrap();
+    // The arms' values name a setting the runs do have apart, so the pair is
+    // not refused, and library_learning is left to the deviations.
+    let mut sp = spec(Metric::PassRate, &[(1, "a", "b")]);
+    sp.arm_values = ArmValues {
+        test: [("frontier_size".to_owned(), json!(4))].into(),
+        control: [("frontier_size".to_owned(), json!(6))].into(),
+    };
+    let report = analyse(&sp, dir.path()).unwrap();
     let d = report.deviations.join("\n");
     assert!(
         d.contains("setting frontier_size differs: 4 in a, 6 in b"),
@@ -746,6 +757,7 @@ fn cheap_pair(dir: &Path, groups: Vec<(u64, Value)>, passed: u64) -> Spec {
     write(&dir.join("b"), &b);
     let mut sp = spec(Metric::CheapRate, &[(1, "a", "b")]);
     sp.arm_settings = Vec::new();
+    sp.arm_values = ArmValues::default();
     sp
 }
 
@@ -835,4 +847,86 @@ fn programs_the_sweep_refused_are_not_cheap_and_warned_about() {
         .warnings
         .iter()
         .any(|w| w.contains("could not be run on the growth sweep")));
+}
+
+#[test]
+fn arm_settings_need_arm_values_for_both_arms() {
+    let dir = tempfile::tempdir().unwrap();
+    let pairs = plain_pairs(dir.path(), 7001, 2);
+    let mut sp = spec(Metric::PassRate, &refs(&pairs));
+    sp.arm_values.control = BTreeMap::new();
+    let err = analyse(&sp, dir.path()).unwrap_err();
+    assert!(err.0.contains("needs arm_values for both arms"), "{err}");
+    sp.arm_values = ArmValues::default();
+    assert!(analyse(&sp, dir.path()).is_err());
+    // Without arm_settings, arm_values are not needed.
+    sp.arm_settings = Vec::new();
+    assert!(analyse(&sp, dir.path()).is_ok());
+}
+
+#[test]
+fn setting_values_are_equal_by_number_at_any_depth() {
+    let same = |a: Value, b: Value| same_value(&a, &b);
+    assert!(same(json!(6), json!(6.0)));
+    assert!(same(
+        json!({"wall_ms": 600000}),
+        json!({"wall_ms": 600000.0})
+    ));
+    assert!(same(json!([1, {"a": 2}]), json!([1.0, {"a": 2.0}])));
+    assert!(!same(json!({"wall_ms": 1}), json!({"wall_ms": 1, "x": 0})));
+    assert!(!same(json!([1]), json!([1, 2])));
+    assert!(!same(json!(6), json!(6.5)));
+    // Integers are exact: u64::MAX is not 2^64, though both round to the
+    // same float, and 2^53 + 1 is not 2^53.
+    assert!(!same(json!(u64::MAX), json!(18_446_744_073_709_551_616.0)));
+    assert!(!same(
+        json!(9_007_199_254_740_993u64),
+        json!(9_007_199_254_740_992u64)
+    ));
+    assert!(same(json!(u64::MAX), json!(u64::MAX)));
+    assert!(same(json!(-3), json!(-3.0)));
+    assert!(!same(json!("6"), json!(6)));
+}
+
+#[test]
+fn programs_without_a_class_give_one_warning_per_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sp = cheap_pair(
+        dir.path(),
+        vec![
+            (2, json!({"not_measured": {"reason": "time ran out"}})),
+            (2, json!({"not_measured": {"reason": "a size timed out"}})),
+            (1, json!({"refused": {"reason": "memory limit"}})),
+            (1, json!({"refused": {"reason": "memory limit"}})),
+        ],
+        6,
+    );
+    sp.metric = Metric::PassRate;
+    let report = analyse(&sp, dir.path()).unwrap();
+    let about = |it: u64, kind: &str| -> Vec<&String> {
+        report
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with(&format!("run a iteration {it} chains/count")))
+            .filter(|w| w.contains(kind))
+            .collect()
+    };
+    let unmeasured = about(1, "were not measured");
+    assert_eq!(unmeasured.len(), 1, "{:?}", report.warnings);
+    assert!(
+        unmeasured[0].contains(
+            "4 passed programs were not measured (a size timed out; time ran out); \
+             they count as neither cheap nor worse than n"
+        ),
+        "{}",
+        unmeasured[0]
+    );
+    let refused = about(1, "could not be run");
+    assert_eq!(refused.len(), 1, "{:?}", report.warnings);
+    assert!(
+        refused[0]
+            .contains("2 passed programs could not be run on the growth sweep (memory limit)"),
+        "{}",
+        refused[0]
+    );
 }

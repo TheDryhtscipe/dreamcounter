@@ -38,7 +38,10 @@ impl std::fmt::Display for TestError {
             TestError::TooMany(s) => {
                 write!(f, "the exact test takes at most {MAX_PAIRS} pairs, not {s}")
             }
-            TestError::NotFinite => write!(f, "a pair's difference is not a finite number"),
+            TestError::NotFinite => write!(
+                f,
+                "a pair's difference, or the sum of the differences, is not a finite number"
+            ),
         }
     }
 }
@@ -86,7 +89,11 @@ impl Patterns {
             sums.push(sum);
             signs.push(sign);
         }
-        let scale = d.iter().map(|x| x.abs()).sum();
+        let scale: f64 = d.iter().map(|x| x.abs()).sum();
+        // Sums that overflow cannot be compared.
+        if !scale.is_finite() {
+            return Err(TestError::NotFinite);
+        }
         Ok(Patterns { sums, signs, scale })
     }
 
@@ -196,13 +203,9 @@ pub fn interval(d: &[f64], alpha: f64) -> Result<Interval, TestError> {
         .map(|(delta, _)| patterns.p(*delta) > alpha)
         .collect();
     let Some(lo) = inside.iter().position(|x| *x) else {
-        // No shift gives p > alpha. Not possible: p at the mean of all the
-        // differences is 1. Kept as an empty interval for safety.
-        return Ok(Interval {
-            lower: Some(f64::NAN),
-            upper: Some(f64::NAN),
-            has_gaps: false,
-        });
+        // No shift gives p > alpha. Not possible for finite sums: p at the
+        // mean of all the differences is 1. Refused rather than reported.
+        return Err(TestError::NotFinite);
     };
     let hi = inside.iter().rposition(|x| *x).unwrap_or(lo);
     let has_gaps = inside[lo..=hi].iter().any(|x| !x);
