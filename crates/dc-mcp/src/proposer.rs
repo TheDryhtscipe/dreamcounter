@@ -604,7 +604,7 @@ pub fn check_pending(
 /// workers start than submissions wait when the call begins. Each check
 /// uses up to the run's memory limit, so the caller sets `workers` with the
 /// machine's memory in mind. After each check, a worker's thread gives back
-/// the memory it freed (see [`crate::blocking`]).
+/// the memory it freed (see the module `crate::blocking`).
 ///
 /// `claimed_elsewhere` names the batches that still waited, claimed by
 /// another checker, once every worker was done; a batch one worker held
