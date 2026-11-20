@@ -856,9 +856,27 @@ fn arm_settings_need_arm_values_for_both_arms() {
     let mut sp = spec(Metric::PassRate, &refs(&pairs));
     sp.arm_values.control = BTreeMap::new();
     let err = analyse(&sp, dir.path()).unwrap_err();
-    assert!(err.0.contains("needs arm_values for both arms"), "{err}");
+    assert!(
+        err.0
+            .contains("need a setting with a different value in each arm"),
+        "{err}"
+    );
     sp.arm_values = ArmValues::default();
     assert!(analyse(&sp, dir.path()).is_err());
+    // A setting with one value in both arms does not tell them apart.
+    sp.arm_values = ArmValues {
+        test: [("library_learning".to_owned(), json!(false))].into(),
+        control: [("library_learning".to_owned(), json!(false))].into(),
+    };
+    let err = analyse(&sp, dir.path()).unwrap_err();
+    assert!(err.0.contains("a different value in each arm"), "{err}");
+    // Nor do settings that are in one arm only.
+    sp.arm_values = ArmValues {
+        test: [("library_learning".to_owned(), json!(true))].into(),
+        control: [("frontier_size".to_owned(), json!(6))].into(),
+    };
+    let err = analyse(&sp, dir.path()).unwrap_err();
+    assert!(err.0.contains("a different value in each arm"), "{err}");
     // Without arm_settings, arm_values are not needed.
     sp.arm_settings = Vec::new();
     assert!(analyse(&sp, dir.path()).is_ok());

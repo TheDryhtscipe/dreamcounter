@@ -325,6 +325,19 @@ fn the_interval_scales_with_the_differences() {
 #[test]
 fn sums_that_overflow_are_refused() {
     let d = [1e308; 6];
-    assert_eq!(sign_flip_p(&d), Err(TestError::NotFinite));
-    assert_eq!(interval(&d, 0.05), Err(TestError::NotFinite));
+    assert_eq!(sign_flip_p(&d), Err(TestError::TooLarge));
+    assert_eq!(interval(&d, 0.05), Err(TestError::TooLarge));
+}
+
+#[test]
+fn differences_too_large_to_test_exactly_are_refused() {
+    let d = [1.5e308, 0.0, 0.0, 0.0, 0.0, 0.0];
+    assert_eq!(sign_flip_p(&d), Err(TestError::TooLarge));
+    assert_eq!(interval(&d, 0.05), Err(TestError::TooLarge));
+    assert_eq!(
+        sign_flip_p(&[-8e307, 8e307, 1.0, 1.0, 1.0, 1.0]),
+        Err(TestError::TooLarge)
+    );
+    // At the bound, the test runs.
+    assert!(sign_flip_p(&[MAX_DIFFERENCE, 1.0]).is_ok());
 }

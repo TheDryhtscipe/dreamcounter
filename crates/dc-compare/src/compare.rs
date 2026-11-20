@@ -1026,11 +1026,19 @@ pub fn analyse(spec: &Spec, base: &Path) -> Result<Report, CompareError> {
     }
     // Without each arm's value, a pair with its arms swapped would flip
     // the sign of its difference unseen.
-    if !spec.arm_settings.is_empty()
-        && (spec.arm_values.test.is_empty() || spec.arm_values.control.is_empty())
-    {
+    // So arm_values must tell the arms apart: some setting in both, with
+    // different values.
+    let apart = spec.arm_values.test.iter().any(|(k, v)| {
+        spec.arm_values
+            .control
+            .get(k)
+            .is_some_and(|w| !same_value(v, w))
+    });
+    if !spec.arm_settings.is_empty() && !apart {
         return Err(CompareError(
-            "the spec names arm_settings, so it needs arm_values for both arms".to_owned(),
+            "the spec names arm_settings, so its arm_values need a setting with a different \
+             value in each arm"
+                .to_owned(),
         ));
     }
     let mut loaded: Vec<(u64, Run, Run)> = Vec::with_capacity(spec.pairs.len());

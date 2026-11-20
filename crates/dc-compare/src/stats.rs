@@ -29,7 +29,14 @@ pub enum TestError {
     TooMany(usize),
     /// A difference is not a finite number.
     NotFinite,
+    /// A difference is larger than [`MAX_DIFFERENCE`] in size.
+    TooLarge,
 }
+
+/// The largest difference the test takes, in size. Sums of differences up
+/// to this stay exact enough in a float; rates, costs and token counts are
+/// far below it.
+pub const MAX_DIFFERENCE: f64 = 1e15;
 
 impl std::fmt::Display for TestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -38,9 +45,10 @@ impl std::fmt::Display for TestError {
             TestError::TooMany(s) => {
                 write!(f, "the exact test takes at most {MAX_PAIRS} pairs, not {s}")
             }
-            TestError::NotFinite => write!(
+            TestError::NotFinite => write!(f, "a pair's difference is not a finite number"),
+            TestError::TooLarge => write!(
                 f,
-                "a pair's difference, or the sum of the differences, is not a finite number"
+                "a pair's difference is larger than {MAX_DIFFERENCE:e}, too large to test exactly"
             ),
         }
     }
@@ -71,6 +79,9 @@ impl Patterns {
         if d.iter().any(|x| !x.is_finite()) {
             return Err(TestError::NotFinite);
         }
+        if d.iter().any(|x| x.abs() > MAX_DIFFERENCE) {
+            return Err(TestError::TooLarge);
+        }
         let n = 1usize << d.len();
         let mut sums = Vec::with_capacity(n);
         let mut signs = Vec::with_capacity(n);
@@ -89,11 +100,8 @@ impl Patterns {
             sums.push(sum);
             signs.push(sign);
         }
+        // Finite: each difference is at most MAX_DIFFERENCE in size.
         let scale: f64 = d.iter().map(|x| x.abs()).sum();
-        // Sums that overflow cannot be compared.
-        if !scale.is_finite() {
-            return Err(TestError::NotFinite);
-        }
         Ok(Patterns { sums, signs, scale })
     }
 
