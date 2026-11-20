@@ -608,9 +608,10 @@ pub fn check_pending(
 ///
 /// `claimed_elsewhere` names the batches that still waited, claimed by
 /// another checker, once every worker was done; a batch one worker held
-/// while another finished is not among them. When a worker meets an error,
-/// the others finish the checks they hold and take up no more; the first
-/// error, in time, is returned, and checks the workers committed stay
+/// while another finished is not among them. When a worker's check fails or
+/// panics, the others finish the checks they hold and take up no more; an
+/// error from the store, outside a check, stops them once its worker has
+/// returned. The first error, in time, is returned, and checks the workers committed stay
 /// committed though the call does not count them. A panic in a worker is
 /// resumed on the calling thread, once the other workers are done. Each
 /// worker builds its own verifier if `verifiers` keeps none for the run's
@@ -664,6 +665,17 @@ pub fn available_memory() -> Option<u64> {
     mem_available(&std::fs::read_to_string("/proc/meminfo").ok()?)
 }
 
+/// Sets its flag if it is dropped while its thread panics.
+struct StopOnPanic<'a>(&'a AtomicBool);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// How [`check_pending_parallel_with`] checks a pending submission's
 /// programs. Several threads call it at once.
 type CheckShared<'a> = dyn Fn(&Verifier, &Pending) -> Result<Vec<Check>, Refused> + Sync + 'a;
@@ -696,7 +708,14 @@ fn check_pending_parallel_with(
                             stopped = true;
                             return Err(Refused::State("another worker failed".into()));
                         }
-                        crate::blocking::releasing(|| check(v, p))
+                        // Set before the claim is let go, on an error or a
+                        // panic, so no other worker takes the batch up.
+                        let _stop = StopOnPanic(&stopping);
+                        let checked = crate::blocking::releasing(|| check(v, p));
+                        if checked.is_err() {
+                            stopping.store(true, Ordering::SeqCst);
+                        }
+                        checked
                     });
                     match done {
                         Ok(done) => done.checked,
@@ -2099,9 +2118,10 @@ mod tests {
         assert_eq!(default_check_workers(0, None, 512 * MIB), 1);
     }
 
-    /// A worker whose check fails stops the others taking up more checks:
-    /// the failing submission is not tried again by another worker, and the
-    /// call returns that error.
+    /// A worker whose check fails stops the others taking up more checks,
+    /// so another worker does not try the failing submission again, and the
+    /// call returns that error. The 500 ms wait gives the failed worker time
+    /// to return; on a machine too slow for that, the test fails falsely.
     #[test]
     fn a_failed_worker_stops_the_others() {
         use std::sync::mpsc;
@@ -2172,5 +2192,68 @@ mod tests {
         assert_eq!(mem_available("MemTotal: 1 kB\n"), None);
         assert_eq!(mem_available("MemAvailable: lots kB\n"), None);
         assert_eq!(mem_available("MemAvailable: 12\n"), None);
+    }
+
+    /// A worker whose check panics stops the others taking up more checks,
+    /// so the panicking submission is not tried by each worker in turn.
+    #[test]
+    fn a_panicking_worker_stops_the_others() {
+        use std::sync::mpsc;
+        use std::sync::Mutex;
+
+        let (_dir, store, run) = setup(2, 1);
+        for (batch, worker) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            next_batch(&store, &run, worker, 0).unwrap();
+            sub(
+                &store,
+                &run,
+                batch as u64,
+                worker,
+                vec!["let solve xs = xs".into()],
+                None,
+                1,
+            )
+            .unwrap();
+        }
+        let calls: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let (b_in, on_b_in) = mpsc::channel::<()>();
+        let (a_failed, on_a_failed) = mpsc::channel::<()>();
+        let (b_in, on_b_in) = (Mutex::new(b_in), Mutex::new(on_b_in));
+        let (a_failed, on_a_failed) = (Mutex::new(a_failed), Mutex::new(on_a_failed));
+        let verifiers = VerifierCache::default();
+        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_pending_parallel_with(&store, &run, &verifiers, 2, &|v, p| {
+                calls.lock().unwrap().push(p.batch);
+                match p.batch {
+                    0 => {
+                        let _ = on_b_in
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(30));
+                        a_failed.lock().unwrap().send(()).unwrap();
+                        panic!("boom");
+                    }
+                    1 => {
+                        b_in.lock().unwrap().send(()).unwrap();
+                        let _ = on_a_failed
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(30));
+                        // Time for the panicking worker to unwind.
+                        std::thread::sleep(Duration::from_millis(500));
+                        checks(v, &p.task, p.wanted, &p.programs)
+                    }
+                    _ => checks(v, &p.task, p.wanted, &p.programs),
+                }
+            })
+        }));
+        assert!(done.is_err(), "the panic was not passed on");
+        let mut calls = calls.into_inner().unwrap_or_else(PoisonError::into_inner);
+        calls.sort_unstable();
+        assert_eq!(
+            calls,
+            [0, 1],
+            "a worker went on checking after another panicked"
+        );
     }
 }
