@@ -287,3 +287,14 @@ fn mean_and_sd() {
     assert_eq!(sd(&[1.0]), None);
     assert_eq!(sd(&[1.0, 2.0, 3.0]), Some(1.0));
 }
+
+#[test]
+fn tiny_differences_are_not_all_ties() {
+    // The tolerance on ties is relative: differences of 1e-12 are tested as
+    // their size allows, not as all equal.
+    let d: Vec<f64> = [1.0, 2.0, 3.0, 1.0, 2.0, 5.0]
+        .iter()
+        .map(|x| x * 1e-12)
+        .collect();
+    assert_eq!(sign_flip_p(&d), Ok(2.0 / 64.0));
+}

@@ -15,7 +15,7 @@ use dc_mcp::state::CostClass;
 use dc_tasks::growth::GrowthClass;
 use serde::{Deserialize, Serialize};
 
-use crate::records::{RecordError, RunRecords};
+use crate::records::{GrowthResult, RecordError, RunRecords};
 use crate::stats::{self, Call, Cell, Interval, Spread, TestError};
 
 /// The primary metric of a comparison.
@@ -64,6 +64,18 @@ pub struct PairSpec {
     pub control: RunSpec,
 }
 
+/// Settings of `dc_run_status` with the value each arm's runs must have.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArmValues {
+    /// The arm under test's values, by setting.
+    #[serde(default)]
+    pub test: BTreeMap<String, serde_json::Value>,
+    /// The control arm's values, by setting.
+    #[serde(default)]
+    pub control: BTreeMap<String, serde_json::Value>,
+}
+
 fn default_alpha() -> f64 {
     0.05
 }
@@ -96,6 +108,18 @@ pub struct Spec {
     /// setting that differs within a pair is a deviation.
     #[serde(default)]
     pub arm_settings: Vec<String>,
+    /// The value each arm's runs must have for some settings of
+    /// `dc_run_status`, so a pair with its arms swapped is a deviation.
+    #[serde(default)]
+    pub arm_values: ArmValues,
+    /// The number of pairs fixed before the runs (D33: 12). A spec with
+    /// another number is a deviation.
+    #[serde(default)]
+    pub planned_pairs: Option<usize>,
+    /// Accept counted or check iterations that have not finished. Only for
+    /// checking the script on runs that stopped early; it is warned about.
+    #[serde(default)]
+    pub allow_unfinished: bool,
     /// Tasks for the secondary share of passed programs worse than `n`.
     #[serde(default)]
     pub worse_than_n_tasks: Vec<String>,
@@ -277,11 +301,29 @@ fn load(
                  next unused seed"
             )));
         };
-        if !stats.quota_in || stats.pending_checks > 0 {
-            warnings.push(format!(
-                "run {id} iteration {i}: quota_in {}, {} checks pending; its counts may be short",
-                stats.quota_in, stats.pending_checks
-            ));
+        if stats.pending_checks > 0 {
+            return Err(CompareError(format!(
+                "run {id} iteration {i} has {} submissions waiting to be checked; run \
+                 dc_check_pending, then export the records again",
+                stats.pending_checks
+            )));
+        }
+        let finished = *i < records.status.iteration;
+        if !finished || !stats.quota_in {
+            let msg = format!(
+                "run {id} iteration {i} {}: batches whose lease has not ended count as fails",
+                if finished {
+                    "finished without its quota"
+                } else {
+                    "has not finished"
+                }
+            );
+            if !finished && !spec.allow_unfinished {
+                return Err(CompareError(format!(
+                    "{msg}. Finish the iteration, or set allow_unfinished to check the script"
+                )));
+            }
+            warnings.push(msg);
         }
         let diversity = records.diversity_of(*i);
         if records.diversity.is_some() && diversity.is_none() {
@@ -306,11 +348,15 @@ fn load(
                 let groups = groups.map_or(&[][..], |g| g.groups.as_slice());
                 let in_groups: u64 = groups.iter().map(|g| g.count).sum();
                 if in_groups != t.passed {
-                    warnings.push(format!(
+                    let msg = format!(
                         "run {id} iteration {i} {}: diversity.json has {in_groups} passed \
-                         programs, proposal_stats.json {}",
+                         programs, proposal_stats.json {}; export both after the run's checks",
                         t.name, t.passed
-                    ));
+                    );
+                    if need_growth {
+                        return Err(CompareError(msg));
+                    }
+                    warnings.push(msg);
                 }
                 let mut cheap = 0;
                 let mut classed = 0;
@@ -323,6 +369,21 @@ fn load(
                             t.name
                         )));
                     };
+                    match growth {
+                        GrowthResult::NotMeasured { reason } if need_growth => {
+                            return Err(CompareError(format!(
+                                "run {id} iteration {i} {}: a program was not measured \
+                                 ({reason}); run dc_diversity with a longer deadline_seconds",
+                                t.name
+                            )));
+                        }
+                        GrowthResult::Refused { reason } => warnings.push(format!(
+                            "run {id} iteration {i} {}: {} passed programs could not be run \
+                             on the growth sweep ({reason}); they count as not cheap",
+                            t.name, g.count
+                        )),
+                        _ => {}
+                    }
                     if let Some(class) = growth.class() {
                         let rank = class_rank(class);
                         classed += g.count;
@@ -356,7 +417,8 @@ pub struct Test {
     pub sd: Option<f64>,
     /// The two-sided p of the exact sign-flip test.
     pub p: f64,
-    /// The 95% interval for the mean difference, by test inversion.
+    /// The interval for the mean difference at the comparison's level, by
+    /// test inversion.
     pub interval: Interval,
 }
 
@@ -750,6 +812,22 @@ fn pair_deviations(spec: &Spec, seed: u64, t: &Run, c: &Run, out: &mut Vec<Strin
             names(c)
         ));
     }
+    for (arm, run, values) in [
+        (&spec.arms.test, t, &spec.arm_values.test),
+        (&spec.arms.control, c, &spec.arm_values.control),
+    ] {
+        let settings = run.records.settings();
+        for (k, want) in values {
+            let got = settings.get(k);
+            if got != Some(want) {
+                out.push(format!(
+                    "pair {seed}: the {arm} run {} has {k} {}, but its arm has {want}",
+                    run.records.status.run,
+                    got.map_or("absent".to_owned(), ToString::to_string),
+                ));
+            }
+        }
+    }
     let (st, sc) = (t.records.settings(), c.records.settings());
     let keys: BTreeSet<&String> = st.keys().chain(sc.keys()).collect();
     for k in keys {
@@ -808,8 +886,65 @@ pub fn analyse(spec: &Spec, base: &Path) -> Result<Report, CompareError> {
             return Err(CompareError(format!("seed {} is in two pairs", p.seed)));
         }
     }
+    for (what, list) in [
+        ("task", &spec.tasks),
+        ("worse-than-n task", &spec.worse_than_n_tasks),
+    ] {
+        let mut seen = BTreeSet::new();
+        for t in list {
+            if !seen.insert(t) {
+                return Err(CompareError(format!("{what} {t} is listed twice")));
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for i in &spec.counted_iterations {
+        if !seen.insert(i) {
+            return Err(CompareError(format!("iteration {i} is counted twice")));
+        }
+    }
     let mut warnings = Vec::new();
     let mut deviations = Vec::new();
+    // D33: each comparison uses its seeds in order and skips none, and runs
+    // a fixed number of pairs.
+    let first = spec.pairs[0].seed;
+    let in_order = spec
+        .pairs
+        .iter()
+        .zip(0u64..)
+        .all(|(p, k)| first.checked_add(k) == Some(p.seed));
+    if !in_order {
+        let listed: Vec<u64> = spec.pairs.iter().map(|p| p.seed).collect();
+        deviations.push(format!(
+            "the pairs' seeds {listed:?} are not consecutive from {first} in order (D33)"
+        ));
+    }
+    match spec.planned_pairs {
+        Some(n) if n != spec.pairs.len() => deviations.push(format!(
+            "the spec has {} pairs, but {n} were planned",
+            spec.pairs.len()
+        )),
+        Some(_) => {}
+        None => {
+            warnings.push("the spec names no planned_pairs, so the count is not checked".to_owned())
+        }
+    }
+    if spec.check_iteration.is_none() {
+        warnings.push("the spec names no check_iteration; D33 checks iteration 0".to_owned());
+    }
+    if spec.allow_unfinished {
+        warnings.push(
+            "allow_unfinished is set: iterations that have not finished are counted".to_owned(),
+        );
+    }
+    if !spec.arm_settings.is_empty()
+        && spec.arm_values.test.is_empty()
+        && spec.arm_values.control.is_empty()
+    {
+        warnings.push(
+            "the spec names no arm_values, so a pair with its arms swapped is not found".to_owned(),
+        );
+    }
     let mut loaded: Vec<(u64, Run, Run)> = Vec::with_capacity(spec.pairs.len());
     for p in &spec.pairs {
         let t = load(spec, base, &p.test, &mut warnings)?;
@@ -821,10 +956,10 @@ pub fn analyse(spec: &Spec, base: &Path) -> Result<Report, CompareError> {
     for (_, t, c) in &loaded {
         for r in [t, c] {
             if !ids.insert(r.records.status.run.clone()) {
-                warnings.push(format!(
+                return Err(CompareError(format!(
                     "run {} is in more than one place in the spec",
                     r.records.status.run
-                ));
+                )));
             }
         }
     }

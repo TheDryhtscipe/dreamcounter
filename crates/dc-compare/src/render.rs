@@ -32,7 +32,7 @@ fn call(c: Call) -> &'static str {
     }
 }
 
-fn compared(out: &mut String, c: &Compared, with_pairs: bool) {
+fn compared(out: &mut String, c: &Compared, with_pairs: bool, alpha: f64) {
     let _ = writeln!(
         out,
         "  {}: test arm mean {}, control mean {}",
@@ -44,10 +44,11 @@ fn compared(out: &mut String, c: &Compared, with_pairs: bool) {
         (Some(t), _) => {
             let _ = writeln!(
                 out,
-                "    mean difference {:+.4}, sd {}, p {:.4}, 95% interval {}, {} pairs",
+                "    mean difference {:+.4}, sd {}, p {:.4}, {}% interval {}, {} pairs",
                 t.mean,
                 num(t.sd),
                 t.p,
+                (1.0 - alpha) * 100.0,
                 interval(&t.interval),
                 t.pairs
             );
@@ -94,11 +95,11 @@ pub fn text(r: &Report, commit: Option<&str>) -> String {
         r.alpha, r.smallest_effect
     );
     let _ = writeln!(out, "\nPRIMARY ({:?})", r.metric);
-    compared(&mut out, &r.primary.metric, true);
+    compared(&mut out, &r.primary.metric, true, r.alpha);
     let _ = writeln!(out, "  CALL: {}", call(r.primary.call));
     if let Some(c) = &r.check {
         let _ = writeln!(out, "\nCHECK (iteration {}, not data)", c.iteration);
-        compared(&mut out, &c.metric, true);
+        compared(&mut out, &c.metric, true, r.alpha);
         let _ = writeln!(
             out,
             "  {}",
@@ -129,7 +130,7 @@ pub fn text(r: &Report, commit: Option<&str>) -> String {
     }
     let _ = writeln!(out, "\nEXPLORATORY (no call)");
     for c in &r.exploratory {
-        compared(&mut out, c, false);
+        compared(&mut out, c, false, r.alpha);
     }
     let _ = writeln!(out, "\nFAILURES (spec tasks, counted iterations)");
     for (arm, f) in [&r.arms.test, &r.arms.control].iter().zip(&r.failures) {

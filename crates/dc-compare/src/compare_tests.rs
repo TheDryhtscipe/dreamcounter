@@ -21,6 +21,10 @@ struct RunData {
     /// By iteration and task, each group's count and growth as JSON.
     growth: Option<Growth>,
     foreign: u64,
+    /// Submissions waiting to be checked, in every iteration.
+    pending_checks: u64,
+    /// Whether the last iteration has not finished.
+    unfinished: bool,
 }
 
 const TASKS: [&str; 2] = ["chains/count", "chains/heaviest"];
@@ -35,6 +39,8 @@ fn run(run: &str, seed: u64, library: bool, iterations: Vec<(u64, Vec<Row>)>) ->
         iterations,
         growth: None,
         foreign: 0,
+        pending_checks: 0,
+        unfinished: false,
     }
 }
 
@@ -46,7 +52,7 @@ fn write(dir: &Path, r: &RunData) {
         "programs_per_batch": r.programs_per_batch, "lease_seconds": 1800,
         "max_unchecked_per_batch": 3, "frontier_size": r.frontier_size,
         "stitch": if r.library_learning { json!({"iterations": 3}) } else { Value::Null },
-        "iteration": last + 1,
+        "iteration": if r.unfinished { last } else { last + 1 },
         "tasks": TASKS.iter().map(|t| json!({"name": t, "frontier_size": 1})).collect::<Vec<_>>(),
         "library_size": 0, "autodoc": true, "library_learning": r.library_learning,
         "max_memory_mib": 512, "compared_with": null, "approach_hints": false,
@@ -61,7 +67,7 @@ fn write(dir: &Path, r: &RunData) {
         .map(|(i, rows)| {
             let passed: u64 = rows.iter().map(|r| r.5).sum();
             json!({
-                "iteration": i, "quota_in": true, "pending_checks": 0, "tasks_solved": 0,
+                "iteration": i, "quota_in": true, "pending_checks": r.pending_checks, "tasks_solved": 0,
                 "submissions": 0, "late": 1, "repeats": 0, "foreign": r.foreign,
                 "refused_repeats": 0, "refused_foreign": 0, "payload_bytes": 0,
                 "submission_bytes": 0, "models": [],
@@ -115,6 +121,9 @@ fn spec(metric: Metric, pairs: &[(u64, &str, &str)]) -> Spec {
             control: "baseline".to_owned(),
         },
         arm_settings: vec!["library_learning".to_owned(), "stitch".to_owned()],
+        arm_values: ArmValues::default(),
+        planned_pairs: None,
+        allow_unfinished: false,
         worse_than_n_tasks: Vec::new(),
         pairs: pairs
             .iter()
@@ -325,7 +334,8 @@ fn the_cheap_rate_counts_only_fitted_classes_up_to_n_log_n() {
         let its = vec![(0, rows.clone()), (1, rows.clone()), (2, rows)];
         // Iterations 1 and 2: the test arm has k cheap programs in each
         // (classes n log n and n), the control 1. The rest are n², too
-        // noisy, not fitted (a timeout), or not measured: none is cheap.
+        // noisy, not fitted (a timeout), refused by the sweep, or
+        // incorrect: none is cheap.
         let groups = |cheap: u64| -> Vec<(u64, Value)> {
             let mut g = vec![(1, class("n log n"))];
             if cheap > 1 {
@@ -336,7 +346,7 @@ fn the_cheap_rate_counts_only_fitted_classes_up_to_n_log_n() {
                 class("n^2"),
                 json!({"verdict": {"too_noisy": {"best": "n"}}}),
                 json!({"verdict": {"not_fitted": {"reason": "fit window has incomplete sizes: timed out [16, 32]"}}}),
-                json!({"not_measured": {"reason": "the time for measuring ran out"}}),
+                json!({"refused": {"reason": "over the memory limit"}}),
                 json!("incorrect"),
             ];
             for (j, f) in fill.iter().enumerate() {
@@ -526,4 +536,221 @@ fn a_spec_reads_from_json_and_refuses_unknown_fields() {
     assert_eq!(s.pairs[0].test.logs, [PathBuf::from("l/a")]);
     let bad = text.replace("\"smallest_effect\"", "\"smallest\"");
     assert!(serde_json::from_str::<Spec>(&bad).is_err());
+}
+
+/// Rows where each task passes `passed` of 6 in each of iterations 0 to 2.
+fn plain(passed: u64) -> Vec<(u64, Vec<Row>)> {
+    let rows: Vec<Row> = vec![
+        ("chains/count", 6, 6, 6, 6, passed),
+        ("chains/heaviest", 6, 6, 6, 6, passed),
+    ];
+    vec![(0, rows.clone()), (1, rows.clone()), (2, rows)]
+}
+
+/// Writes runs `t<k>` (library) and `c<k>` (baseline) for seeds
+/// `first + k`, k from 0, and returns their pairs.
+fn plain_pairs(dir: &Path, first: u64, n: u64) -> Vec<(u64, String, String)> {
+    (0..n)
+        .map(|k| {
+            let seed = first + k;
+            let (t, c) = (format!("t{seed}"), format!("c{seed}"));
+            write(&dir.join(&t), &run(&t, seed, true, plain(4)));
+            write(&dir.join(&c), &run(&c, seed, false, plain(3)));
+            (seed, t, c)
+        })
+        .collect()
+}
+
+fn refs(pairs: &[(u64, String, String)]) -> Vec<(u64, &str, &str)> {
+    pairs
+        .iter()
+        .map(|(s, t, c)| (*s, t.as_str(), c.as_str()))
+        .collect()
+}
+
+#[test]
+fn a_pair_with_its_arms_swapped_is_a_deviation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pairs = plain_pairs(dir.path(), 7001, 2);
+    // The second pair lists its baseline run as the arm under test.
+    let (s, t, c) = pairs.pop().unwrap();
+    pairs.push((s, c, t));
+    let mut sp = spec(Metric::PassRate, &refs(&pairs));
+    sp.arm_values
+        .test
+        .insert("library_learning".to_owned(), json!(true));
+    sp.arm_values
+        .control
+        .insert("library_learning".to_owned(), json!(false));
+    let report = analyse(&sp, dir.path()).unwrap();
+    let d = report.deviations.join("\n");
+    assert!(
+        d.contains(
+            "pair 7002: the library run c7002 has library_learning false, but its arm has true"
+        ),
+        "{d}"
+    );
+    assert!(!d.contains("pair 7001"), "{d}");
+}
+
+#[test]
+fn seeds_out_of_order_or_too_few_pairs_are_deviations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pairs = plain_pairs(dir.path(), 7001, 3);
+    // Pair 7002 dropped: 7001, 7003.
+    pairs.remove(1);
+    let mut sp = spec(Metric::PassRate, &refs(&pairs));
+    sp.planned_pairs = Some(12);
+    let report = analyse(&sp, dir.path()).unwrap();
+    let d = report.deviations.join("\n");
+    assert!(d.contains("not consecutive from 7001"), "{d}");
+    assert!(
+        d.contains("the spec has 2 pairs, but 12 were planned"),
+        "{d}"
+    );
+    // In order and as planned: neither.
+    let pairs = plain_pairs(dir.path(), 8001, 3);
+    let mut sp = spec(Metric::PassRate, &refs(&pairs));
+    sp.planned_pairs = Some(3);
+    let report = analyse(&sp, dir.path()).unwrap();
+    assert!(report.deviations.is_empty(), "{:?}", report.deviations);
+}
+
+#[test]
+fn a_listed_twice_task_iteration_or_run_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let pairs = plain_pairs(dir.path(), 7001, 2);
+    let mut sp = spec(Metric::PassRate, &refs(&pairs));
+    sp.tasks.push("chains/count".to_owned());
+    let err = analyse(&sp, dir.path()).unwrap_err();
+    assert!(err.0.contains("task chains/count is listed twice"), "{err}");
+    let mut sp = spec(Metric::PassRate, &refs(&pairs));
+    sp.counted_iterations.push(1);
+    let err = analyse(&sp, dir.path()).unwrap_err();
+    assert!(err.0.contains("iteration 1 is counted twice"), "{err}");
+    let mut sp = spec(Metric::PassRate, &refs(&pairs));
+    sp.pairs[1].control.records = PathBuf::from("c7001");
+    let err = analyse(&sp, dir.path()).unwrap_err();
+    assert!(
+        err.0.contains("run c7001 is in more than one place"),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_unfinished_iteration_or_pending_checks_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = run("a", 1, true, plain(3));
+    a.unfinished = true;
+    write(&dir.path().join("a"), &a);
+    write(&dir.path().join("b"), &run("b", 1, false, plain(3)));
+    let mut sp = spec(Metric::PassRate, &[(1, "a", "b")]);
+    let err = analyse(&sp, dir.path()).unwrap_err();
+    assert!(
+        err.0.contains("run a iteration 2 has not finished"),
+        "{err}"
+    );
+    // Allowed for checking the script, with a warning.
+    sp.allow_unfinished = true;
+    let report = analyse(&sp, dir.path()).unwrap();
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("run a iteration 2 has not finished")));
+    let mut b = run("b", 1, false, plain(3));
+    b.pending_checks = 1;
+    write(&dir.path().join("b"), &b);
+    let err = analyse(&sp, dir.path()).unwrap_err();
+    assert!(err.0.contains("waiting to be checked"), "{err}");
+}
+
+/// A cheap-rate pair whose test run's count task has `groups` in every
+/// iteration (6 passed), and whose control has 6 programs of class n².
+fn cheap_pair(dir: &Path, groups: Vec<(u64, Value)>, passed: u64) -> Spec {
+    let rows: Vec<Row> = vec![
+        ("chains/count", 6, 6, 6, 6, passed),
+        ("chains/heaviest", 6, 6, 6, 6, 0),
+    ];
+    let its = vec![(0, rows.clone()), (1, rows.clone()), (2, rows)];
+    let growth = |g: &Vec<(u64, Value)>| -> Option<Growth> {
+        Some(
+            [0u64, 1, 2]
+                .iter()
+                .flat_map(|i| {
+                    [
+                        (*i, "chains/count", g.clone()),
+                        (*i, "chains/heaviest", Vec::new()),
+                    ]
+                })
+                .collect(),
+        )
+    };
+    let mut a = run("a", 1, true, its.clone());
+    a.growth = growth(&groups);
+    let mut b = run("b", 1, true, its);
+    b.growth = growth(&vec![(passed, json!({"verdict": {"class": "n^2"}}))]);
+    write(&dir.join("a"), &a);
+    write(&dir.join("b"), &b);
+    let mut sp = spec(Metric::CheapRate, &[(1, "a", "b")]);
+    sp.arm_settings = Vec::new();
+    sp
+}
+
+#[test]
+fn the_cheap_rate_refuses_programs_that_were_not_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let sp = cheap_pair(
+        dir.path(),
+        vec![
+            (3, json!({"verdict": {"class": "n log n"}})),
+            (
+                3,
+                json!({"not_measured": {"reason": "the time for measuring ran out"}}),
+            ),
+        ],
+        6,
+    );
+    let err = analyse(&sp, dir.path()).unwrap_err();
+    assert!(err.0.contains("was not measured"), "{err}");
+    // The pass rate does not need growth, so it still runs.
+    let mut sp = sp;
+    sp.metric = Metric::PassRate;
+    assert!(analyse(&sp, dir.path()).is_ok());
+}
+
+#[test]
+fn the_cheap_rate_refuses_diversity_that_disagrees_with_the_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    // 4 programs in the groups, 6 passed in proposal_stats.
+    let sp = cheap_pair(
+        dir.path(),
+        vec![(4, json!({"verdict": {"class": "n log n"}}))],
+        6,
+    );
+    let err = analyse(&sp, dir.path()).unwrap_err();
+    assert!(
+        err.0
+            .contains("diversity.json has 4 passed programs, proposal_stats.json 6"),
+        "{err}"
+    );
+}
+
+#[test]
+fn programs_the_sweep_refused_are_not_cheap_and_warned_about() {
+    let dir = tempfile::tempdir().unwrap();
+    let sp = cheap_pair(
+        dir.path(),
+        vec![
+            (4, json!({"verdict": {"class": "n"}})),
+            (2, json!({"refused": {"reason": "over the memory limit"}})),
+        ],
+        6,
+    );
+    let report = analyse(&sp, dir.path()).unwrap();
+    // 4 cheap of 12 issued in each counted iteration.
+    assert_eq!(report.primary.metric.pairs[0].test, Some(8.0 / 24.0));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("could not be run on the growth sweep")));
 }

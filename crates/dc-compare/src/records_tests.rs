@@ -325,8 +325,16 @@ fn launch_summaries_are_found_under_the_log_directories_and_kept_by_run() {
         SUMMARY.replace("\"probe2\"", "\"probe3\""),
     )
     .unwrap();
-    let read = RunRecords::read(&records, &[logs]).unwrap();
+    // The directory listed twice, and a subdirectory of it, count once.
+    let read =
+        RunRecords::read(&records, &[logs.clone(), logs.join("iter0"), logs.clone()]).unwrap();
     assert_eq!(read.launches.len(), 1);
+    // A copy of the same launch's summary elsewhere counts once too.
+    let copy = dir.path().join("copy");
+    fs::create_dir(&copy).unwrap();
+    fs::copy(logs.join("iter0/summary.json"), copy.join("summary.json")).unwrap();
+    let both = RunRecords::read(&records, &[logs.clone(), copy]).unwrap();
+    assert_eq!(both.launches.len(), 1);
     let l = &read.launches[0];
     assert_eq!(
         (l.launch.as_str(), l.run.as_str(), l.interrupted),

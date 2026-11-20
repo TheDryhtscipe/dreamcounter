@@ -16,8 +16,9 @@
 
 use serde::Serialize;
 
-/// The most pairs the exact test enumerates: `2^20` sign patterns.
-pub const MAX_PAIRS: usize = 20;
+/// The most pairs the exact test takes. The interval checks about `2^S`
+/// shifts against `2^S` patterns each, which takes seconds at 16.
+pub const MAX_PAIRS: usize = 16;
 
 /// Why a test cannot be run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,14 +97,14 @@ impl Patterns {
     fn p(&self, delta: f64) -> f64 {
         let n = self.sums.len();
         let observed = (self.sums[0] - delta * self.signs[0]).abs();
-        let tolerance = 1e-9 * (1.0 + self.scale + self.signs[0] * delta.abs());
+        let tolerance = 1e-9 * (self.scale + self.signs[0] * delta.abs());
         let at_least = self
             .sums
             .iter()
             .zip(&self.signs)
             .filter(|(s, k)| (*s - delta * *k).abs() >= observed - tolerance)
             .count();
-        // Both counts are at most 2^20, so they are exact in f64.
+        // Both counts are at most 2^16, so they are exact in f64.
         at_least as f64 / n as f64
     }
 }

@@ -371,10 +371,13 @@ impl RunRecords {
         for log in logs {
             summaries(log, &mut paths)?;
         }
+        // A directory listed twice, or inside another listed one, or a copy
+        // of a summary, must not count a launch twice: each launch once.
+        let mut seen = std::collections::BTreeSet::new();
         let mut launches = Vec::new();
         for path in paths {
             let summary: LaunchSummary = read_json(&path)?;
-            if summary.run == status.run {
+            if summary.run == status.run && seen.insert(summary.launch.clone()) {
                 launches.push(summary);
             }
         }
