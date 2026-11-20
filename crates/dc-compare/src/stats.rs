@@ -170,13 +170,18 @@ pub fn interval(d: &[f64], alpha: f64) -> Result<Interval, TestError> {
         breaks.push(sum / count);
     }
     breaks.sort_by(f64::total_cmp);
-    breaks.dedup_by(|a, b| (*a - *b).abs() <= 1e-12 * (1.0 + b.abs()));
+    // Breaks that differ only by rounding are one break. The tolerance is
+    // relative, so differences of any scale keep their own breaks.
+    breaks.dedup_by(|a, b| (*a - *b).abs() <= 1e-12 * a.abs().max(b.abs()));
     // Each candidate shift: beyond the lowest break, then each break and
     // the midpoint after it, the last midpoint replaced by a point beyond
     // the highest break.
     let first = breaks[0];
     let last = breaks[breaks.len() - 1];
-    let reach = 1.0 + (last - first).abs();
+    // Far enough beyond the breaks at the scale of the differences; 1 when
+    // every break is 0.
+    let span = (last - first).abs().max(first.abs()).max(last.abs());
+    let reach = if span > 0.0 { span } else { 1.0 };
     let below = first - reach;
     let above = last + reach;
     let mut candidates: Vec<(f64, Option<f64>)> = Vec::with_capacity(2 * breaks.len() + 1);

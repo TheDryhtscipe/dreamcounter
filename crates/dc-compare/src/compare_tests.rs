@@ -23,8 +23,11 @@ struct RunData {
     foreign: u64,
     /// Submissions waiting to be checked, in every iteration.
     pending_checks: u64,
-    /// Whether the last iteration has not finished.
+    /// Whether the last iteration is the current one. If not, the current
+    /// iteration is the one after it, with nothing in.
     unfinished: bool,
+    /// Whether the last iteration has its quota.
+    quota_in: bool,
 }
 
 const TASKS: [&str; 2] = ["chains/count", "chains/heaviest"];
@@ -41,6 +44,7 @@ fn run(run: &str, seed: u64, library: bool, iterations: Vec<(u64, Vec<Row>)>) ->
         foreign: 0,
         pending_checks: 0,
         unfinished: false,
+        quota_in: true,
     }
 }
 
@@ -61,13 +65,18 @@ fn write(dir: &Path, r: &RunData) {
         "batches_issued": 0, "current": {}
     });
     fs::write(dir.join("status.json"), status.to_string()).unwrap();
-    let iterations: Vec<Value> = r
-        .iterations
+    // As dc-mcp exports them: every iteration up to the current one.
+    let mut rows = r.iterations.clone();
+    if !r.unfinished {
+        rows.push((last + 1, Vec::new()));
+    }
+    let iterations: Vec<Value> = rows
         .iter()
         .map(|(i, rows)| {
             let passed: u64 = rows.iter().map(|r| r.5).sum();
+            let quota_in = if *i == last { r.quota_in } else { *i < last };
             json!({
-                "iteration": i, "quota_in": true, "pending_checks": r.pending_checks, "tasks_solved": 0,
+                "iteration": i, "quota_in": quota_in, "pending_checks": r.pending_checks, "tasks_solved": 0,
                 "submissions": 0, "late": 1, "repeats": 0, "foreign": r.foreign,
                 "refused_repeats": 0, "refused_foreign": 0, "payload_bytes": 0,
                 "submission_bytes": 0, "models": [],
@@ -443,10 +452,10 @@ fn a_run_short_of_a_counted_iteration_is_refused() {
         ("chains/count", 6, 6, 6, 6, 6),
         ("chains/heaviest", 6, 6, 6, 6, 0),
     ];
-    write(
-        &dir.path().join("a"),
-        &run("a", 1, true, vec![(0, rows.clone()), (1, rows.clone())]),
-    );
+    // Run a is in iteration 1, with its quota in.
+    let mut a = run("a", 1, true, vec![(0, rows.clone()), (1, rows.clone())]);
+    a.unfinished = true;
+    write(&dir.path().join("a"), &a);
     write(
         &dir.path().join("b"),
         &run(
@@ -569,7 +578,7 @@ fn refs(pairs: &[(u64, String, String)]) -> Vec<(u64, &str, &str)> {
 }
 
 #[test]
-fn a_pair_with_its_arms_swapped_is_a_deviation() {
+fn a_pair_with_its_arms_swapped_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let mut pairs = plain_pairs(dir.path(), 7001, 2);
     // The second pair lists its baseline run as the arm under test.
@@ -582,8 +591,7 @@ fn a_pair_with_its_arms_swapped_is_a_deviation() {
     sp.arm_values
         .control
         .insert("library_learning".to_owned(), json!(false));
-    let report = analyse(&sp, dir.path()).unwrap();
-    let d = report.deviations.join("\n");
+    let d = analyse(&sp, dir.path()).unwrap_err().0;
     assert!(
         d.contains(
             "pair 7002: the library run c7002 has library_learning false, but its arm has true"
@@ -591,6 +599,35 @@ fn a_pair_with_its_arms_swapped_is_a_deviation() {
         "{d}"
     );
     assert!(!d.contains("pair 7001"), "{d}");
+    // Numbers are compared by value: 6.0 is the frontier size 6.
+    let pairs = plain_pairs(dir.path(), 7001, 2);
+    let mut sp = spec(Metric::PassRate, &refs(&pairs));
+    sp.arm_values
+        .test
+        .insert("frontier_size".to_owned(), json!(6.0));
+    assert!(analyse(&sp, dir.path()).is_ok());
+    sp.arm_values
+        .test
+        .insert("frontier_size".to_owned(), json!(7));
+    assert!(analyse(&sp, dir.path()).is_err());
+}
+
+#[test]
+fn records_exported_at_different_times_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("a"), &run("a", 1, true, plain(3)));
+    write(&dir.path().join("b"), &run("b", 1, false, plain(3)));
+    // status.json moves on to iteration 4; proposal_stats.json stays at 3.
+    let path = dir.path().join("a/status.json");
+    let mut status: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    status["iteration"] = json!(4);
+    fs::write(&path, status.to_string()).unwrap();
+    let err = analyse(&spec(Metric::PassRate, &[(1, "a", "b")]), dir.path()).unwrap_err();
+    assert!(
+        err.0
+            .contains("status.json is at iteration 4, but proposal_stats.json ends at 3"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -642,12 +679,14 @@ fn an_unfinished_iteration_or_pending_checks_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = run("a", 1, true, plain(3));
     a.unfinished = true;
+    a.quota_in = false;
     write(&dir.path().join("a"), &a);
     write(&dir.path().join("b"), &run("b", 1, false, plain(3)));
     let mut sp = spec(Metric::PassRate, &[(1, "a", "b")]);
     let err = analyse(&sp, dir.path()).unwrap_err();
     assert!(
-        err.0.contains("run a iteration 2 has not finished"),
+        err.0
+            .contains("run a iteration 2 does not have its quota yet"),
         "{err}"
     );
     // Allowed for checking the script, with a warning.
@@ -656,7 +695,21 @@ fn an_unfinished_iteration_or_pending_checks_are_refused() {
     assert!(report
         .warnings
         .iter()
-        .any(|w| w.contains("run a iteration 2 has not finished")));
+        .any(|w| w.contains("run a iteration 2 does not have its quota yet")));
+    // The current iteration with its quota in and every submission checked
+    // is complete: no error and no warning, without allow_unfinished.
+    a.quota_in = true;
+    write(&dir.path().join("a"), &a);
+    sp.allow_unfinished = false;
+    let report = analyse(&sp, dir.path()).unwrap();
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.contains("run a iteration")),
+        "{:?}",
+        report.warnings
+    );
     let mut b = run("b", 1, false, plain(3));
     b.pending_checks = 1;
     write(&dir.path().join("b"), &b);
@@ -711,11 +764,28 @@ fn the_cheap_rate_refuses_programs_that_were_not_measured() {
         6,
     );
     let err = analyse(&sp, dir.path()).unwrap_err();
-    assert!(err.0.contains("was not measured"), "{err}");
-    // The pass rate does not need growth, so it still runs.
+    assert!(err.0.contains("were not measured"), "{err}");
+    // A task outside the spec's tasks does not change the primary metric:
+    // a warning, not a refusal.
+    let mut other = sp.clone();
+    other.tasks = vec!["chains/heaviest".to_owned()];
+    let report = analyse(&other, dir.path()).unwrap();
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("chains/count: 3 passed programs were not measured")),
+        "{:?}",
+        report.warnings
+    );
+    // The pass rate does not need growth, so it runs, with the warning.
     let mut sp = sp;
     sp.metric = Metric::PassRate;
-    assert!(analyse(&sp, dir.path()).is_ok());
+    let report = analyse(&sp, dir.path()).unwrap();
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("were not measured")));
 }
 
 #[test]
@@ -732,6 +802,18 @@ fn the_cheap_rate_refuses_diversity_that_disagrees_with_the_stats() {
         err.0
             .contains("diversity.json has 4 passed programs, proposal_stats.json 6"),
         "{err}"
+    );
+    // For a task outside the spec's tasks, a warning.
+    let mut other = sp;
+    other.tasks = vec!["chains/heaviest".to_owned()];
+    let report = analyse(&other, dir.path()).unwrap();
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("diversity.json has 4 passed programs")),
+        "{:?}",
+        report.warnings
     );
 }
 

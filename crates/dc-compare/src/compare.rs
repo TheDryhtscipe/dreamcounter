@@ -293,6 +293,17 @@ fn load(
             "run {id} has no diversity.json, and the cheap rate needs dc_diversity with growth"
         )));
     }
+    // The records must be exported together: proposal_stats.json ends at
+    // the iteration status.json says the run is in.
+    let last = records.stats.iterations.iter().map(|s| s.iteration).max();
+    if last != Some(records.status.iteration) {
+        return Err(CompareError(format!(
+            "run {id}: status.json is at iteration {}, but proposal_stats.json ends at {}; \
+             export the records again, together",
+            records.status.iteration,
+            last.map_or("no iteration".to_owned(), |l| l.to_string())
+        )));
+    }
     let mut counts = BTreeMap::new();
     for i in &wanted {
         let Some(stats) = records.iteration(*i) else {
@@ -308,19 +319,21 @@ fn load(
                 stats.pending_checks
             )));
         }
+        // An iteration is complete once it has finished, or, if it is the
+        // current one, once every task has its programs and all are checked.
         let finished = *i < records.status.iteration;
-        if !finished || !stats.quota_in {
+        if !stats.quota_in {
             let msg = format!(
                 "run {id} iteration {i} {}: batches whose lease has not ended count as fails",
                 if finished {
                     "finished without its quota"
                 } else {
-                    "has not finished"
+                    "does not have its quota yet"
                 }
             );
             if !finished && !spec.allow_unfinished {
                 return Err(CompareError(format!(
-                    "{msg}. Finish the iteration, or set allow_unfinished to check the script"
+                    "{msg}. Wait for its quota, or set allow_unfinished to check the script"
                 )));
             }
             warnings.push(msg);
@@ -335,6 +348,9 @@ fn load(
         }
         let mut by_task = BTreeMap::new();
         for t in &stats.tasks {
+            // Records that would change the primary metric stop the
+            // analysis; elsewhere they are warned about.
+            let strict = need_growth && spec.tasks.contains(&t.name);
             let mut c = Counts {
                 issued: t.batches * per_batch,
                 programs: t.programs,
@@ -353,7 +369,7 @@ fn load(
                          programs, proposal_stats.json {}; export both after the run's checks",
                         t.name, t.passed
                     );
-                    if need_growth {
+                    if strict {
                         return Err(CompareError(msg));
                     }
                     warnings.push(msg);
@@ -370,12 +386,17 @@ fn load(
                         )));
                     };
                     match growth {
-                        GrowthResult::NotMeasured { reason } if need_growth => {
-                            return Err(CompareError(format!(
-                                "run {id} iteration {i} {}: a program was not measured \
-                                 ({reason}); run dc_diversity with a longer deadline_seconds",
-                                t.name
-                            )));
+                        GrowthResult::NotMeasured { reason } => {
+                            let msg = format!(
+                                "run {id} iteration {i} {}: {} passed programs were not \
+                                 measured ({reason}); run dc_diversity with a longer \
+                                 deadline_seconds",
+                                t.name, g.count
+                            );
+                            if strict {
+                                return Err(CompareError(msg));
+                            }
+                            warnings.push(format!("{msg}. They count as not cheap"));
                         }
                         GrowthResult::Refused { reason } => warnings.push(format!(
                             "run {id} iteration {i} {}: {} passed programs could not be run \
@@ -787,8 +808,26 @@ pub struct Report {
     pub not_computed: Vec<String>,
 }
 
+/// Whether two setting values are equal, numbers by value: `6` and `6.0`
+/// are the same.
+fn same_value(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 /// Compares two runs of a pair: the seed, the tasks, and the settings.
-fn pair_deviations(spec: &Spec, seed: u64, t: &Run, c: &Run, out: &mut Vec<String>) {
+/// A run whose setting is not its arm's value in `arm_values` is not a run
+/// of that arm, so it goes to `errors`; everything else to `out`.
+fn pair_deviations(
+    spec: &Spec,
+    seed: u64,
+    t: &Run,
+    c: &Run,
+    out: &mut Vec<String>,
+    errors: &mut Vec<String>,
+) {
     for (arm, run) in [(&spec.arms.test, t), (&spec.arms.control, c)] {
         if run.records.status.seed != seed {
             out.push(format!(
@@ -819,8 +858,8 @@ fn pair_deviations(spec: &Spec, seed: u64, t: &Run, c: &Run, out: &mut Vec<Strin
         let settings = run.records.settings();
         for (k, want) in values {
             let got = settings.get(k);
-            if got != Some(want) {
-                out.push(format!(
+            if !got.is_some_and(|g| same_value(g, want)) {
+                errors.push(format!(
                     "pair {seed}: the {arm} run {} has {k} {}, but its arm has {want}",
                     run.records.status.run,
                     got.map_or("absent".to_owned(), ToString::to_string),
@@ -832,7 +871,10 @@ fn pair_deviations(spec: &Spec, seed: u64, t: &Run, c: &Run, out: &mut Vec<Strin
     let keys: BTreeSet<&String> = st.keys().chain(sc.keys()).collect();
     for k in keys {
         let (a, b) = (st.get(k), sc.get(k));
-        let differs = a != b;
+        let differs = match (a, b) {
+            (Some(x), Some(y)) => !same_value(x, y),
+            _ => a != b,
+        };
         let expected = spec.arm_settings.contains(k);
         if differs && !expected {
             out.push(format!(
@@ -946,11 +988,18 @@ pub fn analyse(spec: &Spec, base: &Path) -> Result<Report, CompareError> {
         );
     }
     let mut loaded: Vec<(u64, Run, Run)> = Vec::with_capacity(spec.pairs.len());
+    let mut wrong_arm = Vec::new();
     for p in &spec.pairs {
         let t = load(spec, base, &p.test, &mut warnings)?;
         let c = load(spec, base, &p.control, &mut warnings)?;
-        pair_deviations(spec, p.seed, &t, &c, &mut deviations);
+        pair_deviations(spec, p.seed, &t, &c, &mut deviations, &mut wrong_arm);
         loaded.push((p.seed, t, c));
+    }
+    if !wrong_arm.is_empty() {
+        return Err(CompareError(format!(
+            "runs are not in the arm the spec puts them in: {}",
+            wrong_arm.join("; ")
+        )));
     }
     let mut ids = BTreeSet::new();
     for (_, t, c) in &loaded {

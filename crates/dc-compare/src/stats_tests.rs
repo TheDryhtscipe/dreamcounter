@@ -298,3 +298,26 @@ fn tiny_differences_are_not_all_ties() {
         .collect();
     assert_eq!(sign_flip_p(&d), Ok(2.0 / 64.0));
 }
+
+#[test]
+fn the_interval_scales_with_the_differences() {
+    // The interval of differences scaled by k is the interval scaled by k,
+    // at any scale: no tolerance in it is absolute.
+    let raw = [5, -2, 10, 7, 1, 12, 3, -4, 9, 6, 8, 2];
+    let base = interval(&hundredths(&raw), 0.05).unwrap();
+    let (Some(lo), Some(hi)) = (base.lower, base.upper) else {
+        panic!("{base:?}");
+    };
+    for k in [1e-14, 1e-9, 1e6, 1e12] {
+        let d: Vec<f64> = hundredths(&raw).iter().map(|x| x * k).collect();
+        let ci = interval(&d, 0.05).unwrap();
+        let (Some(l), Some(h)) = (ci.lower, ci.upper) else {
+            panic!("{k}: {ci:?}");
+        };
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs().max(f64::MIN_POSITIVE);
+        assert!(
+            close(l, lo * k) && close(h, hi * k),
+            "{k}: {ci:?} against {base:?}"
+        );
+    }
+}
