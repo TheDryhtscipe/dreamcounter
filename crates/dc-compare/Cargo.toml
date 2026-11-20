@@ -1,0 +1,24 @@
+[package]
+name = "dc-compare"
+description = "Analysis of a DreamCounter arm comparison: metrics, the paired sign-flip test, its interval, and the call (decision D33)"
+version.workspace = true
+edition.workspace = true
+# dc-mcp needs 1.89.
+rust-version = "1.89"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+dc-driver.workspace = true
+dc-mcp.workspace = true
+dc-tasks.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+rand_chacha.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

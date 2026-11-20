@@ -292,6 +292,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-compare"
+version = "0.1.0"
+dependencies = [
+ "dc-driver",
+ "dc-mcp",
+ "dc-tasks",
+ "rand_chacha 0.9.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "dc-compress"
 version = "0.1.0"
 dependencies = [
