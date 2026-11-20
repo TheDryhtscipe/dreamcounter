@@ -608,12 +608,16 @@ pub fn check_pending(
 ///
 /// `claimed_elsewhere` names the batches that still waited, claimed by
 /// another checker, once every worker was done; a batch one worker held
-/// while another finished is not among them. When a worker's check fails or
-/// panics, the others finish the checks they hold and take up no more; an
-/// error from the store, outside a check, stops them once its worker has
-/// returned. The first error, in time, is returned, and checks the workers committed stay
-/// committed though the call does not count them. A panic in a worker is
-/// resumed on the calling thread, once the other workers are done. Each
+/// while another finished is not among them.
+///
+/// When a worker's check fails or panics, the stop is set before its claim
+/// is let go: the others finish the checks they hold and take up no more.
+/// An error or a panic outside a check, such as a verifier that does not
+/// build, stops them only once its worker has returned or unwound, so in
+/// that moment another worker can claim the same submission. The error
+/// returned is the first one a worker records. Checks the workers committed
+/// stay committed, though the call does not count them. A panic in a worker
+/// is resumed on the calling thread, once the other workers are done. Each
 /// worker builds its own verifier if `verifiers` keeps none for the run's
 /// library.
 pub fn check_pending_parallel(
@@ -702,6 +706,9 @@ fn check_pending_parallel_with(
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
+                    // A panic outside a check, as in a verifier's build,
+                    // stops the others once it has unwound this far.
+                    let _stop = StopOnPanic(&stopping);
                     let mut stopped = false;
                     let done = check_pending_with(store, run, verifiers, &mut |v, p| {
                         if stopping.load(Ordering::SeqCst) {
