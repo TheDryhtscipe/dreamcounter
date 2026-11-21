@@ -27,7 +27,15 @@
 //!    step returns [`DriverError::Interrupted`]. Any other error, such as a
 //!    worker stopped at its time limit, skips compression for the iteration:
 //!    the frontiers are still updated, and the library is unchanged.
-//! 4. **Library update.** Each new abstraction gets a type scheme inferred from
+//! 4. **Library update.** First, each new abstraction with no parameters whose
+//!    body is not a lambda, a literal, a primitive or a library reference is
+//!    written out in place: in the later abstractions and in the rewritten
+//!    programs, its uses are replaced by its body, and the abstractions after
+//!    it are numbered down. A use of a library entry means its definition
+//!    written out (D1), so such an entry is computed again at each use, though
+//!    it reads as a constant. The report lists each one
+//!    ([`CompressionReport::Ran`], `written_out`).
+//!    Then each new abstraction gets a type scheme inferred from
 //!    its body with the earlier ones, and the new abstractions are cut at the
 //!    first that does not type or is too large to print. A rewritten program
 //!    is accepted if it types against its task's signature with the library's
@@ -282,8 +290,8 @@ pub struct LeftOut {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Untyped {
-    /// Its place among the new abstractions: it would have been
-    /// `lib_{library.len() + abstraction}`.
+    /// Its place among the new abstractions left after those written out
+    /// ([`WrittenOut`]): it would have been `lib_{library.len() + abstraction}`.
     pub abstraction: usize,
     /// Its term, or nothing if it is too large to print.
     pub term: String,
@@ -347,7 +355,24 @@ pub enum CompressionReport {
         kept: usize,
         /// The programs whose rewriting was refused.
         fallbacks: Vec<Fallback>,
+        /// The abstractions with no parameters whose body does work, written
+        /// out in place instead of joining the library (step 4 of the crate
+        /// docs). Absent in a report from before they were.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        written_out: Vec<WrittenOut>,
     },
+}
+
+/// An abstraction with no parameters that does work, written out where it is
+/// used instead of joining the library.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WrittenOut {
+    /// Its index among the abstractions Stitch found.
+    pub abstraction: usize,
+    /// Its body, as an s-expression, as Stitch found it, or nothing if it is
+    /// too large to print.
+    pub term: String,
 }
 
 /// What happened to each program in one step, for the run's log. The new
@@ -885,6 +910,139 @@ fn run_stitch(
     }
 }
 
+/// Whether an abstraction with no parameters and this body is a value: a
+/// lambda, a literal, a primitive or a library reference. Any other body is
+/// evaluated again at each use, because a use means its definition written
+/// out (D1). That is a little work for a partial application such as
+/// `(add 1)`, and can be a great deal for one that builds a table; the rule
+/// does not tell them apart.
+fn is_value(arena: &Arena, body: TermId) -> bool {
+    matches!(
+        arena.get(body),
+        Term::Lam(_) | Term::Int(_) | Term::Bool(_) | Term::Unit | Term::Prim(_) | Term::Lib(_)
+    )
+}
+
+/// `root` with each reference to a new abstraction `old_len + i` replaced by
+/// `subst[i]`. The replacements are closed, so no index is shifted. Walks the
+/// shared term graph with a work list, each node once.
+fn substitute_libs(
+    arena: &mut Arena,
+    root: TermId,
+    old_len: usize,
+    subst: &[TermId],
+    memo: &mut HashMap<TermId, TermId>,
+) -> TermId {
+    let mut stack = vec![(root, false)];
+    while let Some((id, ready)) = stack.pop() {
+        if memo.contains_key(&id) {
+            continue;
+        }
+        let term = arena.get(id);
+        if !ready {
+            stack.push((id, true));
+            for c in children(&term) {
+                if !memo.contains_key(&c) {
+                    stack.push((c, false));
+                }
+            }
+            continue;
+        }
+        let m = |c: TermId| memo[&c];
+        let out = match term {
+            Term::Lib(LibId(l)) => {
+                let l = l as usize;
+                match l.checked_sub(old_len).and_then(|i| subst.get(i)) {
+                    Some(&t) => t,
+                    None => id,
+                }
+            }
+            Term::Lam(b) => {
+                let b = m(b);
+                arena.intern(Term::Lam(b))
+            }
+            Term::App(f, a) => {
+                let t = Term::App(m(f), m(a));
+                arena.intern(t)
+            }
+            Term::Let(b, e) => {
+                let t = Term::Let(m(b), m(e));
+                arena.intern(t)
+            }
+            Term::If(c, t, e) => {
+                let t = Term::If(m(c), m(t), m(e));
+                arena.intern(t)
+            }
+            Term::And(a, b) => {
+                let t = Term::And(m(a), m(b));
+                arena.intern(t)
+            }
+            Term::Or(a, b) => {
+                let t = Term::Or(m(a), m(b));
+                arena.intern(t)
+            }
+            Term::Var(_) | Term::Int(_) | Term::Bool(_) | Term::Unit | Term::Prim(_) => id,
+        };
+        memo.insert(id, out);
+    }
+    memo[&root]
+}
+
+/// The first part of step 4 of the crate docs: each new abstraction with no
+/// parameters whose body is not a value ([`is_value`]) is written out where
+/// the later abstractions and the rewritten programs use it, and the
+/// abstractions after it are numbered down. Returns the compression changed
+/// so, and the abstractions written out.
+fn write_out_work(
+    arena: &mut Arena,
+    old_len: usize,
+    c: &Compression,
+) -> Result<(Compression, Vec<WrittenOut>), DriverError> {
+    let mut subst: Vec<TermId> = Vec::with_capacity(c.new_libs.len());
+    let mut new_libs = Vec::with_capacity(c.new_libs.len());
+    let mut written_out = Vec::new();
+    for (i, def) in c.new_libs.iter().enumerate() {
+        // The body refers only to earlier abstractions, which `subst` covers.
+        let mut memo = HashMap::new();
+        let body = substitute_libs(arena, def.term, old_len, &subst, &mut memo);
+        if def.arity == 0 && !is_value(arena, body) {
+            // A runner that skips the bridge's checks could give a body too
+            // large to print; the report then has no term, as for `Untyped`.
+            written_out.push(WrittenOut {
+                abstraction: i,
+                term: sexpr::print(arena, def.term).unwrap_or_default(),
+            });
+            subst.push(body);
+        } else {
+            let id = u32::try_from(old_len + new_libs.len()).map_err(|_| DriverError::TooLarge)?;
+            subst.push(arena.intern(Term::Lib(LibId(id))));
+            new_libs.push(LibDef {
+                arity: def.arity,
+                term: body,
+            });
+        }
+    }
+    if written_out.is_empty() {
+        return Ok((c.clone(), written_out));
+    }
+    let mut memo = HashMap::new();
+    let rewritten = c
+        .rewritten
+        .iter()
+        .map(|&p| substitute_libs(arena, p, old_len, &subst, &mut memo))
+        .collect();
+    Ok((
+        Compression {
+            new_libs,
+            rewritten,
+            names: c.names.clone(),
+            stitch_steps: c.stitch_steps,
+            rejected: c.rejected.clone(),
+        },
+        written_out,
+    ))
+}
+
 /// Step 4 of the crate docs: types the new abstractions, accepts each
 /// rewriting that types and keeps its program's expansion, and cuts the
 /// abstractions that are not used. Changes the accepted programs in `kept`
@@ -899,6 +1057,9 @@ fn update_library(
     left_out: Vec<LeftOut>,
 ) -> Result<(Vec<LibraryEntry>, CompressionReport), DriverError> {
     let old_len = library.defs.len();
+    let found = c.new_libs.len();
+    let (written, written_out) = write_out_work(arena, old_len, c)?;
+    let c = &written;
     let mut schemes = library.schemes.clone();
     let mut untyped = None;
     for (i, def) in c.new_libs.iter().enumerate() {
@@ -1003,11 +1164,12 @@ fn update_library(
             .rejected
             .as_ref()
             .map(|r| format!("step {} ({}): {}", r.step, r.name, r.reason)),
-        found: c.new_libs.len(),
+        found,
         untyped,
         unused: typed - kept_new,
         kept: kept_new,
         fallbacks,
+        written_out,
     };
     Ok((new_library, report))
 }

@@ -161,7 +161,9 @@ fn library(state: &RunState, verifier: &Verifier) -> String {
     }
     let mut out = String::from(
         "## Library\n\nThese functions are in scope. A use of one means exactly its \
-         definition written out.\n\n",
+         definition written out, so it is computed again at each use. If a definition \
+         has no parameters and you use it more than once, or inside a function, bind it \
+         once with `let`, outside any function that uses it, and use that name.\n\n",
     );
     for (i, (entry, scheme)) in state.library().iter().zip(verifier.schemes()).enumerate() {
         let name = entry_name(i, entry);
@@ -679,6 +681,14 @@ mod tests {
         assert!(p.prompt.contains("fn_0 : List "), "{}", p.prompt);
         assert!(p.prompt.contains("let fn_0 = fun"), "{}", p.prompt);
         assert!(p.prompt.contains("reverse (reverse"), "{}", p.prompt);
+        // A use is computed again each time (D1): the section says so, and
+        // says to bind a definition with no parameters once (ceee1f).
+        assert!(
+            p.prompt.contains("is computed again at each use"),
+            "{}",
+            p.prompt
+        );
+        assert!(p.prompt.contains("bind it once with `let`"), "{}", p.prompt);
         let cancel = crate::verify::task("collapse/cancel").unwrap();
         assert!(p.prompt.contains(cancel.description()));
         assert!(p.prompt.contains("let solve = fun"), "{}", p.prompt);
