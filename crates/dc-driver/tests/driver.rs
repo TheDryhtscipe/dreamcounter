@@ -707,6 +707,145 @@ fn the_library_is_cut_at_the_first_abstraction_that_does_not_type() {
 }
 
 #[test]
+fn an_arity_0_abstraction_that_does_work_is_written_out_in_place() {
+    // lib_0 has no parameters and its body is an application: a use of it
+    // would compute it again (D1), so it does not join the library. lib_1
+    // uses it, and is kept as lib_0 with lib_0's body written out.
+    let tasks = [task("a", "Int"), task("b", "Int")];
+    let cands = [
+        candidate("a", "(add (add 2 3) (add 2 3))"),
+        candidate("b", "(mul 4 (add 2 3))"),
+    ];
+    let mut stitch = Fixed {
+        libs: vec![(0, "(add 2 3)"), (1, "(lam (mul $0 lib_0))")],
+        rewritten: vec!["(add lib_0 lib_0)", "(lib_1 4)"],
+    };
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &config(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert_eq!(
+        out.new_library,
+        vec![LibraryEntry {
+            arity: 1,
+            term: "(lam (mul $0 (add 2 3)))".into()
+        }]
+    );
+    assert_eq!(out.frontiers["a"], vec!["(add (add 2 3) (add 2 3))"]);
+    assert_eq!(out.frontiers["b"], vec!["(lib_0 4)"]);
+    let CompressionReport::Ran {
+        found,
+        kept,
+        written_out,
+        fallbacks,
+        ..
+    } = &out.report.compression
+    else {
+        panic!("{:?}", out.report.compression);
+    };
+    assert_eq!((*found, *kept), (2, 1));
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+    assert_eq!(written_out.len(), 1);
+    assert_eq!(written_out[0].abstraction, 0);
+    assert_eq!(written_out[0].term, "(add 2 3)");
+}
+
+#[test]
+fn an_arity_0_abstraction_written_out_after_a_kept_one_keeps_its_uses() {
+    // lib_1 has no parameters and uses lib_0, which is kept.
+    let tasks = [task("a", "Int")];
+    let cands = [candidate("a", "(add (mul 3 3) (mul 3 3))")];
+    let mut stitch = Fixed {
+        libs: vec![(1, "(lam (mul $0 $0))"), (0, "(lib_0 3)")],
+        rewritten: vec!["(add lib_1 lib_1)"],
+    };
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &config(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert_eq!(
+        out.new_library,
+        vec![LibraryEntry {
+            arity: 1,
+            term: "(lam (mul $0 $0))".into()
+        }]
+    );
+    assert_eq!(out.frontiers["a"], vec!["(add (lib_0 3) (lib_0 3))"]);
+}
+
+#[test]
+fn an_arity_0_abstraction_that_names_a_written_out_one_is_written_out_too() {
+    // lib_1's body is a bare reference, a value on its face, but lib_0 is
+    // written out, so lib_1's body is the application it stands for.
+    let tasks = [task("a", "Int")];
+    let cands = [candidate("a", "(add (add 2 3) (add 2 3))")];
+    let mut stitch = Fixed {
+        libs: vec![(0, "(add 2 3)"), (0, "lib_0")],
+        rewritten: vec!["(add lib_1 lib_1)"],
+    };
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &config(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert!(out.new_library.is_empty(), "{:?}", out.new_library);
+    assert_eq!(out.frontiers["a"], vec!["(add (add 2 3) (add 2 3))"]);
+    let CompressionReport::Ran { written_out, .. } = &out.report.compression else {
+        panic!("{:?}", out.report.compression);
+    };
+    let which: Vec<usize> = written_out.iter().map(|w| w.abstraction).collect();
+    assert_eq!(which, vec![0, 1]);
+}
+
+#[test]
+fn an_arity_0_abstraction_that_is_a_function_joins_the_library() {
+    let tasks = [task("a", "Int")];
+    let cands = [candidate(
+        "a",
+        "(mul ((lam (add $0 $0)) 3) ((lam (add $0 $0)) 4))",
+    )];
+    let mut stitch = Fixed {
+        libs: vec![(0, "(lam (add $0 $0))")],
+        rewritten: vec!["(mul (lib_0 3) (lib_0 4))"],
+    };
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &config(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert_eq!(
+        out.new_library,
+        vec![LibraryEntry {
+            arity: 0,
+            term: "(lam (add $0 $0))".into()
+        }]
+    );
+    assert_eq!(out.frontiers["a"], vec!["(mul (lib_0 3) (lib_0 4))"]);
+    let CompressionReport::Ran { written_out, .. } = &out.report.compression else {
+        panic!("{:?}", out.report.compression);
+    };
+    assert!(written_out.is_empty());
+}
+
+#[test]
 fn a_failed_stitch_run_still_updates_the_frontiers() {
     let tasks = shared_tasks();
     let cands = shared_candidates();
