@@ -34,7 +34,10 @@ use crate::diversity::{
 };
 use crate::iterate::{finish_iteration_in_worker, WorkerStart};
 use crate::naming::{next_naming_job, submit_naming, NamingReceipt, NextNamingJob};
-use crate::proposer::{check_pending, next_batch, submit, Clock, NextBatch, Receipt, Refused};
+use crate::proposer::{
+    available_memory, check_pending, check_pending_parallel, default_check_workers, next_batch,
+    submit, Clock, NextBatch, Receipt, Refused, MAX_CHECK_WORKERS,
+};
 use crate::state::{
     Arm, Event, FrontierMember, LibraryUptake, LogKind, LogRecord, RunConfig, RunId, RunState,
     StitchSettings, DEFAULT_MAX_UNCHECKED_PER_BATCH, MAX_EVALUATION_MEMORY,
@@ -143,6 +146,21 @@ pub const DEFAULT_LEASE_SECONDS: u64 = 1800;
 pub struct RunArg {
     /// The run's id.
     pub run: String,
+}
+
+/// The arguments of `dc_check_pending`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckPendingArg {
+    /// The run's id.
+    pub run: String,
+    /// How many submissions to check at once, each on a thread of its own,
+    /// from 1 to 64. Each check may hold up to the run's max_memory_mib. If
+    /// absent, one for each core, but no more than the memory the system
+    /// has available when the call starts holds at the run's
+    /// max_memory_mib each. Other calls running at once, and memory
+    /// limits of a cgroup, are not counted.
+    pub workers: Option<usize>,
 }
 
 /// The arguments of `dc_add_note`.
@@ -630,6 +648,10 @@ pub struct CheckReport {
     /// by a process that hangs: stop that process, and its claim goes with
     /// it.
     pub claimed_elsewhere: Vec<u64>,
+    /// The most submissions this call would check at once: the workers
+    /// asked for, or the default. It starts no more workers than
+    /// submissions wait when it begins.
+    pub workers: usize,
 }
 
 /// The result of `dc_finish_iteration`.
@@ -1393,22 +1415,45 @@ impl DcServer {
     #[tool(
         name = "dc_check_pending",
         description = "Check every submission of a DreamCounter run that waits to be checked, \
-                       and wait until they are done. A submission that another server is \
-                       checking is left to it. Proposer servers do this in the background; use \
-                       this when one stopped before it finished, or to see why checks fail. \
-                       Returns how many it checked, how many still wait, and the batches \
-                       another server is checking."
+                       and wait until they are done. Several are checked at once, each on a \
+                       thread of its own: workers of them (default: one for each core, as far \
+                       as the available memory holds them at the run's max_memory_mib each). \
+                       A submission that another server is checking is left to it. Proposer \
+                       servers check in the background, one at a time; use this when one \
+                       stopped before it finished, or to see why checks fail. Returns how \
+                       many it checked, how many still wait, the batches another server is \
+                       checking, and the most it would check at once. The default counts \
+                       only the memory free when the call starts: a caller that runs \
+                       several calls at once should pass workers."
     )]
     async fn check_pending(
         &self,
-        Parameters(arg): Parameters<RunArg>,
+        Parameters(arg): Parameters<CheckPendingArg>,
     ) -> Result<Json<CheckReport>, String> {
         let run = run_id(&arg.run)?;
+        if let Some(workers) = arg.workers {
+            if !(1..=MAX_CHECK_WORKERS).contains(&workers) {
+                return Err(format!(
+                    "workers is {workers}; it must be from 1 to {MAX_CHECK_WORKERS}"
+                ));
+            }
+        }
         self.blocking(move |store| {
+            let workers = match arg.workers {
+                Some(workers) => workers,
+                None => {
+                    let max_memory = store
+                        .read(&run, |state| state.config().max_memory)
+                        .map_err(|e| e.to_string())?;
+                    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+                    default_check_workers(cores, available_memory(), max_memory)
+                }
+            };
             // This server serves many runs, so it keeps no verifier between
             // calls; one call builds one for each library length it meets.
             let verifiers = VerifierCache::default();
-            let done = check_pending(store, &run, &verifiers).map_err(|e| e.to_string())?;
+            let done = check_pending_parallel(store, &run, &verifiers, workers)
+                .map_err(|e| e.to_string())?;
             let pending_checks = store
                 .read(&run, |state| state.pending_checks().len())
                 .map_err(|e| e.to_string())?;
@@ -1417,6 +1462,7 @@ impl DcServer {
                 checked: done.checked,
                 pending_checks,
                 claimed_elsewhere: done.claimed_elsewhere,
+                workers,
             })
         })
         .await
