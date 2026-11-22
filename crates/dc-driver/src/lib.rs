@@ -79,6 +79,7 @@
 //! program's cost grows with its input plays no part yet: that is the
 //! cost-aware objective of P5.
 
+mod bucketing;
 pub mod objective;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
