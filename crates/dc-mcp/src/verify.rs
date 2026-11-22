@@ -438,7 +438,7 @@ impl VerifierCache {
 /// expected value, and for any other error.
 ///
 /// A check stops at the first example that fails, so this is about that
-/// example only. The error shows values cut to [`SHOWN_VALUES`], so two
+/// example only. The error shows values cut to `SHOWN_VALUES`, so two
 /// long values that differ after the cut count as the same.
 pub fn known_mistake(task: &str, error: &str) -> bool {
     with_mistake_errors(task, |errors| errors.contains(error))
