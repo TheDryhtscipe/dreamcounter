@@ -37,6 +37,7 @@
 //! Started as `dc-mcp --stitch-worker`, the binary is the Stitch worker
 //! process of `dc_finish_iteration` and serves nothing (see [`iterate`]).
 
+mod arguments;
 mod blocking;
 pub mod cost;
 pub mod diversity;

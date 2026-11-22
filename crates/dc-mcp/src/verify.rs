@@ -5,7 +5,11 @@
 //! library definition `i` is in scope as `fn_i`. A [`Verifier`] checks a
 //! program in three stages and stops at the first that fails:
 //!
-//! 1. **Compile.** The text parses and desugars, and defines [`ENTRY`].
+//! 1. **Compile.** The text parses and desugars, and defines [`ENTRY`]. An
+//!    argument of a library definition that the definition can evaluate more
+//!    than once is then bound once, around the use, and so is each argument
+//!    of a use with fewer arguments than the definition has parameters
+//!    (decision D35, `arguments`).
 //! 2. **Type.** The entry has the task's signature, with the prelude's and
 //!    the library's type schemes.
 //! 3. **Run.** The entry, with the prelude and the library expanded, gives
@@ -28,6 +32,7 @@ use dc_surface::TopLevel;
 use dc_tasks::harness::{check_examples, check_gate, CheckFailure, HarnessConfig, RunFailure};
 use dc_tasks::task::TaskFamily;
 
+use crate::arguments::{bind_arguments, repeated_parameters};
 use crate::state::{Check, LibraryEntry, RunConfig};
 
 /// The name of the definition a submitted program is checked by.
@@ -153,6 +158,9 @@ pub struct Verifier {
     top: TopLevel,
     expander: Expander,
     schemes: Vec<Scheme>,
+    /// For each library entry, which parameters one use can evaluate more
+    /// than once ([`repeated_parameters`]).
+    repeated: Vec<Vec<bool>>,
     harness: HarnessConfig,
     /// The library, to build the verifier again after a panic.
     library: Vec<LibraryEntry>,
@@ -198,7 +206,7 @@ impl Verifier {
                     .map_err(|e| bad(e.to_string()))?;
             }
         }
-        let expander = Expander::new(&mut arena, &defs).map_err(|e| {
+        let bad_expansion = |e: ExpandError| {
             let index = match e {
                 ExpandError::UnknownLib(LibId(l))
                 | ExpandError::ForwardReference { lib: LibId(l), .. }
@@ -209,13 +217,29 @@ impl Verifier {
                 index,
                 reason: e.to_string(),
             }
-        })?;
+        };
+        let mut expander = Expander::new(&mut arena, &defs).map_err(bad_expansion)?;
+        let mut repeated = Vec::with_capacity(defs.len());
+        for (index, def) in defs.iter().enumerate() {
+            // A reference with no arguments expands to the entry's whole
+            // definition, `λ^arity. body`, with the entries it uses written out.
+            let id = u32::try_from(index).map_err(|_| BadLibrary {
+                index,
+                reason: "too many entries".to_owned(),
+            })?;
+            let reference = arena.lib(LibId(id));
+            let whole = expander
+                .expand(&mut arena, reference)
+                .map_err(bad_expansion)?;
+            repeated.push(repeated_parameters(&arena, whole, def.arity));
+        }
         Ok(Verifier {
             arena,
             prelude,
             top,
             expander,
             schemes,
+            repeated,
             harness: HarnessConfig {
                 max_memory,
                 ..HarnessConfig::default()
@@ -343,14 +367,16 @@ impl Verifier {
         }
     }
 
-    fn compile(&mut self, text: &str) -> Result<TermId, String> {
+    pub(crate) fn compile(&mut self, text: &str) -> Result<TermId, String> {
         let mut top = self.top.clone();
         let names = top.add_source("program", text).map_err(|e| e.to_string())?;
         if !names.iter().any(|n| n == ENTRY) {
             return Err(format!("the program has no definition named '{ENTRY}'"));
         }
-        top.close_definition(&mut self.arena, ENTRY)
-            .map_err(|e| e.to_string())
+        let program = top
+            .close_definition(&mut self.arena, ENTRY)
+            .map_err(|e| e.to_string())?;
+        Ok(bind_arguments(&mut self.arena, program, &self.repeated))
     }
 }
 
