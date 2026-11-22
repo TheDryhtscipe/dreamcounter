@@ -583,7 +583,8 @@ pub struct IterationStats {
 }
 
 /// Which learned library entries the programs that passed in one iteration
-/// refer to. A seed entry of the run counts as a learned entry here. Only programs that passed every example are counted, as only
+/// refer to. A seed entry of the run counts as a learned entry here.
+/// Only programs that passed every example are counted, as only
 /// they are kept compiled. A program counts an entry once however often it
 /// refers to it. Every reference in the compiled program counts, one in a
 /// binding that is never used too, so this counts uptake, not calls made

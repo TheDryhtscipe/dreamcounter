@@ -740,7 +740,8 @@ pub enum Event {
     LibrarySeeded {
         /// The entries, one for each seed entry in order: the seed entry
         /// with each reference to a seed entry numbered as in the library
-        /// (`crate::seed::placed`). The state refuses any other entries.
+        /// (`crate::seed::placed`). The state checks their number, arities,
+        /// names and docs against the settings, and not their terms.
         entries: Vec<LibraryEntry>,
     },
     /// A naming job for a library entry is handed to a proposer (D23).
@@ -1441,12 +1442,19 @@ impl RunState {
                         "seed entries join the library once, in iteration 0".to_owned(),
                     ));
                 }
-                let placed =
-                    crate::seed::placed(seeds, self.library.len()).map_err(Rejected::Seed)?;
-                if *entries != placed {
+                // The terms are not compared: that would parse and print
+                // them, and a journal must read back under a later build
+                // whose parser or printer differs. Like the terms of a
+                // `LibraryExtended`, they are as the step wrote them.
+                let same = entries.len() == seeds.len()
+                    && entries
+                        .iter()
+                        .zip(seeds)
+                        .all(|(e, s)| (e.arity, &e.name, &e.doc) == (s.arity, &s.name, &s.doc));
+                if !same {
                     return Err(Rejected::Seed(
-                        "the entries are not the run's seed entries, in order, as they \
-                         join the library"
+                        "the entries are not the run's seed entries, in order, with their \
+                         arities, names and docs"
                             .to_owned(),
                     ));
                 }

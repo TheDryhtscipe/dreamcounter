@@ -1150,18 +1150,12 @@ fn a_seeding_that_is_not_the_runs_seed_entries_is_refused() {
     let mut arity = seeds.clone();
     arity[1].arity = 1;
     refused(arity, "not the run's seed entries");
-    // Another term, and the right term numbered for another place.
-    let mut term = seeds.clone();
-    term[0].term = "(lam (lam (lam $1)))".to_owned();
-    refused(term, "not the run's seed entries");
-    refused(
-        crate::seed::placed(&seeds, 3).unwrap(),
-        "not the run's seed entries",
-    );
+
     assert!(store.read(&run, |s| s.library().is_empty()).unwrap());
-    // The run's own entries are taken.
+    // The run's own entries are taken, as the step places them.
+    let entries = crate::seed::placed(&seeds, 0).unwrap();
     store
-        .append(&run, vec![Event::LibrarySeeded { entries: seeds }])
+        .append(&run, vec![Event::LibrarySeeded { entries }])
         .unwrap();
     assert_eq!(store.read(&run, |s| s.library().len()).unwrap(), 2);
 }
@@ -1256,4 +1250,19 @@ fn a_refusing_run_logs_the_bucketing_abstraction_it_refused() {
     // A run that does not refuse writes nothing out: the abstraction is cut
     // only because no program uses it.
     assert!(logged(false).is_empty());
+}
+
+#[test]
+fn the_store_makes_no_run_with_a_seed_term_that_does_not_type() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("r").unwrap();
+    let mut config = config(2, shipped_prelude());
+    config.seed_entries = crate::seed::tests::bucketing_entries();
+    config.seed_entries[1].term = "(lam (lam (add $0 true)))".to_owned();
+    let error = store
+        .create_run(&run, config, vec![MERGE.to_owned()])
+        .unwrap_err();
+    assert!(error.to_string().contains("seed entry 1"), "{error}");
+    assert!(store.state(&run).is_err());
 }

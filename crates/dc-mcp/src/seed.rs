@@ -30,6 +30,9 @@ pub const MAX_SEED_TERM_LEN: usize = 4096;
 /// (decision D34). `max_memory` is the run's limit for an evaluation; no
 /// program runs here.
 pub fn check(entries: &[LibraryEntry], max_memory: u64) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
     if entries.len() > MAX_SEED_ENTRIES {
         return Err(format!(
             "seed_entries has {} entries; the most is {MAX_SEED_ENTRIES}",
