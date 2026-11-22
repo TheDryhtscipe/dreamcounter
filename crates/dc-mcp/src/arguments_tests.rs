@@ -288,6 +288,18 @@ fn the_branches_of_a_case_are_paths_not_functions() {
         repeated(2, "(lam (lam (list_case nil $0 (lam (add $0 $2)))))"),
         [true, false]
     );
+    // match o with None -> 0 | Some _ -> x, run: `x` is not evaluated for
+    // `none`, and is for `some`.
+    let mut o = verifier(&[entry(2, "(lam (lam (option_case $0 (lam 0) (lam $2))))")]);
+    let text = "let solve n = fn_0 (10 / n) (if n = 0 then None else Some n)";
+    assert!(matches!(
+        run(&mut o, text, &[Value::Int(0)]),
+        Outcome::Value(Value::Int(0), _)
+    ));
+    assert!(matches!(
+        run(&mut o, text, &[Value::Int(5)]),
+        Outcome::Value(Value::Int(2), _)
+    ));
     // The guard still guards.
     let mut v = verifier(&[entry(2, guard)]);
     assert!(matches!(

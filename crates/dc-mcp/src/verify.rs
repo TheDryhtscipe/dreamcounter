@@ -7,8 +7,9 @@
 //!
 //! 1. **Compile.** The text parses and desugars, and defines [`ENTRY`]. An
 //!    argument of a library definition that the definition can evaluate more
-//!    than once is then bound once, around the use (decision D35,
-//!    `arguments`).
+//!    than once is then bound once, around the use, and so is each argument
+//!    of a use with fewer arguments than the definition has parameters
+//!    (decision D35, `arguments`).
 //! 2. **Type.** The entry has the task's signature, with the prelude's and
 //!    the library's type schemes.
 //! 3. **Run.** The entry, with the prelude and the library expanded, gives
