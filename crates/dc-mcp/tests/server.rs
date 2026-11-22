@@ -680,6 +680,14 @@ fn compared_runs_may_differ_in_seed_entries_and_refuse_bucketing() {
     assert_eq!(without["refuse_bucketing"], json!(true));
     assert_eq!(without["seed_entries"], json!([]));
     assert_eq!(without["compared_with"]["run"], "with");
+    // A run compared with a refusing run does not refuse unless asked to.
+    let third = create(
+        &mut client,
+        json!({ "run": "third", "compared_with": "without" }),
+    )
+    .unwrap();
+    assert_eq!(third["refuse_bucketing"], json!(false));
+    assert_eq!(third["seed_entries"], json!([]));
 
     // Both change the library, so a run that learns none refuses them.
     for extra in [

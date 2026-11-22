@@ -350,8 +350,12 @@ fn a_config_from_before_the_settings_has_them_off() {
     let object = value.as_object_mut().unwrap();
     assert!(object.remove("approach_hints").is_some());
     assert!(object.remove("show_received").is_some());
+    // The settings of D36 are not written when they are off or empty.
+    assert!(object.remove("refuse_bucketing").is_some());
+    assert!(!object.contains_key("seed_entries"));
     let old: RunConfig = serde_json::from_value(value).unwrap();
     assert!(!old.approach_hints && !old.show_received);
+    assert!(!old.refuse_bucketing && old.seed_entries.is_empty());
 }
 
 /// A batch whose lease ended without a submission gives its approach back:

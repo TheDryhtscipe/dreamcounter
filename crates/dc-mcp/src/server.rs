@@ -583,7 +583,7 @@ pub struct IterationStats {
 }
 
 /// Which learned library entries the programs that passed in one iteration
-/// refer to. Only programs that passed every example are counted, as only
+/// refer to. A seed entry of the run counts as a learned entry here. Only programs that passed every example are counted, as only
 /// they are kept compiled. A program counts an entry once however often it
 /// refers to it. Every reference in the compiled program counts, one in a
 /// binding that is never used too, so this counts uptake, not calls made
@@ -1295,7 +1295,6 @@ impl DcServer {
                 refuse_bucketing,
                 seed_entries,
             };
-            crate::seed::check(&config.seed_entries, config.max_memory)?;
             if let (Some(name), Some((other_config, other_tasks))) = (&compared_with, &other) {
                 let found = differences(&config, &tasks, other_config, other_tasks);
                 if !found.is_empty() {

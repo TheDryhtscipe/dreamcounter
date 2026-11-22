@@ -515,6 +515,10 @@ impl Store {
         config: RunConfig,
         tasks: Vec<String>,
     ) -> Result<RunState, StoreError> {
+        // Only here, not when a journal is read again: the check builds a
+        // verifier, and a run made by an earlier build must still load.
+        crate::seed::check(&config.seed_entries, config.max_memory)
+            .map_err(|why| StoreError::Rejected(Rejected::Seed(why)))?;
         let created = Event::Created { config, tasks };
         let state = RunState::replay([&created]).map_err(StoreError::Rejected)?;
         let dir_path = self.root.join(run.as_str());

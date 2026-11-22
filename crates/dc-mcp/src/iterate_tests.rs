@@ -1150,6 +1150,14 @@ fn a_seeding_that_is_not_the_runs_seed_entries_is_refused() {
     let mut arity = seeds.clone();
     arity[1].arity = 1;
     refused(arity, "not the run's seed entries");
+    // Another term, and the right term numbered for another place.
+    let mut term = seeds.clone();
+    term[0].term = "(lam (lam (lam $1)))".to_owned();
+    refused(term, "not the run's seed entries");
+    refused(
+        crate::seed::placed(&seeds, 3).unwrap(),
+        "not the run's seed entries",
+    );
     assert!(store.read(&run, |s| s.library().is_empty()).unwrap());
     // The run's own entries are taken.
     store
@@ -1200,4 +1208,52 @@ fn the_library_settings_need_library_learning_and_seed_entries_need_names() {
         c.refuse_bucketing = true;
     })
     .unwrap();
+}
+
+/// A Stitch run that finds one bucketing abstraction and rewrites nothing.
+struct FindsBucketing;
+
+impl Stitch for FindsBucketing {
+    fn run(
+        &mut self,
+        arena: &mut Arena,
+        _prelude: Option<&Prelude>,
+        _libs: &[LibDef],
+        programs: &[FrontierProgram],
+        _cfg: &CompressConfig,
+    ) -> Result<Compression, CompressError> {
+        let term = dc_core::sexpr::parse(
+            arena,
+            "(lam (lam (array_set $1 $0 (cons 7 (array_get $1 $0)))))",
+        )
+        .unwrap();
+        Ok(Compression {
+            new_libs: vec![LibDef { arity: 2, term }],
+            rewritten: programs.iter().map(|p| p.program).collect(),
+            names: Default::default(),
+            stitch_steps: 1,
+            rejected: None,
+        })
+    }
+}
+
+#[test]
+fn a_refusing_run_logs_the_bucketing_abstraction_it_refused() {
+    let logged = |refuse: bool| {
+        let (_dir, store, run) = setup_with(2, |c| c.refuse_bucketing = refuse);
+        fill(&store, &run, 0);
+        let done = finish_iteration(&store, &run, &mut FindsBucketing).unwrap();
+        assert_eq!(done.new_abstractions, 0);
+        let CompressionReport::Ran { written_out, .. } = done.report.compression else {
+            panic!("{:?}", done.report.compression);
+        };
+        written_out
+    };
+    let refused = logged(true);
+    assert_eq!(refused.len(), 1);
+    assert!(refused[0].bucketing);
+    assert_eq!(refused[0].abstraction, 0);
+    // A run that does not refuse writes nothing out: the abstraction is cut
+    // only because no program uses it.
+    assert!(logged(false).is_empty());
 }

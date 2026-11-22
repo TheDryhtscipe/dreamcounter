@@ -75,6 +75,9 @@ fn a_seed_entry_that_does_not_fit_is_refused_with_its_index() {
     };
     refused(&[good[0].clone(), twice], "names another library function");
     refused(&[entry(1, "(lam $0)", "map")], "primitive or prelude");
+    // No parameters and a term that does work (D34); a constant is taken.
+    refused(&[entry(0, "(add 2 3)", "five")], "does work");
+    check(&[entry(0, "5", "five")], MEMORY).unwrap();
     // Too long, and too many.
     let long = format!("(lam (add $0 {}))", "1".repeat(MAX_SEED_TERM_LEN));
     refused(&[entry(1, &long, "long")], "bytes");

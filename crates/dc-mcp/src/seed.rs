@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use dc_core::{sexpr, Arena, LibId};
+use dc_core::{sexpr, Arena, LibId, Term};
 
 use crate::naming::{check_doc, check_name};
 use crate::state::LibraryEntry;
@@ -25,7 +25,9 @@ pub const MAX_SEED_TERM_LEN: usize = 4096;
 /// [`MAX_SEED_TERM_LEN`] bytes, a name [`check_name`] accepts and a doc
 /// [`check_doc`] accepts; and each term parses, types and expands with the
 /// prelude and the entries before it, with at least as many leading lambdas
-/// as its arity. `max_memory` is the run's limit for an evaluation; no
+/// as its arity. An entry with no parameters must be a lambda, a literal, a
+/// primitive or a library reference: any other is computed again at each use
+/// (decision D34). `max_memory` is the run's limit for an evaluation; no
 /// program runs here.
 pub fn check(entries: &[LibraryEntry], max_memory: u64) -> Result<(), String> {
     if entries.len() > MAX_SEED_ENTRIES {
@@ -48,8 +50,23 @@ pub fn check(entries: &[LibraryEntry], max_memory: u64) -> Result<(), String> {
         check_doc(doc).map_err(bad)?;
     }
     Verifier::new(entries, max_memory)
-        .map(|_| ())
-        .map_err(|e| format!("seed entry {}: {}", e.index, e.reason))
+        .map_err(|e| format!("seed entry {}: {}", e.index, e.reason))?;
+    let mut arena = Arena::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let bad = |why: String| format!("seed entry {i}: {why}");
+        let term = sexpr::parse(&mut arena, &entry.term).map_err(|e| bad(e.to_string()))?;
+        let value = matches!(
+            arena.get(term),
+            Term::Lam(_) | Term::Int(_) | Term::Bool(_) | Term::Unit | Term::Prim(_) | Term::Lib(_)
+        );
+        if entry.arity == 0 && !value {
+            return Err(bad(
+                "it has no parameters and its term does work, which each use would do again"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The seed entries as they join a library that holds `base` entries: each

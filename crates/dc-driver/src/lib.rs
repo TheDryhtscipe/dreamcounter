@@ -42,7 +42,8 @@
 //!    entry or an earlier new abstraction that is bucketing. A use of it is
 //!    replaced by its body with the arguments put in for the parameters, as
 //!    expansion does (D1), so a use with too few arguments becomes a function
-//!    of the others. The report marks each one (`bucketing`).
+//!    of the others. The report marks each one (`bucketing`), except one with
+//!    no parameters that does work, which the first rule has already taken.
 //!    Then each new abstraction gets a type scheme inferred from
 //!    its body with the earlier ones, and the new abstractions are cut at the
 //!    first that does not type or is too large to print. A rewritten program
@@ -1200,11 +1201,11 @@ fn write_out_bucketing(
                 let before = refused[..j].iter().filter(|&&r| r).count();
                 let id = u32::try_from(old_len + j - before)
                     .map_err(|_| DriverError::LibraryTooLarge)?;
-                let n = fresh.next().expect("fewer than 2^64 literals");
+                let n = fresh.next().ok_or(DriverError::LibraryTooLarge)?;
                 (arena.int(n), Some(LibId(id)))
             }
             None => {
-                let n = fresh.next().expect("fewer than 2^64 literals");
+                let n = fresh.next().ok_or(DriverError::LibraryTooLarge)?;
                 (arena.int(n), Some(LibId(l)))
             }
         };

@@ -168,8 +168,9 @@ pub struct RunConfig {
 /// library that holds `library` before them: each has a name that
 /// [`check_name_form`](crate::naming::check_name_form) accepts and no other
 /// entry has, and a doc that [`check_doc`](crate::naming::check_doc)
-/// accepts. The terms are not checked here: `dc_create_run` checks them
-/// (`crate::seed`), as it checks a name against the primitives and the prelude.
+/// accepts. The terms are not checked here: the store checks them when it
+/// makes a run (`crate::seed::check`), as it checks a name against the
+/// primitives and the prelude.
 fn check_seed_forms(
     entries: &[LibraryEntry],
     base: usize,
@@ -738,7 +739,8 @@ pub enum Event {
     /// iteration 0.
     LibrarySeeded {
         /// The entries, one for each seed entry in order: the seed entry
-        /// with each reference to a seed entry numbered as in the library.
+        /// with each reference to a seed entry numbered as in the library
+        /// (`crate::seed::placed`). The state refuses any other entries.
         entries: Vec<LibraryEntry>,
     },
     /// A naming job for a library entry is handed to a proposer (D23).
@@ -1134,7 +1136,8 @@ pub struct ModelCounts {
 }
 
 /// Which learned library entries the programs that passed in one iteration
-/// refer to. A program counts an entry once however often it refers to it.
+/// refer to. A seed entry ([`RunConfig::seed_entries`]) counts as a learned
+/// entry here. A program counts an entry once however often it refers to it.
 /// Every reference in the compiled program counts, one in a binding that is
 /// never used too. Only a direct reference counts: one inside another
 /// entry's body does not. Prelude functions are not learned entries and are
@@ -1438,15 +1441,12 @@ impl RunState {
                         "seed entries join the library once, in iteration 0".to_owned(),
                     ));
                 }
-                let same = entries.len() == seeds.len()
-                    && entries
-                        .iter()
-                        .zip(seeds)
-                        .all(|(e, s)| (e.arity, &e.name, &e.doc) == (s.arity, &s.name, &s.doc));
-                if !same {
+                let placed =
+                    crate::seed::placed(seeds, self.library.len()).map_err(Rejected::Seed)?;
+                if *entries != placed {
                     return Err(Rejected::Seed(
-                        "the entries are not the run's seed entries, in order, with their \
-                         arities, names and docs"
+                        "the entries are not the run's seed entries, in order, as they \
+                         join the library"
                             .to_owned(),
                     ));
                 }
