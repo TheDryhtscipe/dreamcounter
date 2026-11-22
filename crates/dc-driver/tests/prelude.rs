@@ -3,12 +3,13 @@
 
 use std::collections::BTreeMap;
 
-use dc_compress::CompressConfig;
+use dc_compress::{CompressConfig, CompressError, Compression, FrontierProgram};
 use dc_core::{expand, sexpr, Arena, LibDef, LibId, Scheme};
 use dc_driver::{
     run_iteration, Candidate, CompressionReport, DriverConfig, DriverError, Fate, InProcess,
-    IterationInput, IterationOutcome, LibraryEntry, Source, TaskSpec,
+    IterationInput, IterationOutcome, LibraryEntry, Source, Stitch, TaskSpec,
 };
+use dc_stitch::LibNames;
 use dc_surface::prelude::{Prelude, PreludeMode};
 
 fn scheme(text: &str) -> Scheme {
@@ -43,6 +44,7 @@ fn config() -> DriverConfig {
     DriverConfig {
         frontier_size: 5,
         compress: Some(CompressConfig::default()),
+        refuse_bucketing: false,
     }
 }
 
@@ -262,4 +264,91 @@ fn the_new_library_feeds_the_next_iteration_with_the_prelude() {
         .programs
         .iter()
         .any(|p| p.source == source("t0") && p.fate == Fate::Kept));
+}
+
+/// A Stitch runner that returns one abstraction and one rewritten program, as
+/// text, whatever the input.
+struct Fixed {
+    lib: (u32, String),
+    rewritten: String,
+}
+
+impl Stitch for Fixed {
+    fn run(
+        &mut self,
+        arena: &mut Arena,
+        _prelude: Option<&Prelude>,
+        _libs: &[LibDef],
+        _programs: &[FrontierProgram],
+        _cfg: &CompressConfig,
+    ) -> Result<Compression, CompressError> {
+        Ok(Compression {
+            new_libs: vec![LibDef {
+                arity: self.lib.0,
+                term: sexpr::parse(arena, &self.lib.1).unwrap(),
+            }],
+            rewritten: vec![sexpr::parse(arena, &self.rewritten).unwrap()],
+            names: LibNames::new(),
+            stitch_steps: 1,
+            rejected: None,
+        })
+    }
+}
+
+#[test]
+fn writing_out_a_refused_abstraction_keeps_prelude_uses_and_every_literal() {
+    // The program uses `map` and the least integer. Writing out puts each
+    // library reference that stays aside as an integer literal the terms do
+    // not hold: the first one free is the least integer but one.
+    let prelude = Prelude::load().unwrap();
+    let map = lib_text(prelude.get("map").unwrap().lib());
+    let least = i64::MIN;
+    let tasks = [task(
+        "put",
+        "Array (List (List Int)) -> List Int -> Array (List (List Int))",
+    )];
+    let program = format!(
+        "(lam (lam (array_set $1 {least} \
+         (cons ({map} (lam (add $0 {})) $0) (array_get $1 {least})))))",
+        least + 1
+    );
+    let cands = [candidate("put", program.clone())];
+    let mut stitch = Fixed {
+        lib: (
+            2,
+            format!("(lam (lam (array_set $1 {least} (cons $0 (array_get $1 {least})))))"),
+        ),
+        rewritten: format!(
+            "(lam (lam (lib_0 $1 ({map} (lam (add $0 {})) $0))))",
+            least + 1
+        ),
+    };
+    let out = run_iteration(
+        IterationInput {
+            tasks: &tasks,
+            library: &[],
+            frontiers: &BTreeMap::new(),
+            candidates: &cands,
+            prelude: Some(&prelude),
+        },
+        &DriverConfig {
+            refuse_bucketing: true,
+            ..config()
+        },
+        &mut stitch,
+    )
+    .unwrap();
+    assert!(out.new_library.is_empty(), "{:?}", out.new_library);
+    assert_eq!(out.frontiers["put"], [program]);
+    let CompressionReport::Ran {
+        written_out,
+        fallbacks,
+        ..
+    } = &out.report.compression
+    else {
+        panic!("{:?}", out.report.compression);
+    };
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+    assert_eq!(written_out.len(), 1);
+    assert!(written_out[0].bucketing);
 }

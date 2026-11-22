@@ -117,7 +117,11 @@ fn same_shifted(arena: &Arena, outer: TermId, inner: TermId, by: u32) -> bool {
         }
         match (arena.get(x), arena.get(y)) {
             (Term::Var(i), Term::Var(j)) => {
-                let want = if i < cutoff { Some(i) } else { i.checked_add(by) };
+                let want = if i < cutoff {
+                    Some(i)
+                } else {
+                    i.checked_add(by)
+                };
                 if want != Some(j) {
                     return false;
                 }
@@ -197,7 +201,9 @@ mod tests {
             "(lam (lam (lam (lam (array_set $3 $1 (cons $0 (array_get $2 $1)))))))"
         ));
         // A new list in the slot, and a value that is not a list.
-        assert!(!bucketing("(lam (lam (lam (array_set $2 $1 (cons $0 nil)))))"));
+        assert!(!bucketing(
+            "(lam (lam (lam (array_set $2 $1 (cons $0 nil)))))"
+        ));
         assert!(!bucketing(
             "(lam (lam (lam (array_set $2 $1 (add $0 (array_get $2 $1))))))"
         ));

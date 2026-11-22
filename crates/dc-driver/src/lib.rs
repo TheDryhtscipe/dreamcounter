@@ -35,6 +35,14 @@
 //!    written out (D1), so such an entry is computed again at each use, though
 //!    it reads as a constant. The report lists each one
 //!    ([`CompressionReport::Ran`], `written_out`).
+//!    With [`DriverConfig::refuse_bucketing`], each new abstraction left that
+//!    is bucketing is written out as well (decision D36). An abstraction is
+//!    bucketing if its body holds a term that puts a value onto the list in an
+//!    array slot (the two forms are in `bucketing.rs`), or a use of a library
+//!    entry or an earlier new abstraction that is bucketing. A use of it is
+//!    replaced by its body with the arguments put in for the parameters, as
+//!    expansion does (D1), so a use with too few arguments becomes a function
+//!    of the others. The report marks each one (`bucketing`).
 //!    Then each new abstraction gets a type scheme inferred from
 //!    its body with the earlier ones, and the new abstractions are cut at the
 //!    first that does not type or is too large to print. A rewritten program
@@ -139,6 +147,10 @@ pub struct DriverConfig {
     /// compression: it selects the frontiers and leaves the library as it is,
     /// as an LLM-only baseline needs (decision D24).
     pub compress: Option<CompressConfig>,
+    /// Whether each bucketing abstraction Stitch finds is refused: written
+    /// out where it is used instead of joining the library (decision D36;
+    /// step 4 of the crate docs).
+    pub refuse_bucketing: bool,
 }
 
 /// The input of one step. Every name in `frontiers` and every program in it is
@@ -356,16 +368,17 @@ pub enum CompressionReport {
         kept: usize,
         /// The programs whose rewriting was refused.
         fallbacks: Vec<Fallback>,
-        /// The abstractions with no parameters whose body does work, written
-        /// out in place instead of joining the library (step 4 of the crate
+        /// The abstractions written out in place instead of joining the
+        /// library, in the order Stitch found them (step 4 of the crate
         /// docs). Absent in a report from before they were.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         written_out: Vec<WrittenOut>,
     },
 }
 
-/// An abstraction with no parameters that does work, written out where it is
-/// used instead of joining the library.
+/// An abstraction written out where it is used instead of joining the
+/// library: one with no parameters that does work, or a bucketing one that
+/// the step refuses ([`DriverConfig::refuse_bucketing`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WrittenOut {
@@ -374,6 +387,10 @@ pub struct WrittenOut {
     /// Its body, as an s-expression, as Stitch found it, or nothing if it is
     /// too large to print.
     pub term: String,
+    /// Whether it was written out because it is bucketing. Absent, and false,
+    /// for one with no parameters that does work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bucketing: bool,
 }
 
 /// What happened to each program in one step, for the run's log. The new
@@ -998,10 +1015,11 @@ fn write_out_work(
     arena: &mut Arena,
     old_len: usize,
     c: &Compression,
-) -> Result<(Compression, Vec<WrittenOut>), DriverError> {
+) -> Result<(Compression, Vec<WrittenOut>, Vec<usize>), DriverError> {
     let mut subst: Vec<TermId> = Vec::with_capacity(c.new_libs.len());
     let mut new_libs = Vec::with_capacity(c.new_libs.len());
     let mut written_out = Vec::new();
+    let mut origin = Vec::with_capacity(c.new_libs.len());
     for (i, def) in c.new_libs.iter().enumerate() {
         // The body refers only to earlier abstractions, which `subst` covers.
         let mut memo = HashMap::new();
@@ -1012,11 +1030,13 @@ fn write_out_work(
             written_out.push(WrittenOut {
                 abstraction: i,
                 term: sexpr::print(arena, def.term).unwrap_or_default(),
+                bucketing: false,
             });
             subst.push(body);
         } else {
             let id = u32::try_from(old_len + new_libs.len()).map_err(|_| DriverError::TooLarge)?;
             subst.push(arena.intern(Term::Lib(LibId(id))));
+            origin.push(i);
             new_libs.push(LibDef {
                 arity: def.arity,
                 term: body,
@@ -1024,7 +1044,7 @@ fn write_out_work(
         }
     }
     if written_out.is_empty() {
-        return Ok((c.clone(), written_out));
+        return Ok((c.clone(), written_out, origin));
     }
     let mut memo = HashMap::new();
     let rewritten = c
@@ -1041,7 +1061,229 @@ fn write_out_work(
             rejected: c.rejected.clone(),
         },
         written_out,
+        origin,
     ))
+}
+
+/// The integer literals and the library references in the terms `roots`.
+fn ints_and_libs(arena: &Arena, roots: &[TermId]) -> (HashSet<i64>, Vec<(TermId, LibId)>) {
+    let mut ints = HashSet::new();
+    let mut libs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = roots.to_vec();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let term = arena.get(id);
+        match term {
+            Term::Int(n) => {
+                ints.insert(n);
+            }
+            Term::Lib(l) => libs.push((id, l)),
+            _ => stack.extend(children(&term)),
+        }
+    }
+    libs.sort_by_key(|&(_, l)| l);
+    (ints, libs)
+}
+
+/// `root` with each node that is a key of `map` replaced by its value. The
+/// values are closed, so no index is shifted. Walks the shared term graph
+/// with a work list, each node once.
+fn replace_nodes(
+    arena: &mut Arena,
+    root: TermId,
+    map: &HashMap<TermId, TermId>,
+    memo: &mut HashMap<TermId, TermId>,
+) -> TermId {
+    let mut stack = vec![(root, false)];
+    while let Some((id, ready)) = stack.pop() {
+        if memo.contains_key(&id) {
+            continue;
+        }
+        if let Some(&to) = map.get(&id) {
+            memo.insert(id, to);
+            continue;
+        }
+        let term = arena.get(id);
+        if !ready {
+            stack.push((id, true));
+            for c in children(&term) {
+                if !memo.contains_key(&c) {
+                    stack.push((c, false));
+                }
+            }
+            continue;
+        }
+        let m = |c: TermId| memo[&c];
+        let out = match term {
+            Term::Lam(b) => Term::Lam(m(b)),
+            Term::App(f, a) => Term::App(m(f), m(a)),
+            Term::Let(b, e) => Term::Let(m(b), m(e)),
+            Term::If(c, t, e) => Term::If(m(c), m(t), m(e)),
+            Term::And(a, b) => Term::And(m(a), m(b)),
+            Term::Or(a, b) => Term::Or(m(a), m(b)),
+            Term::Var(_)
+            | Term::Int(_)
+            | Term::Bool(_)
+            | Term::Unit
+            | Term::Prim(_)
+            | Term::Lib(_) => term,
+        };
+        let out = arena.intern(out);
+        memo.insert(id, out);
+    }
+    memo[&root]
+}
+
+/// The second part of step 4 of the crate docs, for a step that refuses
+/// bucketing abstractions: each new abstraction of `c` that is bucketing is
+/// written out where the other abstractions and the rewritten programs use
+/// it, and the abstractions after it are numbered down. `old` is the library,
+/// and `origin[j]` is the index Stitch gave `c`'s abstraction `j`, which
+/// `found` holds as Stitch found it. Returns the compression changed so, and
+/// the abstractions written out; or why the refused abstractions do not
+/// expand.
+///
+/// A use is written out by expansion (D1), and the expander replaces every
+/// library reference it meets. So each reference that stays is first put
+/// aside as an integer literal that occurs nowhere in the terms, and put
+/// back after.
+fn write_out_bucketing(
+    arena: &mut Arena,
+    old: &[LibDef],
+    c: &Compression,
+    origin: &[usize],
+    found: &[LibDef],
+) -> Result<Result<(Compression, Vec<WrittenOut>), String>, DriverError> {
+    let old_len = old.len();
+    let mut flags: Vec<bool> = Vec::with_capacity(old_len + c.new_libs.len());
+    for def in old.iter().chain(&c.new_libs) {
+        // An entry refers only to earlier ones, which `flags` covers. A
+        // prelude function has an id past every entry, and is not bucketing.
+        let flag = bucketing::is_bucketing(arena, def.term, |l| {
+            flags.get(l as usize).copied().unwrap_or(false)
+        });
+        flags.push(flag);
+    }
+    let refused = &flags[old_len..];
+    if !refused.contains(&true) {
+        return Ok(Ok((c.clone(), Vec::new())));
+    }
+
+    let roots: Vec<TermId> = c
+        .new_libs
+        .iter()
+        .map(|d| d.term)
+        .chain(c.rewritten.iter().copied())
+        .collect();
+    let (ints, libs) = ints_and_libs(arena, &roots);
+    // `aside` sends a reference that stays to its literal, and a reference to
+    // a refused abstraction to that abstraction's place among the refused.
+    // `back` sends each literal to the reference under the new numbering.
+    let mut aside = HashMap::new();
+    let mut back = HashMap::new();
+    let mut fresh = (i64::MIN..).filter(|n| !ints.contains(n));
+    for (node, LibId(l)) in libs {
+        let new = (l as usize)
+            .checked_sub(old_len)
+            .filter(|&j| j < refused.len());
+        let (to, lib) = match new {
+            Some(j) if refused[j] => {
+                let rank = refused[..j].iter().filter(|&&r| r).count();
+                let rank = u32::try_from(rank).map_err(|_| DriverError::LibraryTooLarge)?;
+                (arena.intern(Term::Lib(LibId(rank))), None)
+            }
+            Some(j) => {
+                let before = refused[..j].iter().filter(|&&r| r).count();
+                let id = u32::try_from(old_len + j - before)
+                    .map_err(|_| DriverError::LibraryTooLarge)?;
+                let n = fresh.next().expect("fewer than 2^64 literals");
+                (arena.int(n), Some(LibId(id)))
+            }
+            None => {
+                let n = fresh.next().expect("fewer than 2^64 literals");
+                (arena.int(n), Some(LibId(l)))
+            }
+        };
+        aside.insert(node, to);
+        if let Some(lib) = lib {
+            let lib = arena.intern(Term::Lib(lib));
+            back.insert(to, lib);
+        }
+    }
+
+    let mut aside_memo = HashMap::new();
+    let mut put = |arena: &mut Arena, t: TermId| replace_nodes(arena, t, &aside, &mut aside_memo);
+    let refused_defs: Vec<LibDef> = c
+        .new_libs
+        .iter()
+        .zip(refused)
+        .filter(|&(_, &r)| r)
+        .map(|(def, _)| LibDef {
+            arity: def.arity,
+            term: put(arena, def.term),
+        })
+        .collect();
+    let mut expander = match Expander::new(arena, &refused_defs) {
+        Ok(x) => x,
+        Err(e) => return Ok(Err(format!("the refused abstractions do not expand: {e}"))),
+    };
+    let mut back_memo = HashMap::new();
+    let mut write_out = |arena: &mut Arena, t: TermId| -> Result<TermId, String> {
+        let t = put(arena, t);
+        let t = expander
+            .expand(arena, t)
+            .map_err(|e| format!("a use of a refused abstraction does not expand: {e}"))?;
+        Ok(replace_nodes(arena, t, &back, &mut back_memo))
+    };
+
+    let mut new_libs = Vec::new();
+    let mut written_out = Vec::new();
+    for ((def, &r), &i) in c.new_libs.iter().zip(refused).zip(origin) {
+        if r {
+            written_out.push(WrittenOut {
+                abstraction: i,
+                term: sexpr::print(arena, found[i].term).unwrap_or_default(),
+                bucketing: true,
+            });
+        } else {
+            match write_out(arena, def.term) {
+                Ok(term) => new_libs.push(LibDef {
+                    arity: def.arity,
+                    term,
+                }),
+                Err(e) => return Ok(Err(e)),
+            }
+        }
+    }
+    let mut rewritten = Vec::with_capacity(c.rewritten.len());
+    for &p in &c.rewritten {
+        match write_out(arena, p) {
+            Ok(t) => rewritten.push(t),
+            Err(e) => return Ok(Err(e)),
+        }
+    }
+    Ok(Ok((
+        Compression {
+            new_libs,
+            rewritten,
+            names: c.names.clone(),
+            stitch_steps: c.stitch_steps,
+            rejected: c.rejected.clone(),
+        },
+        written_out,
+    )))
+}
+
+/// What a Stitch run found.
+struct Found<'a> {
+    /// For each program given to Stitch, its task and its place in the
+    /// task's kept programs.
+    slots: &'a [(usize, usize)],
+    /// The abstractions and the rewritten programs, one for each slot.
+    c: &'a Compression,
 }
 
 /// Step 4 of the crate docs: types the new abstractions, accepts each
@@ -1053,13 +1295,24 @@ fn update_library(
     library: &Library<'_>,
     tasks: &[TaskSpec],
     kept: &mut [Vec<Pooled>],
-    slots: &[(usize, usize)],
-    c: &Compression,
+    found: Found<'_>,
     left_out: Vec<LeftOut>,
+    refuse_bucketing: bool,
 ) -> Result<(Vec<LibraryEntry>, CompressionReport), DriverError> {
+    let Found { slots, c } = found;
     let old_len = library.defs.len();
     let found = c.new_libs.len();
-    let (written, written_out) = write_out_work(arena, old_len, c)?;
+    let (mut written, mut written_out, origin) = write_out_work(arena, old_len, c)?;
+    if refuse_bucketing {
+        match write_out_bucketing(arena, &library.defs, &written, &origin, &c.new_libs)? {
+            Ok((without, refused)) => {
+                written = without;
+                written_out.extend(refused);
+                written_out.sort_by_key(|w| w.abstraction);
+            }
+            Err(error) => return Ok((Vec::new(), CompressionReport::Failed { left_out, error })),
+        }
+    }
     let c = &written;
     let mut schemes = library.schemes.clone();
     let mut untyped = None;
@@ -1218,9 +1471,12 @@ pub fn run_iteration(
             &library,
             input.tasks,
             &mut kept,
-            &slots,
-            &compression,
+            Found {
+                slots: &slots,
+                c: &compression,
+            },
             left_out,
+            cfg.refuse_bucketing,
         )?,
     };
 
