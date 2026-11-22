@@ -436,14 +436,29 @@ impl VerifierCache {
 /// ([`TaskFamily::known_mistake`], decision D36). It is false for a task
 /// that names no mistake, for an example on which the mistake gives the
 /// expected value, and for any other error.
+///
+/// A check stops at the first example that fails, so this is about that
+/// example only. The error shows values cut to [`SHOWN_VALUES`], so two
+/// long values that differ after the cut count as the same.
 pub fn known_mistake(task: &str, error: &str) -> bool {
-    static ERRORS: OnceLock<Mutex<BTreeMap<String, Arc<BTreeSet<String>>>>> = OnceLock::new();
+    with_mistake_errors(task, |errors| errors.contains(error))
+}
+
+/// Whether some example of `task` tells its known mistake from the right
+/// answer, so that [`known_mistake`] can be true for it.
+pub fn shows_known_mistake(task: &str) -> bool {
+    with_mistake_errors(task, |errors| !errors.is_empty())
+}
+
+/// Calls `f` with [`mistake_errors`] of `task`, computed once for each task.
+fn with_mistake_errors<T>(task: &str, f: impl FnOnce(&BTreeSet<String>) -> T) -> T {
+    static ERRORS: OnceLock<Mutex<BTreeMap<String, BTreeSet<String>>>> = OnceLock::new();
     let kept = ERRORS.get_or_init(Mutex::default);
     let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
     if !kept.contains_key(task) {
-        kept.insert(task.to_owned(), Arc::new(mistake_errors(task)));
+        kept.insert(task.to_owned(), mistake_errors(task));
     }
-    kept.get(task).is_some_and(|errors| errors.contains(error))
+    f(&kept[task])
 }
 
 /// The error of each example of `task` on which its known mistake gives
@@ -554,6 +569,36 @@ mod tests {
             .unwrap();
         let good = v.references.last().unwrap().entry;
         (v.family, v.source, good)
+    }
+
+    #[test]
+    fn only_a_task_with_an_example_of_its_known_mistake_shows_it() {
+        // Example 7 of each chain task tells the two readings apart.
+        for name in [
+            "chains/count",
+            "chains/longest",
+            "chains/heaviest",
+            "chains/longest-count",
+        ] {
+            assert!(shows_known_mistake(name), "{name}");
+        }
+        assert!(known_mistake(
+            "chains/longest",
+            "example 7: expected 3, got 4"
+        ));
+        assert!(!known_mistake(
+            "chains/longest",
+            "example 7: expected 3, got 5"
+        ));
+        assert!(!known_mistake(
+            "chains/longest",
+            "example 6: expected 3, got 4"
+        ));
+        // A task that names no mistake, and a name that is no task.
+        for name in ["collapse/merge", "no/such-task"] {
+            assert!(!shows_known_mistake(name), "{name}");
+            assert!(!known_mistake(name, "example 7: expected 3, got 4"));
+        }
     }
 
     #[test]

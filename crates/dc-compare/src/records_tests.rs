@@ -15,7 +15,7 @@ fn task_stats(name: &str, batches: u64, passed: u64) -> sv::TaskStats {
         compiled: batches,
         typed: batches,
         passed,
-        known_mistake: 2,
+        known_mistake: Some(2),
         solved: passed > 0,
     }
 }
@@ -91,6 +91,7 @@ fn proposal_stats_read_back() {
         ),
         ("chains/count", 6, 6, 6, 6, 3, true)
     );
+    assert_eq!(t.known_mistake, Some(2));
 }
 
 #[test]

@@ -235,9 +235,12 @@ pub fn interval(d: &[f64], alpha: f64) -> Result<Interval, TestError> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Call {
-    /// `p ≤ α`, and the mean difference favours the arm under test.
+    /// `p ≤ α`, and the mean difference is above 0: the arm under test has
+    /// the higher metric. That favours it, unless a higher metric is worse
+    /// (the known-mistake rate).
     Positive,
-    /// `p ≤ α`, and the mean difference favours the control arm.
+    /// `p ≤ α`, and the mean difference is below 0: the control arm has
+    /// the higher metric.
     Negative,
     /// `p > α`, and the whole interval lies strictly between `-m` and `+m`,
     /// the smallest effect that matters.

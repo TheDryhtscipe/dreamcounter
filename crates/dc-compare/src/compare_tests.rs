@@ -1008,6 +1008,15 @@ fn the_known_mistake_rate_is_over_batches_issued_in_the_counted_iterations() {
         .find(|m| m.name == "pass rate")
         .unwrap();
     assert_eq!(pass.test.as_ref().unwrap().mean, 0.0);
+    // The report says which way the call reads.
+    let text = crate::render::text(&report, None);
+    assert!(
+        text.contains("A higher rate is worse: POSITIVE says the library arm"),
+        "{text}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let pass = analyse(&six_pairs(dir.path()), dir.path()).unwrap();
+    assert!(!crate::render::text(&pass, None).contains("A higher rate is worse"));
 }
 
 #[test]

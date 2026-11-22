@@ -464,10 +464,15 @@ pub struct TaskStats {
     pub typed: u64,
     /// Programs that passed every example.
     pub passed: u64,
-    /// Programs that gave, on an example, the value of the task's known
-    /// mistake (decision D36). For a chain task that is the answer without
-    /// the order of positions. Always 0 for a task that names no mistake.
-    pub known_mistake: u64,
+    /// Programs that gave, on the first example they failed, the value of
+    /// the task's known mistake (decision D36). For a chain task that is
+    /// the answer without the order of positions. A program with the
+    /// mistake that fails an earlier example for another reason is not
+    /// counted, and a program that gives that value for another reason is.
+    /// Absent for a task with no example that tells its known mistake from
+    /// the right answer, such as a task that names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_mistake: Option<u64>,
     /// Whether at least one program passed.
     pub solved: bool,
 }
@@ -593,7 +598,8 @@ impl IterationStats {
                     compiled: c.compiled,
                     typed: c.typed,
                     passed: c.passed,
-                    known_mistake: c.known_mistake,
+                    known_mistake: crate::verify::shows_known_mistake(name)
+                        .then_some(c.known_mistake),
                     solved: c.passed > 0,
                 }
             })

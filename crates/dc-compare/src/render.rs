@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use crate::compare::{Compared, Report};
+use crate::compare::{Compared, Metric, Report};
 use crate::stats::{Call, Interval};
 
 fn num(x: Option<f64>) -> String {
@@ -97,6 +97,13 @@ pub fn text(r: &Report, commit: Option<&str>) -> String {
     let _ = writeln!(out, "\nPRIMARY ({:?})", r.metric);
     compared(&mut out, &r.primary.metric, true, r.alpha);
     let _ = writeln!(out, "  CALL: {}", call(r.primary.call));
+    if r.metric == Metric::KnownMistakeRate {
+        let _ = writeln!(
+            out,
+            "  A higher rate is worse: POSITIVE says the {} arm makes the mistake more often.",
+            r.arms.test
+        );
+    }
     if let Some(c) = &r.check {
         let _ = writeln!(out, "\nCHECK (iteration {}, not data)", c.iteration);
         compared(&mut out, &c.metric, true, r.alpha);

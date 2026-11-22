@@ -137,9 +137,10 @@ pub struct TaskStats {
     pub typed: u64,
     /// Programs that passed every example.
     pub passed: u64,
-    /// Programs that gave, on an example, the value of the task's known
-    /// mistake (D36). `None` in records exported by a dc-mcp from before
-    /// it counted them.
+    /// Programs that gave, on the first example they failed, the value of
+    /// the task's known mistake (D36). `None` for a task with no example
+    /// that shows its known mistake, and in records exported by a dc-mcp
+    /// from before it counted them.
     #[serde(default)]
     pub known_mistake: Option<u64>,
     /// Whether a program passed.

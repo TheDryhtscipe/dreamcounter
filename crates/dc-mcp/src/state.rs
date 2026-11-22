@@ -1040,8 +1040,11 @@ pub struct TaskCounts {
     pub typed: u64,
     /// Programs that passed every example.
     pub passed: u64,
-    /// Programs that gave, on an example, the value of the task's known
-    /// mistake ([`crate::verify::known_mistake`], decision D36).
+    /// Programs that gave, on the first example they failed, the value of
+    /// the task's known mistake ([`crate::verify::known_mistake`], decision
+    /// D36). Unlike the other counts, it depends on this build's task
+    /// definitions as well as on the journal: a journal replayed by a build
+    /// with other examples can give another count.
     pub known_mistake: u64,
 }
 

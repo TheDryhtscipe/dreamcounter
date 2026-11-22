@@ -29,10 +29,10 @@ pub enum Metric {
     /// less in D27), over programs the batches issued asked for
     /// (dreamcounter-a86001).
     CheapRate,
-    /// Programs that gave, on an example, the value of their task's known
-    /// mistake, over programs the batches issued asked for (decision D36).
-    /// A higher rate is worse, so a positive call says that the arm under
-    /// test makes the mistake more often.
+    /// Programs that gave, on the first example they failed, the value of
+    /// their task's known mistake, over programs the batches issued asked
+    /// for (decision D36). A higher rate is worse, so a positive call says
+    /// that the arm under test makes the mistake more often.
     KnownMistakeRate,
 }
 
@@ -376,8 +376,9 @@ fn load(
                 && t.known_mistake.is_none()
             {
                 return Err(CompareError(format!(
-                    "run {id} iteration {i} {}: proposal_stats.json has no known_mistake; \
-                     export the records again with a dc-mcp that counts it (D36)",
+                    "run {id} iteration {i} {}: proposal_stats.json has no known_mistake. \
+                     Either the task has no example that shows a known mistake, or the \
+                     records are from a dc-mcp that does not count it (D36): export them again",
                     t.name
                 )));
             }
@@ -1294,8 +1295,8 @@ pub fn analyse(spec: &Spec, base: &Path) -> Result<Report, CompareError> {
         runs.push(rc);
     }
     let mut not_computed = vec![
-        "causes of failure finer than compile, type and examples (such as positions out of \
-         order): the records count only those stages; the checks' messages are in the journal"
+        "causes of failure finer than compile, type and examples, other than each task's \
+         known mistake: the records count only those; the checks' messages are in the journal"
             .to_owned(),
         "tokens and cost for each iteration: launch summaries give them for each run only \
          (dreamcounter-f3bcfa)"
