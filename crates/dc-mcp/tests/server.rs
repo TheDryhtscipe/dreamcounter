@@ -635,6 +635,76 @@ fn bad_requests_are_tool_errors_and_change_nothing() {
     client.kill();
 }
 
+/// The settings of decision D36 are arm settings: two runs compared with
+/// each other may differ in them, a run does not take them from the run it
+/// is compared with, and `dc_run_status` reports them.
+#[test]
+fn compared_runs_may_differ_in_seed_entries_and_refuse_bucketing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut client = Client::start(dir.path());
+    let seeds = json!([
+        {
+            "term": "(lam (lam (lam (let (array_get $2 $0) \
+                     (array_set $2 $0 (cons $1 (array_get $2 $0)))))))",
+            "arity": 1, "name": "bucket_push_index",
+            "doc": "Puts index i onto the list in the bucket of keys[i]."
+        },
+        {
+            "term": "(lam (lam (foldl (lib_0 $0) (array_tabulate 16384 (lam nil)) $1)))",
+            "arity": 2, "name": "group_indices_by_key",
+            "doc": "Folds the indices into 16384 buckets by key, with bucket_push_index."
+        }
+    ]);
+    let base = json!({ "seed": 7, "proposals_per_task": 2, "frontier_size": 3 });
+    let create = |client: &mut Client, extra: Value| {
+        let mut arguments = base.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            arguments[k] = v.clone();
+        }
+        client.call("dc_create_run", arguments)
+    };
+    let with = create(&mut client, json!({ "run": "with", "seed_entries": seeds })).unwrap();
+    assert_eq!(
+        with["seed_entries"],
+        json!(["bucket_push_index", "group_indices_by_key"])
+    );
+    assert_eq!(with["refuse_bucketing"], json!(false));
+    // The entries join the library when iteration 0 ends, not before.
+    assert_eq!(with["library_size"], 0);
+
+    let without = create(
+        &mut client,
+        json!({ "run": "without", "refuse_bucketing": true, "compared_with": "with" }),
+    )
+    .unwrap();
+    assert_eq!(without["refuse_bucketing"], json!(true));
+    assert_eq!(without["seed_entries"], json!([]));
+    assert_eq!(without["compared_with"]["run"], "with");
+
+    // Both change the library, so a run that learns none refuses them.
+    for extra in [
+        json!({ "run": "x", "library_learning": false, "refuse_bucketing": true }),
+        json!({ "run": "x", "library_learning": false, "seed_entries": seeds }),
+    ] {
+        let error = create(&mut client, extra).unwrap_err();
+        assert!(error.contains("library_learning"), "{error}");
+    }
+    // An entry that does not type is refused with its index, and no run is
+    // made.
+    let mut wrong = seeds.clone();
+    wrong[1]["term"] = json!("(lam (lam (add $0 true)))");
+    let error = create(&mut client, json!({ "run": "x", "seed_entries": wrong })).unwrap_err();
+    assert!(error.contains("seed entry 1"), "{error}");
+    let mut unnamed = seeds.clone();
+    unnamed[0].as_object_mut().unwrap().remove("name");
+    assert!(create(&mut client, json!({ "run": "x", "seed_entries": unnamed })).is_err());
+    let error = client
+        .call("dc_run_status", json!({ "run": "x" }))
+        .unwrap_err();
+    assert!(error.contains("no run"), "{error}");
+    client.kill();
+}
+
 /// A baseline run made with `compared_with` takes the settings it does not
 /// give from the run it is compared with, is refused if a setting it gives
 /// differs, and reports the pairing with that run's iteration (D24).

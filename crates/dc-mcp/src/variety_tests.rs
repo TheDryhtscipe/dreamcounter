@@ -33,6 +33,8 @@ fn config(quota: u32, hints: bool, received: bool) -> RunConfig {
         compared_with: None,
         approach_hints: hints,
         show_received: received,
+        refuse_bucketing: false,
+        seed_entries: Vec::new(),
     }
 }
 

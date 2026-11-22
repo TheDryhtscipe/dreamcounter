@@ -26,6 +26,8 @@ fn config(autodoc: bool) -> RunConfig {
         compared_with: None,
         approach_hints: false,
         show_received: false,
+        refuse_bucketing: false,
+        seed_entries: Vec::new(),
     }
 }
 

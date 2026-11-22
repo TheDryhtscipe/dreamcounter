@@ -116,6 +116,8 @@ fn build(past: u64) -> (TempDir, Store, RunId) {
                 compared_with: None,
                 approach_hints: false,
                 show_received: false,
+                refuse_bucketing: false,
+                seed_entries: Vec::new(),
             },
             vec![MERGE.to_owned(), CANCEL.to_owned()],
         )

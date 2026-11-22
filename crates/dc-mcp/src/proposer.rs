@@ -916,6 +916,8 @@ mod tests {
                     compared_with: None,
                     approach_hints: false,
                     show_received: false,
+                    refuse_bucketing: false,
+                    seed_entries: Vec::new(),
                 },
                 vec![MERGE.into(), CANCEL.into()],
             )
@@ -1099,6 +1101,8 @@ mod tests {
             compared_with: None,
             approach_hints: false,
             show_received: false,
+            refuse_bucketing: false,
+            seed_entries: Vec::new(),
         };
         let tasks = vec![MERGE.to_owned(), CANCEL.to_owned()];
         let created = Event::Created {
@@ -1649,6 +1653,8 @@ mod tests {
             compared_with: None,
             approach_hints: false,
             show_received: false,
+            refuse_bucketing: false,
+            seed_entries: Vec::new(),
         }
     }
 

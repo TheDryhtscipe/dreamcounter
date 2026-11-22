@@ -61,6 +61,8 @@ fn a_claim_held_by_a_killed_process_does_not_strand_its_submission() {
                 compared_with: None,
                 approach_hints: false,
                 show_received: false,
+                refuse_bucketing: false,
+                seed_entries: Vec::new(),
             },
             vec!["collapse/merge".into()],
         )

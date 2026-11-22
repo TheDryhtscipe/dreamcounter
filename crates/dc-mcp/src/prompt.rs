@@ -581,6 +581,8 @@ mod tests {
                 compared_with: None,
                 approach_hints: false,
                 show_received: false,
+                refuse_bucketing: false,
+                seed_entries: Vec::new(),
             },
             tasks.iter().map(|t| (*t).to_owned()).collect(),
         )

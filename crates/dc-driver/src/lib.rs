@@ -1090,8 +1090,9 @@ fn ints_and_libs(arena: &Arena, roots: &[TermId]) -> (HashSet<i64>, Vec<(TermId,
 
 /// `root` with each node that is a key of `map` replaced by its value. The
 /// values are closed, so no index is shifted. Walks the shared term graph
-/// with a work list, each node once.
-fn replace_nodes(
+/// with a work list, each node once. `memo` holds the nodes already done, and
+/// can be given again for another root with the same `map`.
+pub fn replace_nodes(
     arena: &mut Arena,
     root: TermId,
     map: &HashMap<TermId, TermId>,

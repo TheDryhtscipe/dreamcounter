@@ -133,6 +133,41 @@ pub struct CreateRun {
     /// task in this iteration, without results, and asks for a different
     /// approach (decision D32). If absent, the compared run's, or false.
     pub show_received: Option<bool>,
+    /// Whether the step that ends each iteration refuses the bucketing
+    /// abstractions Stitch finds (decision D36). An abstraction is
+    /// bucketing if it puts a value onto the list in an array slot, as
+    /// `array_set a k (cons v (array_get a k))` or with the list named
+    /// first by a `let`, or if it uses a library entry or an earlier new
+    /// abstraction that is bucketing. A refused abstraction does not join
+    /// the library: each use of it is written out, and the compression log
+    /// lists it in `written_out` with `bucketing` true. It needs
+    /// library_learning. It is not taken from the compared run, and the two
+    /// runs may differ in it. If absent, false.
+    pub refuse_bucketing: Option<bool>,
+    /// Entries that join the library when iteration 0 ends, after the
+    /// entries Stitch finds then, each with its name and doc and with no
+    /// naming job (decision D36). At most 16. In a term, `lib_k` is entry
+    /// `k` of this list, and an entry may use only the prelude and the
+    /// entries before it. Each must type. They need library_learning. They
+    /// are not taken from the compared run, and the two runs may differ in
+    /// them. If absent, none.
+    pub seed_entries: Option<Vec<SeedEntry>>,
+}
+
+/// One entry of `dc_create_run`'s seed_entries.
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SeedEntry {
+    /// The closed term `λ^arity. body`, as an s-expression, at most 4096
+    /// bytes.
+    pub term: String,
+    /// The number of parameters: the leading lambdas of the term that a use
+    /// fills in by substitution.
+    pub arity: u32,
+    /// Its name, under the rules for a name a proposer gives an entry.
+    pub name: String,
+    /// What it does, in one line of printable ASCII, at most 400 bytes.
+    pub doc: String,
 }
 
 /// The most programs one batch asks for when `dc_create_run` does not say.
@@ -245,6 +280,12 @@ pub struct RunStatus {
     /// Whether each payload shows the programs already received for its
     /// task in this iteration (decision D32).
     pub show_received: bool,
+    /// Whether the run refuses the bucketing abstractions Stitch finds
+    /// (decision D36).
+    pub refuse_bucketing: bool,
+    /// The names of the run's seed entries, in order (decision D36). They
+    /// are in the library from the end of iteration 0.
+    pub seed_entries: Vec<String>,
     /// How many definitions wait for a naming result. While any does, no
     /// batch is issued.
     pub unnamed: u64,
@@ -309,6 +350,12 @@ impl RunStatus {
             }),
             approach_hints: config.approach_hints,
             show_received: config.show_received,
+            refuse_bucketing: config.refuse_bucketing,
+            seed_entries: config
+                .seed_entries
+                .iter()
+                .filter_map(|e| e.name.clone())
+                .collect(),
             unnamed: state.names_pending(),
             tasks: state
                 .tasks()
@@ -1124,6 +1171,31 @@ impl DcServer {
                 }
             }
         }
+        let refuse_bucketing = arg.refuse_bucketing.unwrap_or(false);
+        let seed_entries: Vec<crate::state::LibraryEntry> = arg
+            .seed_entries
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| crate::state::LibraryEntry {
+                arity: e.arity,
+                term: e.term,
+                name: Some(e.name),
+                doc: Some(e.doc),
+            })
+            .collect();
+        if !library_learning {
+            for (name, given) in [
+                ("refuse_bucketing", refuse_bucketing),
+                ("seed_entries", !seed_entries.is_empty()),
+            ] {
+                if given {
+                    return Err(format!(
+                        "{name} changes the library, and a run with library_learning off \
+                         has none"
+                    ));
+                }
+            }
+        }
         if arg.max_memory_mib == Some(0) {
             return Err("max_memory_mib must be at least 1".to_owned());
         }
@@ -1220,7 +1292,10 @@ impl DcServer {
                     .show_received
                     .or(other.as_ref().map(|(c, _)| c.show_received))
                     .unwrap_or(false),
+                refuse_bucketing,
+                seed_entries,
             };
+            crate::seed::check(&config.seed_entries, config.max_memory)?;
             if let (Some(name), Some((other_config, other_tasks))) = (&compared_with, &other) {
                 let found = differences(&config, &tasks, other_config, other_tasks);
                 if !found.is_empty() {
@@ -2142,6 +2217,8 @@ mod tests {
             compared_with: None,
             approach_hints: false,
             show_received: false,
+            refuse_bucketing: false,
+            seed_entries: Vec::new(),
         };
         let tasks = vec!["a".to_owned(), "b".to_owned()];
         // What does not fix the proposals may differ.
@@ -2204,6 +2281,8 @@ mod tests {
             (
                 RunConfig {
                     show_received: true,
+                    refuse_bucketing: false,
+                    seed_entries: Vec::new(),
                     ..base.clone()
                 },
                 "show_received is true, not false",
@@ -2260,6 +2339,8 @@ mod tests {
                     compared_with: None,
                     approach_hints: false,
                     show_received: false,
+                    refuse_bucketing: false,
+                    seed_entries: Vec::new(),
                 },
                 vec!["collapse/merge".into()],
             )
@@ -2348,6 +2429,8 @@ mod tests {
                         compared_with: None,
                         approach_hints: false,
                         show_received: false,
+                        refuse_bucketing: false,
+                        seed_entries: Vec::new(),
                     },
                     vec!["collapse/merge".into()],
                 )
