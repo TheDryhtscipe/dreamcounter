@@ -163,7 +163,8 @@ fn library(state: &RunState, verifier: &Verifier) -> String {
         "## Library\n\nThese functions are in scope. A use of one means exactly its \
          definition written out, so it is computed again at each use. If a definition \
          has no parameters and you use it more than once, or inside a function, bind it \
-         once with `let`, outside any function that uses it, and use that name.\n\n",
+         once with `let`, outside any function that uses it, and use that name. An \
+         argument you pass is computed at most once, as in any call.\n\n",
     );
     for (i, (entry, scheme)) in state.library().iter().zip(verifier.schemes()).enumerate() {
         let name = entry_name(i, entry);
@@ -689,6 +690,13 @@ mod tests {
             p.prompt
         );
         assert!(p.prompt.contains("bind it once with `let`"), "{}", p.prompt);
+        // An argument is bound once where the entry could repeat it (D35).
+        assert!(
+            p.prompt
+                .contains("An argument you pass is computed at most once"),
+            "{}",
+            p.prompt
+        );
         let cancel = crate::verify::task("collapse/cancel").unwrap();
         assert!(p.prompt.contains(cancel.description()));
         assert!(p.prompt.contains("let solve = fun"), "{}", p.prompt);
