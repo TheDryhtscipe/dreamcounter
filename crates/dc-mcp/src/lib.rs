@@ -46,6 +46,7 @@ pub mod journal;
 pub mod naming;
 pub mod prompt;
 pub mod proposer;
+pub mod seed;
 pub mod server;
 pub mod state;
 pub mod store;

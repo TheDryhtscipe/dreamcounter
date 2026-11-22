@@ -13,6 +13,7 @@ use tempfile::TempDir;
 use super::*;
 use crate::proposer::{next_batch, submit, Refused};
 use crate::state::{Arm, Check, CostVerdict, ProgramCost, RunConfig, Standing};
+use crate::verify::Verifier;
 
 const MERGE: &str = "collapse/merge";
 const CANCEL: &str = "collapse/cancel";
@@ -39,6 +40,8 @@ fn config(quota: u32, prelude: u64) -> RunConfig {
         compared_with: None,
         approach_hints: false,
         show_received: false,
+        refuse_bucketing: false,
+        seed_entries: Vec::new(),
     }
 }
 
@@ -1023,4 +1026,243 @@ fn a_call_that_starts_after_the_server_shut_down_is_stopped() {
     assert!(started.elapsed() < STUCK_WALL);
     assert_eq!(journal(&dir), before);
     assert_eq!(store.read(&run, RunState::iteration).unwrap(), 0);
+}
+
+/// A run as `setup` makes, with the settings changed by `change`.
+fn setup_with(quota: u32, change: impl FnOnce(&mut RunConfig)) -> (TempDir, Store, RunId) {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("r").unwrap();
+    let tasks = TASKS.iter().map(|t| (*t).to_owned()).collect();
+    let mut config = config(quota, shipped_prelude());
+    change(&mut config);
+    store.create_run(&run, config, tasks).unwrap();
+    (dir, store, run)
+}
+
+#[test]
+fn seed_entries_join_the_library_named_when_iteration_0_ends() {
+    let seeds = crate::seed::tests::bucketing_entries();
+    let (_dir, store, run) = setup_with(2, |c| {
+        c.seed_entries.clone_from(&seeds);
+        // With autodoc on, an entry with no naming result holds batches back.
+        c.autodoc = true;
+    });
+    assert!(store.read(&run, |s| s.library().is_empty()).unwrap());
+    fill(&store, &run, 0);
+    let before = events(&store, &run).len();
+    let done = finish_iteration(&store, &run, &mut InProcess).unwrap();
+    let found = done.new_abstractions;
+    assert!(found > 0, "{:?}", done.report.compression);
+
+    // The record holds the seeding after the entries Stitch found.
+    let kinds: Vec<&str> = events(&store, &run)[before..]
+        .iter()
+        .filter_map(|e| match e {
+            Event::LibraryExtended { .. } => Some("library"),
+            Event::LibrarySeeded { .. } => Some("seeded"),
+            Event::IterationFinished { .. } => Some("finished"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, ["library", "seeded", "finished"]);
+
+    let state = store.state(&run).unwrap();
+    let library = state.library();
+    assert_eq!(library.len(), found + 2);
+    // Stitch's entries have no name yet; the seed entries have theirs, with
+    // the second one's reference numbered as the library numbers the first.
+    assert!(library[..found].iter().all(|e| e.name.is_none()));
+    assert_eq!(library[found].name, seeds[0].name);
+    assert_eq!(library[found].term, seeds[0].term);
+    assert_eq!(library[found + 1].name, seeds[1].name);
+    assert_eq!(library[found + 1].doc, seeds[1].doc);
+    assert_eq!(
+        library[found + 1].term,
+        format!("(lam (lam (foldl (lib_{found} $0) (array_tabulate 16384 (lam nil)) $1)))")
+    );
+    assert_eq!(state.added_in((found + 1) as u64), Some(0));
+    // Only Stitch's entries wait for a name.
+    assert_eq!(state.names_pending(), found as u64);
+    assert!(state.is_named(found as u64) && state.is_named((found + 1) as u64));
+    // The library loads, and a program can call a seed entry by its name.
+    let mut verifier = Verifier::new(library, state.config().max_memory).unwrap();
+    let family = task(MERGE).unwrap();
+    let calling = |name: &str| {
+        format!(
+            "let grouped = fun u -> {name} [0] (array_tabulate 1 (fun i -> 0))\n{}",
+            solution(MERGE, 0)
+        )
+    };
+    let result = verifier.check(family.as_ref(), &calling("group_indices_by_key"));
+    assert!(matches!(result, Check::Passed { .. }), "{result:?}");
+    // The same program with a name the library does not have is refused,
+    // so the name above was looked up.
+    let result = verifier.check(family.as_ref(), &calling("group_indices_by_keys"));
+    assert!(matches!(result, Check::Compile { .. }), "{result:?}");
+}
+
+#[test]
+fn seed_entries_join_the_library_once() {
+    let seeds = crate::seed::tests::bucketing_entries();
+    let (_dir, store, run) = setup_with(2, |c| c.seed_entries.clone_from(&seeds));
+    fill(&store, &run, 0);
+    let first = finish_iteration(&store, &run, &mut InProcess).unwrap();
+    let after_first = store.read(&run, |s| s.library().len()).unwrap();
+    assert_eq!(after_first, first.new_abstractions + 2);
+    fill(&store, &run, 10_000);
+    let second = finish_iteration(&store, &run, &mut InProcess).unwrap();
+    let state = store.state(&run).unwrap();
+    assert_eq!(state.library().len(), after_first + second.new_abstractions);
+    let seeded = events(&store, &run)
+        .iter()
+        .filter(|e| matches!(e, Event::LibrarySeeded { .. }))
+        .count();
+    assert_eq!(seeded, 1);
+    // A second seeding is refused, as is one in a run with no seed entries.
+    let again = Event::LibrarySeeded {
+        entries: crate::seed::placed(&seeds, state.library().len()).unwrap(),
+    };
+    let error = store.append(&run, vec![again.clone()]).unwrap_err();
+    assert!(
+        error.to_string().contains("once, in iteration 0"),
+        "{error}"
+    );
+    let (_dir, plain, run) = setup(2);
+    let error = plain.append(&run, vec![again]).unwrap_err();
+    assert!(error.to_string().contains("no seed entries"), "{error}");
+}
+
+#[test]
+fn a_seeding_that_is_not_the_runs_seed_entries_is_refused() {
+    let seeds = crate::seed::tests::bucketing_entries();
+    let (_dir, store, run) = setup_with(2, |c| c.seed_entries.clone_from(&seeds));
+    let refused = |entries: Vec<LibraryEntry>, part: &str| {
+        let error = store
+            .append(&run, vec![Event::LibrarySeeded { entries }])
+            .unwrap_err();
+        assert!(error.to_string().contains(part), "{error}");
+    };
+    refused(seeds[..1].to_vec(), "not the run's seed entries");
+    let mut renamed = seeds.clone();
+    renamed[0].name = Some("other_name".to_owned());
+    refused(renamed, "not the run's seed entries");
+    let mut arity = seeds.clone();
+    arity[1].arity = 1;
+    refused(arity, "not the run's seed entries");
+
+    assert!(store.read(&run, |s| s.library().is_empty()).unwrap());
+    // The run's own entries are taken, as the step places them.
+    let entries = crate::seed::placed(&seeds, 0).unwrap();
+    store
+        .append(&run, vec![Event::LibrarySeeded { entries }])
+        .unwrap();
+    assert_eq!(store.read(&run, |s| s.library().len()).unwrap(), 2);
+}
+
+#[test]
+fn a_run_that_refuses_bucketing_gives_the_step_that_setting() {
+    let plain = config(2, shipped_prelude());
+    assert!(!driver_config(&plain).refuse_bucketing);
+    let refusing = RunConfig {
+        refuse_bucketing: true,
+        ..plain
+    };
+    assert!(driver_config(&refusing).refuse_bucketing);
+}
+
+#[test]
+fn the_library_settings_need_library_learning_and_seed_entries_need_names() {
+    let seeds = crate::seed::tests::bucketing_entries();
+    let create = |change: &dyn Fn(&mut RunConfig)| {
+        let mut config = config(2, shipped_prelude());
+        change(&mut config);
+        RunState::create(config, vec![MERGE.to_owned()]).map(|_| ())
+    };
+    let error = create(&|c| {
+        c.library_learning = false;
+        c.refuse_bucketing = true;
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("refuse_bucketing"), "{error}");
+    let error = create(&|c| {
+        c.library_learning = false;
+        c.seed_entries.clone_from(&seeds);
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("seed_entries"), "{error}");
+    let error = create(&|c| {
+        c.seed_entries.clone_from(&seeds);
+        c.seed_entries[1].doc = None;
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("seed entry 1"), "{error}");
+    create(&|c| {
+        c.seed_entries.clone_from(&seeds);
+        c.refuse_bucketing = true;
+    })
+    .unwrap();
+}
+
+/// A Stitch run that finds one bucketing abstraction and rewrites nothing.
+struct FindsBucketing;
+
+impl Stitch for FindsBucketing {
+    fn run(
+        &mut self,
+        arena: &mut Arena,
+        _prelude: Option<&Prelude>,
+        _libs: &[LibDef],
+        programs: &[FrontierProgram],
+        _cfg: &CompressConfig,
+    ) -> Result<Compression, CompressError> {
+        let term = dc_core::sexpr::parse(
+            arena,
+            "(lam (lam (array_set $1 $0 (cons 7 (array_get $1 $0)))))",
+        )
+        .unwrap();
+        Ok(Compression {
+            new_libs: vec![LibDef { arity: 2, term }],
+            rewritten: programs.iter().map(|p| p.program).collect(),
+            names: Default::default(),
+            stitch_steps: 1,
+            rejected: None,
+        })
+    }
+}
+
+#[test]
+fn a_refusing_run_logs_the_bucketing_abstraction_it_refused() {
+    let logged = |refuse: bool| {
+        let (_dir, store, run) = setup_with(2, |c| c.refuse_bucketing = refuse);
+        fill(&store, &run, 0);
+        let done = finish_iteration(&store, &run, &mut FindsBucketing).unwrap();
+        assert_eq!(done.new_abstractions, 0);
+        let CompressionReport::Ran { written_out, .. } = done.report.compression else {
+            panic!("{:?}", done.report.compression);
+        };
+        written_out
+    };
+    let refused = logged(true);
+    assert_eq!(refused.len(), 1);
+    assert!(refused[0].bucketing);
+    assert_eq!(refused[0].abstraction, 0);
+    // A run that does not refuse writes nothing out: the abstraction is cut
+    // only because no program uses it.
+    assert!(logged(false).is_empty());
+}
+
+#[test]
+fn the_store_makes_no_run_with_a_seed_term_that_does_not_type() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let run = RunId::new("r").unwrap();
+    let mut config = config(2, shipped_prelude());
+    config.seed_entries = crate::seed::tests::bucketing_entries();
+    config.seed_entries[1].term = "(lam (lam (add $0 true)))".to_owned();
+    let error = store
+        .create_run(&run, config, vec![MERGE.to_owned()])
+        .unwrap_err();
+    assert!(error.to_string().contains("seed entry 1"), "{error}");
+    assert!(store.state(&run).is_err());
 }

@@ -19,6 +19,8 @@ fn created() -> Event {
             compared_with: None,
             approach_hints: false,
             show_received: false,
+            refuse_bucketing: false,
+            seed_entries: Vec::new(),
         },
         tasks: vec!["a".into()],
     }

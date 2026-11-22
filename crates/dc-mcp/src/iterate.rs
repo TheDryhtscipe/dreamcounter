@@ -19,7 +19,8 @@
 //!    changes nothing the step chose.
 //! 4. **Commit.** In one record, so that a restart finds all of it or none:
 //!    a `FrontierSet` for each task, its members with their costs, a
-//!    `LibraryExtended` if abstractions join the library, a log record of
+//!    `LibraryExtended` if abstractions join the library, in iteration 0 a
+//!    `LibrarySeeded` if the run has seed entries, a log record of
 //!    kind [`LogKind::Compression`] whose text is the step's [`IterationReport`] as JSON, and an
 //!    `IterationFinished` that takes the verified programs the step read.
 //!    Programs verified during the step stay for the next one.
@@ -132,6 +133,9 @@ pub enum FinishError {
         /// The iteration the step read.
         iteration: u64,
     },
+    /// The run's seed entries cannot join the library, in words.
+    /// `dc_create_run` checks them, so this means a bug.
+    Seed(String),
     /// Submissions that came in during the step still wait after
     /// [`COMMIT_TRIES`] checks, or checking them failed.
     ChecksPending(String),
@@ -181,6 +185,9 @@ impl fmt::Display for FinishError {
                 "iteration {iteration} was ended by another server, or the run was replaced, \
                  while this step ran. This step changed nothing"
             ),
+            FinishError::Seed(why) => {
+                write!(f, "the run's seed entries cannot join the library: {why}")
+            }
             FinishError::ChecksPending(why) => write!(
                 f,
                 "the step ran, but the iteration cannot end while submissions wait to be \
@@ -207,6 +214,7 @@ fn driver_config(config: &RunConfig) -> DriverConfig {
             iterations: config.stitch.iterations as usize,
             max_arity: config.stitch.max_arity,
         }),
+        refuse_bucketing: config.refuse_bucketing,
     }
 }
 
@@ -223,6 +231,9 @@ struct Snapshot {
     stitch: StitchSettings,
     /// The run's [`RunConfig::max_memory`], for measuring.
     max_memory: u64,
+    /// The run's [`RunConfig::seed_entries`] in iteration 0, when they join
+    /// the library; none in a later iteration.
+    seeds: Vec<LibraryEntry>,
 }
 
 /// The step's input, or why the iteration cannot end now.
@@ -279,6 +290,11 @@ fn snapshot(state: &RunState) -> Result<Snapshot, FinishError> {
         config: driver_config(state.config()),
         stitch: state.config().stitch,
         max_memory: state.config().max_memory,
+        seeds: if state.iteration() == 0 {
+            state.config().seed_entries.clone()
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -480,6 +496,14 @@ fn finish(
                     term: e.term.clone(),
                 })
                 .collect(),
+        });
+    }
+    if !snap.seeds.is_empty() {
+        // After the entries Stitch found, so those keep the numbers the
+        // step's programs use.
+        let base = snap.library.len() + outcome.new_library.len();
+        events.push(Event::LibrarySeeded {
+            entries: crate::seed::placed(&snap.seeds, base).map_err(FinishError::Seed)?,
         });
     }
     events.push(Event::Logged(LogRecord {

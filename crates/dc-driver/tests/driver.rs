@@ -11,6 +11,7 @@ use dc_core::{expand, sexpr, Arena, LibDef, Scheme, TermId};
 use dc_driver::{
     run_iteration, stitch_cost, Candidate, CompressionReport, DriverConfig, DriverError, Fate,
     InProcess, IterationInput, IterationOutcome, LibraryEntry, Source, Stitch, TaskSpec,
+    WrittenOut,
 };
 use dc_stitch::LibNames;
 use dc_surface::prelude::Prelude;
@@ -37,6 +38,15 @@ fn config(k: usize) -> DriverConfig {
     DriverConfig {
         frontier_size: k,
         compress: Some(CompressConfig::default()),
+        refuse_bucketing: false,
+    }
+}
+
+/// [`config`] with bucketing abstractions refused (decision D36).
+fn refusing(k: usize) -> DriverConfig {
+    DriverConfig {
+        refuse_bucketing: true,
+        ..config(k)
     }
 }
 
@@ -845,6 +855,250 @@ fn an_arity_0_abstraction_that_is_a_function_joins_the_library() {
     assert!(written_out.is_empty());
 }
 
+/// The signature of the programs in the bucketing tests: buckets and a key.
+const BUCKETS: &str = "Array (List Int) -> Int -> Array (List Int)";
+/// Puts 7 onto the list in the slot after the key's.
+const PUT_AFTER: &str = "(lam (lam (array_set $1 (add $0 1) (cons 7 (array_get $1 (add $0 1))))))";
+/// An abstraction of two parameters, buckets and a key, that puts 7 onto the
+/// key's list.
+const PUT: &str = "(lam (lam (array_set $1 $0 (cons 7 (array_get $1 $0)))))";
+
+#[test]
+fn a_refused_bucketing_abstraction_is_written_out_where_it_is_used() {
+    // lib_0 is bucketing and lib_1 is not. The program uses both: lib_0's
+    // use is replaced by its body with the arguments put in (D1), and lib_1
+    // joins the library as lib_0.
+    let tasks = [task("a", BUCKETS)];
+    let cands = [candidate("a", PUT_AFTER)];
+    let mut stitch = Fixed {
+        libs: vec![(2, PUT), (1, "(lam (add $0 1))")],
+        rewritten: vec!["(lam (lam (lib_0 $1 (lib_1 $0))))"],
+    };
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &refusing(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert_eq!(
+        out.new_library,
+        vec![LibraryEntry {
+            arity: 1,
+            term: "(lam (add $0 1))".into()
+        }]
+    );
+    assert_eq!(
+        out.frontiers["a"],
+        vec!["(lam (lam (array_set $1 (lib_0 $0) (cons 7 (array_get $1 (lib_0 $0))))))"]
+    );
+    let CompressionReport::Ran {
+        found,
+        kept,
+        written_out,
+        fallbacks,
+        ..
+    } = &out.report.compression
+    else {
+        panic!("{:?}", out.report.compression);
+    };
+    assert_eq!((*found, *kept), (2, 1));
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+    assert_eq!(
+        written_out,
+        &vec![WrittenOut {
+            abstraction: 0,
+            term: PUT.into(),
+            bucketing: true,
+        }]
+    );
+}
+
+#[test]
+fn a_bucketing_abstraction_joins_the_library_when_it_is_not_refused() {
+    let tasks = [task("a", BUCKETS)];
+    let cands = [candidate("a", PUT_AFTER)];
+    let mut stitch = Fixed {
+        libs: vec![(2, PUT), (1, "(lam (add $0 1))")],
+        rewritten: vec!["(lam (lam (lib_0 $1 (lib_1 $0))))"],
+    };
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &config(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert_eq!(out.new_library.len(), 2);
+    assert_eq!(out.new_library[0].term, PUT);
+    assert_eq!(
+        out.frontiers["a"],
+        vec!["(lam (lam (lib_0 $1 (lib_1 $0))))"]
+    );
+    let CompressionReport::Ran { written_out, .. } = &out.report.compression else {
+        panic!("{:?}", out.report.compression);
+    };
+    assert!(written_out.is_empty());
+}
+
+#[test]
+fn an_abstraction_that_uses_a_refused_one_is_refused_too() {
+    // lib_1 is bucketing only through lib_0. With lib_0 written out it holds
+    // the form itself, so it is written out as well, and the program is as it
+    // was.
+    let tasks = [task("a", BUCKETS)];
+    let cands = [candidate("a", PUT_AFTER)];
+    let mut stitch = Fixed {
+        libs: vec![(2, PUT), (2, "(lam (lam (lib_0 $1 (add $0 1))))")],
+        rewritten: vec!["(lam (lam (lib_1 $1 $0)))"],
+    };
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &refusing(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert!(out.new_library.is_empty(), "{:?}", out.new_library);
+    assert_eq!(out.frontiers["a"], vec![PUT_AFTER]);
+    let CompressionReport::Ran {
+        written_out,
+        fallbacks,
+        ..
+    } = &out.report.compression
+    else {
+        panic!("{:?}", out.report.compression);
+    };
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+    let which: Vec<(usize, bool)> = written_out
+        .iter()
+        .map(|w| (w.abstraction, w.bucketing))
+        .collect();
+    assert_eq!(which, vec![(0, true), (1, true)]);
+    // The report holds each body as Stitch found it.
+    assert_eq!(written_out[1].term, "(lam (lam (lib_0 $1 (add $0 1))))");
+}
+
+#[test]
+fn a_refused_abstraction_used_with_too_few_arguments_is_a_function() {
+    // lib_0 is given one of its two arguments, so its use is the body under
+    // one lambda for the other (D1). The program expands to what the
+    // original expands to, so the rewriting is accepted.
+    let tasks = [task("a", BUCKETS)];
+    let cands = [candidate("a", PUT)];
+    let mut stitch = Fixed {
+        libs: vec![(2, PUT)],
+        rewritten: vec!["(lam (lib_0 $0))"],
+    };
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &refusing(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert!(out.new_library.is_empty(), "{:?}", out.new_library);
+    assert_eq!(out.frontiers["a"], vec![PUT]);
+    let CompressionReport::Ran { fallbacks, .. } = &out.report.compression else {
+        panic!("{:?}", out.report.compression);
+    };
+    assert!(fallbacks.is_empty(), "{fallbacks:?}");
+}
+
+#[test]
+fn the_report_numbers_refused_abstractions_as_stitch_found_them() {
+    // lib_0 has no parameters and does work, so it is written out first
+    // (D34). lib_1 is bucketing and lib_2 is kept as lib_0.
+    let tasks = [task("a", BUCKETS)];
+    let cands = [candidate(
+        "a",
+        "(lam (lam (array_set $1 (add $0 1) (cons (add 2 3) (array_get $1 (add $0 1))))))",
+    )];
+    let mut stitch = Fixed {
+        libs: vec![
+            (0, "(add 2 3)"),
+            (
+                2,
+                "(lam (lam (array_set $1 $0 (cons lib_0 (array_get $1 $0)))))",
+            ),
+            (1, "(lam (add $0 1))"),
+        ],
+        rewritten: vec!["(lam (lam (lib_1 $1 (lib_2 $0))))"],
+    };
+    let out = run(
+        &tasks,
+        &[],
+        &BTreeMap::new(),
+        &cands,
+        &refusing(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert_eq!(
+        out.new_library,
+        vec![LibraryEntry {
+            arity: 1,
+            term: "(lam (add $0 1))".into()
+        }]
+    );
+    assert_eq!(
+        out.frontiers["a"],
+        vec!["(lam (lam (array_set $1 (lib_0 $0) (cons (add 2 3) (array_get $1 (lib_0 $0))))))"]
+    );
+    let CompressionReport::Ran { written_out, .. } = &out.report.compression else {
+        panic!("{:?}", out.report.compression);
+    };
+    let which: Vec<(usize, bool)> = written_out
+        .iter()
+        .map(|w| (w.abstraction, w.bucketing))
+        .collect();
+    assert_eq!(which, vec![(0, false), (1, true)]);
+}
+
+#[test]
+fn a_new_abstraction_that_uses_a_bucketing_entry_of_the_library_is_refused() {
+    // The library already holds a bucketing entry, as a run with seeded
+    // entries does. A new abstraction that uses it is bucketing; the entry
+    // itself stays, and the program still uses it.
+    let tasks = [task("a", BUCKETS)];
+    let library = [LibraryEntry {
+        arity: 2,
+        term: PUT.into(),
+    }];
+    let cands = [candidate("a", "(lam (lam (lib_0 $1 (add $0 1))))")];
+    let mut stitch = Fixed {
+        libs: vec![(2, "(lam (lam (lib_0 $1 (add $0 1))))")],
+        rewritten: vec!["(lam (lam (lib_1 $1 $0)))"],
+    };
+    let out = run(
+        &tasks,
+        &library,
+        &BTreeMap::new(),
+        &cands,
+        &refusing(5),
+        &mut stitch,
+    )
+    .unwrap();
+    assert!(out.new_library.is_empty(), "{:?}", out.new_library);
+    assert_eq!(
+        out.frontiers["a"],
+        vec!["(lam (lam (lib_0 $1 (add $0 1))))"]
+    );
+    let CompressionReport::Ran { written_out, .. } = &out.report.compression else {
+        panic!("{:?}", out.report.compression);
+    };
+    assert_eq!(written_out.len(), 1);
+    assert!(written_out[0].bucketing);
+}
+
 #[test]
 fn a_failed_stitch_run_still_updates_the_frontiers() {
     let tasks = shared_tasks();
@@ -930,6 +1184,7 @@ fn with_compression_off_stitch_does_not_run() {
     let cfg = DriverConfig {
         frontier_size: 5,
         compress: None,
+        refuse_bucketing: false,
     };
     let mut stitch = Nothing::default();
     let out = run(&tasks, &[], &BTreeMap::new(), &cands, &cfg, &mut stitch).unwrap();

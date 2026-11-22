@@ -123,6 +123,8 @@ fn run_status_reads_back_and_keeps_its_settings() {
         compared_with: None,
         approach_hints: false,
         show_received: true,
+        refuse_bucketing: true,
+        seed_entries: vec!["bucket_push_index".to_owned()],
         unnamed: 0,
         log_counts: sv::LogCounts {
             compression: 1,
@@ -174,6 +176,8 @@ fn run_status_reads_back_and_keeps_its_settings() {
         "max_memory_mib",
         "approach_hints",
         "show_received",
+        "refuse_bucketing",
+        "seed_entries",
     ] {
         assert!(settings.contains_key(kept), "{kept}");
     }

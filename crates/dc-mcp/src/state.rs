@@ -148,6 +148,45 @@ pub struct RunConfig {
     /// has it off.
     #[serde(default)]
     pub show_received: bool,
+    /// Whether the step that ends each iteration refuses the bucketing
+    /// abstractions Stitch finds, and writes each out where it is used
+    /// (`dc_driver::DriverConfig::refuse_bucketing`, decision D36). It
+    /// needs library learning. A run made before the setting has it off.
+    #[serde(default)]
+    pub refuse_bucketing: bool,
+    /// Entries that join the library when iteration 0 ends, after the
+    /// entries Stitch finds then, each with its name and doc and with no
+    /// naming job (decision D36). In a term here, `lib_k` is entry `k` of
+    /// this list; [`Event::LibrarySeeded`] holds them as they are in the
+    /// library. They need library learning. A run made before the setting
+    /// has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed_entries: Vec<LibraryEntry>,
+}
+
+/// Checks the form of seed entries that take the places from `base` on in a
+/// library that holds `library` before them: each has a name that
+/// [`check_name_form`](crate::naming::check_name_form) accepts and no other
+/// entry has, and a doc that [`check_doc`](crate::naming::check_doc)
+/// accepts. The terms are not checked here: the store checks them when it
+/// makes a run (`crate::seed::check`), as it checks a name against the
+/// primitives and the prelude.
+fn check_seed_forms(
+    entries: &[LibraryEntry],
+    base: usize,
+    library: &[LibraryEntry],
+) -> Result<(), Rejected> {
+    let mut all = library.to_vec();
+    all.extend(entries.iter().cloned());
+    for (i, entry) in entries.iter().enumerate() {
+        let bad = |why: String| Rejected::Seed(format!("seed entry {i}: {why}"));
+        let (Some(name), Some(doc)) = (&entry.name, &entry.doc) else {
+            return Err(bad("it needs a name and a doc".to_owned()));
+        };
+        crate::naming::check_name_form(name, base + i, &all).map_err(bad)?;
+        crate::naming::check_doc(doc).map_err(bad)?;
+    }
+    Ok(())
 }
 
 /// The [`RunConfig::library_learning`] of a run made before the setting.
@@ -695,6 +734,16 @@ pub enum Event {
         /// The new definitions, at least one.
         entries: Vec<LibraryEntry>,
     },
+    /// The run's seed entries ([`RunConfig::seed_entries`]) join the end of
+    /// the library, each with its name and doc. Once in a run, in
+    /// iteration 0.
+    LibrarySeeded {
+        /// The entries, one for each seed entry in order: the seed entry
+        /// with each reference to a seed entry numbered as in the library
+        /// (`crate::seed::placed`). The state checks their number, arities,
+        /// names and docs against the settings, and not their terms.
+        entries: Vec<LibraryEntry>,
+    },
     /// A naming job for a library entry is handed to a proposer (D23).
     NamingIssued(NamingIssued),
     /// A naming job ends: the entry gets its name and doc, or keeps `fn_i`.
@@ -855,6 +904,12 @@ pub enum Rejected {
     NoLearning,
     /// The settings turn autodoc on in a run that does not learn a library.
     AutodocWithoutLearning,
+    /// The settings name a setting of the library, here by its name, in a
+    /// run that does not learn one.
+    SettingWithoutLearning(&'static str),
+    /// A seed entry of the settings, or a `LibrarySeeded` event, is wrong,
+    /// in words.
+    Seed(String),
     /// The iteration number would overflow.
     IterationOverflow,
     /// A `BatchIssued` event does not have the next batch number.
@@ -945,6 +1000,12 @@ impl fmt::Display for Rejected {
                 "autodoc needs library learning: a run that does not learn a library has \
                  nothing to name"
             ),
+            Rejected::SettingWithoutLearning(name) => write!(
+                f,
+                "{name} needs library learning: a run that does not learn a library has no \
+                 library to change"
+            ),
+            Rejected::Seed(why) => f.write_str(why),
             Rejected::Naming(why) => f.write_str(why),
             Rejected::IterationOverflow => write!(f, "the iteration number would overflow"),
             Rejected::WrongBatchNumber { next, given } => write!(
@@ -1076,7 +1137,8 @@ pub struct ModelCounts {
 }
 
 /// Which learned library entries the programs that passed in one iteration
-/// refer to. A program counts an entry once however often it refers to it.
+/// refer to. A seed entry ([`RunConfig::seed_entries`]) counts as a learned
+/// entry here. A program counts an entry once however often it refers to it.
 /// Every reference in the compiled program counts, one in a binding that is
 /// never used too. Only a direct reference counts: one inside another
 /// entry's body does not. Prelude functions are not learned entries and are
@@ -1187,6 +1249,8 @@ pub struct RunState {
     verified: Vec<Verified>,
     naming_jobs: Vec<NamingJob>,
     named: Vec<bool>,
+    /// Whether the run's seed entries have joined the library.
+    seeded: bool,
     /// The iteration whose end added each library entry, by index.
     added: Vec<u64>,
     uptake: ByIteration<LibraryUptake>,
@@ -1255,6 +1319,13 @@ impl RunState {
         if config.autodoc && !config.library_learning {
             return Err(Rejected::AutodocWithoutLearning);
         }
+        if config.refuse_bucketing && !config.library_learning {
+            return Err(Rejected::SettingWithoutLearning("refuse_bucketing"));
+        }
+        if !config.seed_entries.is_empty() && !config.library_learning {
+            return Err(Rejected::SettingWithoutLearning("seed_entries"));
+        }
+        check_seed_forms(&config.seed_entries, 0, &[])?;
         let mut frontiers = BTreeMap::new();
         for task in &tasks {
             if frontiers.insert(task.clone(), Vec::new()).is_some() {
@@ -1279,6 +1350,7 @@ impl RunState {
             verified: Vec::new(),
             naming_jobs: Vec::new(),
             named: Vec::new(),
+            seeded: false,
             added: Vec::new(),
             uptake: ByIteration::default(),
             received: BTreeMap::new(),
@@ -1359,6 +1431,38 @@ impl RunState {
                 self.library.extend(entries.iter().cloned());
                 self.named.resize(self.library.len(), false);
                 self.added.resize(self.library.len(), self.iteration);
+            }
+            Event::LibrarySeeded { entries } => {
+                let seeds = &self.config.seed_entries;
+                if seeds.is_empty() {
+                    return Err(Rejected::Seed("the run has no seed entries".to_owned()));
+                }
+                if self.iteration != 0 || self.seeded {
+                    return Err(Rejected::Seed(
+                        "seed entries join the library once, in iteration 0".to_owned(),
+                    ));
+                }
+                // The terms are not compared: that would parse and print
+                // them, and a journal must read back under a later build
+                // whose parser or printer differs. Like the terms of a
+                // `LibraryExtended`, they are as the step wrote them.
+                let same = entries.len() == seeds.len()
+                    && entries
+                        .iter()
+                        .zip(seeds)
+                        .all(|(e, s)| (e.arity, &e.name, &e.doc) == (s.arity, &s.name, &s.doc));
+                if !same {
+                    return Err(Rejected::Seed(
+                        "the entries are not the run's seed entries, in order, with their \
+                         arities, names and docs"
+                            .to_owned(),
+                    ));
+                }
+                check_seed_forms(entries, self.library.len(), &self.library)?;
+                self.library.extend(entries.iter().cloned());
+                self.named.resize(self.library.len(), true);
+                self.added.resize(self.library.len(), self.iteration);
+                self.seeded = true;
             }
             Event::NamingIssued(issued) => self.issue_naming(issued)?,
             Event::NamingDone(done) => self.finish_naming(done)?,
@@ -2032,6 +2136,8 @@ mod tests {
             compared_with: None,
             approach_hints: false,
             show_received: false,
+            refuse_bucketing: false,
+            seed_entries: Vec::new(),
         }
     }
 
