@@ -22,11 +22,13 @@
 //! and library references in place, so the compressor sees `map` as a token,
 //! not its body (spec §10).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use dc_core::types::{check, infer};
 use dc_core::{sexpr, Arena, ExpandError, Expander, LibDef, LibId, Scheme, TermId};
+use dc_eval::Value;
 use dc_surface::prelude::{Prelude, PreludeMode};
 use dc_surface::TopLevel;
 use dc_tasks::harness::{check_examples, check_gate, CheckFailure, HarnessConfig, RunFailure};
@@ -356,7 +358,7 @@ impl Verifier {
                 error: e.to_string(),
             },
             Err(CheckFailure::Example { index, failure }) => Check::Run {
-                error: format!("example {index}: {}", describe(&failure)),
+                error: example_error(index, &failure),
             },
             Err(CheckFailure::Gate { index, failure }) => Check::Run {
                 error: format!("large input {index}: {}", describe_hidden(&failure)),
@@ -427,6 +429,52 @@ impl VerifierCache {
         }
         Ok(built)
     }
+}
+
+/// Whether `error`, the error of a [`Check::Run`] for `task`, says that an
+/// example gave the value of the task's known mistake
+/// ([`TaskFamily::known_mistake`], decision D36). It is false for a task
+/// that names no mistake, for an example on which the mistake gives the
+/// expected value, and for any other error.
+pub fn known_mistake(task: &str, error: &str) -> bool {
+    static ERRORS: OnceLock<Mutex<BTreeMap<String, Arc<BTreeSet<String>>>>> = OnceLock::new();
+    let kept = ERRORS.get_or_init(Mutex::default);
+    let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+    if !kept.contains_key(task) {
+        kept.insert(task.to_owned(), Arc::new(mistake_errors(task)));
+    }
+    kept.get(task).is_some_and(|errors| errors.contains(error))
+}
+
+/// The error of each example of `task` on which its known mistake gives
+/// another value than the example expects, as [`Verifier::check`] writes
+/// it for a program that returns the mistake's value.
+fn mistake_errors(task: &str) -> BTreeSet<String> {
+    let Some(family) = self::task(task) else {
+        return BTreeSet::new();
+    };
+    family
+        .examples()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, example)| {
+            let actual = family.known_mistake(&example.inputs)?;
+            (actual != example.output)
+                .then(|| example_error(index, &wrong_output(example.output, actual)))
+        })
+        .collect()
+}
+
+fn wrong_output(expected: Value, actual: Value) -> RunFailure {
+    RunFailure::WrongOutput {
+        expected: Box::new(expected),
+        actual: Box::new(actual),
+    }
+}
+
+/// The error of a [`Check::Run`] for a failure on example `index`.
+fn example_error(index: usize, failure: &RunFailure) -> String {
+    format!("example {index}: {}", describe(failure))
 }
 
 /// A short account of a failed run.

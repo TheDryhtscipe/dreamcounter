@@ -29,6 +29,11 @@ pub enum Metric {
     /// less in D27), over programs the batches issued asked for
     /// (dreamcounter-a86001).
     CheapRate,
+    /// Programs that gave, on an example, the value of their task's known
+    /// mistake, over programs the batches issued asked for (decision D36).
+    /// A higher rate is worse, so a positive call says that the arm under
+    /// test makes the mistake more often.
+    KnownMistakeRate,
 }
 
 /// The two arms' labels.
@@ -182,6 +187,9 @@ pub struct Counts {
     pub typed: u64,
     /// Programs that passed.
     pub passed: u64,
+    /// Programs that gave the value of their task's known mistake. `None`
+    /// if the records do not count them.
+    pub known_mistake: Option<u64>,
     /// Passed programs whose class has rank [`CHEAP_RANK`] or less. `None`
     /// without growth in the records.
     pub cheap: Option<u64>,
@@ -199,6 +207,7 @@ impl Counts {
         self.typed += o.typed;
         self.passed += o.passed;
         let sum = |a: Option<u64>, b: Option<u64>| a.zip(b).map(|(a, b)| a + b);
+        self.known_mistake = sum(self.known_mistake, o.known_mistake);
         self.cheap = sum(self.cheap, o.cheap);
         self.classed = sum(self.classed, o.classed);
         self.worse_than_n = sum(self.worse_than_n, o.worse_than_n);
@@ -207,6 +216,7 @@ impl Counts {
     fn zero(growth: bool) -> Counts {
         let g = growth.then_some(0);
         Counts {
+            known_mistake: Some(0),
             cheap: g,
             classed: g,
             worse_than_n: g,
@@ -219,6 +229,7 @@ impl Counts {
         match metric {
             Metric::PassRate => Some(self.passed),
             Metric::CheapRate => self.cheap,
+            Metric::KnownMistakeRate => self.known_mistake,
         }
     }
 }
@@ -357,8 +368,19 @@ fn load(
                 compiled: t.compiled,
                 typed: t.typed,
                 passed: t.passed,
+                known_mistake: t.known_mistake,
                 ..Counts::default()
             };
+            if spec.metric == Metric::KnownMistakeRate
+                && spec.tasks.contains(&t.name)
+                && t.known_mistake.is_none()
+            {
+                return Err(CompareError(format!(
+                    "run {id} iteration {i} {}: proposal_stats.json has no known_mistake; \
+                     export the records again with a dc-mcp that counts it (D36)",
+                    t.name
+                )));
+            }
             if let Some(d) = diversity {
                 let groups = d.tasks.iter().find(|g| g.task == t.name);
                 let groups = groups.map_or(&[][..], |g| g.groups.as_slice());
@@ -1074,6 +1096,7 @@ pub fn analyse(spec: &Spec, base: &Path) -> Result<Report, CompareError> {
         match metric {
             Metric::PassRate => "pass rate",
             Metric::CheapRate => "cheap rate",
+            Metric::KnownMistakeRate => "known-mistake rate",
         },
         &pairs,
         spec.alpha,
@@ -1175,6 +1198,20 @@ pub fn analyse(spec: &Spec, base: &Path) -> Result<Report, CompareError> {
             Some(solved as f64 / counted.len() as f64)
         },
     )?);
+    if metric == Metric::KnownMistakeRate {
+        exploratory.push(compared("pass rate", &pairs, spec.alpha, &|r| {
+            r.rate(Metric::PassRate, counted, tasks)
+        })?);
+        for t in tasks {
+            let one = std::slice::from_ref(t);
+            exploratory.push(compared(
+                &format!("known-mistake rate of {t}"),
+                &pairs,
+                spec.alpha,
+                &|r| r.rate(Metric::KnownMistakeRate, counted, one),
+            )?);
+        }
+    }
     if metric == Metric::CheapRate {
         for t in tasks {
             let one = std::slice::from_ref(t);

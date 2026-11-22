@@ -96,6 +96,14 @@ pub trait TaskFamily {
     fn sizes(&self) -> Vec<u64> {
         DEFAULT_SIZES.to_vec()
     }
+
+    /// The answer to `inputs` under a wrong reading of the task that
+    /// solvers are known to make, if the family names one. It is for
+    /// counting that mistake in recorded results (decision D36), and takes
+    /// no part in checking a candidate. The default is none.
+    fn known_mistake(&self, _inputs: &[Value]) -> Option<Value> {
+        None
+    }
 }
 
 /// The input of size `n` for seed `seed`: `family.generate(n, TaskRng::new(n, seed))`.

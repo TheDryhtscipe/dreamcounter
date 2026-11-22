@@ -464,6 +464,10 @@ pub struct TaskStats {
     pub typed: u64,
     /// Programs that passed every example.
     pub passed: u64,
+    /// Programs that gave, on an example, the value of the task's known
+    /// mistake (decision D36). For a chain task that is the answer without
+    /// the order of positions. Always 0 for a task that names no mistake.
+    pub known_mistake: u64,
     /// Whether at least one program passed.
     pub solved: bool,
 }
@@ -589,6 +593,7 @@ impl IterationStats {
                     compiled: c.compiled,
                     typed: c.typed,
                     passed: c.passed,
+                    known_mistake: c.known_mistake,
                     solved: c.passed > 0,
                 }
             })

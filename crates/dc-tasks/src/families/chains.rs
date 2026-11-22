@@ -482,6 +482,33 @@ impl TaskFamily for Chains {
     fn sizes(&self) -> Vec<u64> {
         SIZES.to_vec()
     }
+
+    /// The answer without the order of positions: a chain is then any set
+    /// of positions that can be put in an order along which both lists
+    /// strictly increase.
+    fn known_mistake(&self, inputs: &[Value]) -> Option<Value> {
+        let xs = ints_of(&inputs[0]);
+        let ys = ints_of(&inputs[1]);
+        let ws = inputs.get(2).map(ints_of).unwrap_or_default();
+        // Two positions of such a chain differ in `xs`, so in order of
+        // `xs` every such chain has increasing positions, and `answer`
+        // counts it.
+        let mut order: Vec<usize> = (0..xs.len()).collect();
+        order.sort_by_key(|&i| xs[i]);
+        let pick = |v: &[i64]| -> Vec<i64> {
+            if v.is_empty() {
+                Vec::new()
+            } else {
+                order.iter().map(|&i| v[i]).collect()
+            }
+        };
+        Some(Value::Int(answer(
+            self.0,
+            &pick(&xs),
+            &pick(&ys),
+            &pick(&ws),
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -572,6 +599,69 @@ mod tests {
                 let ws = e.inputs.get(2).map(ints_of).unwrap_or_default();
                 let want = brute(v, &ints_of(&e.inputs[0]), &ints_of(&e.inputs[1]), &ws);
                 assert_eq!(e.output, Value::Int(want), "{v:?} on {:?}", e.inputs);
+            }
+        }
+    }
+
+    /// The answers when a chain is any set of positions that some order
+    /// makes strictly increasing in both lists, from every set of positions.
+    fn brute_without_order(v: Variant, xs: &[i64], ys: &[i64], ws: &[i64]) -> i64 {
+        let n = xs.len();
+        let chains: Vec<Vec<usize>> = (1_u32..1 << n)
+            .map(|mask| {
+                let mut c: Vec<usize> = (0..n).filter(|&i| mask >> i & 1 == 1).collect();
+                c.sort_by_key(|&i| xs[i]);
+                c
+            })
+            .filter(|c| {
+                c.windows(2)
+                    .all(|w| xs[w[0]] < xs[w[1]] && ys[w[0]] < ys[w[1]])
+            })
+            .collect();
+        match v {
+            Variant::Count => chains.len() as i64 % MODULUS,
+            Variant::Longest => chains.iter().map(|c| c.len() as i64).max().unwrap_or(0),
+            Variant::Heaviest => chains
+                .iter()
+                .map(|c| c.iter().map(|&i| ws[i]).sum::<i64>())
+                .max()
+                .unwrap_or(0),
+            Variant::LongestCount => {
+                let top = chains.iter().map(Vec::len).max().unwrap_or(0);
+                chains.iter().filter(|c| c.len() == top).count() as i64 % MODULUS
+            }
+        }
+    }
+
+    #[test]
+    fn the_known_mistake_is_the_answer_without_the_order_of_positions() {
+        // Example 7 of each variant, as recorded in comparison 2fa7a8.
+        for (v, want) in [
+            (Variant::Count, 35),
+            (Variant::Longest, 4),
+            (Variant::Heaviest, 20),
+            (Variant::LongestCount, 4),
+        ] {
+            let e = &Chains(v).examples()[7];
+            assert_eq!(Chains(v).known_mistake(&e.inputs), Some(Value::Int(want)));
+        }
+        for v in Variant::ALL {
+            let f = Chains(v);
+            for e in f.examples() {
+                let ws = e.inputs.get(2).map(ints_of).unwrap_or_default();
+                let want =
+                    brute_without_order(v, &ints_of(&e.inputs[0]), &ints_of(&e.inputs[1]), &ws);
+                assert_eq!(f.known_mistake(&e.inputs), Some(Value::Int(want)), "{v:?}");
+            }
+            for seed in 0..12 {
+                let i = generate_input(&f, 10, seed);
+                let ws = i.get(2).map(ints_of).unwrap_or_default();
+                let want = brute_without_order(v, &ints_of(&i[0]), &ints_of(&i[1]), &ws);
+                assert_eq!(
+                    f.known_mistake(&i),
+                    Some(Value::Int(want)),
+                    "{v:?}, seed {seed}"
+                );
             }
         }
     }
