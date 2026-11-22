@@ -113,6 +113,15 @@ fn free_variables_of_the_arguments_keep_their_meaning() {
         run(&mut v, inline, &[Value::Int(3), Value::Int(4)]),
         Outcome::Value(Value::Int(38), _)
     ));
+    // A binder inside an argument that is moved under a new binding.
+    let inline = "let solve a b = fn_0 ((fun x -> x + a) b) ((fun x -> x * a) b)";
+    let bound =
+        "let solve a b = let p = (fun x -> x + a) b in let q = (fun x -> x * a) b in fn_0 p q";
+    assert_eq!(compiled(&mut v, inline), compiled(&mut v, bound));
+    assert!(matches!(
+        run(&mut v, inline, &[Value::Int(3), Value::Int(4)]),
+        Outcome::Value(Value::Int(38), _)
+    ));
     // Only the second parameter of fn_2 is used more than once: the first
     // argument stays in place, under the new binding.
     let inline = "let solve a b = fn_2 (a + b) (range a b)";
@@ -218,4 +227,75 @@ fn the_entries_of_run_lib_7108_cost_one_pass_over_the_buckets() {
     // about 230,000. Written out at each use, the buckets were built 16384
     // times: about 800,000,000 steps, against a limit of 10,000,000.
     assert!(steps < 400_000, "{steps} steps");
+}
+
+#[test]
+fn every_argument_of_a_use_with_too_few_arguments_is_bound() {
+    // fn_0 m y = length m + y uses `m` once. With one argument the use is a
+    // function, and each call of it would evaluate the argument again.
+    let add_length = entry(2, "(lam (lam (add (length $1) $0)))");
+    let mut v = verifier(&[add_length]);
+    let inline = "let solve xs = map (fn_0 (map (fun x -> x + 1) xs)) xs";
+    let bound = "let solve xs = map (let m = map (fun x -> x + 1) xs in fn_0 m) xs";
+    assert_eq!(compiled(&mut v, inline), compiled(&mut v, bound));
+    // With both arguments the entry evaluates each once: nothing is bound.
+    let whole = compiled(
+        &mut v,
+        "let solve xs = fn_0 (map (fun x -> x + 1) xs) (1 + 2)",
+    );
+    assert_eq!(
+        sexpr::print(v.arena(), whole).unwrap(),
+        format!(
+            "(lam (lib_0 (lib_{map} (lam (add $0 1)) $0) (add 1 2)))",
+            map = prelude_id("map")
+        )
+    );
+}
+
+#[test]
+fn the_branches_of_a_case_are_paths_not_functions() {
+    // match xs with [] -> 0 | _ :: _ -> x: `x` is evaluated at most once.
+    let guard = "(lam (lam (list_case $0 (lam 0) (lam (lam $3)))))";
+    assert_eq!(repeated(2, guard), [false, false]);
+    assert_eq!(
+        repeated(1, "(lam (option_case none (lam $1) (lam (add $0 $1))))"),
+        [false]
+    );
+    assert_eq!(
+        repeated(1, "(lam (tree_case leaf (lam $1) (lam (lam (lam $3)))))"),
+        [false]
+    );
+    // Twice in one branch.
+    assert_eq!(
+        repeated(1, "(lam (option_case none (lam $1) (lam (add $1 $1))))"),
+        [true]
+    );
+    // In what the case looks at and in a branch.
+    assert_eq!(
+        repeated(1, "(lam (list_case $0 (lam 0) (lam (lam (length $2)))))"),
+        [true]
+    );
+    // A branch that returns a function: the function can be called again.
+    assert_eq!(
+        repeated(
+            1,
+            "(lam (list_case nil (lam (lam $2)) (lam (lam (lam $3)))))"
+        ),
+        [true]
+    );
+    // A branch that is not written as a function of the case's arguments.
+    assert_eq!(
+        repeated(2, "(lam (lam (list_case nil $0 (lam (add $0 $2)))))"),
+        [true, false]
+    );
+    // The guard still guards.
+    let mut v = verifier(&[entry(2, guard)]);
+    assert!(matches!(
+        run(
+            &mut v,
+            "let solve xs = fn_0 (10 / length xs) xs",
+            &[ints(0)]
+        ),
+        Outcome::Value(Value::Int(0), _)
+    ));
 }

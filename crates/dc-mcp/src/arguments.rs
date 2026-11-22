@@ -20,7 +20,13 @@
 //! An argument for a parameter that the entry evaluates at most once stays
 //! where it is. Such an entry can be a guard, `fn_2 x n = if n = 0 then 0
 //! else x`, and the programs it was learned from rely on `x` not being
-//! evaluated when `n` is 0.
+//! evaluated when `n` is 0. The rule counts occurrences, so it protects a
+//! guard only if the guarded parameter occurs once on each path, and not
+//! inside a function: see [`repeated_parameters`].
+//!
+//! A use with fewer arguments than the entry has parameters is a function,
+//! and each call of it would evaluate the arguments it has again. So every
+//! argument of such a use that is not free to evaluate is bound.
 //!
 //! Programs that the compressor rewrites are not changed: their uses come
 //! from D1's rewriting, which keeps each program's steps as they were.
@@ -28,7 +34,7 @@
 use std::collections::HashMap;
 
 use dc_core::term::children;
-use dc_core::{Arena, LibId, Term, TermId};
+use dc_core::{Arena, LibId, Prim, Term, TermId};
 
 /// A count of evaluations: 0, 1, or this for more than one.
 const MANY: u8 = 2;
@@ -42,8 +48,12 @@ const MANY: u8 = 2;
 /// inside a function in the body, since the function can be called any
 /// number of times, or if it occurs more than once on one path through the
 /// body: the two branches of an `if` are different paths; both sides of
-/// `and` and of `or` are on one. The count is of occurrences, so it can say
-/// "more than once" of a parameter that every run evaluates once. If
+/// `and` and of `or` are on one. The two branches of `option_case`,
+/// `list_case` and `tree_case` (a `match`) are different paths too, and not
+/// functions, where each is written with the lambdas the case calls it
+/// with. The count is of occurrences, so it can say "more than once" of a
+/// parameter that every run evaluates once: one used twice in a branch that
+/// a guard skips, or inside a function that is called once. If
 /// `entry` has fewer than `arity` leading lambdas, every parameter counts as
 /// evaluated more than once.
 pub(crate) fn repeated_parameters(arena: &Arena, entry: TermId, arity: u32) -> Vec<bool> {
@@ -65,10 +75,12 @@ pub(crate) fn repeated_parameters(arena: &Arena, entry: TermId, arity: u32) -> V
         }
         let node = arena.get(id);
         let under = depth.saturating_add(1);
-        let parts: Vec<(TermId, u32)> = match node {
-            Term::Lam(b) => vec![(b, under)],
-            Term::Let(x, b) => vec![(x, depth), (b, under)],
-            other => children(&other).into_iter().map(|c| (c, depth)).collect(),
+        let case = case_parts(arena, id, depth);
+        let parts: Vec<(TermId, u32)> = match (&case, node) {
+            (Some(parts), _) => parts.to_vec(),
+            (None, Term::Lam(b)) => vec![(b, under)],
+            (None, Term::Let(x, b)) => vec![(x, depth), (b, under)],
+            (None, other) => children(&other).into_iter().map(|c| (c, depth)).collect(),
         };
         if !ready {
             stack.push((id, depth, true));
@@ -80,6 +92,8 @@ pub(crate) fn repeated_parameters(arena: &Arena, entry: TermId, arity: u32) -> V
             continue;
         }
         let count = |i: usize, j: usize| memo[&parts[i]][j];
+        // What is looked at, then one of two branches: an `if` or a case.
+        let paths = case.is_some() || matches!(node, Term::If(..));
         let counts: Vec<u8> = (0..k)
             .map(|j| match node {
                 // Parameter `j` under `depth` binders is `$(depth + k - 1 - j)`.
@@ -94,7 +108,7 @@ pub(crate) fn repeated_parameters(arena: &Arena, entry: TermId, arity: u32) -> V
                         MANY
                     }
                 }
-                Term::If(..) => count(0, j) + count(1, j).max(count(2, j)),
+                _ if paths => count(0, j) + count(1, j).max(count(2, j)),
                 _ => (0..parts.len()).map(|i| count(i, j)).sum(),
             })
             .map(|c| c.min(MANY))
@@ -102,6 +116,46 @@ pub(crate) fn repeated_parameters(arena: &Arena, entry: TermId, arity: u32) -> V
         memo.insert((id, depth), counts);
     }
     memo[&(body, 0)].iter().map(|&c| c >= MANY).collect()
+}
+
+/// If `id`, under `depth` binders, is `option_case`, `list_case` or
+/// `tree_case` applied to all three arguments, and each branch is written
+/// with at least the lambdas the case calls it with: what the case looks
+/// at, and the body of each branch under those lambdas, each with the
+/// number of binders it is under. The case calls one branch, once, so the
+/// bodies are two paths. A branch written any other way, a variable say,
+/// makes this `None`, and the case then counts as any application.
+fn case_parts(arena: &Arena, id: TermId, depth: u32) -> Option<[(TermId, u32); 3]> {
+    let Term::App(f, second) = arena.get(id) else {
+        return None;
+    };
+    let Term::App(f, first) = arena.get(f) else {
+        return None;
+    };
+    let Term::App(f, looked_at) = arena.get(f) else {
+        return None;
+    };
+    // The empty branch is called with unit; the other with the parts.
+    let called_with = match arena.get(f) {
+        Term::Prim(Prim::OptionCase) => [1, 1],
+        Term::Prim(Prim::ListCase) => [1, 2],
+        Term::Prim(Prim::TreeCase) => [1, 3],
+        _ => return None,
+    };
+    let body = |mut branch: TermId, lambdas: u32| {
+        for _ in 0..lambdas {
+            match arena.get(branch) {
+                Term::Lam(b) => branch = b,
+                _ => return None,
+            }
+        }
+        Some((branch, depth.saturating_add(lambdas)))
+    };
+    Some([
+        (looked_at, depth),
+        body(first, called_with[0])?,
+        body(second, called_with[1])?,
+    ])
 }
 
 /// `root` with every free variable moved up by `by`: the term to put under
@@ -202,8 +256,10 @@ fn free_to_evaluate(arena: &Arena, term: TermId, repeated: &[Vec<bool>]) -> bool
 /// evaluate and has `repeated[i][j]` is bound, in argument order:
 /// `let x = aj in fn_i ... x ...`. So the bound arguments are evaluated
 /// first, in order, and each once, even if the entry would not have
-/// evaluated one. A use with fewer arguments than the entry's parameters
-/// binds those it has. The result is the same term whatever order the
+/// evaluated one. In a use with fewer arguments than the entry has
+/// parameters, every argument that is not free to evaluate is bound,
+/// whatever `repeated[i]` says: the use is a function, and each call of it
+/// would evaluate them again. The result is the same term whatever order the
 /// program's parts are visited in, and binding a program again changes
 /// nothing. Walks with a work list.
 pub(crate) fn bind_arguments(arena: &mut Arena, root: TermId, repeated: &[Vec<bool>]) -> TermId {
@@ -282,8 +338,11 @@ fn bind_use(
     args: &[TermId],
     repeated: &[Vec<bool>],
 ) -> TermId {
+    // A use with too few arguments is a function: each call of it would
+    // evaluate the arguments again.
+    let function = args.len() < entry.len();
     let bound: Vec<usize> = (0..args.len().min(entry.len()))
-        .filter(|&j| entry[j] && !free_to_evaluate(arena, args[j], repeated))
+        .filter(|&j| (function || entry[j]) && !free_to_evaluate(arena, args[j], repeated))
         .collect();
     // An entry has few parameters; a count that does not fit is not bound.
     let Ok(lets) = u32::try_from(bound.len()) else {
