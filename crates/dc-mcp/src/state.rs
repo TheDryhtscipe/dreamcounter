@@ -1040,6 +1040,12 @@ pub struct TaskCounts {
     pub typed: u64,
     /// Programs that passed every example.
     pub passed: u64,
+    /// Programs that gave, on the first example they failed, the value of
+    /// the task's known mistake ([`crate::verify::known_mistake`], decision
+    /// D36). Unlike the other counts, it depends on this build's task
+    /// definitions as well as on the journal: a journal replayed by a build
+    /// with other examples can give another count.
+    pub known_mistake: u64,
 }
 
 /// What came in during one iteration, over all tasks.
@@ -1621,7 +1627,11 @@ impl RunState {
                     Check::Extra => continue,
                     Check::Compile { .. } => (false, false, false),
                     Check::Type { .. } => (true, false, false),
-                    Check::Run { .. } => (true, true, false),
+                    Check::Run { error } => {
+                        tc.known_mistake +=
+                            u64::from(crate::verify::known_mistake(&batch.task, error));
+                        (true, true, false)
+                    }
                     Check::Passed { .. } => (true, true, true),
                 };
                 tc.programs += 1;
@@ -2554,6 +2564,34 @@ mod tests {
     }
 
     #[test]
+    fn a_wrong_value_that_is_the_known_mistake_is_counted() {
+        const TASK: &str = "chains/heaviest";
+        let mut s = RunState::create(config(), vec![TASK.into()]).unwrap();
+        // Example 7 expects 18; without the order of positions it is 20.
+        let errors = [
+            "example 7: expected 18, got 20",
+            "example 7: expected 18, got 19",
+            "example 7: no result within 10000000 steps",
+            "large input 0: wrong output",
+        ];
+        for (b, error) in errors.into_iter().enumerate() {
+            let b = b as u64;
+            s.apply(&issued(b, TASK, 1, 0)).unwrap();
+            s.apply(&submitted(b, 1, Standing::OnTime, 1)).unwrap();
+            s.apply(&checked(
+                b,
+                vec![Check::Run {
+                    error: error.into(),
+                }],
+            ))
+            .unwrap();
+        }
+        let c = s.task_counts(0, TASK);
+        assert_eq!((c.programs, c.typed, c.passed), (4, 4, 0));
+        assert_eq!(c.known_mistake, 1);
+    }
+
+    #[test]
     fn batches_go_to_the_task_with_the_most_open_slots() {
         // Quota 4, at most 2 programs a batch, tasks a and b.
         let mut s = new_state();
@@ -2685,6 +2723,7 @@ mod tests {
                 compiled: 3,
                 typed: 2,
                 passed: 1,
+                known_mistake: 0,
             }
         );
         let ic = s.iteration_counts(0);

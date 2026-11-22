@@ -22,11 +22,13 @@
 //! and library references in place, so the compressor sees `map` as a token,
 //! not its body (spec §10).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use dc_core::types::{check, infer};
 use dc_core::{sexpr, Arena, ExpandError, Expander, LibDef, LibId, Scheme, TermId};
+use dc_eval::Value;
 use dc_surface::prelude::{Prelude, PreludeMode};
 use dc_surface::TopLevel;
 use dc_tasks::harness::{check_examples, check_gate, CheckFailure, HarnessConfig, RunFailure};
@@ -356,7 +358,7 @@ impl Verifier {
                 error: e.to_string(),
             },
             Err(CheckFailure::Example { index, failure }) => Check::Run {
-                error: format!("example {index}: {}", describe(&failure)),
+                error: example_error(index, &failure),
             },
             Err(CheckFailure::Gate { index, failure }) => Check::Run {
                 error: format!("large input {index}: {}", describe_hidden(&failure)),
@@ -427,6 +429,67 @@ impl VerifierCache {
         }
         Ok(built)
     }
+}
+
+/// Whether `error`, the error of a [`Check::Run`] for `task`, says that an
+/// example gave the value of the task's known mistake
+/// ([`TaskFamily::known_mistake`], decision D36). It is false for a task
+/// that names no mistake, for an example on which the mistake gives the
+/// expected value, and for any other error.
+///
+/// A check stops at the first example that fails, so this is about that
+/// example only. The error shows values cut to `SHOWN_VALUES`, so two
+/// long values that differ after the cut count as the same.
+pub fn known_mistake(task: &str, error: &str) -> bool {
+    with_mistake_errors(task, |errors| errors.contains(error))
+}
+
+/// Whether some example of `task` tells its known mistake from the right
+/// answer, so that [`known_mistake`] can be true for it.
+pub fn shows_known_mistake(task: &str) -> bool {
+    with_mistake_errors(task, |errors| !errors.is_empty())
+}
+
+/// Calls `f` with [`mistake_errors`] of `task`, computed once for each task.
+fn with_mistake_errors<T>(task: &str, f: impl FnOnce(&BTreeSet<String>) -> T) -> T {
+    static ERRORS: OnceLock<Mutex<BTreeMap<String, BTreeSet<String>>>> = OnceLock::new();
+    let kept = ERRORS.get_or_init(Mutex::default);
+    let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
+    if !kept.contains_key(task) {
+        kept.insert(task.to_owned(), mistake_errors(task));
+    }
+    f(&kept[task])
+}
+
+/// The error of each example of `task` on which its known mistake gives
+/// another value than the example expects, as [`Verifier::check`] writes
+/// it for a program that returns the mistake's value.
+fn mistake_errors(task: &str) -> BTreeSet<String> {
+    let Some(family) = self::task(task) else {
+        return BTreeSet::new();
+    };
+    family
+        .examples()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, example)| {
+            let actual = family.known_mistake(&example.inputs)?;
+            (actual != example.output)
+                .then(|| example_error(index, &wrong_output(example.output, actual)))
+        })
+        .collect()
+}
+
+fn wrong_output(expected: Value, actual: Value) -> RunFailure {
+    RunFailure::WrongOutput {
+        expected: Box::new(expected),
+        actual: Box::new(actual),
+    }
+}
+
+/// The error of a [`Check::Run`] for a failure on example `index`.
+fn example_error(index: usize, failure: &RunFailure) -> String {
+    format!("example {index}: {}", describe(failure))
 }
 
 /// A short account of a failed run.
@@ -506,6 +569,36 @@ mod tests {
             .unwrap();
         let good = v.references.last().unwrap().entry;
         (v.family, v.source, good)
+    }
+
+    #[test]
+    fn only_a_task_with_an_example_of_its_known_mistake_shows_it() {
+        // Example 7 of each chain task tells the two readings apart.
+        for name in [
+            "chains/count",
+            "chains/longest",
+            "chains/heaviest",
+            "chains/longest-count",
+        ] {
+            assert!(shows_known_mistake(name), "{name}");
+        }
+        assert!(known_mistake(
+            "chains/longest",
+            "example 7: expected 3, got 4"
+        ));
+        assert!(!known_mistake(
+            "chains/longest",
+            "example 7: expected 3, got 5"
+        ));
+        assert!(!known_mistake(
+            "chains/longest",
+            "example 6: expected 3, got 4"
+        ));
+        // A task that names no mistake, and a name that is no task.
+        for name in ["collapse/merge", "no/such-task"] {
+            assert!(!shows_known_mistake(name), "{name}");
+            assert!(!known_mistake(name, "example 7: expected 3, got 4"));
+        }
     }
 
     #[test]

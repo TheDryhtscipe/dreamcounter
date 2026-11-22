@@ -464,8 +464,34 @@ pub struct TaskStats {
     pub typed: u64,
     /// Programs that passed every example.
     pub passed: u64,
+    /// Programs that gave, on the first example they failed, the value of
+    /// the task's known mistake (decision D36). For a chain task that is
+    /// the answer without the order of positions. A program with the
+    /// mistake that fails an earlier example for another reason is not
+    /// counted, and a program that gives that value for another reason is.
+    /// Absent for a task with no example that tells its known mistake from
+    /// the right answer, such as a task that names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_mistake: Option<u64>,
     /// Whether at least one program passed.
     pub solved: bool,
+}
+
+impl TaskStats {
+    /// The stats of task `name` from its counts `c` in one iteration.
+    fn of(name: &str, c: crate::state::TaskCounts) -> TaskStats {
+        TaskStats {
+            name: name.to_owned(),
+            batches: c.batches,
+            received: c.received,
+            programs: c.programs,
+            compiled: c.compiled,
+            typed: c.typed,
+            passed: c.passed,
+            known_mistake: crate::verify::shows_known_mistake(name).then_some(c.known_mistake),
+            solved: c.passed > 0,
+        }
+    }
 }
 
 /// What came in during one iteration.
@@ -579,19 +605,7 @@ impl IterationStats {
         let tasks: Vec<TaskStats> = state
             .tasks()
             .iter()
-            .map(|name| {
-                let c = state.task_counts(iteration, name);
-                TaskStats {
-                    name: name.clone(),
-                    batches: c.batches,
-                    received: c.received,
-                    programs: c.programs,
-                    compiled: c.compiled,
-                    typed: c.typed,
-                    passed: c.passed,
-                    solved: c.passed > 0,
-                }
-            })
+            .map(|name| TaskStats::of(name, state.task_counts(iteration, name)))
             .collect();
         let counts = state.iteration_counts(iteration);
         let quota = u64::from(state.config().proposals_per_task);
@@ -2093,6 +2107,23 @@ mod tests {
     /// Every setting that fixes the proposals is compared, including the
     /// two that `dc_create_run` cannot make differ by itself: the prelude,
     /// and a lease that differs by less than a second.
+    #[test]
+    fn task_stats_hold_the_known_mistake_only_for_a_task_that_shows_one() {
+        let counts = crate::state::TaskCounts {
+            programs: 5,
+            known_mistake: 3,
+            ..Default::default()
+        };
+        let json = |name: &str| serde_json::to_value(TaskStats::of(name, counts)).unwrap();
+        assert_eq!(json("chains/heaviest")["known_mistake"], 3);
+        let zero = serde_json::to_value(TaskStats::of("chains/heaviest", Default::default()));
+        assert_eq!(zero.unwrap()["known_mistake"], 0);
+        // A task that names no mistake has no count, not a count of 0.
+        let merge = json("collapse/merge");
+        assert_eq!(merge["programs"], 5);
+        assert!(merge.get("known_mistake").is_none(), "{merge}");
+    }
+
     #[test]
     fn differences_name_every_setting_that_fixes_proposals() {
         let base = RunConfig {

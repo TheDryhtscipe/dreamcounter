@@ -28,6 +28,9 @@ struct RunData {
     unfinished: bool,
     /// Whether the last iteration has its quota.
     quota_in: bool,
+    /// The known mistakes of each task in every iteration after 0, if the
+    /// records count them. Iteration 0 then has none.
+    known_mistake: Option<u64>,
 }
 
 const TASKS: [&str; 2] = ["chains/count", "chains/heaviest"];
@@ -45,6 +48,7 @@ fn run(run: &str, seed: u64, library: bool, iterations: Vec<(u64, Vec<Row>)>) ->
         pending_checks: 0,
         unfinished: false,
         quota_in: true,
+        known_mistake: None,
     }
 }
 
@@ -81,10 +85,16 @@ fn write(dir: &Path, r: &RunData) {
                 "refused_repeats": 0, "refused_foreign": 0, "payload_bytes": 0,
                 "submission_bytes": 0, "models": [],
                 "library_uptake": {"passed": passed, "using_library": passed / 2, "entries": []},
-                "tasks": rows.iter().map(|(n, b, p, c, t, s)| json!({
-                    "name": n, "batches": b, "received": p, "programs": p, "compiled": c,
-                    "typed": t, "passed": s, "solved": *s > 0
-                })).collect::<Vec<_>>()
+                "tasks": rows.iter().map(|(n, b, p, c, t, s)| {
+                    let mut task = json!({
+                        "name": n, "batches": b, "received": p, "programs": p, "compiled": c,
+                        "typed": t, "passed": s, "solved": *s > 0
+                    });
+                    if let Some(m) = r.known_mistake {
+                        task["known_mistake"] = json!(if *i == 0 { 0 } else { m });
+                    }
+                    task
+                }).collect::<Vec<_>>()
             })
         })
         .collect();
@@ -947,4 +957,76 @@ fn programs_without_a_class_give_one_warning_per_task() {
         "{}",
         refused[0]
     );
+}
+
+/// Six pairs with the same passes in both arms. Each task of the arm under
+/// test has `1 + k` known mistakes in each counted iteration in pair `k`,
+/// and each task of the control arm has 1.
+fn six_pairs_with_mistakes(dir: &Path, control_counts: bool) -> Spec {
+    let rows: Vec<Row> = vec![
+        ("chains/count", 6, 6, 6, 6, 0),
+        ("chains/heaviest", 6, 6, 6, 6, 0),
+    ];
+    let mut pairs = Vec::new();
+    for k in 0..6u64 {
+        let seed = 7200 + k;
+        let (t, c) = (format!("with-{seed}"), format!("without-{seed}"));
+        let its = || vec![(0, rows.clone()), (1, rows.clone()), (2, rows.clone())];
+        let mut with = run(&t, seed, true, its());
+        with.known_mistake = Some(1 + k);
+        write(&dir.join(&t), &with);
+        let mut without = run(&c, seed, false, its());
+        without.known_mistake = control_counts.then_some(1);
+        write(&dir.join(&c), &without);
+        pairs.push((seed, t, c));
+    }
+    let refs: Vec<(u64, &str, &str)> = pairs
+        .iter()
+        .map(|(s, t, c)| (*s, t.as_str(), c.as_str()))
+        .collect();
+    spec(Metric::KnownMistakeRate, &refs)
+}
+
+#[test]
+fn the_known_mistake_rate_is_over_batches_issued_in_the_counted_iterations() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = six_pairs_with_mistakes(dir.path(), true);
+    let report = analyse(&spec, dir.path()).unwrap();
+    let primary = &report.primary.metric;
+    assert_eq!(primary.name, "known-mistake rate");
+    // Pair k: 4 (1 + k) of 24 against 4 of 24, so the differences are
+    // k / 6 for k = 0..6, and their mean is 2.5 / 6. Five differences are
+    // positive and one is 0: of the 64 sign patterns, the 4 that give all
+    // five the same sign are as extreme.
+    let test = primary.test.as_ref().unwrap();
+    assert!((test.mean - 2.5 / 6.0).abs() < 1e-12, "{}", test.mean);
+    assert!((test.p - 4.0 / 64.0).abs() < 1e-12, "{}", test.p);
+    // The passes are equal, so the pass rate reports no difference.
+    let pass = report
+        .exploratory
+        .iter()
+        .find(|m| m.name == "pass rate")
+        .unwrap();
+    assert_eq!(pass.test.as_ref().unwrap().mean, 0.0);
+    // The report says which way the call reads.
+    let text = crate::render::text(&report, None);
+    assert!(
+        text.contains("A higher rate is worse: POSITIVE says the library arm"),
+        "{text}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let pass = analyse(&six_pairs(dir.path()), dir.path()).unwrap();
+    assert!(!crate::render::text(&pass, None).contains("A higher rate is worse"));
+}
+
+#[test]
+fn the_known_mistake_rate_needs_records_that_count_the_mistake() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = six_pairs_with_mistakes(dir.path(), false);
+    let err = analyse(&spec, dir.path()).unwrap_err();
+    assert!(err.0.contains("has no known_mistake"), "{}", err.0);
+    // The pass rate does not need it.
+    let mut pass = spec;
+    pass.metric = Metric::PassRate;
+    analyse(&pass, dir.path()).unwrap();
 }
