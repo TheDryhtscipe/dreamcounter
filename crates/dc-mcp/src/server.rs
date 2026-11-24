@@ -149,9 +149,12 @@ pub struct CreateRun {
     /// frontier is ranked by DL(p | L) + λ·C(p), where C(p) is the rank of
     /// the program's growth class (1 is 0, log n 1, n 2, n log n 3, n² 4,
     /// n³ 5, 2ⁿ 6), a program with no class gets the largest in its task
-    /// plus 1 (7 if none has one), and one that timed out gets 8. Its first
-    /// member is the one selected, and at λ above 0 Stitch sees only the
-    /// members that grow no faster than it. Description lengths are Stitch
+    /// plus 1 (7 if none has one), and one that timed out gets 8. A program
+    /// that gave a wrong output on a generated input is not a solution:
+    /// at λ above 0 it ranks last. At λ above 0 the first member is the one
+    /// selected, and Stitch sees only the members that grow no faster than
+    /// it. The compression log records each member's C and the selection
+    /// λ = 0 would make from the same frontier. Description lengths are Stitch
     /// costs, about 100 for each node. At 0 selection is by description
     /// length alone. At least 0 and at most 2^64. It is not taken from the
     /// compared run, and the two runs may differ in it. If absent, 0.

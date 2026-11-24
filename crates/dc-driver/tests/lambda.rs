@@ -487,3 +487,39 @@ fn a_report_from_before_selection_was_logged_still_reads() {
     let report: dc_driver::IterationReport = serde_json::from_str(json).unwrap();
     assert_eq!(report.selection, None);
 }
+
+#[test]
+fn the_report_gives_the_member_a_lambda_zero_step_puts_first_even_if_it_is_incorrect() {
+    let tasks = [task("t", "Int")];
+    let candidates = [candidate("t", SHORT_SLOW), candidate("t", LONG_FAST)];
+    let growths = candidates_growth(&[Growth::Incorrect, fitted(GrowthClass::Linear)]);
+    let case = Case {
+        tasks: &tasks,
+        frontiers: BTreeMap::new(),
+        candidates: &candidates,
+        growths: Some(&growths),
+    };
+    // At λ = 0 the incorrect program is shortest, so it comes first and is
+    // what proposers are shown; J(L) selects the correct one.
+    let zero = case.run(&config(5, 0.0), &mut Nothing::default());
+    assert_eq!(zero.frontiers["t"], vec![SHORT_SLOW, LONG_FAST]);
+    let report = zero.report.selection.unwrap();
+    let t = &report.tasks["t"];
+    assert_eq!(
+        (t.selected, t.baseline, t.baseline_first),
+        (Some(1), Some(1), Some(0))
+    );
+    assert_eq!((report.changed, report.changed_first), (0, 0));
+
+    // At λ > 0 the incorrect program ranks last, so the member shown first
+    // differs from what λ = 0 shows, though J(L) selects the same one.
+    let weighted = case.run(&config(5, 1.0), &mut Nothing::default());
+    assert_eq!(weighted.frontiers["t"], vec![LONG_FAST, SHORT_SLOW]);
+    let report = weighted.report.selection.unwrap();
+    let t = &report.tasks["t"];
+    assert_eq!(
+        (t.selected, t.baseline, t.baseline_first),
+        (Some(0), Some(0), Some(1))
+    );
+    assert_eq!((report.changed, report.changed_first), (0, 1));
+}

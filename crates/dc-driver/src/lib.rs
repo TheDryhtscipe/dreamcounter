@@ -476,6 +476,11 @@ pub struct SelectionReport {
     pub baseline_total_cost: u64,
     /// How many tasks select another member than λ = 0 does.
     pub changed: usize,
+    /// How many tasks have another first member, the one proposers are
+    /// shown, than a step at λ = 0 would give the same frontier. It differs
+    /// from `changed` when an incorrect member is shortest: λ = 0 puts it
+    /// first, but `J(L)` never selects it.
+    pub changed_first: usize,
 }
 
 /// One task's new frontier under `J(L)`.
@@ -487,6 +492,10 @@ pub struct TaskSelection {
     pub selected: Option<usize>,
     /// The position of the member λ = 0 would select.
     pub baseline: Option<usize>,
+    /// The position of the member a step at λ = 0 would put first: the
+    /// shortest, the earliest on a tie, incorrect or not. `None` for an
+    /// empty frontier.
+    pub baseline_first: Option<usize>,
     /// Each member, in the frontier's order.
     pub members: Vec<MemberScore>,
 }
@@ -868,6 +877,7 @@ fn selection_report(tasks: &[TaskSpec], kept: &[Vec<Pooled>], lambda: Lambda) ->
         total_cost: 0,
         baseline_total_cost: 0,
         changed: 0,
+        changed_first: 0,
     };
     for (task, pool) in tasks.iter().zip(kept) {
         let costs = member_costs(&members(pool));
@@ -879,6 +889,15 @@ fn selection_report(tasks: &[TaskSpec], kept: &[Vec<Pooled>], lambda: Lambda) ->
         report.baseline_total_cost += c(baseline);
         if selected != baseline {
             report.changed += 1;
+        }
+        // min_by_key gives the first of equal keys.
+        let baseline_first = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| p.sort_key())
+            .map(|(i, _)| i);
+        if baseline_first.is_some_and(|i| i != 0) {
+            report.changed_first += 1;
         }
         let members = pool
             .iter()
@@ -894,6 +913,7 @@ fn selection_report(tasks: &[TaskSpec], kept: &[Vec<Pooled>], lambda: Lambda) ->
             TaskSelection {
                 selected,
                 baseline,
+                baseline_first,
                 members,
             },
         );

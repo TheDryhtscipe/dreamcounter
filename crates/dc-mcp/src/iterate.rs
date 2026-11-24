@@ -27,7 +27,11 @@
 //!    [`sources`](dc_driver::IterationOutcome::sources). A rewritten program
 //!    has its original's expansion, and measuring runs the expansion, so the
 //!    cost holds. A member with no measured or incorrect cost is measured
-//!    again, in what is left of the budget after step 2.
+//!    again, within a budget of its own: a run with more programs than
+//!    step 2 had time for still gets the kept ones measured, as it did
+//!    before step 2 existed. So measuring can take up to twice
+//!    [`MEASURE_BUDGET`] in one call, and a client's tool timeout must
+//!    allow for that and Stitch's limit.
 //! 5. **Commit.** In one record, so that a restart finds all of it or none:
 //!    a `FrontierSet` for each task, its members with their costs, a
 //!    `LibraryExtended` if abstractions join the library, in iteration 0 a
@@ -477,8 +481,11 @@ pub fn finish_iteration_with_budget(
 /// `start` says, under the time and memory limits of the run's settings
 /// ([`StitchSettings`]). Setting `cancel` from another thread stops the
 /// worker within about 50 milliseconds; the result is then
-/// [`FinishError::Interrupted`]. The result is the same if `cancel` is set
-/// when an attempt to commit reads it, under the run's lock.
+/// [`FinishError::Interrupted`]. While programs are measured, before or
+/// after Stitch, a cancel waits for the run in progress, or for a task's
+/// fuel plan if one is being made (up to about 15 seconds, once per task
+/// in a process). The result is the same if `cancel` is set when an
+/// attempt to commit reads it, under the run's lock.
 pub fn finish_iteration_in_worker(
     store: &Store,
     run: &RunId,
@@ -523,7 +530,6 @@ fn finish(
             "the call was cancelled".to_owned(),
         ));
     }
-    let budget_left = budget.saturating_sub(measuring.elapsed());
     // The fingerprint was compared under the lock, so this is the prelude
     // the run's programs were compiled with.
     let prelude = Prelude::load().expect("the shipped prelude loads");
@@ -564,8 +570,8 @@ fn finish(
     // The frontiers are chosen. Each member keeps the cost its program had
     // before the step: a rewritten program has its original's expansion,
     // and measuring runs the expansion. Members with no measured or
-    // incorrect cost are measured again in what is left of the budget,
-    // without the lock.
+    // incorrect cost are measured again, in a budget of their own, without
+    // the lock.
     let library: Vec<LibraryEntry> = snap
         .library
         .iter()
@@ -618,7 +624,7 @@ fn finish(
         &carried,
         snap.max_memory,
         cost::Limits {
-            deadline: Instant::now() + budget_left,
+            deadline: Instant::now() + budget,
             cancel: cancelled,
         },
     );
