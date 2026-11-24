@@ -41,6 +41,7 @@ fn config(quota: u32, prelude: u64) -> RunConfig {
         approach_hints: false,
         show_received: false,
         refuse_bucketing: false,
+        lambda: dc_driver::Lambda::ZERO,
         seed_entries: Vec::new(),
     }
 }
@@ -268,7 +269,20 @@ fn the_kept_programs_are_measured_and_measuring_changes_nothing_else() {
     let a = finish_iteration(&measured, &run, &mut InProcess).unwrap();
     let b =
         finish_iteration_with_budget(&unmeasured, &run, &mut InProcess, Duration::ZERO).unwrap();
-    assert_eq!(a, b, "the step's outcome does not depend on measuring");
+    // Measuring changes only the costs the selection report gives (λ is 0).
+    let without_selection = |f: &Finished| Finished {
+        report: IterationReport {
+            selection: None,
+            ..f.report.clone()
+        },
+        ..f.clone()
+    };
+    assert_eq!(
+        without_selection(&a),
+        without_selection(&b),
+        "the step's outcome does not depend on measuring"
+    );
+    assert_ne!(a.report.selection, b.report.selection);
     let with = kept(&measured, &run, 0);
     let without = kept(&unmeasured, &run, 0);
     assert_eq!(programs(&with), programs(&without));
@@ -793,6 +807,12 @@ fn stuck_server() -> (
     let tasks = TASKS.iter().map(|t| (*t).to_owned()).collect();
     store.create_run(&run, config, tasks).unwrap();
     fill(&store, &run, 0);
+    // Programs are measured before the step, and a task's fuel plan is made
+    // once per process, under one lock, without reading the cancel flag.
+    // Made here, the plans are not part of the times the tests check.
+    for task in TASKS {
+        crate::cost::fuel_plan(task).unwrap();
+    }
     let server = crate::server::DcServer::new(Store::open(dir.path()).unwrap(), sleeper());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -1265,4 +1285,133 @@ fn the_store_makes_no_run_with_a_seed_term_that_does_not_type() {
         .unwrap_err();
     assert!(error.to_string().contains("seed entry 1"), "{error}");
     assert!(store.state(&run).is_err());
+}
+
+#[test]
+fn a_run_with_a_lambda_gives_the_step_that_lambda_and_an_old_run_has_zero() {
+    let plain = config(2, shipped_prelude());
+    assert!(driver_config(&plain).lambda.is_zero());
+    let weighted = RunConfig {
+        lambda: dc_driver::Lambda::new(2.5).unwrap(),
+        ..plain.clone()
+    };
+    assert_eq!(driver_config(&weighted).lambda.get(), 2.5);
+    // A run made before the setting has no lambda in its journal.
+    let mut old = serde_json::to_value(&plain).unwrap();
+    old.as_object_mut().unwrap().remove("lambda").unwrap();
+    let read: RunConfig = serde_json::from_value(old).unwrap();
+    assert!(read.lambda.is_zero());
+    let mut bad = serde_json::to_value(&plain).unwrap();
+    bad["lambda"] = serde_json::json!(-1.0);
+    assert!(serde_json::from_value::<RunConfig>(bad).is_err());
+}
+
+/// The class estimator C gave each kept program of `task` after `iteration`.
+fn classes(
+    store: &Store,
+    run: &RunId,
+    iteration: u64,
+    task: &str,
+) -> Vec<Option<crate::state::CostClass>> {
+    kept(store, run, iteration)[task]
+        .iter()
+        .map(|m| match &m.cost {
+            Some(ProgramCost::Measured {
+                verdict: CostVerdict::Class(c),
+                ..
+            }) => Some(*c),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_large_lambda_puts_the_program_that_grows_slower_first_in_each_frontier() {
+    use crate::state::CostClass;
+
+    // Each task gets its naive reference, which is short and quadratic,
+    // and its good one, which is longer and linear.
+    let made = |lambda: f64| {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let run = RunId::new("r").unwrap();
+        let settings = RunConfig {
+            lambda: dc_driver::Lambda::new(lambda).unwrap(),
+            ..config(2, shipped_prelude())
+        };
+        let tasks = TASKS.iter().map(|t| (*t).to_owned()).collect();
+        store.create_run(&run, settings, tasks).unwrap();
+        fill(&store, &run, 0);
+        let done = finish_iteration(&store, &run, &mut InProcess).unwrap();
+        (dir, store, run, done)
+    };
+    let (_d0, zero, run, at_zero) = made(0.0);
+    let (_d1, large_store, _, at_large) = made(1e6);
+    for task in TASKS {
+        assert_eq!(
+            classes(&zero, &run, 0, task),
+            vec![Some(CostClass::Quadratic), Some(CostClass::Linear)],
+            "{task} at lambda 0"
+        );
+        assert_eq!(
+            classes(&large_store, &run, 0, task),
+            vec![Some(CostClass::Linear), Some(CostClass::Quadratic)],
+            "{task} at lambda 1e6"
+        );
+    }
+    let zero = at_zero.report.selection.unwrap();
+    assert_eq!((zero.changed, zero.total_cost), (0, 3 * 4));
+    // At lambda 1e6 Stitch is given only the linear programs, so the
+    // library is learned from them alone: each is rewritten with it, and
+    // each quadratic program stays as it came in. The rewritten linear
+    // program is then the shortest too, so lambda 0 would select it from
+    // the same frontier.
+    let large = at_large.report.selection.unwrap();
+    assert_eq!(large.total_cost, 3 * 2);
+    assert_eq!(large.baseline_total_cost, 3 * 2);
+    assert_eq!(large.changed, 0);
+    let frontiers = kept(&large_store, &run, 0);
+    for task in TASKS {
+        let t = &large.tasks[task];
+        assert_eq!((t.selected, t.baseline), (Some(0), Some(0)), "{task}");
+        let members = &frontiers[task];
+        assert!(
+            members[0].program.contains("(lib_0 "),
+            "{task}: {members:?}"
+        );
+        assert!(
+            !members[1].program.contains("(lib_0 "),
+            "{task}: {members:?}"
+        );
+        assert!(t.members[0].dl < t.members[1].dl, "{task}");
+    }
+}
+
+#[test]
+fn each_program_is_measured_once_and_a_rewritten_member_keeps_its_cost() {
+    let (_dir, store, run) = setup(2);
+    fill(&store, &run, 0);
+    let candidates = store.read(&run, |s| s.verified().len()).unwrap();
+    let started = crate::cost::started();
+    let done = finish_iteration(&store, &run, &mut InProcess).unwrap();
+    assert!(done.new_abstractions > 0);
+    assert_eq!(
+        crate::cost::started() - started,
+        candidates as u64,
+        "each candidate is measured before the step, and none again after it"
+    );
+    let members = kept(&store, &run, 0);
+    let all: Vec<&FrontierMember> = members.values().flatten().collect();
+    assert!(
+        all.iter().any(|m| m.program.contains("(lib_0 ")),
+        "some member was rewritten: {all:?}"
+    );
+    for m in all {
+        assert!(
+            matches!(m.cost, Some(ProgramCost::Measured { .. })),
+            "{}: {:?}",
+            m.program,
+            m.cost
+        );
+    }
 }

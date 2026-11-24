@@ -20,6 +20,7 @@ fn created() -> Event {
             approach_hints: false,
             show_received: false,
             refuse_bucketing: false,
+            lambda: dc_driver::Lambda::ZERO,
             seed_entries: Vec::new(),
         },
         tasks: vec!["a".into()],

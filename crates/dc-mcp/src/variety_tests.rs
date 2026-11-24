@@ -34,6 +34,7 @@ fn config(quota: u32, hints: bool, received: bool) -> RunConfig {
         approach_hints: hints,
         show_received: received,
         refuse_bucketing: false,
+        lambda: dc_driver::Lambda::ZERO,
         seed_entries: Vec::new(),
     }
 }

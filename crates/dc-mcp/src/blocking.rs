@@ -205,17 +205,26 @@ mod tests {
                 (reached, status_bytes("VmRSS:"))
             }
             "releasing" => {
-                // Each thread passes `done` once its check and the release
-                // after it are over, then waits at `measured` until the
-                // memory is read.
+                // Each thread waits at `held` after its check, inside
+                // `releasing`, so that the checks' freed memory is resident
+                // at once until every check is over; on a busy machine the
+                // checks need not overlap otherwise. It passes `done` once
+                // the release after its check is over, then waits at
+                // `measured` until the memory is read.
+                let held = Arc::new(Barrier::new(JOBS));
                 let done = Arc::new(Barrier::new(JOBS + 1));
                 let measured = Arc::new(Barrier::new(JOBS + 1));
                 let threads: Vec<_> = (0..JOBS)
                     .map(|_| {
+                        let held = Arc::clone(&held);
                         let done = Arc::clone(&done);
                         let measured = Arc::clone(&measured);
                         std::thread::spawn(move || {
-                            let reached = releasing(runaway_check);
+                            let reached = releasing(|| {
+                                let reached = runaway_check();
+                                held.wait();
+                                reached
+                            });
                             done.wait();
                             measured.wait();
                             reached

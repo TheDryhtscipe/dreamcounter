@@ -635,6 +635,49 @@ fn bad_requests_are_tool_errors_and_change_nothing() {
     client.kill();
 }
 
+/// λ (decision D4) is an arm setting: two runs compared with each other may
+/// differ in it, a run does not take it from the run it is compared with,
+/// and `dc_run_status` reports it.
+#[test]
+fn compared_runs_may_differ_in_lambda_and_a_bad_lambda_is_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut client = Client::start(dir.path());
+    let base = json!({ "seed": 7, "proposals_per_task": 2, "frontier_size": 3 });
+    let create = |client: &mut Client, extra: Value| {
+        let mut arguments = base.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            arguments[k] = v.clone();
+        }
+        client.call("dc_create_run", arguments)
+    };
+    let plain = create(&mut client, json!({ "run": "plain" })).unwrap();
+    assert_eq!(plain["lambda"], json!(0.0));
+    let weighted = create(
+        &mut client,
+        json!({ "run": "weighted", "lambda": 2500.0, "compared_with": "plain" }),
+    )
+    .unwrap();
+    assert_eq!(weighted["lambda"], json!(2500.0));
+    let third = create(
+        &mut client,
+        json!({ "run": "third", "compared_with": "weighted" }),
+    )
+    .unwrap();
+    assert_eq!(third["lambda"], json!(0.0));
+    // An LLM-only baseline selects frontiers too, so it may have a lambda.
+    let baseline = create(
+        &mut client,
+        json!({ "run": "baseline", "library_learning": false, "lambda": 1.0 }),
+    )
+    .unwrap();
+    assert_eq!(baseline["lambda"], json!(1.0));
+    for bad in [json!(-1.0), json!(1e30)] {
+        let error = create(&mut client, json!({ "run": "x", "lambda": bad })).unwrap_err();
+        assert!(error.contains("lambda"), "{error}");
+    }
+    client.kill();
+}
+
 /// The settings of decision D36 are arm settings: two runs compared with
 /// each other may differ in them, a run does not take them from the run it
 /// is compared with, and `dc_run_status` reports them.

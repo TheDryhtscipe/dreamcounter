@@ -15,13 +15,21 @@
 //! 2. **Frontiers.** Each task's pool is its frontier, then its candidates in
 //!    the order given. Of the programs with one expansion, the pool keeps the
 //!    cheapest, and the earliest of those on a tie; the others are each a
-//!    [`Fate::Duplicate`] of it. The pool is sorted by
-//!    [`stitch_cost`], stably, and the first [`DriverConfig::frontier_size`]
-//!    programs are kept. This is selection at λ = 0, pure description length
-//!    (D4): Stitch is given every kept program with its task's label, and it
-//!    counts only the cheapest rewrite of each task.
+//!    [`Fate::Duplicate`] of it. The pool is sorted, and the first
+//!    [`DriverConfig::frontier_size`] programs are kept. At λ = 0
+//!    ([`DriverConfig::lambda`]) the sort is by [`stitch_cost`], stably: pure
+//!    description length. At λ > 0 it is by `DL(p | L) + λ · C(p)` of
+//!    `J(L)` (decisions D4 and D27, [`objective::rank`]), with each `C(p)`
+//!    from the program's [`Growth`] ([`IterationInput::growth`]) taken over
+//!    the pool, the earlier on a tie, and incorrect programs last.
 //! 3. **Compression.** The kept programs of every task, in task order, go to a
-//!    [`Stitch`] runner. A program the bridge refuses before Stitch runs (it
+//!    [`Stitch`] runner, which counts only the cheapest rewrite of each task.
+//!    At λ = 0 every kept program goes. At λ > 0 a task's correct programs go
+//!    whose `C(p)`, taken over the kept frontier, is at most that of the
+//!    member `J(L)` selects: Stitch then chooses abstractions for the
+//!    selected member and for members that grow no faster, never for a
+//!    member that grows faster (D4: select, compress, select again). A
+//!    program the bridge refuses before Stitch runs (it
 //!    cannot be encoded, or is too deep) is left out and stays in its frontier
 //!    as it is. If the run is cancelled, or its worker cannot be started, the
 //!    step returns [`DriverError::Interrupted`]. Any other error, such as a
@@ -55,7 +63,12 @@
 //!    accepted. So a program that uses a cut abstraction stays as it was, even
 //!    when a rewriting with the earlier abstractions alone would type. New
 //!    abstractions after the last one an accepted rewriting uses are cut too.
-//!    Each frontier is sorted again by cost under the new library.
+//!    Each frontier is sorted again under the new library, as in step 2 but
+//!    with each `C(p)` taken over the new frontier, so its first member is
+//!    the one `J(L)` selects. [`IterationReport::selection`] gives each
+//!    member's description length, `C(p)` and the cause if it has no fitted
+//!    class, the selected member, and the member λ = 0 would select from the
+//!    same frontier.
 //!
 //! # The prelude
 //!
@@ -84,12 +97,18 @@
 //! # What the caller checks
 //!
 //! The candidates must be verified: [`run_iteration`] checks their syntax,
-//! expansion and type, not their behaviour on the task's examples. How fast a
-//! program's cost grows with its input plays no part yet: that is the
-//! cost-aware objective of P5.
+//! expansion and type, not their behaviour on the task's examples. The step
+//! does not measure how a program's cost grows: the caller gives each
+//! program's [`Growth`]. A rewritten program keeps its original's expansion,
+//! so a cost measured on the expansion holds for the program in its new
+//! frontier, found through [`IterationOutcome::sources`].
 
 mod bucketing;
 pub mod objective;
+
+pub use objective::{Growth, Lambda};
+
+use objective::{member_costs, Member, Unfitted};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -152,6 +171,32 @@ pub struct DriverConfig {
     /// out where it is used instead of joining the library (decision D36;
     /// step 4 of the crate docs).
     pub refuse_bucketing: bool,
+    /// λ of the cost-aware objective `J(L)` (decision D4): how much one step
+    /// of `C(p)` weighs against description length when frontiers are
+    /// selected. At [`Lambda::ZERO`] the step selects by description length
+    /// alone, as it did before λ was a setting.
+    pub lambda: Lambda,
+}
+
+/// What is known about the cost growth of each program the step reads, for
+/// selection under `J(L)` ([`objective`]). A program with no entry is
+/// [`Growth::NotMeasured`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Growths {
+    /// Each task's frontier members, in the frontier's order.
+    pub members: BTreeMap<String, Vec<Growth>>,
+    /// Each candidate, in the order of [`IterationInput::candidates`].
+    pub candidates: Vec<Growth>,
+}
+
+impl Growths {
+    fn of(&self, source: &Source) -> Growth {
+        let found = match source {
+            Source::Member { task, index } => self.members.get(task).and_then(|m| m.get(*index)),
+            Source::Candidate { index } => self.candidates.get(*index),
+        };
+        found.copied().unwrap_or(Growth::NotMeasured)
+    }
 }
 
 /// The input of one step. Every name in `frontiers` and every program in it is
@@ -173,6 +218,9 @@ pub struct IterationInput<'a> {
     /// `Term::Lib(LibId(PRELUDE_LIB_BASE + i))`; with `None`, such a reference
     /// is an unknown library.
     pub prelude: Option<&'a Prelude>,
+    /// The cost growth of each program, or `None` if none is known: every
+    /// program is then [`Growth::NotMeasured`].
+    pub growth: Option<&'a Growths>,
 }
 
 /// Runs Stitch on the selected programs.
@@ -405,6 +453,68 @@ pub struct IterationReport {
     pub programs: Vec<ProgramFate>,
     /// The compression step.
     pub compression: CompressionReport,
+    /// How each task's new frontier scores under `J(L)`. `None` in a report
+    /// written before the step logged it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionReport>,
+}
+
+/// How each task's new frontier scores under `J(L)` (decisions D4 and
+/// D27), with the selection λ = 0 would make from the same frontier
+/// (decision D33). Each member's `C(p)` is
+/// [`member_costs`] of its task's new frontier.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionReport {
+    /// The run's λ.
+    pub lambda: Lambda,
+    /// Each task of the run.
+    pub tasks: BTreeMap<String, TaskSelection>,
+    /// `Σ_t C(selected_t)`, component (b) of D4.
+    pub total_cost: u64,
+    /// `Σ_t C` of the member λ = 0 selects in each task.
+    pub baseline_total_cost: u64,
+    /// How many tasks select another member than λ = 0 does.
+    pub changed: usize,
+    /// How many tasks have another first member, the one proposers are
+    /// shown, than a step at λ = 0 would give the same frontier. It differs
+    /// from `changed` when an incorrect member is shortest: λ = 0 puts it
+    /// first, but `J(L)` never selects it.
+    pub changed_first: usize,
+}
+
+/// One task's new frontier under `J(L)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSelection {
+    /// The position of the selected member, or `None` if no member is
+    /// correct.
+    pub selected: Option<usize>,
+    /// The position of the member λ = 0 would select.
+    pub baseline: Option<usize>,
+    /// The position of the member a step at λ = 0 would put first if this
+    /// frontier were its pool: the shortest, incorrect or not, and on a tie
+    /// the earliest in this frontier's order. Programs trimmed from the
+    /// pool are not considered, and at λ > 0 this frontier's order puts
+    /// lower `C(p)` first, so this is a lower bound on how much λ changed
+    /// what proposers are shown. `None` for an empty frontier.
+    pub baseline_first: Option<usize>,
+    /// Each member, in the frontier's order.
+    pub members: Vec<MemberScore>,
+}
+
+/// One member of a new frontier.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberScore {
+    /// `DL(p | L)` under the new library, or `None` if Stitch cannot be
+    /// given the program; it then ranks as the largest description length.
+    pub dl: Option<u64>,
+    /// `C(p)`, or `None` for an incorrect member, which is not a solution.
+    pub c: Option<u32>,
+    /// Why the member has no fitted class, if it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfitted: Option<Unfitted>,
 }
 
 /// The result of one step.
@@ -414,6 +524,8 @@ pub struct IterationOutcome {
     pub new_library: Vec<LibraryEntry>,
     /// The new frontier of every task, best first.
     pub frontiers: BTreeMap<String, Vec<String>>,
+    /// Where each member of each new frontier came from, in the same order.
+    pub sources: BTreeMap<String, Vec<Source>>,
     /// What happened.
     pub report: IterationReport,
 }
@@ -687,6 +799,8 @@ struct Pooled {
     /// [`stitch_cost`] under the library, or why Stitch cannot be given the
     /// program.
     cost: Result<u64, String>,
+    /// What is known about its cost growth.
+    growth: Growth,
 }
 
 impl Pooled {
@@ -694,6 +808,125 @@ impl Pooled {
     fn sort_key(&self) -> u64 {
         *self.cost.as_ref().unwrap_or(&u64::MAX)
     }
+
+    /// The program as a member of `J(L)`: its sort key as `DL(p | L)`.
+    fn member(&self) -> Member {
+        Member {
+            dl: self.sort_key(),
+            growth: self.growth,
+        }
+    }
+}
+
+/// `pool`'s members for [`objective`].
+fn members(pool: &[Pooled]) -> Vec<Member> {
+    pool.iter().map(Pooled::member).collect()
+}
+
+/// The position [`objective::select`] gives in `pool` at `lambda`.
+fn selected(pool: &[Pooled], lambda: f64) -> Option<usize> {
+    objective::select(&members(pool), lambda)
+        .expect("a Lambda is valid")
+        .map(|s| s.index)
+}
+
+/// Sorts `pool` best first. At λ = 0 this is a stable sort by
+/// [`Pooled::sort_key`], as the step did before λ was a setting. Otherwise
+/// it is [`objective::rank`] with each `C(p)` taken over `pool`: by
+/// `DL(p | L) + λ · C(p)`, the earlier on a tie, incorrect programs last.
+fn order(pool: &mut Vec<Pooled>, lambda: Lambda) {
+    if lambda.is_zero() {
+        pool.sort_by_key(Pooled::sort_key);
+        return;
+    }
+    let ranked = objective::rank(&members(pool), lambda.get()).expect("a Lambda is valid");
+    let mut taken: Vec<Option<Pooled>> = pool.drain(..).map(Some).collect();
+    pool.extend(
+        ranked
+            .into_iter()
+            .map(|i| taken[i].take().expect("rank gives each position once")),
+    );
+}
+
+/// Which members of `pool`, a task's frontier, Stitch is given. At λ = 0,
+/// all of them. Otherwise the correct members whose `C(p)` (over `pool`) is
+/// at most that of the selected member: none if no member is correct.
+///
+/// The selected member is then the shortest of those given, so what
+/// Stitch minimises, `DL(L)` plus each task's shortest given member, is
+/// `J(L)` less `λ · Σ_t C(selected_t)` under the old library. A member that
+/// grows faster than the selected one is not given, so no abstraction is
+/// chosen for it; it stays in the frontier as it is.
+fn given_to_stitch(pool: &[Pooled], lambda: Lambda) -> Vec<bool> {
+    if lambda.is_zero() {
+        return vec![true; pool.len()];
+    }
+    let costs = member_costs(&members(pool));
+    let Some(limit) = selected(pool, lambda.get()).and_then(|i| costs[i]) else {
+        return vec![false; pool.len()];
+    };
+    costs
+        .iter()
+        .map(|c| c.is_some_and(|c| c.c <= limit.c))
+        .collect()
+}
+
+/// The selection report of the new frontiers `kept`, each task's in
+/// `tasks`'s order.
+fn selection_report(tasks: &[TaskSpec], kept: &[Vec<Pooled>], lambda: Lambda) -> SelectionReport {
+    let mut report = SelectionReport {
+        lambda,
+        tasks: BTreeMap::new(),
+        total_cost: 0,
+        baseline_total_cost: 0,
+        changed: 0,
+        changed_first: 0,
+    };
+    for (task, pool) in tasks.iter().zip(kept) {
+        let costs = member_costs(&members(pool));
+        let selected = selected(pool, lambda.get());
+        let baseline = selected_at_zero(pool);
+        let c =
+            |i: Option<usize>| -> u64 { i.and_then(|i| costs[i]).map_or(0, |m| u64::from(m.c)) };
+        report.total_cost += c(selected);
+        report.baseline_total_cost += c(baseline);
+        if selected != baseline {
+            report.changed += 1;
+        }
+        // min_by_key gives the first of equal keys.
+        let baseline_first = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| p.sort_key())
+            .map(|(i, _)| i);
+        if baseline_first.is_some_and(|i| i != 0) {
+            report.changed_first += 1;
+        }
+        let members = pool
+            .iter()
+            .zip(&costs)
+            .map(|(p, m)| MemberScore {
+                dl: p.cost.as_ref().ok().copied(),
+                c: m.map(|m| m.c),
+                unfitted: m.and_then(|m| m.unfitted),
+            })
+            .collect();
+        report.tasks.insert(
+            task.name.clone(),
+            TaskSelection {
+                selected,
+                baseline,
+                baseline_first,
+                members,
+            },
+        );
+    }
+    report
+}
+
+/// The position λ = 0 selects in `pool`.
+fn selected_at_zero(pool: &[Pooled]) -> Option<usize> {
+    selected(pool, 0.0)
 }
 
 /// Builds each task's new frontier from its members and candidates (step 2 of
@@ -705,6 +938,7 @@ fn select(
     names: &LibNames,
     input: IterationInput<'_>,
     frontier_size: usize,
+    lambda: Lambda,
 ) -> Result<(Vec<Vec<Pooled>>, Vec<ProgramFate>), DriverError> {
     let mut by_task: HashMap<&str, usize> = HashMap::new();
     for (i, t) in input.tasks.iter().enumerate() {
@@ -802,14 +1036,15 @@ fn select(
                         program: *program,
                         expanded: *expanded,
                         cost: cost.unwrap_or_else(|| Err(String::new())),
+                        growth: input.growth.map_or(Growth::NotMeasured, |g| g.of(source)),
                     });
                     None
                 }
             };
             entries.push((source.clone(), fate));
         }
-        // A stable sort: among programs of equal cost, the earlier stays first.
-        pool.sort_by_key(Pooled::sort_key);
+        // Among programs of equal score, the earlier stays first.
+        order(&mut pool, lambda);
         let trimmed: HashSet<Source> = pool
             .iter()
             .skip(frontier_size)
@@ -859,15 +1094,18 @@ fn is_interruption(e: &CompressError) -> bool {
     )
 }
 
-/// Runs Stitch on the kept programs, leaving out each program the bridge
+/// Runs Stitch on the kept programs that [`given_to_stitch`] picks under
+/// `lambda`, leaving out each program the bridge
 /// refuses before Stitch runs (step 3 of the crate docs). Programs that cannot
 /// be encoded are left out first; the bridge's other refusals are found one
 /// run at a time. Adds the programs left out to `left_out`.
+#[allow(clippy::too_many_arguments)]
 fn run_stitch(
     arena: &mut Arena,
     library: &Library<'_>,
     tasks: &[TaskSpec],
     kept: &[Vec<Pooled>],
+    lambda: Lambda,
     cfg: &CompressConfig,
     stitch: &mut dyn Stitch,
     left_out: &mut Vec<LeftOut>,
@@ -883,7 +1121,11 @@ fn run_stitch(
     };
     let mut slots = Vec::new();
     for (t, pool) in kept.iter().enumerate() {
+        let given = given_to_stitch(pool, lambda);
         for (p, pooled) in pool.iter().enumerate() {
+            if !given[p] {
+                continue;
+            }
             match &pooled.cost {
                 Ok(_) => slots.push((t, p)),
                 Err(e) => leave_out(arena, t, p, format!("it cannot be encoded: {e}"))?,
@@ -1449,6 +1691,7 @@ pub fn run_iteration(
         &old_names,
         input,
         cfg.frontier_size,
+        cfg.lambda,
     )?;
 
     let mut left_out = Vec::new();
@@ -1459,6 +1702,7 @@ pub fn run_iteration(
             &library,
             input.tasks,
             &kept,
+            cfg.lambda,
             compress,
             stitch,
             &mut left_out,
@@ -1485,23 +1729,31 @@ pub fn run_iteration(
     // Sort each frontier again under the new library.
     let new_names = names(old_len + new_library.len(), input.prelude)?;
     let mut frontiers = BTreeMap::new();
+    let mut sources = BTreeMap::new();
     for (task, pool) in input.tasks.iter().zip(&mut kept) {
         for p in pool.iter_mut() {
             p.cost = stitch_cost(&arena, p.program, &new_names).map_err(|e| e.to_string());
         }
-        pool.sort_by_key(Pooled::sort_key);
+        order(pool, cfg.lambda);
         let texts = pool
             .iter()
             .map(|p| print(&arena, p.program))
             .collect::<Result<Vec<String>, DriverError>>()?;
         frontiers.insert(task.name.clone(), texts);
+        sources.insert(
+            task.name.clone(),
+            pool.iter().map(|p| p.source.clone()).collect(),
+        );
     }
+    let selection = selection_report(input.tasks, &kept, cfg.lambda);
     Ok(IterationOutcome {
         new_library,
         frontiers,
+        sources,
         report: IterationReport {
             programs,
             compression,
+            selection: Some(selection),
         },
     })
 }

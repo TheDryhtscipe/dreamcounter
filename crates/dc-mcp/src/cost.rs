@@ -1,9 +1,10 @@
 //! What frontier programs cost on their task's sweep (bead
 //! dreamcounter-08a350).
 //!
-//! When an iteration's step has chosen the frontiers, [`measure_frontiers`]
-//! runs each kept program on its task's growth sweep with the `dc-tasks`
-//! harness, and the costs are committed with the frontiers
+//! When an iteration ends, [`measure_frontiers`] runs each frontier member
+//! and each new program on its task's growth sweep with the `dc-tasks`
+//! harness, before the step selects the new frontiers, and the costs of the
+//! programs the step keeps are committed with the frontiers
 //! ([`crate::iterate`]). For each program it records the step counts of each
 //! seed at each size, their median, and estimator C's verdict
 //! ([`ClassSelect::default`]).
@@ -25,11 +26,11 @@
 //! it. A plan that cannot be made is tried once in each call of
 //! [`measure_frontiers`], and the task's programs are refused.
 //!
-//! # What it does not change
+//! # What it changes
 //!
-//! Measuring happens after the step has chosen the frontiers, and only adds
-//! a cost to each member. Which programs are kept, and in what order, is the
-//! step's alone; a cost-aware choice is plan item P5.
+//! Each program's cost gives its growth ([`growth`]) to the step, which
+//! selects frontiers under `J(L)` at the run's λ (decisions D4 and D27). At
+//! λ = 0 costs change nothing the step chooses.
 //!
 //! # Time
 //!

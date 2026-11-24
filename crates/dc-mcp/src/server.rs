@@ -144,6 +144,22 @@ pub struct CreateRun {
     /// library_learning. It is not taken from the compared run, and the two
     /// runs may differ in it. If absent, false.
     pub refuse_bucketing: Option<bool>,
+    /// λ of the cost-aware objective J(L) = DL(L) + Σ_t min_p [DL(p | L) +
+    /// λ·C(p)] (decisions D4 and D27). When an iteration ends, each task's
+    /// frontier is ranked by DL(p | L) + λ·C(p), where C(p) is the rank of
+    /// the program's growth class (1 is 0, log n 1, n 2, n log n 3, n² 4,
+    /// n³ 5, 2ⁿ 6), a program with no class gets the largest in its task
+    /// plus 1 (7 if none has one), and one that timed out gets 8. A program
+    /// found to give a wrong output on a generated input is not a solution:
+    /// at λ above 0 it ranks last, and it is never selected. At λ above 0
+    /// the first member is the one selected, if any member is a solution,
+    /// and Stitch sees only the members that grow no faster than it. The
+    /// compression log records each member's C as the step used it, and the
+    /// selection λ = 0 would make from the same frontier. Description lengths are Stitch
+    /// costs, about 100 for each node. At 0 selection is by description
+    /// length alone. At least 0 and at most 2^64. It is not taken from the
+    /// compared run, and the two runs may differ in it. If absent, 0.
+    pub lambda: Option<f64>,
     /// Entries that join the library when iteration 0 ends, after the
     /// entries Stitch finds then, each with its name and doc and with no
     /// naming job (decision D36). At most 16. In a term, `lib_k` is entry
@@ -283,6 +299,8 @@ pub struct RunStatus {
     /// Whether the run refuses the bucketing abstractions Stitch finds
     /// (decision D36).
     pub refuse_bucketing: bool,
+    /// λ of the cost-aware objective J(L) (decision D4).
+    pub lambda: f64,
     /// The names of the run's seed entries, in order (decision D36). They
     /// are in the library from the end of iteration 0.
     pub seed_entries: Vec<String>,
@@ -351,6 +369,7 @@ impl RunStatus {
             approach_hints: config.approach_hints,
             show_received: config.show_received,
             refuse_bucketing: config.refuse_bucketing,
+            lambda: config.lambda.get(),
             seed_entries: config
                 .seed_entries
                 .iter()
@@ -1173,6 +1192,10 @@ impl DcServer {
             }
         }
         let refuse_bucketing = arg.refuse_bucketing.unwrap_or(false);
+        let lambda = arg
+            .lambda
+            .map_or(Ok(dc_driver::Lambda::ZERO), dc_driver::Lambda::new)
+            .map_err(|e| e.to_string())?;
         let seed_entries: Vec<crate::state::LibraryEntry> = arg
             .seed_entries
             .unwrap_or_default()
@@ -1294,6 +1317,7 @@ impl DcServer {
                     .or(other.as_ref().map(|(c, _)| c.show_received))
                     .unwrap_or(false),
                 refuse_bucketing,
+                lambda,
                 seed_entries,
             };
             if let (Some(name), Some((other_config, other_tasks))) = (&compared_with, &other) {
@@ -1565,11 +1589,14 @@ impl DcServer {
                        task's best programs as its frontier, runs Stitch on them to find new \
                        abstractions for the library, measures each kept program on its task's \
                        growth sweep (dc_frontiers reports it), and starts the next iteration, \
-                       all in one change to the run. The call first measures every program's \
-                       size, then waits for Stitch for at most the run's stitch.wall_seconds, \
-                       then measures the kept programs' cost, starting no program's run after \
-                       10 minutes (a program not reached is recorded as not measured), then \
-                       checks what \
+                       all in one change to the run. The call first measures the cost of every \
+                       frontier program and every new program, starting no program's run after \
+                       10 minutes, so that the run's lambda can use it; then waits for Stitch \
+                       for at most the run's stitch.wall_seconds; then measures any kept \
+                       program still without a cost, again starting no run after 10 minutes \
+                       (a program not reached is recorded as not measured). Each 10 minutes \
+                       can be passed by one run in progress or one task's fuel plan, so allow \
+                       about 25 minutes plus stitch.wall_seconds. It then checks what \
                        proposers submitted meanwhile, up to 8 times. If Stitch is stopped at a \
                        limit the iteration still ends, with the library unchanged. If you \
                        cancel the call before its change is written, Stitch stops and the run \
@@ -2218,6 +2245,7 @@ mod tests {
             approach_hints: false,
             show_received: false,
             refuse_bucketing: false,
+            lambda: dc_driver::Lambda::ZERO,
             seed_entries: Vec::new(),
         };
         let tasks = vec!["a".to_owned(), "b".to_owned()];
@@ -2340,6 +2368,7 @@ mod tests {
                     approach_hints: false,
                     show_received: false,
                     refuse_bucketing: false,
+                    lambda: dc_driver::Lambda::ZERO,
                     seed_entries: Vec::new(),
                 },
                 vec!["collapse/merge".into()],
@@ -2430,6 +2459,7 @@ mod tests {
                         approach_hints: false,
                         show_received: false,
                         refuse_bucketing: false,
+                        lambda: dc_driver::Lambda::ZERO,
                         seed_entries: Vec::new(),
                     },
                     vec!["collapse/merge".into()],

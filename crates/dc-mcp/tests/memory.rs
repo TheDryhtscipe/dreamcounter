@@ -127,6 +127,7 @@ fn check_cold_reads(notes: u64, note_bytes: usize) {
         approach_hints: false,
         show_received: false,
         refuse_bucketing: false,
+        lambda: dc_driver::Lambda::ZERO,
         seed_entries: Vec::new(),
     };
     store.create_run(&run, config, vec!["t".into()]).unwrap();

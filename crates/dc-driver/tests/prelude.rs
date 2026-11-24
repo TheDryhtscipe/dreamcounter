@@ -45,6 +45,7 @@ fn config() -> DriverConfig {
         frontier_size: 5,
         compress: Some(CompressConfig::default()),
         refuse_bucketing: false,
+        lambda: dc_driver::Lambda::ZERO,
     }
 }
 
@@ -62,6 +63,7 @@ fn run(
             frontiers,
             candidates,
             prelude,
+            growth: None,
         },
         &config(),
         &mut InProcess,
@@ -330,6 +332,7 @@ fn writing_out_a_refused_abstraction_keeps_prelude_uses_and_every_literal() {
             frontiers: &BTreeMap::new(),
             candidates: &cands,
             prelude: Some(&prelude),
+            growth: None,
         },
         &DriverConfig {
             refuse_bucketing: true,
