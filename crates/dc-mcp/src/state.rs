@@ -154,6 +154,13 @@ pub struct RunConfig {
     /// needs library learning. A run made before the setting has it off.
     #[serde(default)]
     pub refuse_bucketing: bool,
+    /// λ of the cost-aware objective `J(L)` (decision D4): how much one
+    /// step of a program's growth class weighs against its description
+    /// length when the step that ends each iteration selects frontiers
+    /// (`dc_driver::DriverConfig::lambda`). At 0 the step selects by
+    /// description length alone. A run made before the setting has 0.
+    #[serde(default)]
+    pub lambda: dc_driver::Lambda,
     /// Entries that join the library when iteration 0 ends, after the
     /// entries Stitch finds then, each with its name and doc and with no
     /// naming job (decision D36). In a term here, `lib_k` is entry `k` of
@@ -278,8 +285,8 @@ pub struct FrontierMember {
     pub program: String,
     /// What the program costs on its task's sweep, measured when the
     /// iteration that kept it ended (`crate::cost`). `None` in a run made
-    /// before costs were measured. It plays no part in which programs are
-    /// kept.
+    /// before costs were measured. In a run whose lambda is above 0 it
+    /// helps decide which programs are kept and which comes first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<ProgramCost>,
 }
@@ -2137,6 +2144,7 @@ mod tests {
             approach_hints: false,
             show_received: false,
             refuse_bucketing: false,
+            lambda: dc_driver::Lambda::ZERO,
             seed_entries: Vec::new(),
         }
     }

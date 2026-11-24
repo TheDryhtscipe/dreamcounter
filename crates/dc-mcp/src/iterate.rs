@@ -1,7 +1,7 @@
 //! Ending an iteration: the step of `dc_driver` run on a run's state, and its
 //! result committed (decisions D18 and D19).
 //!
-//! [`finish_iteration`] does four things:
+//! [`finish_iteration`] does five things:
 //!
 //! 1. **Read.** Under the run's lock it copies what the step needs: the
 //!    library, each task's frontier, and the verified programs no step has
@@ -9,15 +9,26 @@
 //!    and all of them are checked ([`RunState::quota_in`]), and unless the
 //!    run's programs were compiled with this build's prelude
 //!    ([`crate::verify::check_prelude`]).
-//! 2. **Step.** Without the lock, it runs [`dc_driver::run_iteration`] with
+//! 2. **Measure.** Without the lock, it measures each frontier member and
+//!    each verified program the step will read on its task's growth sweep
+//!    ([`crate::cost`]), against the run's library, within
+//!    [`MEASURE_BUDGET`]. A member keeps a measured or incorrect cost it
+//!    already has, and a text is measured once for its task. Each program's
+//!    growth goes into the step, which selects frontiers under `J(L)` at the
+//!    run's λ ([`RunConfig::lambda`], bead dreamcounter-211560). At λ = 0 the
+//!    costs change nothing the step chooses; they give the selection report
+//!    its values.
+//! 3. **Step.** Without the lock, it runs [`dc_driver::run_iteration`] with
 //!    the Stitch runner it is given. This can take as long as the run's
 //!    Stitch limits allow. Proposers' servers go on meanwhile: a submission
 //!    for a batch whose lease ended can still come in and be checked.
-//! 3. **Measure.** Without the lock, it measures each program the step kept
-//!    on its task's growth sweep ([`crate::cost`]), within
-//!    [`MEASURE_BUDGET`]. This adds a cost to each frontier member and
-//!    changes nothing the step chose.
-//! 4. **Commit.** In one record, so that a restart finds all of it or none:
+//! 4. **Costs of the new frontiers.** Each member of a new frontier takes
+//!    the cost its program had in step 2, found through the step's
+//!    [`sources`](dc_driver::IterationOutcome::sources). A rewritten program
+//!    has its original's expansion, and measuring runs the expansion, so the
+//!    cost holds. A member with no measured or incorrect cost is measured
+//!    again, in what is left of the budget after step 2.
+//! 5. **Commit.** In one record, so that a restart finds all of it or none:
 //!    a `FrontierSet` for each task, its members with their costs, a
 //!    `LibraryExtended` if abstractions join the library, in iteration 0 a
 //!    `LibrarySeeded` if the run has seed entries, a log record of
@@ -49,11 +60,12 @@
 //! interruption: the iteration ends without new abstractions, and the log
 //! record says why (D19, item 6).
 //!
-//! The cancel flag of [`finish_iteration_in_worker`] is read while Stitch
-//! runs, before each run of a program while the frontiers are measured,
-//! and under the run's lock at each attempt to commit. A flag set after the
-//! attempt that commits has read it does not stop the commit. It is not
-//! read while the step measures programs before Stitch.
+//! The cancel flag of [`finish_iteration_in_worker`] is read before each run
+//! of a program while programs are measured, after the measuring of step 2,
+//! while Stitch runs, and under the run's lock at each attempt to commit. A
+//! flag set after the attempt that commits has read it does not stop the
+//! commit. It is not read while a task's fuel plan is made, or while the
+//! step works out description lengths before Stitch.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -65,16 +77,16 @@ use std::time::{Duration, Instant};
 use dc_compress::worker::{Limits, Worker};
 use dc_compress::CompressConfig;
 use dc_driver::{
-    run_iteration, Candidate, DriverConfig, DriverError, Isolated, IterationInput, IterationReport,
-    Stitch, TaskSpec,
+    run_iteration, Candidate, DriverConfig, DriverError, Growths, Isolated, IterationInput,
+    IterationReport, Source, Stitch, TaskSpec,
 };
 use dc_surface::prelude::Prelude;
 
 use crate::cost::{self, measure_frontiers, MEASURE_BUDGET};
 use crate::proposer::check_pending;
 use crate::state::{
-    Event, FrontierMember, LibraryEntry, LogKind, LogRecord, RunConfig, RunId, RunState,
-    StitchSettings,
+    Event, FrontierMember, LibraryEntry, LogKind, LogRecord, ProgramCost, RunConfig, RunId,
+    RunState, StitchSettings,
 };
 use crate::store::{Store, StoreError};
 use crate::verify::{check_prelude, shipped_prelude, task, PreludeChanged, VerifierCache};
@@ -215,7 +227,7 @@ fn driver_config(config: &RunConfig) -> DriverConfig {
             max_arity: config.stitch.max_arity,
         }),
         refuse_bucketing: config.refuse_bucketing,
-        lambda: dc_driver::Lambda::ZERO,
+        lambda: config.lambda,
     }
 }
 
@@ -297,6 +309,91 @@ fn snapshot(state: &RunState) -> Result<Snapshot, FinishError> {
             Vec::new()
         },
     })
+}
+
+/// The cost of each program the step reads, measured before the step.
+struct Before {
+    /// Each task's programs, members first and then candidates, each text
+    /// once, with its cost.
+    costs: BTreeMap<String, Vec<FrontierMember>>,
+    /// The same, as the step reads it.
+    growths: Growths,
+}
+
+impl Before {
+    /// The cost of the program at `source`, if it was measured.
+    fn cost<'a>(&'a self, snap: &Snapshot, source: &Source) -> Option<&'a ProgramCost> {
+        let (task, text) = match source {
+            Source::Member { task, index } => (task, snap.frontiers.get(task)?.get(*index)?),
+            Source::Candidate { index } => {
+                let c = snap.candidates.get(*index)?;
+                (&c.task, &c.program)
+            }
+        };
+        self.costs
+            .get(task)?
+            .iter()
+            .find(|m| &m.program == text)?
+            .cost
+            .as_ref()
+    }
+}
+
+/// Measures, against the run's library, each frontier member and each
+/// candidate of the snapshot, as [`measure_frontiers`] does: a member's
+/// measured or incorrect cost is kept, and a text is measured once for its
+/// task. A candidate for a task the run does not have is not measured.
+fn measure_before_step(snap: &Snapshot, limits: cost::Limits<'_>) -> Before {
+    let library: Vec<LibraryEntry> = snap
+        .library
+        .iter()
+        .map(|e| LibraryEntry {
+            name: None,
+            doc: None,
+            arity: e.arity,
+            term: e.term.clone(),
+        })
+        .collect();
+    let mut texts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for t in &snap.tasks {
+        let all = texts.entry(t.clone()).or_default();
+        let members = snap.frontiers.get(t).map(Vec::as_slice).unwrap_or_default();
+        let candidates = snap
+            .candidates
+            .iter()
+            .filter(|c| &c.task == t)
+            .map(|c| &c.program);
+        for text in members.iter().chain(candidates) {
+            if !all.contains(text) {
+                all.push(text.clone());
+            }
+        }
+    }
+    let costs = measure_frontiers(&library, &texts, &snap.members, snap.max_memory, limits);
+    let mut before = Before {
+        costs,
+        growths: Growths::default(),
+    };
+    let growth = |before: &Before, source: Source| cost::growth(before.cost(snap, &source));
+    for t in &snap.tasks {
+        let count = snap.frontiers.get(t).map_or(0, Vec::len);
+        let members = (0..count)
+            .map(|index| {
+                growth(
+                    &before,
+                    Source::Member {
+                        task: t.clone(),
+                        index,
+                    },
+                )
+            })
+            .collect();
+        before.growths.members.insert(t.clone(), members);
+    }
+    before.growths.candidates = (0..snap.candidates.len())
+        .map(|index| growth(&before, Source::Candidate { index }))
+        .collect();
+    before
 }
 
 /// The argument that makes the `dc-mcp` binary a Stitch worker: started with
@@ -407,6 +504,26 @@ fn finish(
             signature: family.signature(),
         });
     }
+    let cancel = match &runner {
+        Runner::Given(_) => None,
+        Runner::Worker { cancel, .. } => Some(*cancel),
+    };
+    // Each program's cost, measured before the step so that selection can
+    // use it (bead dreamcounter-211560).
+    let measuring = Instant::now();
+    let before = measure_before_step(
+        &snap,
+        cost::Limits {
+            deadline: measuring + budget,
+            cancel,
+        },
+    );
+    if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+        return Err(FinishError::Interrupted(
+            "the call was cancelled".to_owned(),
+        ));
+    }
+    let budget_left = budget.saturating_sub(measuring.elapsed());
     // The fingerprint was compared under the lock, so this is the prelude
     // the run's programs were compiled with.
     let prelude = Prelude::load().expect("the shipped prelude loads");
@@ -416,7 +533,7 @@ fn finish(
         frontiers: &snap.frontiers,
         candidates: &snap.candidates,
         prelude: Some(&prelude),
-        growth: None,
+        growth: Some(&before.growths),
     };
     let mut cancelled: Option<&AtomicBool> = None;
     let stepped = match runner {
@@ -444,8 +561,11 @@ fn finish(
         other => FinishError::State(other),
     })?;
 
-    // The frontiers are chosen. Measuring them adds a cost to each member
-    // and changes nothing else; it is done without the lock.
+    // The frontiers are chosen. Each member keeps the cost its program had
+    // before the step: a rewritten program has its original's expansion,
+    // and measuring runs the expansion. Members with no measured or
+    // incorrect cost are measured again in what is left of the budget,
+    // without the lock.
     let library: Vec<LibraryEntry> = snap
         .library
         .iter()
@@ -467,13 +587,38 @@ fn finish(
             )
         })
         .collect();
+    let carried: BTreeMap<String, Vec<FrontierMember>> = snap
+        .tasks
+        .iter()
+        .map(|t| {
+            let texts = outcome
+                .frontiers
+                .get(t)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let sources = outcome
+                .sources
+                .get(t)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let members = texts
+                .iter()
+                .zip(sources)
+                .map(|(program, source)| FrontierMember {
+                    program: program.clone(),
+                    cost: before.cost(&snap, source).cloned(),
+                })
+                .collect();
+            (t.clone(), members)
+        })
+        .collect();
     let mut measured = measure_frontiers(
         &library,
         &kept,
-        &snap.members,
+        &carried,
         snap.max_memory,
         cost::Limits {
-            deadline: Instant::now() + budget,
+            deadline: Instant::now() + budget_left,
             cancel: cancelled,
         },
     );

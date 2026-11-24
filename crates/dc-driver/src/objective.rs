@@ -280,16 +280,18 @@ impl<'de> Deserialize<'de> for Lambda {
 pub fn select(members: &[Member], lambda: f64) -> Result<Option<Selection>, ObjectiveError> {
     check_lambda(lambda)?;
     let costs = member_costs(members);
-    Ok(best(members, &costs, 0..members.len(), lambda).map(|index| {
-        let member = members[index];
-        let cost = costs[index].expect("best takes only correct members");
-        Selection {
-            index,
-            dl: member.dl,
-            cost,
-            score: member.dl as f64 + lambda * f64::from(cost.c),
-        }
-    }))
+    Ok(
+        best(members, &costs, 0..members.len(), lambda).map(|index| {
+            let member = members[index];
+            let cost = costs[index].expect("best takes only correct members");
+            Selection {
+                index,
+                dl: member.dl,
+                cost,
+                score: member.dl as f64 + lambda * f64::from(cost.c),
+            }
+        }),
+    )
 }
 
 /// Of the members at `among`, in the order given, the correct one with the

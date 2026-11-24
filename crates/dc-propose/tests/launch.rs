@@ -94,6 +94,7 @@ impl Fixture {
             approach_hints: false,
             show_received: false,
             refuse_bucketing: false,
+            lambda: Default::default(),
             seed_entries: Vec::new(),
         };
         store

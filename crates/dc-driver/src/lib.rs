@@ -873,9 +873,8 @@ fn selection_report(tasks: &[TaskSpec], kept: &[Vec<Pooled>], lambda: Lambda) ->
         let costs = member_costs(&members(pool));
         let selected = selected(pool, lambda.get());
         let baseline = selected_at_zero(pool);
-        let c = |i: Option<usize>| -> u64 {
-            i.and_then(|i| costs[i]).map_or(0, |m| u64::from(m.c))
-        };
+        let c =
+            |i: Option<usize>| -> u64 { i.and_then(|i| costs[i]).map_or(0, |m| u64::from(m.c)) };
         report.total_cost += c(selected);
         report.baseline_total_cost += c(baseline);
         if selected != baseline {
@@ -1014,9 +1013,7 @@ fn select(
                         program: *program,
                         expanded: *expanded,
                         cost: cost.unwrap_or_else(|| Err(String::new())),
-                        growth: input
-                            .growth
-                            .map_or(Growth::NotMeasured, |g| g.of(source)),
+                        growth: input.growth.map_or(Growth::NotMeasured, |g| g.of(source)),
                     });
                     None
                 }

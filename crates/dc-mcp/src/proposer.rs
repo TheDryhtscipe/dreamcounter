@@ -917,6 +917,7 @@ mod tests {
                     approach_hints: false,
                     show_received: false,
                     refuse_bucketing: false,
+                    lambda: dc_driver::Lambda::ZERO,
                     seed_entries: Vec::new(),
                 },
                 vec![MERGE.into(), CANCEL.into()],
@@ -1102,6 +1103,7 @@ mod tests {
             approach_hints: false,
             show_received: false,
             refuse_bucketing: false,
+            lambda: dc_driver::Lambda::ZERO,
             seed_entries: Vec::new(),
         };
         let tasks = vec![MERGE.to_owned(), CANCEL.to_owned()];
@@ -1654,6 +1656,7 @@ mod tests {
             approach_hints: false,
             show_received: false,
             refuse_bucketing: false,
+            lambda: dc_driver::Lambda::ZERO,
             seed_entries: Vec::new(),
         }
     }

@@ -158,10 +158,7 @@ fn short_slow_and_long_fast() -> (Vec<TaskSpec>, Vec<Candidate>, Growths) {
     (
         vec![task("t", "Int")],
         vec![candidate("t", SHORT_SLOW), candidate("t", LONG_FAST)],
-        candidates_growth(&[
-            fitted(GrowthClass::Quadratic),
-            fitted(GrowthClass::Linear),
-        ]),
+        candidates_growth(&[fitted(GrowthClass::Quadratic), fitted(GrowthClass::Linear)]),
     )
 }
 
@@ -354,7 +351,10 @@ fn after_compression_each_frontier_is_ordered_again_under_j() {
     };
     let out = case.run(&config(5, 1e6), &mut stitch);
     assert_eq!(out.new_library.len(), 1);
-    assert_eq!(out.frontiers["t"], vec!["(lib_0 3)", "(add 1 2)", SHORT_SLOW]);
+    assert_eq!(
+        out.frontiers["t"],
+        vec!["(lib_0 3)", "(add 1 2)", SHORT_SLOW]
+    );
     assert_eq!(
         out.sources["t"],
         vec![
@@ -393,7 +393,10 @@ fn the_report_gives_each_members_cost_and_cause_and_the_lambda_zero_selection() 
         growths: Some(&growths),
     };
     let out = case.run(&config(5, 1e6), &mut Nothing::default());
-    let report = out.report.selection.expect("the step reports its selection");
+    let report = out
+        .report
+        .selection
+        .expect("the step reports its selection");
     assert_eq!(report.lambda, Lambda::new(1e6).unwrap());
 
     let t = &report.tasks["t"];

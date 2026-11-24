@@ -363,7 +363,11 @@ fn the_first_member_rank_gives_is_the_one_select_gives() {
     ];
     for lambda in std::iter::once(0.0).chain(POSITIVE_LAMBDAS) {
         let ranked = rank(&members, lambda).unwrap();
-        assert_eq!(ranked[0], selected(&members, lambda).index, "lambda {lambda}");
+        assert_eq!(
+            ranked[0],
+            selected(&members, lambda).index,
+            "lambda {lambda}"
+        );
         let mut sorted = ranked.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..members.len()).collect::<Vec<_>>());
