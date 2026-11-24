@@ -39,6 +39,7 @@ fn config(k: usize) -> DriverConfig {
         frontier_size: k,
         compress: Some(CompressConfig::default()),
         refuse_bucketing: false,
+        lambda: dc_driver::Lambda::ZERO,
     }
 }
 
@@ -173,6 +174,7 @@ fn run(
             frontiers,
             candidates,
             prelude: None,
+            growth: None,
         },
         cfg,
         stitch,
@@ -1185,6 +1187,7 @@ fn with_compression_off_stitch_does_not_run() {
         frontier_size: 5,
         compress: None,
         refuse_bucketing: false,
+        lambda: dc_driver::Lambda::ZERO,
     };
     let mut stitch = Nothing::default();
     let out = run(&tasks, &[], &BTreeMap::new(), &cands, &cfg, &mut stitch).unwrap();

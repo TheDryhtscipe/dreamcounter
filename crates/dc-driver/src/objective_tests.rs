@@ -323,3 +323,107 @@ fn the_largest_lambda_keeps_j_finite() {
     ];
     assert_eq!(selected(&members, MAX_LAMBDA).index, 0);
 }
+
+#[test]
+fn rank_at_lambda_zero_is_a_stable_sort_by_description_length_with_incorrect_members_last() {
+    let members = [
+        fitted(30, GrowthClass::Quadratic),
+        member(10, Growth::Incorrect),
+        fitted(20, GrowthClass::Linear),
+        too_noisy(20),
+        fitted(5, GrowthClass::Cubic),
+    ];
+    assert_eq!(rank(&members, 0.0).unwrap(), vec![4, 2, 3, 0, 1]);
+}
+
+#[test]
+fn rank_puts_a_slower_member_after_a_longer_faster_one_once_lambda_pays_for_it() {
+    let members = [
+        fitted(10, GrowthClass::Quadratic),
+        fitted(13, GrowthClass::Linear),
+        fitted(11, GrowthClass::Cubic),
+    ];
+    // C is 4, 2 and 5. At λ = 1 the scores are 14, 15 and 16.
+    assert_eq!(rank(&members, 1.0).unwrap(), vec![0, 1, 2]);
+    // At λ = 2 they are 18, 17 and 21.
+    assert_eq!(rank(&members, 2.0).unwrap(), vec![1, 0, 2]);
+    // At a huge λ, C alone decides.
+    assert_eq!(rank(&members, 1e9).unwrap(), vec![1, 0, 2]);
+}
+
+#[test]
+fn the_first_member_rank_gives_is_the_one_select_gives() {
+    let members = [
+        fitted(40, GrowthClass::Quadratic),
+        too_noisy(30),
+        member(25, Growth::TimedOut),
+        member(50, Growth::Incorrect),
+        fitted(45, GrowthClass::Linear),
+        member(30, Growth::NotMeasured),
+    ];
+    for lambda in std::iter::once(0.0).chain(POSITIVE_LAMBDAS) {
+        let ranked = rank(&members, lambda).unwrap();
+        assert_eq!(ranked[0], selected(&members, lambda).index, "lambda {lambda}");
+        let mut sorted = ranked.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..members.len()).collect::<Vec<_>>());
+        assert_eq!(*ranked.last().unwrap(), 3, "the incorrect member is last");
+    }
+}
+
+#[test]
+fn rank_keeps_the_given_order_among_members_with_equal_scores() {
+    let members = [
+        fitted(12, GrowthClass::Linear),
+        fitted(10, GrowthClass::Quadratic),
+        fitted(12, GrowthClass::Linear),
+        fitted(10, GrowthClass::Quadratic),
+    ];
+    // At λ = 1 every score is 14.
+    assert_eq!(rank(&members, 1.0).unwrap(), vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn rank_refuses_a_bad_lambda() {
+    assert_eq!(
+        rank(&[fitted(1, GrowthClass::Linear)], -1.0),
+        Err(ObjectiveError::BadLambda(-1.0))
+    );
+}
+
+#[test]
+fn a_lambda_is_finite_between_zero_and_the_largest_and_minus_zero_is_zero() {
+    for bad in [f64::NAN, f64::INFINITY, -1.0, -1e-300, MAX_LAMBDA * 2.0] {
+        assert!(Lambda::new(bad).is_err(), "{bad}");
+    }
+    let minus_zero = Lambda::new(-0.0).unwrap();
+    assert!(minus_zero.is_zero());
+    assert!(minus_zero.get().is_sign_positive());
+    assert_eq!(minus_zero, Lambda::ZERO);
+    assert_eq!(Lambda::default(), Lambda::ZERO);
+    assert_eq!(Lambda::new(MAX_LAMBDA).unwrap().get(), MAX_LAMBDA);
+    assert!(!Lambda::new(1e-300).unwrap().is_zero());
+}
+
+#[test]
+fn a_lambda_is_written_as_a_number_and_a_bad_one_is_not_read() {
+    let l = Lambda::new(0.25).unwrap();
+    assert_eq!(serde_json::to_string(&l).unwrap(), "0.25");
+    assert_eq!(serde_json::from_str::<Lambda>("0.25").unwrap(), l);
+    assert_eq!(serde_json::from_str::<Lambda>("0").unwrap(), Lambda::ZERO);
+    assert!(serde_json::from_str::<Lambda>("-1").is_err());
+    assert!(serde_json::from_str::<Lambda>("1e30").is_err());
+}
+
+#[test]
+fn an_unfitted_cause_is_written_in_snake_case() {
+    let causes = [
+        Unfitted::TimedOut,
+        Unfitted::NotMeasured,
+        Unfitted::Refused(Refusal::NoiseUnknown),
+    ];
+    assert_eq!(
+        serde_json::to_string(&causes).unwrap(),
+        r#"["timed_out","not_measured",{"refused":"noise_unknown"}]"#
+    );
+}

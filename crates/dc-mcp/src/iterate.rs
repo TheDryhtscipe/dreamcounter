@@ -215,6 +215,7 @@ fn driver_config(config: &RunConfig) -> DriverConfig {
             max_arity: config.stitch.max_arity,
         }),
         refuse_bucketing: config.refuse_bucketing,
+        lambda: dc_driver::Lambda::ZERO,
     }
 }
 
@@ -415,6 +416,7 @@ fn finish(
         frontiers: &snap.frontiers,
         candidates: &snap.candidates,
         prelude: Some(&prelude),
+        growth: None,
     };
     let mut cancelled: Option<&AtomicBool> = None;
     let stepped = match runner {
