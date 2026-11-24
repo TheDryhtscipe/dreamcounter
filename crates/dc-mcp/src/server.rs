@@ -150,11 +150,12 @@ pub struct CreateRun {
     /// the program's growth class (1 is 0, log n 1, n 2, n log n 3, n² 4,
     /// n³ 5, 2ⁿ 6), a program with no class gets the largest in its task
     /// plus 1 (7 if none has one), and one that timed out gets 8. A program
-    /// that gave a wrong output on a generated input is not a solution:
-    /// at λ above 0 it ranks last. At λ above 0 the first member is the one
-    /// selected, and Stitch sees only the members that grow no faster than
-    /// it. The compression log records each member's C and the selection
-    /// λ = 0 would make from the same frontier. Description lengths are Stitch
+    /// found to give a wrong output on a generated input is not a solution:
+    /// at λ above 0 it ranks last, and it is never selected. At λ above 0
+    /// the first member is the one selected, if any member is a solution,
+    /// and Stitch sees only the members that grow no faster than it. The
+    /// compression log records each member's C as the step used it, and the
+    /// selection λ = 0 would make from the same frontier. Description lengths are Stitch
     /// costs, about 100 for each node. At 0 selection is by description
     /// length alone. At least 0 and at most 2^64. It is not taken from the
     /// compared run, and the two runs may differ in it. If absent, 0.
@@ -1588,11 +1589,14 @@ impl DcServer {
                        task's best programs as its frontier, runs Stitch on them to find new \
                        abstractions for the library, measures each kept program on its task's \
                        growth sweep (dc_frontiers reports it), and starts the next iteration, \
-                       all in one change to the run. The call first measures every program's \
-                       size, then waits for Stitch for at most the run's stitch.wall_seconds, \
-                       then measures the kept programs' cost, starting no program's run after \
-                       10 minutes (a program not reached is recorded as not measured), then \
-                       checks what \
+                       all in one change to the run. The call first measures the cost of every \
+                       frontier program and every new program, starting no program's run after \
+                       10 minutes, so that the run's lambda can use it; then waits for Stitch \
+                       for at most the run's stitch.wall_seconds; then measures any kept \
+                       program still without a cost, again starting no run after 10 minutes \
+                       (a program not reached is recorded as not measured). Each 10 minutes \
+                       can be passed by one run in progress or one task's fuel plan, so allow \
+                       about 25 minutes plus stitch.wall_seconds. It then checks what \
                        proposers submitted meanwhile, up to 8 times. If Stitch is stopped at a \
                        limit the iteration still ends, with the library unchanged. If you \
                        cancel the call before its change is written, Stitch stops and the run \

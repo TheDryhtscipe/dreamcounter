@@ -29,9 +29,14 @@
 //!    cost holds. A member with no measured or incorrect cost is measured
 //!    again, within a budget of its own: a run with more programs than
 //!    step 2 had time for still gets the kept ones measured, as it did
-//!    before step 2 existed. So measuring can take up to twice
-//!    [`MEASURE_BUDGET`] in one call, and a client's tool timeout must
-//!    allow for that and Stitch's limit.
+//!    before step 2 existed. Such a cost comes after the step ranked the
+//!    frontier, so the stored cost can differ from the one the step used and
+//!    logged; the next step uses the stored one. Each budget can be passed by
+//!    one run, one program's examples, or one fuel plan in progress, so
+//!    measuring can take a little more than twice [`MEASURE_BUDGET`] in one
+//!    call, and a client's tool timeout must allow for that and Stitch's
+//!    limit. A task whose fuel plan cannot be made has it tried in each
+//!    pass.
 //! 5. **Commit.** In one record, so that a restart finds all of it or none:
 //!    a `FrontierSet` for each task, its members with their costs, a
 //!    `LibraryExtended` if abstractions join the library, in iteration 0 a
@@ -483,8 +488,8 @@ pub fn finish_iteration_with_budget(
 /// worker within about 50 milliseconds; the result is then
 /// [`FinishError::Interrupted`]. While programs are measured, before or
 /// after Stitch, a cancel waits for the run in progress, or for a task's
-/// fuel plan if one is being made (up to about 15 seconds, once per task
-/// in a process). The result is the same if `cancel` is set when an
+/// fuel plan if one is being made (about ten seconds for a development
+/// task; a plan that is made is kept for the process). The result is the same if `cancel` is set when an
 /// attempt to commit reads it, under the run's lock.
 pub fn finish_iteration_in_worker(
     store: &Store,

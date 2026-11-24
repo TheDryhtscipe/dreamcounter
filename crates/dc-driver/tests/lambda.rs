@@ -523,3 +523,34 @@ fn the_report_gives_the_member_a_lambda_zero_step_puts_first_even_if_it_is_incor
     );
     assert_eq!((report.changed, report.changed_first), (0, 1));
 }
+
+#[test]
+fn on_a_tie_in_length_the_first_member_is_the_lambda_zero_choice_at_lambda_zero() {
+    let tasks = [task("t", "Int")];
+    // "5" and "6" have the same description length.
+    let candidates = [
+        candidate("t", "5"),
+        candidate("t", "6"),
+        candidate("t", "7"),
+    ];
+    let growths = candidates_growth(&[
+        Growth::Incorrect,
+        fitted(GrowthClass::Linear),
+        fitted(GrowthClass::Constant),
+    ]);
+    let case = Case {
+        tasks: &tasks,
+        frontiers: BTreeMap::new(),
+        candidates: &candidates,
+        growths: Some(&growths),
+    };
+    let zero = case.run(&config(5, 0.0), &mut Nothing::default());
+    assert_eq!(zero.frontiers["t"], vec!["5", "6", "7"]);
+    let report = zero.report.selection.unwrap();
+    let t = &report.tasks["t"];
+    assert_eq!(
+        (t.selected, t.baseline, t.baseline_first),
+        (Some(1), Some(1), Some(0))
+    );
+    assert_eq!((report.changed, report.changed_first), (0, 0));
+}

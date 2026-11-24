@@ -492,9 +492,12 @@ pub struct TaskSelection {
     pub selected: Option<usize>,
     /// The position of the member λ = 0 would select.
     pub baseline: Option<usize>,
-    /// The position of the member a step at λ = 0 would put first: the
-    /// shortest, the earliest on a tie, incorrect or not. `None` for an
-    /// empty frontier.
+    /// The position of the member a step at λ = 0 would put first if this
+    /// frontier were its pool: the shortest, incorrect or not, and on a tie
+    /// the earliest in this frontier's order. Programs trimmed from the
+    /// pool are not considered, and at λ > 0 this frontier's order puts
+    /// lower `C(p)` first, so this is a lower bound on how much λ changed
+    /// what proposers are shown. `None` for an empty frontier.
     pub baseline_first: Option<usize>,
     /// Each member, in the frontier's order.
     pub members: Vec<MemberScore>,
